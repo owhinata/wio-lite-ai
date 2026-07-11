@@ -164,6 +164,7 @@ firmware_finalize(boot)
 add_executable(bootrom
     "${CMAKE_SOURCE_DIR}/bootrom/main.c"
     "${CMAKE_SOURCE_DIR}/bootrom/clock.c"
+    "${CMAKE_SOURCE_DIR}/bootrom/octospi.c"
     "${CMSIS_DEV}/Source/Templates/system_stm32h7xx.c"
     "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"
     ${HAL_SOURCES})

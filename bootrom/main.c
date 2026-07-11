@@ -16,14 +16,23 @@
 #include "stm32h7xx_hal.h"
 
 void SystemClock_Config(void);
+int  octospi2_init(uint8_t jedec[3]);   // bootrom/octospi.c
 
-#define LED_PORT   GPIOC
-#define LED_PIN    GPIO_PIN_13
+#define LED_PIN    GPIO_PIN_13   /* PC13 red LED */
 
 int main(void)
 {
   HAL_Init();               // MPU/cache off, SysTick at the reset (HSI) clock
   SystemClock_Config();     // HSE -> PLL1 550 (CPU), PLL2 266 (OCTOSPI2), PLL3 48 (USB)
+
+  // Bring up the external OCTOSPI2 flash in memory-mapped mode.
+  uint8_t jedec[3] = {0};
+  int ospi_ok = octospi2_init(jedec);
+
+  // Read the app vector through the memory-mapped window: a valid image has its MSP
+  // in AXI-SRAM (0x24050000).  Confirms mmap reads work end-to-end.
+  uint32_t app_msp = *(volatile uint32_t *)0x70000000u;
+  int mmap_ok = ((app_msp & 0xFF000000u) == 0x24000000u);
 
   __HAL_RCC_GPIOC_CLK_ENABLE();
   GPIO_InitTypeDef led = {0};
@@ -31,13 +40,14 @@ int main(void)
   led.Mode  = GPIO_MODE_OUTPUT_PP;
   led.Pull  = GPIO_NOPULL;
   led.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LED_PORT, &led);
+  HAL_GPIO_Init(GPIOC, &led);
 
-  // ~2.5 Hz heartbeat (HAL_Delay is ms via SysTick, reconfigured to 550 MHz by
-  // HAL_RCC_ClockConfig).  Distinct cadence from the app-first firmwares.
+  // Milestone-2 verdict on PC13:  1 Hz slow = clock + OCTOSPI2 mmap both OK;
+  // ~10 Hz fast strobe = OCTOSPI2 init failed (JEDEC != EF or mmap read wrong).
+  uint32_t period = (ospi_ok && mmap_ok) ? 500u : 50u;
   for (;;)
   {
-    HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
-    HAL_Delay(200);
+    HAL_GPIO_TogglePin(GPIOC, LED_PIN);
+    HAL_Delay(period);
   }
 }
