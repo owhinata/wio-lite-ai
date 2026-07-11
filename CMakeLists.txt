@@ -40,7 +40,8 @@ set(MCU_OPTS
 set(HAL_DIR    "${CMAKE_SOURCE_DIR}/lib/stm32h7xx_hal_driver")
 set(CMSIS_DEV  "${CMAKE_SOURCE_DIR}/lib/cmsis_device_h7")
 set(CMSIS_CORE "${CMAKE_SOURCE_DIR}/lib/cmsis_core")
-set(LDSCRIPT   "${CMAKE_SOURCE_DIR}/ldscript/STM32H725AEIx_XIP.ld")
+set(LDSCRIPT_XIP "${CMAKE_SOURCE_DIR}/ldscript/STM32H725AEIx_XIP.ld")  # app-first (0x70000000)
+set(LDSCRIPT_ROM "${CMAKE_SOURCE_DIR}/ldscript/STM32H725AEIx_ROM.ld")  # standalone (0x08000000)
 
 # stm32h7xx_hal_conf.h from the upstream template (its default HSE_VALUE of
 # 25 MHz already matches the board crystal).
@@ -60,8 +61,8 @@ target_compile_definitions(bsp_iface INTERFACE USE_HAL_DRIVER STM32H725xx)
 target_compile_options(bsp_iface INTERFACE
     ${MCU_OPTS} -Wall -fdata-sections -ffunction-sections -g -gdwarf-2)
 target_link_options(bsp_iface INTERFACE
-    ${MCU_OPTS} -specs=nano.specs -specs=nosys.specs "-T${LDSCRIPT}"
-    -Wl,--gc-sections -Wl,--print-memory-usage)
+    ${MCU_OPTS} -specs=nano.specs -specs=nosys.specs
+    -Wl,--gc-sections -Wl,--print-memory-usage)   # ldscript (-T) is added per firmware
 
 # Compile every HAL driver source; each file self-guards on its
 # HAL_<module>_MODULE_ENABLED define, so unused ones become empty objects.
@@ -69,9 +70,10 @@ file(GLOB HAL_SOURCES "${HAL_DIR}/Src/*.c")
 list(FILTER HAL_SOURCES EXCLUDE REGEX "_template\\.c$")
 
 # --- Post-build artifacts + UF2 + flash target -----------------------------
+# XIP firmwares (blink, boot): linked at 0x70000000, packaged as .uf2 for TinyUF2.
 function(firmware_finalize tgt)
-    target_link_options(${tgt} PRIVATE -Wl,-Map=${tgt}.map,--cref)
-    set_target_properties(${tgt} PROPERTIES LINK_DEPENDS "${LDSCRIPT}")
+    target_link_options(${tgt} PRIVATE "-T${LDSCRIPT_XIP}" -Wl,-Map=${tgt}.map,--cref)
+    set_target_properties(${tgt} PROPERTIES LINK_DEPENDS "${LDSCRIPT_XIP}")
     add_custom_command(TARGET ${tgt} POST_BUILD
         COMMAND "${CMAKE_OBJCOPY}" -O binary -S $<TARGET_FILE:${tgt}> ${tgt}.bin
         COMMAND "${CMAKE_OBJCOPY}" -O ihex   $<TARGET_FILE:${tgt}> ${tgt}.hex
@@ -90,6 +92,18 @@ function(firmware_finalize tgt)
         DEPENDS ${tgt}
         USES_TERMINAL
         COMMENT "Copying ${tgt}.uf2 to the TinyUF2 UF2 drive")
+endfunction()
+
+# Standalone bootloader (bootrom): linked at 0x08000000, flashed via ST-Link (no UF2).
+function(rom_finalize tgt)
+    target_link_options(${tgt} PRIVATE "-T${LDSCRIPT_ROM}" -Wl,-Map=${tgt}.map,--cref)
+    set_target_properties(${tgt} PROPERTIES LINK_DEPENDS "${LDSCRIPT_ROM}")
+    add_custom_command(TARGET ${tgt} POST_BUILD
+        COMMAND "${CMAKE_OBJCOPY}" -O binary -S $<TARGET_FILE:${tgt}> ${tgt}.bin
+        COMMAND "${CMAKE_OBJCOPY}" -O ihex   $<TARGET_FILE:${tgt}> ${tgt}.hex
+        COMMAND "${CMAKE_SIZE}" $<TARGET_FILE:${tgt}>
+        BYPRODUCTS ${tgt}.bin ${tgt}.hex
+        COMMENT "objcopy -> ${tgt}.bin/.hex (flash to 0x08000000 with ST-Link mode=UR)")
 endfunction()
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -142,3 +156,18 @@ target_compile_definitions(boot PRIVATE CFG_TUSB_MCU=OPT_MCU_STM32H7)
 target_compile_options(boot PRIVATE -O2)
 
 firmware_finalize(boot)
+
+# --- bootrom: standalone DFU bootloader (Phase 2), runs from internal flash -----
+# Linked at 0x08000000 (LDSCRIPT_ROM); configures the clock tree / OCTOSPI2 itself
+# (stock CMSIS system file resets to HSI, then SystemClock_Config).  Flashed with
+# the ST-Link (mode=UR), not via UF2.  Milestone 1 = clock + LED blink.
+add_executable(bootrom
+    "${CMAKE_SOURCE_DIR}/bootrom/main.c"
+    "${CMAKE_SOURCE_DIR}/bootrom/clock.c"
+    "${CMSIS_DEV}/Source/Templates/system_stm32h7xx.c"
+    "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"
+    ${HAL_SOURCES})
+target_link_libraries(bootrom PRIVATE bsp_iface)
+target_compile_options(bootrom PRIVATE -O2)
+
+rom_finalize(bootrom)
