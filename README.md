@@ -1,0 +1,46 @@
+# Wio Lite AI — LED blink (bare-metal, XIP from external flash)
+
+A minimal LED blink for the **Seeed Wio Lite AI** (STM32H725AEI6), built with the
+STM32 HAL and packaged as a `.uf2` for the on-board **TinyUF2** bootloader.
+
+The firmware runs **execute-in-place (XIP) from the external OCTOSPI2 NOR flash
+(W25Q128, 16 MB) mapped at `0x70000000`** — the same place the stock application
+lives. See [`BACKUP_README.md`](BACKUP_README.md) for the full flash map and the
+reverse-engineering behind these numbers.
+
+## What it does
+Blinks **LED2 (red, "LED0") on `PC13`** at ~1 Hz (via its on-board NPN buffer).
+
+## Key design points
+- **Does not touch the clock tree.** The TinyUF2 bootloader configures HSE 25 MHz →
+  550 MHz CPU, PLL2R → OCTOSPI2 XIP (~89 MHz), and OCTOSPI2 memory-mapped mode
+  before jumping here. Reprogramming the RCC (as the stock CMSIS `SystemInit`
+  does) would stall the XIP instruction fetch and hang. `src/system_stm32h7xx.c`
+  is a custom, clock-free `SystemInit` (FPU + VTOR only).
+- **Linked at `0x70000000`** (`ldscript/STM32H725AEIx_XIP.ld`); stack in AXI-SRAM
+  (`_estack = 0x24050000`, matching the MSP the bootloader loads).
+- **DWT cycle-counter delay** (CPU-clock based) — no SysTick/interrupt setup.
+
+## Layout
+```
+cmake/     ARM GNU toolchain file (auto-downloads gcc 15.2.rel1 into tools/)
+ldscript/  STM32H725AEIx_XIP.ld  (FLASH @ 0x70000000, RAM = AXI-SRAM)
+lib/       git submodules: cmsis_core, cmsis_device_h7, stm32h7xx_hal_driver
+src/       main.c (blink) + system_stm32h7xx.c (custom SystemInit)
+scripts/   bin2uf2.py  (raw bin -> UF2, family 0x6db66082 @ 0x70000000)
+```
+
+## Build
+```bash
+cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake
+cmake --build build            # -> build/blink.elf/.bin/.hex/.uf2
+```
+
+## Flash
+1. Enter the TinyUF2 bootloader: hold the **USER button** and tap **RST** (the
+   `Arduino`-labelled USB drive appears).
+2. `cmake --build build --target flash`  (copies `blink.uf2` to the drive), or
+   drag `build/blink.uf2` onto the drive manually.
+
+The bootloader writes it to OCTOSPI2 and reboots into the blink.
+To restore the original firmware, re-flash the backups per `BACKUP_README.md`.

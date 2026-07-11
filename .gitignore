@@ -1,0 +1,12 @@
+# Build output
+/build/
+
+# Downloaded ARM GNU toolchain (fetched by cmake/arm-none-eabi-toolchain.cmake)
+/tools/
+
+# Python
+__pycache__/
+
+# Reference material (schematics, datasheets, vendor SDK zips, flash backups) --
+# large binaries, not source. Kept locally only.
+/_ref/
