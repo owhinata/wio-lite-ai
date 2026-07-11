@@ -41,15 +41,22 @@ void *_sbrk(int incr)
   return prev;
 }
 
-// newlib calls this for stdout/stderr; route to the CDC TX FIFO (non-blocking:
-// drops overflow rather than hanging, drained by tud_task() in the main loop).
+// newlib calls this for stdout/stderr; route to the CDC TX FIFO.  When the FIFO
+// fills, pump tud_task() so large bursts (the config dump) aren't dropped; a guard
+// bounds the wait if the host isn't reading.  (Only ever called from the main loop,
+// never from a USB callback, so re-entering tud_task() here is safe.)
 int _write(int fd, char *buf, int len)
 {
   (void) fd;
-  if (tud_cdc_connected())
+  if (!tud_cdc_connected()) return len;
+  int sent = 0;
+  uint32_t guard = 0;
+  while (sent < len && guard < 100000u)
   {
-    tud_cdc_write((uint8_t const *) buf, (uint32_t) len);
+    uint32_t w = tud_cdc_write((uint8_t const *) buf + sent, (uint32_t) (len - sent));
+    sent += (int) w;
     tud_cdc_write_flush();
+    if (w == 0u) { tud_task(); guard++; }
   }
   return len;
 }
@@ -169,6 +176,43 @@ static void led_task(void)
   HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
 }
 
+// Phase 2 prep: dump the clock/OCTOSPI2/GPIO config that TinyUF2 left us, so the
+// standalone bootloader (running from internal flash) can reproduce it exactly.
+#define R32(x) ((unsigned long)(x))
+static void dump_config(void)
+{
+  printf("--- RCC ---\r\n");
+  printf("CR=%08lX CFGR=%08lX PLLCKSELR=%08lX PLLCFGR=%08lX\r\n",
+         R32(RCC->CR), R32(RCC->CFGR), R32(RCC->PLLCKSELR), R32(RCC->PLLCFGR));
+  printf("PLL1DIVR=%08lX PLL1FRACR=%08lX PLL2DIVR=%08lX PLL2FRACR=%08lX PLL3DIVR=%08lX PLL3FRACR=%08lX\r\n",
+         R32(RCC->PLL1DIVR), R32(RCC->PLL1FRACR), R32(RCC->PLL2DIVR), R32(RCC->PLL2FRACR),
+         R32(RCC->PLL3DIVR), R32(RCC->PLL3FRACR));
+  printf("D1CFGR=%08lX D2CFGR=%08lX D3CFGR=%08lX D1CCIPR=%08lX D2CCIP1R=%08lX D2CCIP2R=%08lX D3CCIPR=%08lX\r\n",
+         R32(RCC->D1CFGR), R32(RCC->D2CFGR), R32(RCC->D3CFGR), R32(RCC->D1CCIPR),
+         R32(RCC->D2CCIP1R), R32(RCC->D2CCIP2R), R32(RCC->D3CCIPR));
+  printf("--- PWR --- CR1=%08lX CR3=%08lX D3CR=%08lX   --- FLASH --- ACR=%08lX\r\n",
+         R32(PWR->CR1), R32(PWR->CR3), R32(PWR->D3CR), R32(FLASH->ACR));
+  printf("--- OCTOSPI2 --- CR=%08lX DCR1=%08lX DCR2=%08lX DCR3=%08lX\r\n",
+         R32(OCTOSPI2->CR), R32(OCTOSPI2->DCR1), R32(OCTOSPI2->DCR2), R32(OCTOSPI2->DCR3));
+  printf("  CCR=%08lX TCR=%08lX IR=%08lX ABR=%08lX LPTR=%08lX PIR=%08lX\r\n",
+         R32(OCTOSPI2->CCR), R32(OCTOSPI2->TCR), R32(OCTOSPI2->IR), R32(OCTOSPI2->ABR),
+         R32(OCTOSPI2->LPTR), R32(OCTOSPI2->PIR));
+  printf("--- RCC clk enables --- AHB3ENR=%08lX AHB4ENR=%08lX APB1LENR=%08lX AHB1ENR=%08lX\r\n",
+         R32(RCC->AHB3ENR), R32(RCC->AHB4ENR), R32(RCC->APB1LENR), R32(RCC->AHB1ENR));
+  __HAL_RCC_OCTOSPIM_CLK_ENABLE();   // IOMNGR clock was gated -> enable so PnCR is readable
+  __DSB();
+  printf("--- OCTOSPIM --- CR=%08lX P1CR=%08lX P2CR=%08lX\r\n",
+         R32(OCTOSPIM->CR), R32(OCTOSPIM->PCR[0]), R32(OCTOSPIM->PCR[1]));
+  printf("--- GPIO: MODER OTYPER OSPEEDR PUPDR AFRL AFRH ---\r\n");
+  GPIO_TypeDef *const banks[] = { GPIOA,GPIOB,GPIOC,GPIOD,GPIOE,GPIOF,GPIOG,GPIOH,GPIOJ,GPIOK };
+  const char nm[] = "ABCDEFGHJK";
+  for (int i = 0; i < 10; i++)
+    printf("P%c %08lX %08lX %08lX %08lX %08lX %08lX\r\n", nm[i],
+           R32(banks[i]->MODER), R32(banks[i]->OTYPER), R32(banks[i]->OSPEEDR),
+           R32(banks[i]->PUPDR), R32(banks[i]->AFR[0]), R32(banks[i]->AFR[1]));
+  printf("--- end dump ---\r\n");
+}
+
 // USB CDC console: banner on connect + periodic heartbeat, to demonstrate printf.
 static void console_task(void)
 {
@@ -182,6 +226,7 @@ static void console_task(void)
     printf("flash JEDEC id     : %02X %02X %02X\r\n", g_jedec[0], g_jedec[1], g_jedec[2]);
     printf("OCTOSPI2 self-test : %s\r\n", g_faulted ? "FAULT" : (g_selftest_ok ? "PASS" : "FAIL"));
     printf("printf over USB CDC is live. DFU on alt 0 (dfu-util).\r\n");
+    dump_config();   // Phase 2: capture TinyUF2's live clock/OCTOSPI2/GPIO setup
   }
   was_connected = connected;
 
