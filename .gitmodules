@@ -8,3 +8,6 @@
 	path = lib/cmsis_core
 	url = https://github.com/STMicroelectronics/cmsis-core
 	branch = cm7
+[submodule "lib/tinyuf2"]
+	path = lib/tinyuf2
+	url = https://github.com/adafruit/tinyuf2.git

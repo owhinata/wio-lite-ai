@@ -102,6 +102,14 @@ SECTIONS
   {
     . = ALIGN(4);
     _sdata = .;
+    /* Code that must execute from RAM, not XIP: the OCTOSPI2 self-programming
+     * driver runs while the flash is switched out of memory-mapped mode, so it
+     * (and anything it calls) cannot be fetched from 0x70000000.  Placed at the
+     * head of .data so the CMSIS startup's _sidata->_sdata.._edata copy loads it
+     * into AXI-SRAM before main().  (Empty for firmwares that use no .RamFunc.) */
+    *(.RamFunc)
+    *(.RamFunc*)
+    . = ALIGN(4);
     *(.data)
     *(.data*)
     . = ALIGN(4);
