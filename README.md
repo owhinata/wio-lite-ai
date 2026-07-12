@@ -33,13 +33,12 @@ cmake/     ARM GNU toolchain file (auto-downloads gcc 15.2.rel1 into tools/)
 ldscript/  STM32H725AEIx_XIP.ld  (FLASH @ 0x70000000, RAM = AXI-SRAM)
 lib/       git submodules: cmsis_core, cmsis_device_h7, stm32h7xx_hal_driver
 src/       main.c (blink) + system_stm32h7xx.c (custom SystemInit)
-scripts/   bin2uf2.py  (raw bin -> UF2, family 0x6db66082 @ 0x70000000)
 ```
 
 ## Build
 ```bash
 cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake
-cmake --build build            # -> build/blink.elf/.bin/.hex/.uf2
+cmake --build build            # -> build/blink.elf/.bin/.hex
 ```
 
 ## Flash
@@ -49,6 +48,6 @@ The board now runs the custom DFU bootloader (see [`boot/`](boot/README.md)):
 2. `dfu-util -d 0483:df11 -a 0 -D build/blink.bin`
 
 The bootloader writes it to OCTOSPI2 `0x70000000` and reboots into the blink.
-(The legacy `build/blink.uf2` / `flash-blink` target only worked with the stock
-TinyUF2, which the bootloader replaced.)  To restore, re-flash per
-`BACKUP_README.md` / [`boot/README.md`](boot/README.md).
+(`cmake --build build --target dfu-blink` runs that dfu-util command for you.)
+To restore the stock TinyUF2, re-flash per `BACKUP_README.md` /
+[`boot/README.md`](boot/README.md).

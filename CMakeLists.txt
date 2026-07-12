@@ -7,12 +7,12 @@
 #             (mode=UR).  Produces build/boot.{elf,bin,hex} (no UF2).
 #    blink -- LED blink reference app.  XIP from external OCTOSPI2 0x70000000;
 #             load it with `dfu-util -d 0483:df11 -a 0 -D build/blink.bin` while
-#             `boot` is in DFU mode.  Also produces build/blink.uf2 (legacy).
+#             `boot` is in DFU mode (convenience target: `dfu-blink`).
 #
 #  Configure (downloads the ARM toolchain into ./tools on first run):
 #    cmake -B build -G Ninja \
 #          -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake
-#  Build:  cmake --build build    # -> build/boot.{elf,bin,hex}, build/blink.*
+#  Build:  cmake --build build    # -> build/boot.{elf,bin,hex}, build/blink.{elf,bin,hex}
 #  Flash boot to 0x08000000 (see boot/README.md):
 #    STM32_Programmer_CLI -c port=SWD mode=UR -w build/boot.bin 0x08000000 -v
 # ============================================================================
@@ -73,29 +73,29 @@ target_link_options(bsp_iface INTERFACE
 file(GLOB HAL_SOURCES "${HAL_DIR}/Src/*.c")
 list(FILTER HAL_SOURCES EXCLUDE REGEX "_template\\.c$")
 
-# --- Post-build artifacts + UF2 + flash target -----------------------------
-# XIP firmwares (blink, boot): linked at 0x70000000, packaged as .uf2 for TinyUF2.
+# --- Post-build artifacts + DFU flash target -------------------------------
+# App XIP firmwares (blink, and the future ThreadX shell): linked at 0x70000000,
+# emitted as raw .bin (what the DFU bootloader programs over dfu-util) + .hex.
 function(firmware_finalize tgt)
     target_link_options(${tgt} PRIVATE "-T${LDSCRIPT_XIP}" -Wl,-Map=${tgt}.map,--cref)
     set_target_properties(${tgt} PROPERTIES LINK_DEPENDS "${LDSCRIPT_XIP}")
     add_custom_command(TARGET ${tgt} POST_BUILD
         COMMAND "${CMAKE_OBJCOPY}" -O binary -S $<TARGET_FILE:${tgt}> ${tgt}.bin
         COMMAND "${CMAKE_OBJCOPY}" -O ihex   $<TARGET_FILE:${tgt}> ${tgt}.hex
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/scripts/bin2uf2.py"
-                ${tgt}.bin ${tgt}.uf2 0x70000000 0x6db66082
         COMMAND "${CMAKE_SIZE}" $<TARGET_FILE:${tgt}>
-        BYPRODUCTS ${tgt}.bin ${tgt}.hex ${tgt}.uf2
-        COMMENT "objcopy -> ${tgt}.bin/.hex ; bin2uf2 -> ${tgt}.uf2")
+        BYPRODUCTS ${tgt}.bin ${tgt}.hex
+        COMMENT "objcopy -> ${tgt}.bin/.hex")
 
-    # `flash-<tgt>`: drop the .uf2 onto the mounted TinyUF2 mass-storage drive.
-    # Enter the bootloader first (double-tap RST or hold USER button while pressing
-    # RST) so the "Arduino"-labelled drive appears at /media/$USER/Arduino.  Named
-    # per firmware so `blink` and `boot` don't collide on a single `flash` target.
-    add_custom_target(flash-${tgt}
-        COMMAND "${CMAKE_COMMAND}" -E copy ${tgt}.uf2 "/media/$ENV{USER}/Arduino/${tgt}.uf2"
+    # `dfu-<tgt>`: program the app to OCTOSPI2 0x70000000 over the custom DFU
+    # bootloader.  Put the board in DFU mode first (hold USER/PF1 at reset -- the
+    # red LED stays on).  Named per firmware so app targets never collide on one
+    # `dfu` target.  (TinyUF2 and its .uf2 drive are gone: the bootloader that
+    # replaced it takes a raw .bin over dfu-util, so no UF2 is produced.)
+    add_custom_target(dfu-${tgt}
+        COMMAND dfu-util -d 0483:df11 -a 0 -D ${tgt}.bin
         DEPENDS ${tgt}
         USES_TERMINAL
-        COMMENT "Copying ${tgt}.uf2 to the TinyUF2 UF2 drive")
+        COMMENT "dfu-util -> ${tgt}.bin to OCTOSPI2 0x70000000 (hold PF1 at reset for DFU mode)")
 endfunction()
 
 # Standalone bootloader (boot): linked at 0x08000000, flashed via ST-Link (no UF2).
@@ -109,8 +109,6 @@ function(rom_finalize tgt)
         BYPRODUCTS ${tgt}.bin ${tgt}.hex
         COMMENT "objcopy -> ${tgt}.bin/.hex (flash to 0x08000000 with ST-Link mode=UR)")
 endfunction()
-
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 add_executable(blink
     "${CMAKE_SOURCE_DIR}/src/main.c"
