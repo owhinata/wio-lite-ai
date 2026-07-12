@@ -37,6 +37,9 @@ project(wio-lite-ai C ASM)
 
 set(CMAKE_EXECUTABLE_SUFFIX ".elf")
 
+# ============================================================================
+#  Common build setup (shared by the bootloader and the apps)
+# ============================================================================
 # --- Target / common build options -----------------------------------------
 # Cortex-M7 with the double-precision FPU (fpv5-d16) on the STM32H725.
 set(MCU_OPTS
@@ -74,31 +77,9 @@ target_link_options(bsp_iface INTERFACE
 file(GLOB HAL_SOURCES "${HAL_DIR}/Src/*.c")
 list(FILTER HAL_SOURCES EXCLUDE REGEX "_template\\.c$")
 
-# --- Post-build artifacts + DFU flash target -------------------------------
-# App XIP firmwares (blink, and the future ThreadX shell): linked at 0x70000000,
-# emitted as raw .bin (what the DFU bootloader programs over dfu-util) + .hex.
-function(firmware_finalize tgt)
-    target_link_options(${tgt} PRIVATE "-T${LDSCRIPT_XIP}" -Wl,-Map=${tgt}.map,--cref)
-    set_target_properties(${tgt} PROPERTIES LINK_DEPENDS "${LDSCRIPT_XIP}")
-    add_custom_command(TARGET ${tgt} POST_BUILD
-        COMMAND "${CMAKE_OBJCOPY}" -O binary -S $<TARGET_FILE:${tgt}> ${tgt}.bin
-        COMMAND "${CMAKE_OBJCOPY}" -O ihex   $<TARGET_FILE:${tgt}> ${tgt}.hex
-        COMMAND "${CMAKE_SIZE}" $<TARGET_FILE:${tgt}>
-        BYPRODUCTS ${tgt}.bin ${tgt}.hex
-        COMMENT "objcopy -> ${tgt}.bin/.hex")
-
-    # `dfu-<tgt>`: program the app to OCTOSPI2 0x70000000 over the custom DFU
-    # bootloader.  Put the board in DFU mode first (hold USER/PF1 at reset -- the
-    # red LED stays on).  Named per firmware so app targets never collide on one
-    # `dfu` target.  (TinyUF2 and its .uf2 drive are gone: the bootloader that
-    # replaced it takes a raw .bin over dfu-util, so no UF2 is produced.)
-    add_custom_target(dfu-${tgt}
-        COMMAND dfu-util -d 0483:df11 -a 0 -D ${tgt}.bin
-        DEPENDS ${tgt}
-        USES_TERMINAL
-        COMMENT "dfu-util -> ${tgt}.bin to OCTOSPI2 0x70000000 (hold PF1 at reset for DFU mode)")
-endfunction()
-
+# ============================================================================
+#  Bootloader: boot  (internal flash 0x08000000, flashed via ST-Link mode=UR)
+# ============================================================================
 # Standalone bootloader (boot): linked at 0x08000000, flashed via ST-Link (no UF2).
 function(rom_finalize tgt)
     target_link_options(${tgt} PRIVATE "-T${LDSCRIPT_ROM}" -Wl,-Map=${tgt}.map,--cref)
@@ -111,17 +92,6 @@ function(rom_finalize tgt)
         COMMENT "objcopy -> ${tgt}.bin/.hex (flash to 0x08000000 with ST-Link mode=UR)")
 endfunction()
 
-add_executable(blink
-    "${CMAKE_SOURCE_DIR}/src/main.c"
-    "${CMAKE_SOURCE_DIR}/src/system_stm32h7xx.c"
-    "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"
-    ${HAL_SOURCES})
-target_link_libraries(blink PRIVATE bsp_iface)
-target_compile_options(blink PRIVATE -O2)
-
-firmware_finalize(blink)
-
-# --- boot: standalone USB DFU bootloader ------------------------------------
 # Replaces the stock TinyUF2 at internal flash 0x08000000 (LDSCRIPT_ROM): it
 # configures the clock tree / OCTOSPI2 itself (stock CMSIS system file resets to
 # HSI, then SystemClock_Config), enumerates as a composite DFU + CDC device, and
@@ -161,3 +131,42 @@ target_compile_definitions(boot PRIVATE CFG_TUSB_MCU=OPT_MCU_STM32H7)
 target_compile_options(boot PRIVATE -O2)
 
 rom_finalize(boot)
+
+# ============================================================================
+#  Apps: blink (and the future ThreadX shell)
+#  XIP from external OCTOSPI2 0x70000000; flashed over DFU (dfu-util / dfu-<tgt>)
+# ============================================================================
+# --- Post-build artifacts + DFU flash target -------------------------------
+# App XIP firmwares (blink, and the future ThreadX shell): linked at 0x70000000,
+# emitted as raw .bin (what the DFU bootloader programs over dfu-util) + .hex.
+function(firmware_finalize tgt)
+    target_link_options(${tgt} PRIVATE "-T${LDSCRIPT_XIP}" -Wl,-Map=${tgt}.map,--cref)
+    set_target_properties(${tgt} PROPERTIES LINK_DEPENDS "${LDSCRIPT_XIP}")
+    add_custom_command(TARGET ${tgt} POST_BUILD
+        COMMAND "${CMAKE_OBJCOPY}" -O binary -S $<TARGET_FILE:${tgt}> ${tgt}.bin
+        COMMAND "${CMAKE_OBJCOPY}" -O ihex   $<TARGET_FILE:${tgt}> ${tgt}.hex
+        COMMAND "${CMAKE_SIZE}" $<TARGET_FILE:${tgt}>
+        BYPRODUCTS ${tgt}.bin ${tgt}.hex
+        COMMENT "objcopy -> ${tgt}.bin/.hex")
+
+    # `dfu-<tgt>`: program the app to OCTOSPI2 0x70000000 over the custom DFU
+    # bootloader.  Put the board in DFU mode first (hold USER/PF1 at reset -- the
+    # red LED stays on).  Named per firmware so app targets never collide on one
+    # `dfu` target.  (TinyUF2 and its .uf2 drive are gone: the bootloader that
+    # replaced it takes a raw .bin over dfu-util, so no UF2 is produced.)
+    add_custom_target(dfu-${tgt}
+        COMMAND dfu-util -d 0483:df11 -a 0 -D ${tgt}.bin
+        DEPENDS ${tgt}
+        USES_TERMINAL
+        COMMENT "dfu-util -> ${tgt}.bin to OCTOSPI2 0x70000000 (hold PF1 at reset for DFU mode)")
+endfunction()
+
+add_executable(blink
+    "${CMAKE_SOURCE_DIR}/src/main.c"
+    "${CMAKE_SOURCE_DIR}/src/system_stm32h7xx.c"
+    "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"
+    ${HAL_SOURCES})
+target_link_libraries(blink PRIVATE bsp_iface)
+target_compile_options(blink PRIVATE -O2)
+
+firmware_finalize(blink)
