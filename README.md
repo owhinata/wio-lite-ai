@@ -8,6 +8,12 @@ The firmware runs **execute-in-place (XIP) from the external OCTOSPI2 NOR flash
 lives. See [`BACKUP_README.md`](BACKUP_README.md) for the full flash map and the
 reverse-engineering behind these numbers.
 
+> **Note:** this repo also contains a **standalone USB DFU bootloader** in
+> [`boot/`](boot/README.md) that replaces TinyUF2 at internal flash `0x08000000`.
+> On the development board (board #2) it is already flashed, so `blink` is now
+> loaded over DFU (hold **PF1** at reset for DFU mode, then
+> `dfu-util -d 0483:df11 -a 0 -D build/blink.bin`) rather than via a UF2 drive.
+
 ## What it does
 Blinks **LED2 (red, "LED0") on `PC13`** at ~1 Hz (via its on-board NPN buffer).
 
@@ -37,10 +43,12 @@ cmake --build build            # -> build/blink.elf/.bin/.hex/.uf2
 ```
 
 ## Flash
-1. Enter the TinyUF2 bootloader: hold the **USER button** and tap **RST** (the
-   `Arduino`-labelled USB drive appears).
-2. `cmake --build build --target flash`  (copies `blink.uf2` to the drive), or
-   drag `build/blink.uf2` onto the drive manually.
+The board now runs the custom DFU bootloader (see [`boot/`](boot/README.md)):
 
-The bootloader writes it to OCTOSPI2 and reboots into the blink.
-To restore the original firmware, re-flash the backups per `BACKUP_README.md`.
+1. Enter DFU mode: hold the **USER button (PF1)** and reset the board.
+2. `dfu-util -d 0483:df11 -a 0 -D build/blink.bin`
+
+The bootloader writes it to OCTOSPI2 `0x70000000` and reboots into the blink.
+(The legacy `build/blink.uf2` / `flash-blink` target only worked with the stock
+TinyUF2, which the bootloader replaced.)  To restore, re-flash per
+`BACKUP_README.md` / [`boot/README.md`](boot/README.md).

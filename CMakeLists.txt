@@ -1,16 +1,20 @@
 # ============================================================================
-#  Wio Lite AI (STM32H725AEI6) firmware, all XIP from external OCTOSPI2 flash.
+#  Wio Lite AI (STM32H725AEI6) firmware.
 #
-#  Firmwares (each packaged as <name>.uf2 for the TinyUF2 bootloader):
-#    blink -- LED blink reference app.
-#    boot  -- custom DFU bootloader, built app-first (linked at 0x70000000 and run
-#             under the intact TinyUF2 so board #2 stays recoverable; see HANDOFF.md).
+#  Firmwares:
+#    boot  -- standalone USB DFU bootloader (see boot/README.md).  Runs from
+#             internal flash 0x08000000 (replaces TinyUF2); flashed via ST-Link
+#             (mode=UR).  Produces build/boot.{elf,bin,hex} (no UF2).
+#    blink -- LED blink reference app.  XIP from external OCTOSPI2 0x70000000;
+#             load it with `dfu-util -d 0483:df11 -a 0 -D build/blink.bin` while
+#             `boot` is in DFU mode.  Also produces build/blink.uf2 (legacy).
 #
 #  Configure (downloads the ARM toolchain into ./tools on first run):
 #    cmake -B build -G Ninja \
 #          -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake
-#  Build:                 cmake --build build          # -> build/{blink,boot}.elf/.bin/.hex/.uf2
-#  Flash (UF2 dropzone):  cmake --build build --target flash-blink   (or flash-boot)
+#  Build:  cmake --build build    # -> build/boot.{elf,bin,hex}, build/blink.*
+#  Flash boot to 0x08000000 (see boot/README.md):
+#    STM32_Programmer_CLI -c port=SWD mode=UR -w build/boot.bin 0x08000000 -v
 # ============================================================================
 cmake_minimum_required(VERSION 3.20)
 
@@ -94,7 +98,7 @@ function(firmware_finalize tgt)
         COMMENT "Copying ${tgt}.uf2 to the TinyUF2 UF2 drive")
 endfunction()
 
-# Standalone bootloader (bootrom): linked at 0x08000000, flashed via ST-Link (no UF2).
+# Standalone bootloader (boot): linked at 0x08000000, flashed via ST-Link (no UF2).
 function(rom_finalize tgt)
     target_link_options(${tgt} PRIVATE "-T${LDSCRIPT_ROM}" -Wl,-Map=${tgt}.map,--cref)
     set_target_properties(${tgt} PROPERTIES LINK_DEPENDS "${LDSCRIPT_ROM}")
@@ -118,15 +122,17 @@ target_compile_options(blink PRIVATE -O2)
 
 firmware_finalize(blink)
 
-# --- boot: custom DFU bootloader (Phase 1.x app-first) ----------------------
-# Same XIP-at-0x70000000 build pipeline as blink, sharing the hands-off-the-clocks
-# system layer and the CMSIS startup, plus the TinyUSB device stack + standard DFU
-# class (Phase 1.2).  TinyUSB and its config/descriptors are compiled into ONLY this
-# target (blink stays a pure bare-metal app).
+# --- boot: standalone USB DFU bootloader ------------------------------------
+# Replaces the stock TinyUF2 at internal flash 0x08000000 (LDSCRIPT_ROM): it
+# configures the clock tree / OCTOSPI2 itself (stock CMSIS system file resets to
+# HSI, then SystemClock_Config), enumerates as a composite DFU + CDC device, and
+# programs downloads to the app base 0x70000000.  Flashed with the ST-Link
+# (mode=UR), not via UF2.  TinyUSB and its config/descriptors are compiled into
+# ONLY this target (blink stays a pure bare-metal app).
 set(TUSB_DIR "${CMAKE_SOURCE_DIR}/lib/tinyuf2/lib/tinyusb/src")
 
-# Device-mode subset of TinyUSB: core + FIFO + device stack + DFU class + the
-# Synopsys dwc2 device controller driver (the H725's USB1_OTG_HS is a dwc2 core).
+# Device-mode subset of TinyUSB: core + FIFO + device stack + DFU + CDC classes +
+# the Synopsys dwc2 device controller (the H725's USB1_OTG_HS is a dwc2 core).
 set(TINYUSB_SOURCES
     "${TUSB_DIR}/tusb.c"
     "${TUSB_DIR}/common/tusb_fifo.c"
@@ -139,10 +145,11 @@ set(TINYUSB_SOURCES
 
 add_executable(boot
     "${CMAKE_SOURCE_DIR}/boot/main.c"
+    "${CMAKE_SOURCE_DIR}/boot/clock.c"
+    "${CMAKE_SOURCE_DIR}/boot/octospi.c"
     "${CMAKE_SOURCE_DIR}/boot/usb_descriptors.c"
     "${CMAKE_SOURCE_DIR}/boot/dfu_callbacks.c"
-    "${CMAKE_SOURCE_DIR}/boot/ospi_ram.c"
-    "${CMAKE_SOURCE_DIR}/src/system_stm32h7xx.c"
+    "${CMSIS_DEV}/Source/Templates/system_stm32h7xx.c"
     "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"
     ${TINYUSB_SOURCES}
     ${HAL_SOURCES})
@@ -155,30 +162,4 @@ target_include_directories(boot PRIVATE
 target_compile_definitions(boot PRIVATE CFG_TUSB_MCU=OPT_MCU_STM32H7)
 target_compile_options(boot PRIVATE -O2)
 
-firmware_finalize(boot)
-
-# --- bootrom: standalone DFU bootloader (Phase 2), runs from internal flash -----
-# Linked at 0x08000000 (LDSCRIPT_ROM); configures the clock tree / OCTOSPI2 itself
-# (stock CMSIS system file resets to HSI, then SystemClock_Config).  Flashed with
-# the ST-Link (mode=UR), not via UF2.  Milestones: 1 = clock + LED blink,
-# 2 = OCTOSPI2 memory-mapped init, 3 = USB DFU + CDC (same TinyUSB device subset as
-# `boot`, DFU download targets the app base 0x70000000 -- see bootrom/dfu_callbacks.c).
-add_executable(bootrom
-    "${CMAKE_SOURCE_DIR}/bootrom/main.c"
-    "${CMAKE_SOURCE_DIR}/bootrom/clock.c"
-    "${CMAKE_SOURCE_DIR}/bootrom/octospi.c"
-    "${CMAKE_SOURCE_DIR}/bootrom/usb_descriptors.c"
-    "${CMAKE_SOURCE_DIR}/bootrom/dfu_callbacks.c"
-    "${CMSIS_DEV}/Source/Templates/system_stm32h7xx.c"
-    "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"
-    ${TINYUSB_SOURCES}
-    ${HAL_SOURCES})
-target_link_libraries(bootrom PRIVATE bsp_iface)
-# bootrom/ first so TinyUSB picks up our tusb_config.h; then the TinyUSB headers.
-target_include_directories(bootrom PRIVATE
-    "${CMAKE_SOURCE_DIR}/bootrom"
-    "${TUSB_DIR}")
-target_compile_definitions(bootrom PRIVATE CFG_TUSB_MCU=OPT_MCU_STM32H7)
-target_compile_options(bootrom PRIVATE -O2)
-
-rom_finalize(bootrom)
+rom_finalize(boot)

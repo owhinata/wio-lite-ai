@@ -1,37 +1,41 @@
 /*
- * Wio Lite AI (STM32H725AEI6) -- custom DFU bootloader firmware.  See HANDOFF.md.
+ * Wio Lite AI (STM32H725AEI6) -- standalone USB DFU bootloader.
  *
- * PHASE 1.3: RAM-resident OCTOSPI2 self-programming driver, proven with an on-boot
- * erase -> program -> memory-mapped-read-back round trip against a dedicated scratch
- * sector, WITHOUT disturbing the app executing XIP from the same flash.
+ * Runs from internal flash at 0x08000000 (it replaces the stock TinyUF2).  On
+ * reset it brings up its own clock tree (SystemClock_Config) and the external
+ * OCTOSPI2 flash in memory-mapped mode (octospi2_init), then decides:
  *
- * Two essentials for self-programming the XIP flash on this MCU:
- *   1. The erase/program code runs from RAM (.RamFunc) with IRQs disabled, since the
- *      OCTOSPI is out of memory-mapped mode during the operation (see ospi_ram.c).
- *   2. The I/D caches are OFF: with them on, RAM-context accesses to the OCTOSPI
- *      register block are incoherent and speculative reads of the 0x70000000 window
- *      fault while mmap is off.  We disable them first thing in main().
+ *   - Enter DFU mode if the USER button (PF1, active-low) is held, OR there is
+ *     no valid app in the external flash, OR OCTOSPI2 failed to come up.  It
+ *     enumerates as a composite DFU + CDC device; a download
+ *     (dfu-util -a 0 -D app.bin) is written straight to the app base
+ *     (OCTOSPI2 offset 0 = 0x70000000) via octospi.c.  After the download
+ *     manifests, the board reboots into the new app.  The red LED (PC13) is
+ *     held on while in DFU mode.
+ *   - Otherwise jump to the app at 0x70000000 (set VTOR + MSP, branch to its
+ *     reset vector) -- with SysTick stopped first so a stray tick cannot
+ *     vector into the app.
  *
- * A RAM-resident fault handler (relocated vector table) is a safety net for the
- * mmap-off window: a fault there can't reach a handler at 0x70000000, so we vector
- * to RAM, re-arm mmap, and report "FLT pc=.. cf=.." over USB instead of locking up.
+ * DFU mode is the safe fallback: an erased / invalid app always lands here, so
+ * the board can always be re-loaded over DFU.  It touches NO option bytes /
+ * RDP / DBGMCU / SWD pins, so a bad config leaves the board re-flashable over
+ * SWD.
  *
- * Verdict: LED PC13 slow/mount-state on PASS, fast ~6 Hz strobe on FAIL/fault; and
- * the DFU alt-0 name (dfu-util -l) is "id=<jedec> st=OK|NG" or "FLT ...".  DFU UPLOAD
- * returns the scratch sector for byte-exact host verification.
+ * Caches stay OFF the whole time (reset default): this keeps the OCTOSPI2
+ * register / memory-mapped accesses coherent and avoids speculative reads of
+ * 0x70000000 while the flash is briefly out of memory-mapped mode during a
+ * program.
  */
 
 #include <stdio.h>
 #include "stm32h7xx_hal.h"
 #include "tusb.h"
-#include "ospi_ram.h"
+#include "octospi.h"
 
-#define RAMFUNC __attribute__((section(".RamFunc"), noinline))
+void SystemClock_Config(void);   /* boot/clock.c */
 
-//--------------------------------------------------------------------+
-// printf over USB CDC (newlib retargeting)
-//--------------------------------------------------------------------+
-extern char end;                          // heap start (from the linker script)
+/* --- printf over USB CDC (newlib retargeting) --------------------------- */
+extern char end;                 /* heap start (from the linker script) */
 void *_sbrk(int incr)
 {
   static char *heap = 0;
@@ -41,10 +45,12 @@ void *_sbrk(int incr)
   return prev;
 }
 
-// newlib calls this for stdout/stderr; route to the CDC TX FIFO.  When the FIFO
-// fills, pump tud_task() so large bursts (the config dump) aren't dropped; a guard
-// bounds the wait if the host isn't reading.  (Only ever called from the main loop,
-// never from a USB callback, so re-entering tud_task() here is safe.)
+/*
+ * newlib calls this for stdout/stderr; route it to the CDC TX FIFO.  When the
+ * FIFO fills, pump tud_task() so bursts are not dropped; a guard bounds the
+ * wait if the host is not reading.  Only ever called from the main loop, so
+ * re-entering tud_task() here is safe.
+ */
 int _write(int fd, char *buf, int len)
 {
   (void) fd;
@@ -53,7 +59,8 @@ int _write(int fd, char *buf, int len)
   uint32_t guard = 0;
   while (sent < len && guard < 100000u)
   {
-    uint32_t w = tud_cdc_write((uint8_t const *) buf + sent, (uint32_t) (len - sent));
+    uint32_t w = tud_cdc_write((uint8_t const *) buf + sent,
+                               (uint32_t) (len - sent));
     sent += (int) w;
     tud_cdc_write_flush();
     if (w == 0u) { tud_task(); guard++; }
@@ -61,68 +68,32 @@ int _write(int fd, char *buf, int len)
   return len;
 }
 
-//--------------------------------------------------------------------+
-// LED
-//--------------------------------------------------------------------+
+/* --- LED (PC13, red): held on while in DFU mode ------------------------- */
 #define LED_PORT   GPIOC
 #define LED_PIN    GPIO_PIN_13
-enum { BLINK_FAIL = 90, BLINK_NOT_MOUNTED = 250, BLINK_MOUNTED = 1000, BLINK_SUSPENDED = 2500 };
-static volatile uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
 
-//--------------------------------------------------------------------+
-// Self-test state (published over USB)
-//--------------------------------------------------------------------+
-#define SCRATCH_FLASH_ADDR   0x00400000u   // AXI 0x70400000 (4 MB in, clear of the app)
-#define SCRATCH_AXI_ADDR     0x70400000u
-#define SELFTEST_LEN         512u          // spans two 256 B pages
+/* --- OCTOSPI2 status (published: DFU alt-0 name + CDC banner) ------------ */
+static uint8_t      g_jedec[3];
+static volatile int g_ospi_ok;       /* octospi2_init() verdict (mfr seen) */
+static volatile int g_app_present;   /* app MSP lands in an on-chip RAM */
 
-static uint8_t  g_pattern[SELFTEST_LEN];
-static uint8_t  g_jedec[3];
-static volatile int g_selftest_ok;         // 0 = fail/pending, 1 = pass
+char g_dfu_alt0_str[48] = "OCTOSPI2 app @0x70000000";  /* dfu-util -l name */
 
-char g_dfu_alt0_str[48] = "OCTOSPI2 XIP @0x70000000";  // dfu-util -l name
+/*
+ * Deferred reboot: the DFU manifest callback requests one so the freshly
+ * downloaded app boots.  It is deferred (not done inside the callback) so
+ * tud_task can flush the final USB status response first; the main loop does
+ * the reset once the deadline passes.
+ */
+static volatile uint32_t g_reboot_at_ms;   /* 0 = none pending */
 
-static volatile uint32_t g_faulted, g_fault_pc, g_cfsr, g_hfsr, g_bfar;
-
-static void app_report_and_loop(void);     // fwd
-
-//--------------------------------------------------------------------+
-// RAM vector table + RAM fault handler (reachable with mmap off)
-//--------------------------------------------------------------------+
-static uint32_t g_ram_vt[256] __attribute__((aligned(1024)));
-
-void RAMFUNC ram_fault_c(uint32_t *sp)     // sp -> {r0..r3,r12,lr,pc,xpsr}
+void boot_request_reboot(void)           /* called from dfu_callbacks.c */
 {
-  g_fault_pc = sp[6];
-  g_cfsr = SCB->CFSR;
-  g_hfsr = SCB->HFSR;
-  g_bfar = SCB->BFAR;
-  g_faulted = 1;
-  ospi_ram_recover();                      // re-arm mmap so XIP runs again
-  SCB->CFSR = g_cfsr;                       // clear sticky bits (write-1-to-clear)
-  SCB->HFSR = g_hfsr;
-  sp[6] = (uint32_t) app_report_and_loop;   // redirect exception return into reporter
+  g_reboot_at_ms = HAL_GetTick() + 300u;    /* let dfu-util + USB settle */
 }
 
-__attribute__((naked)) void RAMFUNC ram_fault_entry(void)
-{
-  __asm volatile("tst lr,#4\n ite eq\n mrseq r0,msp\n mrsne r0,psp\n b ram_fault_c\n");
-}
-
-static void setup_ram_vectors(void)
-{
-  const uint32_t *xip_vt = (const uint32_t *)0x70000000u;
-  for (int i = 0; i < 256; i++) g_ram_vt[i] = xip_vt[i];
-  uint32_t h = (uint32_t)ram_fault_entry | 1u;
-  g_ram_vt[3] = h; g_ram_vt[4] = h; g_ram_vt[5] = h; g_ram_vt[6] = h;  // Hard/MM/Bus/Usage
-  __DMB();
-  SCB->VTOR = (uint32_t)g_ram_vt;
-  __DSB();
-  __ISB();
-}
-
-//--------------------------------------------------------------------+
-void SysTick_Handler(void)   { HAL_IncTick(); }
+/* --- interrupt handlers ------------------------------------------------- */
+void SysTick_Handler(void)   { HAL_IncTick(); }   /* HAL tick */
 void OTG_HS_IRQHandler(void) { tud_int_handler(0); }
 
 static void usb_hw_init(void)
@@ -140,80 +111,44 @@ static void usb_hw_init(void)
   __HAL_RCC_USB1_OTG_HS_ULPI_CLK_DISABLE();
 }
 
-static void hex2(char *o, uint8_t b) { static const char h[]="0123456789ABCDEF"; o[0]=h[b>>4]; o[1]=h[b&0xF]; }
-static void hex8(char *o, uint32_t v) { for (int i=0;i<4;i++) hex2(o+i*2,(uint8_t)(v>>(24-i*8))); }
-
-static void run_octospi_selftest(void)
+/* Drive the red LED (PC13) on: steady = "in DFU mode". */
+static void led_on(void)
 {
-  ospi_flash_snapshot();   // capture live mmap config (mmap still active)
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  GPIO_InitTypeDef led = {0};
+  led.Pin   = LED_PIN;
+  led.Mode  = GPIO_MODE_OUTPUT_PP;
+  led.Pull  = GPIO_NOPULL;
+  led.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LED_PORT, &led);
+  HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET);   /* PC13 high = on */
+}
 
-  for (uint32_t i = 0; i < SELFTEST_LEN; i++) g_pattern[i] = (uint8_t)(i ^ 0xA5u);
+static void hex2(char *o, uint8_t b)
+{
+  static const char h[] = "0123456789ABCDEF";
+  o[0] = h[b >> 4];
+  o[1] = h[b & 0xF];
+}
 
-  ospi_ram_erase_program(SCRATCH_FLASH_ADDR, g_pattern, SELFTEST_LEN, g_jedec);
-  // (on a fault inside the above, ram_fault_c redirects to app_report_and_loop)
-
-  int ok = 1;
-  const volatile uint8_t *rb = (const volatile uint8_t *)SCRATCH_AXI_ADDR;
-  for (uint32_t i = 0; i < SELFTEST_LEN; i++)
-    if (rb[i] != g_pattern[i]) { ok = 0; break; }
-  g_selftest_ok = ok;
-
-  // "id=EF4018 st=OK"
+/*
+ * Compose the DFU alt-0 name: "id=EF4018 ok" / " NG" so `dfu-util -l` shows
+ * the flash id and whether OCTOSPI2 came up.
+ */
+static void build_alt0_str(void)
+{
   char *p = g_dfu_alt0_str;
-  const char *a = "id="; while (*a) *p++ = *a++;
-  hex2(p, g_jedec[0]); p += 2; hex2(p, g_jedec[1]); p += 2; hex2(p, g_jedec[2]); p += 2;
-  const char *b = ok ? " st=OK" : " st=NG"; while (*b) *p++ = *b++;
+  const char *a = "id=";
+  while (*a) *p++ = *a++;
+  hex2(p, g_jedec[0]); p += 2;
+  hex2(p, g_jedec[1]); p += 2;
+  hex2(p, g_jedec[2]); p += 2;
+  const char *b = g_ospi_ok ? " ok" : " NG";
+  while (*b) *p++ = *b++;
   *p = '\0';
 }
 
-static void led_task(void)
-{
-  static uint32_t last_ms = 0;
-  uint32_t interval = (g_selftest_ok && !g_faulted) ? blink_interval_ms : BLINK_FAIL;
-  uint32_t now = HAL_GetTick();
-  if (now - last_ms < interval) return;
-  last_ms = now;
-  HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
-}
-
-// Phase 2 prep: dump the clock/OCTOSPI2/GPIO config that TinyUF2 left us, so the
-// standalone bootloader (running from internal flash) can reproduce it exactly.
-#define R32(x) ((unsigned long)(x))
-static void dump_config(void)
-{
-  printf("--- RCC ---\r\n");
-  printf("CR=%08lX CFGR=%08lX PLLCKSELR=%08lX PLLCFGR=%08lX\r\n",
-         R32(RCC->CR), R32(RCC->CFGR), R32(RCC->PLLCKSELR), R32(RCC->PLLCFGR));
-  printf("PLL1DIVR=%08lX PLL1FRACR=%08lX PLL2DIVR=%08lX PLL2FRACR=%08lX PLL3DIVR=%08lX PLL3FRACR=%08lX\r\n",
-         R32(RCC->PLL1DIVR), R32(RCC->PLL1FRACR), R32(RCC->PLL2DIVR), R32(RCC->PLL2FRACR),
-         R32(RCC->PLL3DIVR), R32(RCC->PLL3FRACR));
-  printf("D1CFGR=%08lX D2CFGR=%08lX D3CFGR=%08lX D1CCIPR=%08lX D2CCIP1R=%08lX D2CCIP2R=%08lX D3CCIPR=%08lX\r\n",
-         R32(RCC->D1CFGR), R32(RCC->D2CFGR), R32(RCC->D3CFGR), R32(RCC->D1CCIPR),
-         R32(RCC->D2CCIP1R), R32(RCC->D2CCIP2R), R32(RCC->D3CCIPR));
-  printf("--- PWR --- CR1=%08lX CR3=%08lX D3CR=%08lX   --- FLASH --- ACR=%08lX\r\n",
-         R32(PWR->CR1), R32(PWR->CR3), R32(PWR->D3CR), R32(FLASH->ACR));
-  printf("--- OCTOSPI2 --- CR=%08lX DCR1=%08lX DCR2=%08lX DCR3=%08lX\r\n",
-         R32(OCTOSPI2->CR), R32(OCTOSPI2->DCR1), R32(OCTOSPI2->DCR2), R32(OCTOSPI2->DCR3));
-  printf("  CCR=%08lX TCR=%08lX IR=%08lX ABR=%08lX LPTR=%08lX PIR=%08lX\r\n",
-         R32(OCTOSPI2->CCR), R32(OCTOSPI2->TCR), R32(OCTOSPI2->IR), R32(OCTOSPI2->ABR),
-         R32(OCTOSPI2->LPTR), R32(OCTOSPI2->PIR));
-  printf("--- RCC clk enables --- AHB3ENR=%08lX AHB4ENR=%08lX APB1LENR=%08lX AHB1ENR=%08lX\r\n",
-         R32(RCC->AHB3ENR), R32(RCC->AHB4ENR), R32(RCC->APB1LENR), R32(RCC->AHB1ENR));
-  __HAL_RCC_OCTOSPIM_CLK_ENABLE();   // IOMNGR clock was gated -> enable so PnCR is readable
-  __DSB();
-  printf("--- OCTOSPIM --- CR=%08lX P1CR=%08lX P2CR=%08lX\r\n",
-         R32(OCTOSPIM->CR), R32(OCTOSPIM->PCR[0]), R32(OCTOSPIM->PCR[1]));
-  printf("--- GPIO: MODER OTYPER OSPEEDR PUPDR AFRL AFRH ---\r\n");
-  GPIO_TypeDef *const banks[] = { GPIOA,GPIOB,GPIOC,GPIOD,GPIOE,GPIOF,GPIOG,GPIOH,GPIOJ,GPIOK };
-  const char nm[] = "ABCDEFGHJK";
-  for (int i = 0; i < 10; i++)
-    printf("P%c %08lX %08lX %08lX %08lX %08lX %08lX\r\n", nm[i],
-           R32(banks[i]->MODER), R32(banks[i]->OTYPER), R32(banks[i]->OSPEEDR),
-           R32(banks[i]->PUPDR), R32(banks[i]->AFR[0]), R32(banks[i]->AFR[1]));
-  printf("--- end dump ---\r\n");
-}
-
-// USB CDC console: banner on connect + periodic heartbeat, to demonstrate printf.
+/* USB CDC console: banner on connect + periodic heartbeat. */
 static void console_task(void)
 {
   static bool was_connected = false;
@@ -222,11 +157,15 @@ static void console_task(void)
 
   if (connected && !was_connected)
   {
-    printf("\r\n=== Wio Lite AI DFU bootloader (app-first, Phase 1.4 + CDC) ===\r\n");
-    printf("flash JEDEC id     : %02X %02X %02X\r\n", g_jedec[0], g_jedec[1], g_jedec[2]);
-    printf("OCTOSPI2 self-test : %s\r\n", g_faulted ? "FAULT" : (g_selftest_ok ? "PASS" : "FAIL"));
-    printf("printf over USB CDC is live. DFU on alt 0 (dfu-util).\r\n");
-    dump_config();   // Phase 2: capture TinyUF2's live clock/OCTOSPI2/GPIO setup
+    printf("\r\n=== Wio Lite AI standalone DFU bootloader ===\r\n");
+    printf("flash JEDEC id     : %02X %02X %02X (%s)\r\n",
+           g_jedec[0], g_jedec[1], g_jedec[2],
+           g_ospi_ok ? "OCTOSPI2 up" : "OCTOSPI2 FAIL");
+    printf("app vector[0] (MSP): %08lX (%s)\r\n",
+           (unsigned long) *(volatile uint32_t *)0x70000000u,
+           g_app_present ? "app present" : "no valid app");
+    printf("DFU alt 0 -> app base 0x70000000.  "
+           "dfu-util -d 0483:df11 -a 0 -D app.bin\r\n");
   }
   was_connected = connected;
 
@@ -238,50 +177,114 @@ static void console_task(void)
   }
 }
 
-static void app_report_and_loop(void)
+/* --- boot flow: DFU trigger / app validation / jump --------------------- */
+#define BTN_PORT   GPIOF
+#define BTN_PIN    GPIO_PIN_1    /* USER button, active-low (10K pull-up) */
+
+/*
+ * Force DFU if the USER button (PF1) is held at reset.  PF1 is not an OCTOSPI2
+ * pin, so reconfiguring it as an input does not disturb the flash bus.
+ */
+static int dfu_button_held(void)
 {
-  __enable_irq();   // the driver ran with IRQs masked
+  __HAL_RCC_GPIOF_CLK_ENABLE();     /* already on from octospi2_init */
+  GPIO_InitTypeDef btn = {0};
+  btn.Pin  = BTN_PIN;
+  btn.Mode = GPIO_MODE_INPUT;
+  btn.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(BTN_PORT, &btn);
+  for (volatile int i = 0; i < 2000; i++) { }   /* let the pull settle */
+  return HAL_GPIO_ReadPin(BTN_PORT, BTN_PIN) == GPIO_PIN_RESET;  /* low */
+}
 
-  if (g_faulted)
-  {
-    // "FLT pc=xxxxxxxx cf=xxxxxxxx" (which RAM function + fault type)
-    char *p = g_dfu_alt0_str;
-    const char *a = "FLT pc="; while (*a) *p++ = *a++;
-    hex8(p, g_fault_pc); p += 8;
-    const char *b = " cf="; while (*b) *p++ = *b++;
-    hex8(p, g_cfsr); p += 8;
-    *p = '\0';
-  }
+/*
+ * A valid app image (read through the OCTOSPI2 mmap window) has its initial MSP
+ * in an on-chip RAM region and its reset vector inside the XIP window (thumb
+ * bit set).  This rejects blank (0xFFFFFFFF) / unprogrammed (0) flash.
+ */
+static int app_valid(void)
+{
+  uint32_t msp = *(volatile uint32_t *)0x70000000u;
+  uint32_t rst = *(volatile uint32_t *)0x70000004u;
+  uint32_t msp_hi = msp & 0xFF000000u;
+  int msp_ok = (msp_hi == 0x24000000u) ||   /* AXI-SRAM (D1) */
+               (msp_hi == 0x20000000u) ||   /* DTCM / ITCM */
+               (msp_hi == 0x30000000u) ||   /* D2 SRAM */
+               (msp_hi == 0x38000000u);     /* D3 SRAM */
+  int rst_ok = ((rst & 0xFF000000u) == 0x70000000u) && (rst & 1u);
+  return msp_ok && rst_ok;
+}
 
-  usb_hw_init();
-  tusb_rhport_init_t dev_init = { .role = TUSB_ROLE_DEVICE, .speed = TUSB_SPEED_AUTO };
-  tusb_init(BOARD_TUD_RHPORT, &dev_init);
+/* Hand off to the application in the OCTOSPI2 XIP flash.  Never returns. */
+static void jump_to_app(void)
+{
+  volatile uint32_t const *vec = (volatile uint32_t const *)0x70000000u;
+  uint32_t app_msp   = vec[0];
+  uint32_t app_reset = vec[1];
 
-  setvbuf(stdout, NULL, _IONBF, 0);   // unbuffered: each printf reaches _write now
+  __disable_irq();
+  /*
+   * HAL_Init started SysTick; stop it and clear any pending exception so it
+   * cannot fire into the app (blink, e.g., leaves SysTick as the default
+   * infinite-loop handler).
+   */
+  SysTick->CTRL = 0;
+  SysTick->LOAD = 0;
+  SysTick->VAL  = 0;
+  SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk | SCB_ICSR_PENDSVCLR_Msk;
 
-  for (;;) { tud_task(); led_task(); console_task(); }
+  SCB->VTOR = (uint32_t) vec;       /* app owns the vector table now */
+  __DSB();
+  __ISB();
+
+  /*
+   * MSP/PSP switch + PRIMASK restore + branch as ONE register-only asm block:
+   * once MSP moves, no compiler-scheduled stack access (spill/reload) can
+   * sneak in between.  cpsie i restores the reset-state PRIMASK=0 for the app;
+   * nothing is pending (cleared above) and no NVIC source is enabled here.
+   */
+  __asm volatile (
+      "msr msp, %0\n\t"
+      "msr psp, %0\n\t"
+      "cpsie i\n\t"
+      "bx %1\n\t"
+      :: "r" (app_msp), "r" (app_reset) : "memory");
+  __builtin_unreachable();
 }
 
 int main(void)
 {
-  SCB_DisableICache();
-  SCB_DisableDCache();
+  HAL_Init();               /* NVIC grouping + SysTick at the reset clock */
+  SystemClock_Config();     /* HSE -> PLL1 550, PLL2 266, PLL3 48 (USB) */
 
-  SysTick_Config(SystemCoreClock / 1000U);
+  /* Bring up the external OCTOSPI2 flash in memory-mapped mode. */
+  g_ospi_ok = octospi2_init(g_jedec);
+  build_alt0_str();
 
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  GPIO_InitTypeDef led = {0};
-  led.Pin = LED_PIN; led.Mode = GPIO_MODE_OUTPUT_PP; led.Pull = GPIO_NOPULL;
-  led.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LED_PORT, &led);
+  int forced    = dfu_button_held();
+  g_app_present = app_valid();
 
-  setup_ram_vectors();       // RAM fault handler in place before touching the flash
-  run_octospi_selftest();    // a fault redirects into app_report_and_loop
-  app_report_and_loop();     // normal path
+  /*
+   * Boot the app unless DFU is forced, the app is missing/invalid, or OCTOSPI2
+   * (needed to reach the app) failed to come up.  DFU mode is the safe
+   * fallback everywhere else, so the board can always be re-loaded.
+   */
+  if (!forced && g_ospi_ok && g_app_present)
+    jump_to_app();          /* never returns */
+
+  /* ---- DFU mode ---- */
+  led_on();                 /* steady red LED = DFU mode */
+  usb_hw_init();
+  tusb_rhport_init_t dev_init = { .role  = TUSB_ROLE_DEVICE,
+                                  .speed = TUSB_SPEED_AUTO };
+  tusb_init(BOARD_TUD_RHPORT, &dev_init);
+  setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: printf reaches _write */
+
+  for (;;)
+  {
+    tud_task();
+    console_task();
+    if (g_reboot_at_ms && (int32_t)(HAL_GetTick() - g_reboot_at_ms) >= 0)
+      NVIC_SystemReset();   /* boot the freshly downloaded app */
+  }
 }
-
-//--------------------------------------------------------------------+
-void tud_mount_cb(void)                    { blink_interval_ms = BLINK_MOUNTED; }
-void tud_umount_cb(void)                   { blink_interval_ms = BLINK_NOT_MOUNTED; }
-void tud_suspend_cb(bool remote_wakeup_en) { (void) remote_wakeup_en; blink_interval_ms = BLINK_SUSPENDED; }
-void tud_resume_cb(void)                   { blink_interval_ms = tud_mounted() ? BLINK_MOUNTED : BLINK_NOT_MOUNTED; }

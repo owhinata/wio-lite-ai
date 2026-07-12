@@ -1,18 +1,17 @@
 /*
  * Standalone clock bring-up for the Wio Lite AI DFU bootloader (STM32H725AEI6).
  *
- * The app-first firmware inherited the clock tree from TinyUF2; the standalone
- * bootloader at 0x08000000 is the first code to run after reset, so it configures
- * everything itself.  The parameters here REPRODUCE the exact tree TinyUF2 sets
- * (captured live over CDC, see boot/phase2_config_dump.md), so the app that boots
- * afterwards sees the environment it expects:
+ * The bootloader at 0x08000000 is the first code to run after reset, so it
+ * configures the whole clock tree itself.  The parameters here REPRODUCE the
+ * exact tree the stock TinyUF2 sets (captured live over CDC, see README.md), so
+ * the app that boots afterwards sees the environment it expects:
  *
  *   HSE 25 MHz crystal
- *   PLL1 : /M2 (12.5) xN44 -> VCO 550 ; P/1 -> SYSCLK 550 (CPU) ; Q/5 110 ; R/2 275
- *   PLL2 : /M25 (1)   xN266-> VCO 266 ; R/1 -> 266 -> OCTOSPI2 kernel (DCR2 /3 ~88.7)
- *   PLL3 : /M5 (5)    xN48 -> VCO 240 ; Q/5 -> 48 MHz -> USB
- *   HPRE /2 (AXI/AHB 275), APBx /2 ; FLASH latency 3 ; VOS0 ; SMPS direct supply.
- *   OCTOSPI kernel <- PLL2R ; USB <- PLL3Q.
+ *   PLL1: /M2 (12.5) xN44 -> VCO 550; P/1 -> SYSCLK 550 (CPU); Q/5 110; R/2 275
+ *   PLL2: /M25 (1) xN266 -> VCO 266; R/1 -> 266 -> OCTOSPI2 (DCR2 /3 ~89 MHz)
+ *   PLL3: /M5 (5) xN48 -> VCO 240; Q/5 -> 48 MHz -> USB
+ *   HPRE /2 (AXI/AHB 275), APBx /2; FLASH latency 3; VOS0; SMPS direct supply.
+ *   OCTOSPI kernel <- PLL2R; USB <- PLL3Q.
  */
 
 #include "stm32h7xx_hal.h"
@@ -46,8 +45,9 @@ void SystemClock_Config(void)
   if (HAL_RCC_OscConfig(&osc) != HAL_OK) { while (1) {} }
 
   // Bus clocks: SYSCLK = PLL1 (550), AHB /2 (275), APBx /2.  Flash latency 3.
-  clk.ClockType      = RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_D1PCLK1 |
-                       RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2 | RCC_CLOCKTYPE_D3PCLK1;
+  clk.ClockType      = RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_HCLK |
+                       RCC_CLOCKTYPE_D1PCLK1 | RCC_CLOCKTYPE_PCLK1 |
+                       RCC_CLOCKTYPE_PCLK2 | RCC_CLOCKTYPE_D3PCLK1;
   clk.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
   clk.SYSCLKDivider  = RCC_SYSCLK_DIV1;
   clk.AHBCLKDivider  = RCC_HCLK_DIV2;
