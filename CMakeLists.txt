@@ -172,13 +172,14 @@ target_compile_options(blink PRIVATE -O2)
 firmware_finalize(blink)
 
 # --- shell: interactive Eclipse ThreadX CLI console -------------------------
-# Phase 1 skeleton: XIP app at 0x70000000 (firmware_finalize -> dfu-shell) that
-# starts ThreadX + a USB CDC console.  Reuses src/system_stm32h7xx.c (clock-free
-# SystemInit) so the app inherits the bootloader's 550 MHz clock + OCTOSPI2 XIP.
-# ThreadX core (common/src) + Cortex-M7/GNU port asm; the app supplies its own
+# XIP app at 0x70000000 (firmware_finalize -> dfu-shell): ThreadX + an interactive
+# CLI over USB CDC.  Reuses src/system_stm32h7xx.c (clock-free SystemInit) so the
+# app inherits the bootloader's 550 MHz clock + OCTOSPI2 XIP.  ThreadX core
+# (common/src) + Cortex-M7/GNU port asm; the app supplies its own
 # _tx_initialize_low_level + shared SysTick handler in port/threadx/tx_glue.c.
 # ONE executable compiled uniformly (TX_INCLUDE_USER_DEFINE_FILE + port/threadx on
-# the include path) so the ThreadX core and the app agree on TX_THREAD layout.
+# the include path) so the ThreadX core, the shell core and the app agree on the
+# TX_THREAD layout (ABI).
 set(TX_DIR  "${CMAKE_SOURCE_DIR}/lib/threadx")
 set(TX_PORT "${TX_DIR}/ports/cortex_m7/gnu")
 file(GLOB TX_CORE "${TX_DIR}/common/src/*.c")
@@ -195,6 +196,37 @@ set(APP_TINYUSB_SOURCES
     "${TUSB_DIR}/portable/synopsys/dwc2/dcd_dwc2.c"
     "${TUSB_DIR}/portable/synopsys/dwc2/dwc2_common.c")
 
+# Shell core (ThreadX-aware; cli_core.c is the only tx_* caller) + the USB CDC and
+# dummy backends + the ports of the HW-independent commands + the clean-room printf.
+set(SHELL_SOURCES
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_core.c"
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_complete.c"
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_edit.c"
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_history.c"
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_job.c"
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_parse.c"
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_printf.c"
+    "${CMAKE_SOURCE_DIR}/shell/core/cli_session.c"
+    "${CMAKE_SOURCE_DIR}/shell/backend/cli_backend_usbcdc.c"
+    "${CMAKE_SOURCE_DIR}/shell/backend/cli_backend_dummy.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_builtin.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_system.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_thread.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_free.c"
+    "${CMAKE_SOURCE_DIR}/svc/fmt.c")
+
+# Generate cli_version.h (CLI_FW_NAME / _VERSION / _GIT_DESC) into GEN_DIR (already
+# on the bsp_iface include path) so cmd_system.c can #include "cli_version.h".
+execute_process(
+    COMMAND git -C "${CMAKE_SOURCE_DIR}" describe --always --dirty --tags
+    OUTPUT_VARIABLE CLI_GIT_DESC OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET RESULT_VARIABLE _gitrc)
+if(NOT _gitrc EQUAL 0)
+    set(CLI_GIT_DESC "unknown")
+endif()
+configure_file("${CMAKE_SOURCE_DIR}/cmake/cli_version.h.in"
+               "${GEN_DIR}/cli_version.h" @ONLY)
+
 add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/main.c"
     "${CMAKE_SOURCE_DIR}/app/usb_cdc.c"
@@ -203,6 +235,7 @@ add_executable(shell
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
     "${CMAKE_SOURCE_DIR}/src/system_stm32h7xx.c"
     "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"
+    ${SHELL_SOURCES}
     ${APP_TINYUSB_SOURCES}
     ${TX_CORE} ${TX_ASM}
     ${HAL_SOURCES})
@@ -210,12 +243,19 @@ target_link_libraries(shell PRIVATE bsp_iface)
 target_include_directories(shell PRIVATE
     "${CMAKE_SOURCE_DIR}/app"
     "${CMAKE_SOURCE_DIR}/port/threadx"
+    "${CMAKE_SOURCE_DIR}/shell/include"
+    "${CMAKE_SOURCE_DIR}/shell/core"
+    "${CMAKE_SOURCE_DIR}/shell/backend"
+    "${CMAKE_SOURCE_DIR}/svc"
     "${TUSB_DIR}"
     "${TX_DIR}/common/inc"
     "${TX_PORT}/inc")
 target_compile_definitions(shell PRIVATE
     CFG_TUSB_MCU=OPT_MCU_STM32H7
-    TX_INCLUDE_USER_DEFINE_FILE)
+    TX_INCLUDE_USER_DEFINE_FILE
+    CLI_ENABLE_DANGEROUS_CMDS=1        # reboot (devmem not ported yet)
+    CLI_INSTANCE_STACK_SIZE=4096       # headroom for cli_print + future coremark
+    CLI_BG_JOB_STACK_SIZE=4096)
 target_compile_options(shell PRIVATE -O2)
 
 firmware_finalize(shell)

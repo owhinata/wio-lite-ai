@@ -67,6 +67,19 @@ SECTIONS
     . = ALIGN(4);
   } >FLASH
 
+  /* Shell command registry (CLI_CMD_REGISTER): each root command lands in
+     .shell_root_cmds.<name>; KEEP + SORT packs them in name order between the
+     boundary symbols so the core walks the section as a plain array.  Empty for
+     firmwares that register no commands (e.g. blink). */
+  .shell_root_cmds :
+  {
+    . = ALIGN(4);
+    PROVIDE_HIDDEN (__cli_root_cmds_start = .);
+    KEEP (*(SORT(.shell_root_cmds.*)))
+    PROVIDE_HIDDEN (__cli_root_cmds_end = .);
+    . = ALIGN(4);
+  } >FLASH
+
   .ARM.extab : { *(.ARM.extab* .gnu.linkonce.armextab.*) } >FLASH
   .ARM :
   {

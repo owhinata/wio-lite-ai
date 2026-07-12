@@ -1,5 +1,5 @@
 /*
- * Wio Lite AI (STM32H725AEI6) -- ThreadX shell app entry (Phase 1 skeleton).
+ * Wio Lite AI (STM32H725AEI6) -- ThreadX shell app entry (Phase 2).
  *
  * Runs XIP from the external OCTOSPI2 flash at 0x70000000, launched by the DFU
  * bootloader.  It INHERITS the bootloader's 550 MHz clock tree + OCTOSPI2
@@ -8,26 +8,34 @@
  * NVIC priority grouping and SysTick (reload = SystemCoreClock/1000 = 550000 for a
  * 1 ms tick); it does not touch the PLLs.
  *
- * Phase 1 starts ThreadX with two threads -- a USB CDC console (banner + tick) and
- * an LED heartbeat -- to prove clock-inheritance / SysTick / XIP / USB coexist.
- * No shell yet (Phase 2).
+ * Starts ThreadX with the interactive shell over USB CDC, a USB device pump thread
+ * and an LED heartbeat.  The shell instance (cdc_sh) is bound to the CDC transport
+ * (cdc_tr); the usb thread bridges the CDC FIFOs to that transport's rings.
  */
 #include <stdio.h>
 #include "stm32h7xx_hal.h"
 #include "tx_api.h"
 #include "tusb.h"
 #include "tx_glue.h"
+#include "cli.h"
+#include "cli_instance.h"
+#include "cli_backend_usbcdc.h"
 #include "app.h"
 
-/* --- LED (PC13, red) ---------------------------------------------------- */
+/* --- interactive shell over USB CDC ------------------------------------- */
+CLI_BACKEND_USBCDC_DEFINE(cdc_tr);
+CLI_INSTANCE_DEFINE(cdc_sh, &cdc_tr, "wio> ");
+
+/* --- LED (PC13, red) heartbeat ------------------------------------------ */
 #define LED_PORT   GPIOC
 #define LED_PIN    GPIO_PIN_13
 
 static void led_thread_entry(ULONG arg);
 
-/* Static ThreadX objects + stacks (no byte pool; each thread owns its stack). */
+/* Static ThreadX objects + stacks (no byte pool; each thread owns its stack).
+ * The shell instance's own thread/stack come from CLI_INSTANCE_DEFINE. */
 static TX_THREAD usb_thread;
-static UCHAR     usb_stack[4096] __attribute__((aligned(8)));  /* printf + tud_task headroom */
+static UCHAR     usb_stack[4096] __attribute__((aligned(8)));  /* tud_task + printf headroom */
 static TX_THREAD led_thread;
 static UCHAR     led_stack[512]  __attribute__((aligned(8)));
 
@@ -35,8 +43,17 @@ void tx_application_define(void *first_unused_memory)
 {
   (void) first_unused_memory;
 
-  /* usb console at priority 8, led heartbeat at 10 (lower = higher priority). */
-  tx_thread_create(&usb_thread, "usb", usb_thread_entry, 0,
+  /* Shell instance: create its ThreadX objects + backend, then spawn its thread.
+   * Fail-soft -- a failed cli_init just skips the shell; the usb/led threads and
+   * the rest still run. */
+  if (cli_init(&cdc_sh) == 0)
+    cli_start(&cdc_sh);
+  cli_job_pool_init();          /* background-job worker pool (`cmd &`) */
+
+  /* USB device pump thread (priority 8): the sole owner of tud_task()/tud_cdc_*.
+   * Above the shell instance thread (CLI_INSTANCE_PRIORITY=16) so USB stays
+   * responsive; arg carries the shell's CDC transport for cli_usbcdc_pump(). */
+  tx_thread_create(&usb_thread, "usb", usb_thread_entry, (ULONG)(void *)&cdc_tr,
                    usb_stack, sizeof(usb_stack),
                    8, 8, TX_NO_TIME_SLICE, TX_AUTO_START);
 
@@ -78,6 +95,10 @@ int main(void)
   tusb_init(BOARD_TUD_RHPORT, &dev_init);
   setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered so printf reaches _write */
 
+  /* ThreadX initialization assumes interrupts are locked out; mask them until the
+   * scheduler starts (the Cortex-M7 GNU port re-enables interrupts when it
+   * schedules the first thread).  SysTick/OTG_HS events simply queue until then. */
+  __disable_irq();
   tx_kernel_enter();   /* does not return */
   return 0;
 }
