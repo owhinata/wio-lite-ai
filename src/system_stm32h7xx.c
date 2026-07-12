@@ -24,6 +24,11 @@
 /* Inherited from the bootloader: SYSCLK = HSE(25 MHz) * 22 = 550 MHz (CPU/FCLK). */
 uint32_t SystemCoreClock = 550000000UL;
 
+/* D2/AHB domain clock (HCLK) = SYSCLK / D1CPRE(/1) / HPRE(/2) = 275 MHz.  The H7
+ * HAL clock helpers (HAL_RCC_GetHCLKFreq) return this symbol, so define it
+ * explicitly for the inherited clock rather than relying on incidental linkage. */
+uint32_t SystemD2Clock = 275000000UL;
+
 /* Referenced by stm32h7xx_hal_rcc.c (HAL_RCC_GetHCLKFreq etc.). */
 const uint8_t D1CorePrescTable[16] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 6, 7, 8, 9};
 

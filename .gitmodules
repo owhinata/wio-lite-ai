@@ -11,3 +11,6 @@
 [submodule "lib/tinyusb"]
 	path = lib/tinyusb
 	url = https://github.com/hathach/tinyusb.git
+[submodule "lib/threadx"]
+	path = lib/threadx
+	url = https://github.com/eclipse-threadx/threadx.git

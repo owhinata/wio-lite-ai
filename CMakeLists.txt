@@ -170,3 +170,52 @@ target_link_libraries(blink PRIVATE bsp_iface)
 target_compile_options(blink PRIVATE -O2)
 
 firmware_finalize(blink)
+
+# --- shell: interactive Eclipse ThreadX CLI console -------------------------
+# Phase 1 skeleton: XIP app at 0x70000000 (firmware_finalize -> dfu-shell) that
+# starts ThreadX + a USB CDC console.  Reuses src/system_stm32h7xx.c (clock-free
+# SystemInit) so the app inherits the bootloader's 550 MHz clock + OCTOSPI2 XIP.
+# ThreadX core (common/src) + Cortex-M7/GNU port asm; the app supplies its own
+# _tx_initialize_low_level + shared SysTick handler in port/threadx/tx_glue.c.
+# ONE executable compiled uniformly (TX_INCLUDE_USER_DEFINE_FILE + port/threadx on
+# the include path) so the ThreadX core and the app agree on TX_THREAD layout.
+set(TX_DIR  "${CMAKE_SOURCE_DIR}/lib/threadx")
+set(TX_PORT "${TX_DIR}/ports/cortex_m7/gnu")
+file(GLOB TX_CORE "${TX_DIR}/common/src/*.c")
+list(FILTER TX_CORE EXCLUDE REGEX "tx_misra\\.c$")
+file(GLOB TX_ASM  "${TX_PORT}/src/*.S")
+list(FILTER TX_ASM  EXCLUDE REGEX "tx_misra\\.S$")
+
+# CDC-only TinyUSB device subset (the boot set minus the DFU class).
+set(APP_TINYUSB_SOURCES
+    "${TUSB_DIR}/tusb.c"
+    "${TUSB_DIR}/common/tusb_fifo.c"
+    "${TUSB_DIR}/device/usbd.c"
+    "${TUSB_DIR}/class/cdc/cdc_device.c"
+    "${TUSB_DIR}/portable/synopsys/dwc2/dcd_dwc2.c"
+    "${TUSB_DIR}/portable/synopsys/dwc2/dwc2_common.c")
+
+add_executable(shell
+    "${CMAKE_SOURCE_DIR}/app/main.c"
+    "${CMAKE_SOURCE_DIR}/app/usb_cdc.c"
+    "${CMAKE_SOURCE_DIR}/app/usb_descriptors.c"
+    "${CMAKE_SOURCE_DIR}/app/retarget.c"
+    "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
+    "${CMAKE_SOURCE_DIR}/src/system_stm32h7xx.c"
+    "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"
+    ${APP_TINYUSB_SOURCES}
+    ${TX_CORE} ${TX_ASM}
+    ${HAL_SOURCES})
+target_link_libraries(shell PRIVATE bsp_iface)
+target_include_directories(shell PRIVATE
+    "${CMAKE_SOURCE_DIR}/app"
+    "${CMAKE_SOURCE_DIR}/port/threadx"
+    "${TUSB_DIR}"
+    "${TX_DIR}/common/inc"
+    "${TX_PORT}/inc")
+target_compile_definitions(shell PRIVATE
+    CFG_TUSB_MCU=OPT_MCU_STM32H7
+    TX_INCLUDE_USER_DEFINE_FILE)
+target_compile_options(shell PRIVATE -O2)
+
+firmware_finalize(shell)
