@@ -65,11 +65,15 @@ void tud_dfu_download_cb(uint8_t alt, uint16_t block_num, uint8_t const *data, u
 }
 
 // Invoked on DFU_DNLOAD (wLength=0) + GET_STATUS (DFU_MANIFEST): download complete.
-// Milestone 3 has no boot flow yet, so just acknowledge (the board stays in DFU mode).
+// Acknowledge, then ask the main loop to reboot so the freshly downloaded app boots
+// (deferred, so the final USB status response is flushed first -- see bootrom/main.c).
+void bootrom_request_reboot(void);   // bootrom/main.c
+
 void tud_dfu_manifest_cb(uint8_t alt)
 {
   (void) alt;
   tud_dfu_finish_flashing(DFU_STATUS_OK);
+  bootrom_request_reboot();
 }
 
 // Invoked on DFU_UPLOAD: return the app region read through the memory-mapped OCTOSPI2
