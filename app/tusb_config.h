@@ -32,7 +32,17 @@ extern "C" {
 #endif
 
 // USB DMA: the FS internal PHY uses the dedicated FIFO (no system-memory DMA),
-// so no cache-coherency alignment section is needed.
+// so no cache-coherency alignment section is needed.  Pin dwc2 to slave/FIFO mode
+// explicitly (not just the TinyUSB default): the app runs with the D-cache ENABLED
+// and no MPU, so its no-DMA-into-SRAM safety rests on this -- a future TinyUSB bump
+// flipping the default must not silently enable USB DMA (that would need cache
+// maintenance / MPU non-cacheable buffers).  See SCB_EnableDCache() in app/main.c.
+#ifndef CFG_TUD_DWC2_DMA_ENABLE
+#define CFG_TUD_DWC2_DMA_ENABLE   0
+#endif
+#ifndef CFG_TUD_DWC2_SLAVE_ENABLE
+#define CFG_TUD_DWC2_SLAVE_ENABLE 1
+#endif
 #ifndef CFG_TUSB_MEM_SECTION
 #define CFG_TUSB_MEM_SECTION
 #endif

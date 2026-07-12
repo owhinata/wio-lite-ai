@@ -87,13 +87,26 @@ static void led_thread_entry(ULONG arg)
 
 int main(void)
 {
-  /* I-cache on: the app executes XIP from OCTOSPI2 (uncached instruction fetch is
-   * slow), so enable the L1 I-cache first -- it caches read-only instruction memory,
-   * has no coherency concern (XIP flash is never written), and does NOT touch the
-   * RCC/clock.  D-cache stays OFF (USB dwc2 is slave/FIFO, no system-memory DMA; a
-   * cache-coherency setup is deferred to a future PSRAM/DMA phase).  A reset (DFU
-   * reboot / crash) disables caches in HW, so the boot handoff is unchanged. */
+  /* Caches on: the app executes XIP from OCTOSPI2 and keeps its working data in
+   * AXI-SRAM, both slow uncached.  Enable I-cache (read-only instruction memory ->
+   * no coherency concern) then D-cache.  Neither touches the RCC/clock.
+   *
+   * D-cache is safe here because the app is single-CPU with NO DMA master: USB
+   * dwc2 runs slave/FIFO (the CPU copies buffer<->FIFO by MMIO; app/tusb_config.h
+   * pins CFG_TUD_DWC2_DMA_ENABLE=0), and there is no camera/SD/eth in v1.  One CPU
+   * behind one D-cache is self-coherent across threads/ISRs, so no MPU / clean /
+   * invalidate is needed.  The reset-persistent crash log lives in DTCM, which
+   * bypasses the D-cache, so it stays coherent and survives a reset.  CMSIS
+   * invalidates each cache before enabling; .data/.bss were written to SRAM with
+   * the caches off, so there are no stale lines.  A reset (DFU reboot / crash)
+   * disables the caches in HW, and the app persists no cacheable-SRAM state across
+   * a reset, so the boot handoff is unchanged.
+   *
+   * FUTURE: when a DMA peripheral is added (PSRAM/OCTOSPI1, DCMI camera, SDMMC,
+   * Ethernet, or USB in DMA mode), its DMA buffers MUST be made non-cacheable via
+   * the MPU (or clean/invalidate around each transfer) or D-cache will corrupt them. */
   SCB_EnableICache();
+  SCB_EnableDCache();
 
   /* RAM log first: validate the reset-persistent DTCM ring and record the reset
    * cause before anything else can log, so a fault during the rest of bring-up is

@@ -15,11 +15,16 @@
  *  - Clock is SystemCoreClock (550 MHz, the CPU/DWT clock), NOT HAL_RCC_GetHCLKFreq()
  *    (which returns the D2/AHB clock 275 MHz on this part -- DWT CYCCNT counts at the
  *    core clock, so HCLK would halve every result).
- *  - No SDRAM (the board has none) and no D-cache "cached vs refill" rows: the app
- *    runs with D-cache OFF, so every data access is the raw memory rate.  The
- *    I-cache IS on (app/main.c), so these tiny measurement loops are cached after
- *    the first iteration and the timing reflects data access, not XIP fetch stalls.
- *  - Regions: DTCM (16 KB, .dtcm_bench), AXI-SRAM (32 KB, malloc'd on demand),
+ *  - No SDRAM (the board has none).  Both L1 caches are on (app/main.c): the tiny
+ *    measurement loops are I-cached, and the D-cache (16 KB, 32 B line, 4-way = 512
+ *    lines) is visible in the AXI-SRAM latency rows -- a 4 KB working set fits the
+ *    cache (L1-hit rate) while a 64 KB set overflows it (AXI refill rate).  The
+ *    refill set must exceed 512 lines: at the 64 B chase stride a 32 KB set touches
+ *    exactly 512 lines and still fits, so 64 KB (1024 lines) is used.  Sequential
+ *    *bandwidth* stays high even out-of-cache (burst line-refills), so the cache
+ *    step shows mainly in the dependent-load *latency* rows.  DTCM is TCM (bypasses
+ *    the D-cache, always the raw rate) and Flash is the read-only XIP window.
+ *  - Regions: DTCM (16 KB, .dtcm_bench), AXI-SRAM (64 KB, malloc'd on demand),
  *    Flash = OCTOSPI2 XIP window 0x70000000 (read-only: measures the XIP read rate).
  *
  * Timing: DWT CYCCNT.  Each timed run is sized to ~0.3 ms (< one 1 kHz SysTick
@@ -49,7 +54,8 @@
  * otherwise holds only the log ring).  The SRAM buffer is malloc'd on demand and
  * freed on exit rather than permanently reserving .bss for a rarely-run command. */
 #define DTCM_BENCH_BYTES   (16u * 1024u)
-#define SRAM_BENCH_BYTES   (32u * 1024u)
+#define SRAM_BENCH_BYTES   (64u * 1024u)   /* > 512 D-cache lines @64B stride -> refill */
+#define SRAM_CACHED_BYTES  ( 4u * 1024u)   /* fits in the 16 KB L1 D-cache */
 #define FLASH_BENCH_BYTES  (64u * 1024u)
 #define FLASH_BENCH_BASE   0x70000000u   /* OCTOSPI2 XIP window (read-only) */
 
@@ -332,7 +338,8 @@ static void bw_row(struct cli_instance *sh, const char *label, uint32_t *base,
 	cli_print(sh, "  %-22s %8s %8s %8s\r\n", label, rds, wrs, cps);
 }
 
-/* One latency cell over the whole writable buffer (no cache -> WSS-independent). */
+/* One latency cell over the requested working set (small set = L1-hit, large set
+ * = refill, on the cacheable AXI-SRAM; DTCM/TCM is always the raw rate). */
 static uint32_t lat_ns10(uint32_t *buf, uint32_t wss_bytes, uint32_t clk)
 {
 	struct lat_ctx c;
@@ -387,7 +394,7 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 	if (do_sram) {
 		sram_raw = malloc(SRAM_BENCH_BYTES + 32u);
 		if (sram_raw == NULL) {
-			cli_warn(sh, "membench: no heap for the 32 KB SRAM buffer; "
+			cli_warn(sh, "membench: no heap for the 64 KB SRAM buffer; "
 			             "skipping SRAM rows\r\n");
 			do_sram = 0;
 		} else {
@@ -396,8 +403,8 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 		}
 	}
 
-	cli_print(sh, "DWT CYCCNT @%luMHz; warm-up + tick-guarded min; "
-	          "I-cache on, D-cache off (raw memory rates).\r\n\r\n",
+	cli_print(sh, "DWT CYCCNT @%luMHz; warm-up + tick-guarded min; I-cache + D-cache on "
+	          "(DTCM=TCM uncached; SRAM via 16KB L1 D$; Flash=XIP window).\r\n\r\n",
 	          (unsigned long)(clk / 1000000u));
 
 	/* bandwidth table */
@@ -408,7 +415,8 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 	}
 	if (do_sram) {
 		if (cli_cancel_requested(sh)) goto done;
-		bw_row(sh, "SRAM   (32KB)", sram_bench_buf, SRAM_BENCH_BYTES / 4u, clk, 1);
+		bw_row(sh, "SRAM   ( 4KB, cached)", sram_bench_buf, SRAM_CACHED_BYTES / 4u, clk, 1);
+		bw_row(sh, "SRAM   (64KB, refill)", sram_bench_buf, SRAM_BENCH_BYTES / 4u, clk, 1);
 	}
 	if (do_flash) {
 		if (cli_cancel_requested(sh)) goto done;
@@ -427,9 +435,11 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 		}
 		if (do_sram) {
 			if (cli_cancel_requested(sh)) goto done;
-			char s[12];
-			fmt_ns(s, sizeof s, lat_ns10(sram_bench_buf, SRAM_BENCH_BYTES, clk));
-			cli_print(sh, "  %-22s %8s\r\n", "SRAM   (32KB)", s);
+			char sc[12], sr[12];
+			fmt_ns(sc, sizeof sc, lat_ns10(sram_bench_buf, SRAM_CACHED_BYTES, clk));
+			cli_print(sh, "  %-22s %8s\r\n", "SRAM   ( 4KB, cached)", sc);
+			fmt_ns(sr, sizeof sr, lat_ns10(sram_bench_buf, SRAM_BENCH_BYTES, clk));
+			cli_print(sh, "  %-22s %8s\r\n", "SRAM   (64KB, refill)", sr);
 		}
 	}
 
