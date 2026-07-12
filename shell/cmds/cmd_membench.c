@@ -25,7 +25,9 @@
  *    step shows mainly in the dependent-load *latency* rows.  DTCM is TCM (bypasses
  *    the D-cache, always the raw rate) and Flash is the read-only XIP window.
  *  - Regions: DTCM (16 KB, .dtcm_bench), AXI-SRAM (64 KB, malloc'd on demand),
- *    Flash = OCTOSPI2 XIP window 0x70000000 (read-only: measures the XIP read rate).
+ *    Flash int = embedded flash via AXIM 0x08000000, Flash ext = OCTOSPI2 XIP window
+ *    0x70000000 (both read-only: measure the flash read rate; a read of the boot
+ *    region is harmless -- no write/erase, so no brick risk).
  *
  * Timing: DWT CYCCNT.  Each timed run is sized to ~0.3 ms (< one 1 kHz SysTick
  * period) via a calibration pass, run up to MEMBENCH_TRIALS times; runs during
@@ -57,7 +59,11 @@
 #define SRAM_BENCH_BYTES   (64u * 1024u)   /* > 512 D-cache lines @64B stride -> refill */
 #define SRAM_CACHED_BYTES  ( 4u * 1024u)   /* fits in the 16 KB L1 D-cache */
 #define FLASH_BENCH_BYTES  (64u * 1024u)
-#define FLASH_BENCH_BASE   0x70000000u   /* OCTOSPI2 XIP window (read-only) */
+#define EFLASH_BENCH_BASE  0x70000000u   /* external: OCTOSPI2 XIP window (read-only) */
+#define IFLASH_BENCH_BASE  0x08000000u   /* internal: embedded flash via AXIM (read-only).
+                                          * This is the DFU bootloader's region, but a READ
+                                          * is harmless -- no write/erase, so no brick risk;
+                                          * measured only for the int-vs-ext comparison. */
 
 static uint32_t dtcm_bench_buf[DTCM_BENCH_BYTES / 4]
 	__attribute__((aligned(32), section(".dtcm_bench")));
@@ -404,8 +410,8 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 	}
 
 	cli_print(sh, "DWT CYCCNT @%luMHz; warm-up + tick-guarded min; I-cache + D-cache on "
-	          "(DTCM=TCM uncached; SRAM via 16KB L1 D$; Flash=XIP window).\r\n\r\n",
-	          (unsigned long)(clk / 1000000u));
+	          "(DTCM=TCM uncached; SRAM via 16KB L1 D$; Flash int=embedded/AXIM, "
+	          "ext=OCTOSPI2/XIP).\r\n\r\n", (unsigned long)(clk / 1000000u));
 
 	/* bandwidth table */
 	cli_print(sh, "%-24s %8s %8s %8s\r\n", "bandwidth (MB/s)", "read", "write", "copy");
@@ -420,7 +426,10 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 	}
 	if (do_flash) {
 		if (cli_cancel_requested(sh)) goto done;
-		bw_row(sh, "Flash  (64KB, XIP)", (uint32_t *)FLASH_BENCH_BASE,
+		bw_row(sh, "Flash  int (64KB)", (uint32_t *)IFLASH_BENCH_BASE,
+		       FLASH_BENCH_BYTES / 4u, clk, 0);
+		if (cli_cancel_requested(sh)) goto done;
+		bw_row(sh, "Flash  ext (64KB)", (uint32_t *)EFLASH_BENCH_BASE,
 		       FLASH_BENCH_BYTES / 4u, clk, 0);
 	}
 

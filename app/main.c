@@ -28,18 +28,18 @@
 CLI_BACKEND_USBCDC_DEFINE(cdc_tr);
 CLI_INSTANCE_DEFINE(cdc_sh, &cdc_tr, "wio> ");
 
-/* --- LED (PC13, red) heartbeat ------------------------------------------ */
+/* --- LED (PC13, red): driven off ---------------------------------------- */
+/* The bring-up heartbeat blink was removed on request; the LED is now held off
+ * (PC13 low; the bootloader uses PC13 high = on for the DFU indicator). */
 #define LED_PORT   GPIOC
 #define LED_PIN    GPIO_PIN_13
 
-static void led_thread_entry(ULONG arg);
+static void led_init_off(void);
 
 /* Static ThreadX objects + stacks (no byte pool; each thread owns its stack).
  * The shell instance's own thread/stack come from CLI_INSTANCE_DEFINE. */
 static TX_THREAD usb_thread;
 static UCHAR     usb_stack[4096] __attribute__((aligned(8)));  /* tud_task + printf headroom */
-static TX_THREAD led_thread;
-static UCHAR     led_stack[512]  __attribute__((aligned(8)));
 
 void tx_application_define(void *first_unused_memory)
 {
@@ -59,17 +59,16 @@ void tx_application_define(void *first_unused_memory)
                    usb_stack, sizeof(usb_stack),
                    8, 8, TX_NO_TIME_SLICE, TX_AUTO_START);
 
-  tx_thread_create(&led_thread, "led", led_thread_entry, 0,
-                   led_stack, sizeof(led_stack),
-                   10, 10, TX_NO_TIME_SLICE, TX_AUTO_START);
+  led_init_off();               /* configure PC13 and hold the red LED off */
 
   /* Timer lists exist now -> let the SysTick ISR drive the ThreadX scheduler. */
   tx_glue_timer_enable();
 }
 
-static void led_thread_entry(ULONG arg)
+/* Drive PC13 as a push-pull output at the LED-off level (low).  Register-only
+ * (RCC clock enable + GPIO config); no ThreadX API, safe from tx_application_define. */
+static void led_init_off(void)
 {
-  (void) arg;
   __HAL_RCC_GPIOC_CLK_ENABLE();
   GPIO_InitTypeDef led = {0};
   led.Pin   = LED_PIN;
@@ -77,12 +76,7 @@ static void led_thread_entry(ULONG arg)
   led.Pull  = GPIO_NOPULL;
   led.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LED_PORT, &led);
-
-  for (;;)
-  {
-    HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
-    tx_thread_sleep(125);   /* 125 ms at 1 kHz tick -> ~4 Hz toggle = ~2 Hz blink */
-  }
+  HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_RESET);   /* PC13 low = LED off */
 }
 
 int main(void)
