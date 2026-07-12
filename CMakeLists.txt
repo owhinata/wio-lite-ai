@@ -213,7 +213,12 @@ set(SHELL_SOURCES
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_system.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_thread.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_free.c"
-    "${CMAKE_SOURCE_DIR}/svc/fmt.c")
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_sleep.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_watch.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_jobs.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_devmem.c"
+    "${CMAKE_SOURCE_DIR}/svc/fmt.c"
+    "${CMAKE_SOURCE_DIR}/svc/timebase.c")
 
 # Generate cli_version.h (CLI_FW_NAME / _VERSION / _GIT_DESC) into GEN_DIR (already
 # on the bsp_iface include path) so cmd_system.c can #include "cli_version.h".

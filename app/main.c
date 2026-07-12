@@ -20,6 +20,7 @@
 #include "cli.h"
 #include "cli_instance.h"
 #include "cli_backend_usbcdc.h"
+#include "timebase.h"   /* timebase_init: DWT cycle counter for udelay (usleep) */
 #include "app.h"
 
 /* --- interactive shell over USB CDC ------------------------------------- */
@@ -86,6 +87,7 @@ static void led_thread_entry(ULONG arg)
 int main(void)
 {
   HAL_Init();   /* NVIC grouping + SysTick from SystemCoreClock (550 MHz); no PLL touch */
+  timebase_init();   /* DWT cycle counter for usleep's udelay (CoreDebug/DWT only, no RCC) */
 
   usb_hw_init();
   /* OTG_HS above SysTick(14)/PendSV(15); PRIMASK critical sections mask it anyway. */
