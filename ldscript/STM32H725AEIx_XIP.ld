@@ -153,5 +153,20 @@ SECTIONS
     . = ALIGN(8);
   } >RAM
 
+  /* Reset-persistent RAM log ring (svc/log.c).  Placed in DTCM and marked NOLOAD
+   * so the CMSIS startup -- which only copies .data and zeroes .bss -- never
+   * touches it: the bytes carry over every *system* reset (reboot / fault /
+   * NRST), letting `dmesg` replay a crash after the board comes back.  A *power*
+   * reset (POR/BOR) loses them, which log_init() detects via its magic word.
+   * DTCM (not AXI-SRAM) so a fault-context write bypasses the D-cache and commits
+   * to SRAM immediately.  Kept out of .bss so it is not zero-filled at boot. */
+  .log_noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.log_noinit)
+    *(.log_noinit*)
+    . = ALIGN(4);
+  } >DTCM
+
   .ARM.attributes 0 : { *(.ARM.attributes) }
 }

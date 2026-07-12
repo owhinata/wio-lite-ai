@@ -217,8 +217,11 @@ set(SHELL_SOURCES
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_watch.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_jobs.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_devmem.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_dmesg.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_crash.c"
     "${CMAKE_SOURCE_DIR}/svc/fmt.c"
-    "${CMAKE_SOURCE_DIR}/svc/timebase.c")
+    "${CMAKE_SOURCE_DIR}/svc/timebase.c"
+    "${CMAKE_SOURCE_DIR}/svc/log.c")
 
 # Generate cli_version.h (CLI_FW_NAME / _VERSION / _GIT_DESC) into GEN_DIR (already
 # on the bsp_iface include path) so cmd_system.c can #include "cli_version.h".
@@ -237,6 +240,7 @@ add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/usb_cdc.c"
     "${CMAKE_SOURCE_DIR}/app/usb_descriptors.c"
     "${CMAKE_SOURCE_DIR}/app/retarget.c"
+    "${CMAKE_SOURCE_DIR}/app/fault.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
     "${CMAKE_SOURCE_DIR}/src/system_stm32h7xx.c"
     "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"
@@ -258,7 +262,7 @@ target_include_directories(shell PRIVATE
 target_compile_definitions(shell PRIVATE
     CFG_TUSB_MCU=OPT_MCU_STM32H7
     TX_INCLUDE_USER_DEFINE_FILE
-    CLI_ENABLE_DANGEROUS_CMDS=1        # reboot (devmem not ported yet)
+    CLI_ENABLE_DANGEROUS_CMDS=1        # reboot / devmem / crash
     CLI_INSTANCE_STACK_SIZE=4096       # headroom for cli_print + future coremark
     CLI_BG_JOB_STACK_SIZE=4096)
 target_compile_options(shell PRIVATE -O2)

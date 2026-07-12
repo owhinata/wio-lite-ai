@@ -21,6 +21,7 @@
 #include "cli_instance.h"
 #include "cli_backend_usbcdc.h"
 #include "timebase.h"   /* timebase_init: DWT cycle counter for udelay (usleep) */
+#include "log.h"        /* log_init: reset-persistent RAM log (dmesg / crash record) */
 #include "app.h"
 
 /* --- interactive shell over USB CDC ------------------------------------- */
@@ -86,6 +87,14 @@ static void led_thread_entry(ULONG arg)
 
 int main(void)
 {
+  /* RAM log first: validate the reset-persistent DTCM ring and record the reset
+   * cause before anything else can log, so a fault during the rest of bring-up is
+   * captured.  log_init() only reads RCC->RSR + HAL_GetTick() (0 pre-HAL_Init) --
+   * neither needs HAL_Init().  fault_init() arms the classified faults right after,
+   * so the handler always finds a valid ring. */
+  log_init();
+  fault_init();
+
   HAL_Init();   /* NVIC grouping + SysTick from SystemCoreClock (550 MHz); no PLL touch */
   timebase_init();   /* DWT cycle counter for usleep's udelay (CoreDebug/DWT only, no RCC) */
 
