@@ -207,10 +207,13 @@ GPIOバンク F/G を丸ごと再現するので両端子群をカバー**して
 
 ## manifest 後の自動reboot
 
-- `tud_dfu_manifest_cb` → `boot_request_reboot()` → main loop が 300ms 後
-  `NVIC_SystemReset`（dfu-util が最終statusを受けて USB が落ち着くのを待つ）。
-- descriptor を manifestation-intolerant にしてあるので dfu-util は reset を
-  織り込む（tolerant のままだと `LIBUSB_ERROR_NO_DEVICE` 警告が出ていた）。
+- `tud_dfu_manifest_cb` → `boot_request_reboot()` → main loop が **1500ms 後**
+  `NVIC_SystemReset`。
+- descriptor は manifestation-**intolerant**（自分でresetするため）。
+- **遅延が1000ms超なのが肝**: dfu-util は dfuMANIFEST を見ると ~1000ms sleep して
+  から GET_STATUS を読み直す。300ms で reboot するとその読み直しが消えたデバイスに
+  当たり `LIBUSB_ERROR_NO_DEVICE` 警告になっていた。1500ms 待てば読み直しが
+  dfuMANIFEST-WAIT-RESET を正常に読めて警告が消える。
 
 ## 参照コード
 

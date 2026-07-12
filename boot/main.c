@@ -81,15 +81,18 @@ char g_dfu_alt0_str[48] = "OCTOSPI2 app @0x70000000";  /* dfu-util -l name */
 
 /*
  * Deferred reboot: the DFU manifest callback requests one so the freshly
- * downloaded app boots.  It is deferred (not done inside the callback) so
- * tud_task can flush the final USB status response first; the main loop does
- * the reset once the deadline passes.
+ * downloaded app boots.  The delay must clear dfu-util's manifest handling: on
+ * seeing dfuMANIFEST it sleeps ~1000 ms, then re-reads GET_STATUS (by then we
+ * are in dfuMANIFEST-WAIT-RESET, which it accepts cleanly).  Rebooting sooner
+ * makes that re-read hit a vanished device -> "LIBUSB_ERROR_NO_DEVICE".  So wait
+ * comfortably past 1 s, then reset from the main loop (not the callback, so the
+ * status responses flush first).
  */
 static volatile uint32_t g_reboot_at_ms;   /* 0 = none pending */
 
 void boot_request_reboot(void)           /* called from dfu_callbacks.c */
 {
-  g_reboot_at_ms = HAL_GetTick() + 300u;    /* let dfu-util + USB settle */
+  g_reboot_at_ms = HAL_GetTick() + 1500u;
 }
 
 /* --- interrupt handlers ------------------------------------------------- */
