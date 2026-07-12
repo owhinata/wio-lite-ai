@@ -6,6 +6,12 @@ STM32H725AEI6 用の **TinyUSB標準DFUブートローダ**。内蔵フラッシ
 
 ## ステータス: 実機で全経路動作確認済 (2026-07-12)
 
+> **2026-07-12 更新**: TinyUSB を tinyuf2 内包版 → **直 submodule `hathach/tinyusb`
+> 0.21.0** に変更（0.21.0 は `usbd_control.c` を `usbd.c` に統合）。boot.bin
+> 29496→30332B。良品 Discovery ST-Link / mode=UR で `0x08000000` へ再書込・Download
+> verified・読み戻しバイト一致・RDP 0xAA（非文鎮）。**boot flow / DFU 列挙 / DFU E2E の
+> 全経路を実機で再確認済**（tinyusb 0.21.0 で無回帰）。
+
 board #2 の内蔵 `0x08000000` に焼いて全経路を実機検証:
 
 - 書込後も SWD/UR 健在・RDP 0xAA（文鎮化せず）。読み戻しバイト一致。
