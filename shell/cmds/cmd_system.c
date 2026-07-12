@@ -53,13 +53,14 @@ static int cmd_version(struct cli_instance *sh, int argc, char **argv)
 	          THREADX_MAJOR_VERSION, THREADX_MINOR_VERSION, THREADX_PATCH_VERSION);
 	cli_print(sh, "MCU:      STM32H725 (devid 0x%03lx rev 0x%04lx)\r\n",
 	          (unsigned long)devid, (unsigned long)rev);
-	/* FLASHSIZE_BASE is the internal-die flash size (512 KB on the H725AE), which
-	 * on this board holds only the DFU bootloader; the app itself runs XIP from the
-	 * external OCTOSPI2 flash, so label it explicitly to avoid the two being read as
-	 * one (`free` reports the 0x70000000 XIP window separately). */
-	cli_print(sh, "Int.flash: %lu KB (die; holds the DFU bootloader)\r\n",
+	/* Two distinct flashes on this board: the internal die (FLASHSIZE_BASE = 512 KB
+	 * on the H725AE) holds only the DFU bootloader, while the app runs XIP from the
+	 * 8 MB external OCTOSPI2 window (0x70000000; mirrors the linker XIP region and
+	 * `free`).  Print both with sizes aligned so they are not read as one flash. */
+	cli_print(sh, "Flash:    %lu KB (die; holds the DFU bootloader)\r\n",
 	          (unsigned long)flash_kb);
-	cli_print(sh, "App:      XIP from external OCTOSPI2 flash @0x70000000\r\n");
+	cli_print(sh, "App:      %u KB (XIP from external OCTOSPI2 flash @0x70000000)\r\n",
+	          8u * 1024u);
 	cli_print(sh, "UID:      0x%08lx 0x%08lx 0x%08lx\r\n",
 	          (unsigned long)uid[0], (unsigned long)uid[1], (unsigned long)uid[2]);
 	return 0;
