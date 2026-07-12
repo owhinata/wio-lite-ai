@@ -144,7 +144,7 @@ git branch -d feat/<N>-short-description
 吸収する:
 
 - `STMicroelectronics/stm32h7xx_hal_driver`, `cmsis_device_h7`, `cmsis-core`
-- `adafruit/tinyuf2`（内包する `hathach/tinyusb`）
+- `hathach/tinyusb`（USB DFU/CDC スタック。`lib/tinyusb`、tag 0.21.0 に pin）
 - `eclipse-threadx/threadx`（移植で追加予定。filex/levelx/netxduo/guix も同様）
 
 ## ビルド / フラッシュ

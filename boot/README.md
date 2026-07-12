@@ -221,4 +221,4 @@ GPIOバンク F/G を丸ごと再現するので両端子群をカバー**して
 - TinyUF2: `_ref/tinyuf2/ports/stm32h7/boards.c`（jump/valid の参考。QUADSPI →
   OCTOSPI2 へ移植）。
 - OCTOSPI2 雛形: `_ref/.../STM32H735G-DK/stm32h735g_discovery_ospi.c`。
-- TinyUSB DFUクラス: `lib/tinyuf2/lib/tinyusb/src/class/dfu/dfu_device.{c,h}`。
+- TinyUSB DFUクラス: `lib/tinyusb/src/class/dfu/dfu_device.{c,h}`（直 submodule, 0.21.0）。

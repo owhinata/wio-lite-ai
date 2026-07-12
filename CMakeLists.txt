@@ -18,13 +18,14 @@
 # ============================================================================
 cmake_minimum_required(VERSION 3.20)
 
-# Fetch HAL/CMSIS submodules if any is missing.
+# Fetch HAL/CMSIS/TinyUSB submodules if any is missing.
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/stm32h7xx_hal_driver/Src/stm32h7xx_hal.c"
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/cmsis_core/Include/core_cm7.h"
-   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/cmsis_device_h7/Include/stm32h725xx.h")
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/cmsis_device_h7/Include/stm32h725xx.h"
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/tinyusb/src/tusb.h")
     message(STATUS "Initializing git submodules ...")
     execute_process(
-        COMMAND git submodule update --init --recursive
+        COMMAND git submodule update --init
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         RESULT_VARIABLE _sm)
     if(NOT _sm EQUAL 0)
@@ -127,7 +128,7 @@ firmware_finalize(blink)
 # programs downloads to the app base 0x70000000.  Flashed with the ST-Link
 # (mode=UR), not via UF2.  TinyUSB and its config/descriptors are compiled into
 # ONLY this target (blink stays a pure bare-metal app).
-set(TUSB_DIR "${CMAKE_SOURCE_DIR}/lib/tinyuf2/lib/tinyusb/src")
+set(TUSB_DIR "${CMAKE_SOURCE_DIR}/lib/tinyusb/src")
 
 # Device-mode subset of TinyUSB: core + FIFO + device stack + DFU + CDC classes +
 # the Synopsys dwc2 device controller (the H725's USB1_OTG_HS is a dwc2 core).
@@ -135,7 +136,6 @@ set(TINYUSB_SOURCES
     "${TUSB_DIR}/tusb.c"
     "${TUSB_DIR}/common/tusb_fifo.c"
     "${TUSB_DIR}/device/usbd.c"
-    "${TUSB_DIR}/device/usbd_control.c"
     "${TUSB_DIR}/class/dfu/dfu_device.c"
     "${TUSB_DIR}/class/cdc/cdc_device.c"
     "${TUSB_DIR}/portable/synopsys/dwc2/dcd_dwc2.c"
