@@ -12,8 +12,9 @@ board #2 の内蔵 `0x08000000` に焼いて全経路を実機検証:
 - **boot flow**: reset → clock/OCTOSPI2 mmap → app検証 → jump。jump先アプリの
   CDCダンプが元TinyUF2のクロックとほぼ完全一致（差はPLLCFGRのPLL3VCOSEL 1bit
   のみ＝MEDIUM vs WIDE、240MHz VCOで両範囲有効・無害）。
-- **DFUモード**（PF1保持リセット）: `dfu-util -l` で `name="id=EF4018 ok"` を列挙。
-  DFUモード中は**赤LED (PC13) 点灯**。
+- **DFUモード**（PF1保持リセット）: `dfu-util -l` で
+  `name="Wio Lite AI app @0x70000000"` を列挙（OCTOSPI2失敗時は
+  `"OCTOSPI2 FAIL id=XXXXXX"`）。DFUモード中は**赤LED (PC13) 点灯**。
 - **E2E**: `dfu-util -D blink.bin` → 0x70000000 へ書込 → manifest → 自動reboot
   → blink 起動（LED点滅を実機目視）。焼いたバイトが正しい証明。
 
@@ -67,7 +68,7 @@ CLI=/home/ouwa/work/STM32CubeProgrammer/bin/STM32_Programmer_CLI
 ## アプリを DFU で焼く
 
 1. **PF1 (USERボタン) を保持したままリセット** → ブートローダが DFUモードに留まる
-   （赤LED点灯 / `dfu-util -l` に `name="id=EF4018 ok"`）。
+   （赤LED点灯 / `dfu-util -l` に `name="Wio Lite AI app @0x70000000"`）。
    - SWD経由でリセットするなら PF1 保持中に
      `STM32_Programmer_CLI -c port=SWD mode=UR --start`。
 2. `dfu-util -d 0483:df11 -a 0 -D <app>.bin`

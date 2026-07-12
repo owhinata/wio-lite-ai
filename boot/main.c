@@ -77,16 +77,16 @@ static uint8_t      g_jedec[3];
 static volatile int g_ospi_ok;       /* octospi2_init() verdict (mfr seen) */
 static volatile int g_app_present;   /* app MSP lands in an on-chip RAM */
 
-char g_dfu_alt0_str[48] = "OCTOSPI2 app @0x70000000";  /* dfu-util -l name */
+char g_dfu_alt0_str[48] = "Wio Lite AI app @0x70000000";  /* dfu-util -l */
 
 /*
  * Deferred reboot: the DFU manifest callback requests one so the freshly
  * downloaded app boots.  The delay must clear dfu-util's manifest handling: on
  * seeing dfuMANIFEST it sleeps ~1000 ms, then re-reads GET_STATUS (by then we
  * are in dfuMANIFEST-WAIT-RESET, which it accepts cleanly).  Rebooting sooner
- * makes that re-read hit a vanished device -> "LIBUSB_ERROR_NO_DEVICE".  So wait
- * comfortably past 1 s, then reset from the main loop (not the callback, so the
- * status responses flush first).
+ * makes that re-read hit a vanished device -> LIBUSB_ERROR_NO_DEVICE.  So we
+ * wait comfortably past 1 s, then reset from the main loop (not the callback,
+ * so the status responses flush first).
  */
 static volatile uint32_t g_reboot_at_ms;   /* 0 = none pending */
 
@@ -135,19 +135,26 @@ static void hex2(char *o, uint8_t b)
 }
 
 /*
- * Compose the DFU alt-0 name: "id=EF4018 ok" / " NG" so `dfu-util -l` shows
- * the flash id and whether OCTOSPI2 came up.
+ * Compose the DFU alt-0 name shown by `dfu-util -l`.  A clean label for the app
+ * partition when OCTOSPI2 is up; on failure, show the raw JEDEC id to help
+ * diagnose (the CDC banner also reports the id / status).
  */
 static void build_alt0_str(void)
 {
   char *p = g_dfu_alt0_str;
-  const char *a = "id=";
-  while (*a) *p++ = *a++;
-  hex2(p, g_jedec[0]); p += 2;
-  hex2(p, g_jedec[1]); p += 2;
-  hex2(p, g_jedec[2]); p += 2;
-  const char *b = g_ospi_ok ? " ok" : " NG";
-  while (*b) *p++ = *b++;
+  if (g_ospi_ok)
+  {
+    const char *s = "Wio Lite AI app @0x70000000";
+    while (*s) *p++ = *s++;
+  }
+  else
+  {
+    const char *s = "OCTOSPI2 FAIL id=";
+    while (*s) *p++ = *s++;
+    hex2(p, g_jedec[0]); p += 2;
+    hex2(p, g_jedec[1]); p += 2;
+    hex2(p, g_jedec[2]); p += 2;
+  }
   *p = '\0';
 }
 
