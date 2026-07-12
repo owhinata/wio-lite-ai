@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__codex__codex",
+      "mcp__codex__codex-reply"
+    ]
+  },
+  "mcpServers": {
+    "codex": {
+      "type": "stdio",
+      "command": "codex",
+      "args": ["mcp-server"]
+    }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.command' | { read -r cmd; if echo \"$cmd\" | grep -qE '\\bgh\\b'; then if echo \"$cmd\" | grep -qE 'STMicroelectronics/(stm32h7xx_hal_driver|cmsis_device_h7|cmsis-core)|adafruit/tinyuf2|hathach/tinyusb|eclipse-threadx/(threadx|filex|levelx|netxduo|guix)'; then if echo \"$cmd\" | grep -qE '(create|comment|close|reopen|edit|delete|merge|review|transfer|pin|unpin|lock|unlock|-X (POST|PUT|PATCH|DELETE)|--method (POST|PUT|PATCH|DELETE))'; then echo '{\"decision\":\"block\",\"reason\":\"Upstream submodule repo (HAL / CMSIS / TinyUF2 / TinyUSB / ThreadX) への書き込み操作はブロックされています。fork/別repoで作業してください。\"}'; exit 2; fi; fi; fi; }",
+            "statusMessage": "Checking gh upstream write..."
+          }
+        ]
+      },
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "m=\"$HOME/.claude/.wio-lite-ai-plan-codex-reviewed\"; if [ -f \"$m\" ] && [ $(( $(date +%s) - $(stat -c %Y \"$m\") )) -lt 7200 ]; then exit 0; fi; echo '{\"decision\":\"block\",\"reason\":\"Phase/architecture plan は ExitPlanMode の前に codex-review skill を実行してください (CLAUDE.md Plan+Codex ワークフロー)。app のクロック継承/ThreadX SysTick/XIP/USB CDC/boot 変更は特に厳格に。LGTM に至ると codex-review が marker を更新して通過します。trivial plan で skip する場合は user 承認後に touch ~/.claude/.wio-lite-ai-plan-codex-reviewed\"}'; exit 2",
+            "statusMessage": "Checking codex-review gate..."
+          }
+        ]
+      }
+    ]
+  }
+}
