@@ -87,6 +87,14 @@ static void led_thread_entry(ULONG arg)
 
 int main(void)
 {
+  /* I-cache on: the app executes XIP from OCTOSPI2 (uncached instruction fetch is
+   * slow), so enable the L1 I-cache first -- it caches read-only instruction memory,
+   * has no coherency concern (XIP flash is never written), and does NOT touch the
+   * RCC/clock.  D-cache stays OFF (USB dwc2 is slave/FIFO, no system-memory DMA; a
+   * cache-coherency setup is deferred to a future PSRAM/DMA phase).  A reset (DFU
+   * reboot / crash) disables caches in HW, so the boot handoff is unchanged. */
+  SCB_EnableICache();
+
   /* RAM log first: validate the reset-persistent DTCM ring and record the reset
    * cause before anything else can log, so a fault during the rest of bring-up is
    * captured.  log_init() only reads RCC->RSR + HAL_GetTick() (0 pre-HAL_Init) --

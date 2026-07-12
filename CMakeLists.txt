@@ -18,11 +18,12 @@
 # ============================================================================
 cmake_minimum_required(VERSION 3.20)
 
-# Fetch HAL/CMSIS/TinyUSB submodules if any is missing.
+# Fetch HAL/CMSIS/TinyUSB/CoreMark submodules if any is missing.
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/stm32h7xx_hal_driver/Src/stm32h7xx_hal.c"
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/cmsis_core/Include/core_cm7.h"
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/cmsis_device_h7/Include/stm32h725xx.h"
-   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/tinyusb/src/tusb.h")
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/tinyusb/src/tusb.h"
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/coremark/core_main.c")
     message(STATUS "Initializing git submodules ...")
     execute_process(
         COMMAND git submodule update --init
@@ -219,9 +220,35 @@ set(SHELL_SOURCES
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_devmem.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_dmesg.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_crash.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_coremark.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_membench.c"
     "${CMAKE_SOURCE_DIR}/svc/fmt.c"
     "${CMAKE_SOURCE_DIR}/svc/timebase.c"
     "${CMAKE_SOURCE_DIR}/svc/log.c")
+
+# --- CoreMark object library (run as the shell `coremark` command) ----------
+# Built once at -O3 -funroll-loops and linked into the shell firmware below;
+# cmd_coremark.c calls coremark_main().  core_main.c is compiled with
+# -Dmain=coremark_main so its main() does not clash with the app main() in
+# app/main.c.  MEM_METHOD=MEM_STATIC keeps the TOTAL_DATA_SIZE block in .bss (off
+# the shell thread stack).  ITERATIONS=0 -> CoreMark auto-calibrates the run time.
+set(CMK_DIR "${CMAKE_SOURCE_DIR}/lib/coremark")
+add_library(coremark_obj OBJECT
+    "${CMK_DIR}/core_list_join.c"
+    "${CMK_DIR}/core_main.c"
+    "${CMK_DIR}/core_matrix.c"
+    "${CMK_DIR}/core_state.c"
+    "${CMK_DIR}/core_util.c"
+    "${CMAKE_SOURCE_DIR}/port/coremark/core_portme.c")
+target_link_libraries(coremark_obj PUBLIC bsp_iface)   # HAL_GetTick for timing
+target_include_directories(coremark_obj PRIVATE
+    "${CMK_DIR}" "${CMAKE_SOURCE_DIR}/port/coremark")
+target_compile_definitions(coremark_obj PRIVATE
+    ITERATIONS=0 MEM_METHOD=MEM_STATIC MEM_LOCATION="STATIC")
+target_compile_options(coremark_obj PRIVATE -O3 -funroll-loops)
+# Rename the benchmark entry so it does not collide with the app main().
+set_source_files_properties("${CMK_DIR}/core_main.c" PROPERTIES
+    COMPILE_DEFINITIONS "main=coremark_main")
 
 # Generate cli_version.h (CLI_FW_NAME / _VERSION / _GIT_DESC) into GEN_DIR (already
 # on the bsp_iface include path) so cmd_system.c can #include "cli_version.h".
@@ -248,7 +275,10 @@ add_executable(shell
     ${APP_TINYUSB_SOURCES}
     ${TX_CORE} ${TX_ASM}
     ${HAL_SOURCES})
-target_link_libraries(shell PRIVATE bsp_iface)
+target_link_libraries(shell PRIVATE bsp_iface coremark_obj)
+# CoreMark's canonical report prints its score with %f; pull in newlib's float
+# printf (newlib-nano omits it by default).
+target_link_options(shell PRIVATE -u _printf_float)
 target_include_directories(shell PRIVATE
     "${CMAKE_SOURCE_DIR}/app"
     "${CMAKE_SOURCE_DIR}/port/threadx"
@@ -263,8 +293,9 @@ target_compile_definitions(shell PRIVATE
     CFG_TUSB_MCU=OPT_MCU_STM32H7
     TX_INCLUDE_USER_DEFINE_FILE
     CLI_ENABLE_DANGEROUS_CMDS=1        # reboot / devmem / crash
-    CLI_INSTANCE_STACK_SIZE=4096       # headroom for cli_print + future coremark
-    CLI_BG_JOB_STACK_SIZE=4096)
+    CLI_INSTANCE_STACK_SIZE=4096       # headroom for cli_print + coremark
+    CLI_BG_JOB_STACK_SIZE=4096
+    CLI_USBCDC_TX_BUFFER_SIZE=4096)    # holds a full CoreMark report burst
 target_compile_options(shell PRIVATE -O2)
 
 firmware_finalize(shell)

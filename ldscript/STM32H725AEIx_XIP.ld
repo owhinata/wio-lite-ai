@@ -168,5 +168,16 @@ SECTIONS
     . = ALIGN(4);
   } >DTCM
 
+  /* Scratch working buffer for the `membench` command (cmd_membench.c), in DTCM
+   * after the log ring.  NOLOAD: uninitialized diagnostic scratch, never loaded or
+   * zeroed at boot.  Sits above .log_noinit; the two together use ~24 KB of DTCM. */
+  .dtcm_bench (NOLOAD) :
+  {
+    . = ALIGN(32);
+    *(.dtcm_bench)
+    *(.dtcm_bench*)
+    . = ALIGN(4);
+  } >DTCM
+
   .ARM.attributes 0 : { *(.ARM.attributes) }
 }
