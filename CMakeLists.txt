@@ -160,15 +160,25 @@ firmware_finalize(boot)
 # --- bootrom: standalone DFU bootloader (Phase 2), runs from internal flash -----
 # Linked at 0x08000000 (LDSCRIPT_ROM); configures the clock tree / OCTOSPI2 itself
 # (stock CMSIS system file resets to HSI, then SystemClock_Config).  Flashed with
-# the ST-Link (mode=UR), not via UF2.  Milestone 1 = clock + LED blink.
+# the ST-Link (mode=UR), not via UF2.  Milestones: 1 = clock + LED blink,
+# 2 = OCTOSPI2 memory-mapped init, 3 = USB DFU + CDC (same TinyUSB device subset as
+# `boot`, DFU download targets the app base 0x70000000 -- see bootrom/dfu_callbacks.c).
 add_executable(bootrom
     "${CMAKE_SOURCE_DIR}/bootrom/main.c"
     "${CMAKE_SOURCE_DIR}/bootrom/clock.c"
     "${CMAKE_SOURCE_DIR}/bootrom/octospi.c"
+    "${CMAKE_SOURCE_DIR}/bootrom/usb_descriptors.c"
+    "${CMAKE_SOURCE_DIR}/bootrom/dfu_callbacks.c"
     "${CMSIS_DEV}/Source/Templates/system_stm32h7xx.c"
     "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"
+    ${TINYUSB_SOURCES}
     ${HAL_SOURCES})
 target_link_libraries(bootrom PRIVATE bsp_iface)
+# bootrom/ first so TinyUSB picks up our tusb_config.h; then the TinyUSB headers.
+target_include_directories(bootrom PRIVATE
+    "${CMAKE_SOURCE_DIR}/bootrom"
+    "${TUSB_DIR}")
+target_compile_definitions(bootrom PRIVATE CFG_TUSB_MCU=OPT_MCU_STM32H7)
 target_compile_options(bootrom PRIVATE -O2)
 
 rom_finalize(bootrom)

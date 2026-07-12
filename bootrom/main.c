@@ -2,52 +2,184 @@
  * Wio Lite AI (STM32H725AEI6) -- STANDALONE DFU bootloader, runs from internal
  * flash at 0x08000000 (replaces TinyUF2).  See boot/phase2_config_dump.md.
  *
- * MILESTONE 1 (this file): clock bring-up + LED heartbeat.  Proves the standalone
- * clock tree (SystemClock_Config, reproducing TinyUF2's 550/266/48 MHz) works and
- * the image links/boots from internal flash.  It touches NO option bytes / RDP /
- * DBGMCU / SWD pins, so a bad clock config leaves the board re-flashable over SWD.
+ * MILESTONE 3 (this file): USB DFU + CDC.  The board comes up, brings up its own
+ * clock tree (SystemClock_Config) and the external OCTOSPI2 flash memory-mapped
+ * (octospi2_init), then enumerates as a composite DFU + CDC device.  A DFU download
+ * (dfu-util -a 0 -D app.bin) is written straight to the app base (OCTOSPI2 offset 0 =
+ * 0x70000000) via the flash-resident driver in octospi.c -- no scratch region, because
+ * unlike the app-first firmware this bootloader does NOT execute from OCTOSPI2.
  *
- * Next milestones: OCTOSPI2 memory-mapped init (bring up the external flash),
- * USB DFU + CDC (reuse boot/), boot flow (DFU trigger / valid app -> jump to
- * 0x70000000).  Only flashed to 0x08000000 in Phase 3 (brick risk) after an
- * objdump SWD-safety audit.
+ * This milestone always stays in DFU mode (no boot flow / app jump yet -- milestone 4).
+ * That makes it a safe, self-contained state: flash this once and the board can always
+ * be re-loaded over DFU.  It touches NO option bytes / RDP / DBGMCU / SWD pins, so a
+ * bad config leaves the board re-flashable over SWD.
+ *
+ * Caches stay OFF the whole time (reset default), which keeps the OCTOSPI2 register /
+ * memory-mapped accesses coherent and avoids speculative reads of 0x70000000 while the
+ * flash is momentarily out of memory-mapped mode during a program.
  */
 
+#include <stdio.h>
 #include "stm32h7xx_hal.h"
+#include "tusb.h"
+#include "octospi.h"
 
-void SystemClock_Config(void);
-int  octospi2_init(uint8_t jedec[3]);   // bootrom/octospi.c
+void SystemClock_Config(void);   // bootrom/clock.c
 
-#define LED_PIN    GPIO_PIN_13   /* PC13 red LED */
+//--------------------------------------------------------------------+
+// printf over USB CDC (newlib retargeting)
+//--------------------------------------------------------------------+
+extern char end;                          // heap start (from the linker script)
+void *_sbrk(int incr)
+{
+  static char *heap = 0;
+  if (heap == 0) heap = &end;
+  char *prev = heap;
+  heap += incr;
+  return prev;
+}
+
+// newlib calls this for stdout/stderr; route to the CDC TX FIFO.  When the FIFO
+// fills, pump tud_task() so bursts aren't dropped; a guard bounds the wait if the host
+// isn't reading.  Only ever called from the main loop, so re-entering tud_task() here
+// is safe.
+int _write(int fd, char *buf, int len)
+{
+  (void) fd;
+  if (!tud_cdc_connected()) return len;
+  int sent = 0;
+  uint32_t guard = 0;
+  while (sent < len && guard < 100000u)
+  {
+    uint32_t w = tud_cdc_write((uint8_t const *) buf + sent, (uint32_t) (len - sent));
+    sent += (int) w;
+    tud_cdc_write_flush();
+    if (w == 0u) { tud_task(); guard++; }
+  }
+  return len;
+}
+
+//--------------------------------------------------------------------+
+// LED (PC13 red)
+//--------------------------------------------------------------------+
+#define LED_PORT   GPIOC
+#define LED_PIN    GPIO_PIN_13
+enum { BLINK_FAIL = 90, BLINK_NOT_MOUNTED = 250, BLINK_MOUNTED = 1000, BLINK_SUSPENDED = 2500 };
+static volatile uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
+
+//--------------------------------------------------------------------+
+// OCTOSPI2 status (published over USB: DFU alt-0 name + CDC banner)
+//--------------------------------------------------------------------+
+static uint8_t  g_jedec[3];
+static volatile int g_ospi_ok;             // octospi2_init() verdict (Winbond mfr seen)
+static volatile int g_app_present;         // app vector[0] (MSP) lands in AXI-SRAM
+
+char g_dfu_alt0_str[48] = "OCTOSPI2 app @0x70000000";   // dfu-util -l name (runtime)
+
+//--------------------------------------------------------------------+
+void SysTick_Handler(void)   { HAL_IncTick(); }   // HAL tick (fixes HAL_Delay/HAL_GetTick)
+void OTG_HS_IRQHandler(void) { tud_int_handler(0); }
+
+static void usb_hw_init(void)
+{
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  GPIO_InitTypeDef usb_pins = {0};
+  usb_pins.Pin       = GPIO_PIN_11 | GPIO_PIN_12;
+  usb_pins.Mode      = GPIO_MODE_AF_PP;
+  usb_pins.Pull      = GPIO_NOPULL;
+  usb_pins.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+  usb_pins.Alternate = GPIO_AF10_OTG1_FS;
+  HAL_GPIO_Init(GPIOA, &usb_pins);
+  HAL_PWREx_EnableUSBVoltageDetector();
+  __HAL_RCC_USB1_OTG_HS_CLK_ENABLE();
+  __HAL_RCC_USB1_OTG_HS_ULPI_CLK_DISABLE();
+}
+
+static void led_init(void)
+{
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  GPIO_InitTypeDef led = {0};
+  led.Pin = LED_PIN; led.Mode = GPIO_MODE_OUTPUT_PP; led.Pull = GPIO_NOPULL;
+  led.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LED_PORT, &led);
+}
+
+static void led_task(void)
+{
+  static uint32_t last_ms = 0;
+  uint32_t interval = g_ospi_ok ? blink_interval_ms : BLINK_FAIL;
+  uint32_t now = HAL_GetTick();
+  if (now - last_ms < interval) return;
+  last_ms = now;
+  HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
+}
+
+static void hex2(char *o, uint8_t b) { static const char h[]="0123456789ABCDEF"; o[0]=h[b>>4]; o[1]=h[b&0xF]; }
+
+// Compose the DFU alt-0 name: "id=EF4018 ok" / " NG" so `dfu-util -l` shows the flash id
+// and whether OCTOSPI2 came up.
+static void build_alt0_str(void)
+{
+  char *p = g_dfu_alt0_str;
+  const char *a = "id="; while (*a) *p++ = *a++;
+  hex2(p, g_jedec[0]); p += 2; hex2(p, g_jedec[1]); p += 2; hex2(p, g_jedec[2]); p += 2;
+  const char *b = g_ospi_ok ? " ok" : " NG"; while (*b) *p++ = *b++;
+  *p = '\0';
+}
+
+// USB CDC console: banner on connect + periodic heartbeat.
+static void console_task(void)
+{
+  static bool was_connected = false;
+  static uint32_t last_ms = 0;
+  bool connected = tud_cdc_connected();
+
+  if (connected && !was_connected)
+  {
+    printf("\r\n=== Wio Lite AI standalone DFU bootloader (Phase 2 / milestone 3) ===\r\n");
+    printf("flash JEDEC id     : %02X %02X %02X (%s)\r\n",
+           g_jedec[0], g_jedec[1], g_jedec[2], g_ospi_ok ? "OCTOSPI2 up" : "OCTOSPI2 FAIL");
+    printf("app vector[0] (MSP): %08lX (%s)\r\n",
+           (unsigned long) *(volatile uint32_t *)0x70000000u,
+           g_app_present ? "app present" : "no valid app");
+    printf("DFU alt 0 targets app base 0x70000000.  dfu-util -a 0 -D app.bin\r\n");
+  }
+  was_connected = connected;
+
+  uint32_t now = HAL_GetTick();
+  if (connected && (now - last_ms >= 2000u))
+  {
+    last_ms = now;
+    printf("[tick] %lu ms\r\n", (unsigned long) now);
+  }
+}
 
 int main(void)
 {
-  HAL_Init();               // MPU/cache off, SysTick at the reset (HSI) clock
+  HAL_Init();               // NVIC grouping + SysTick at the reset (HSI) clock
   SystemClock_Config();     // HSE -> PLL1 550 (CPU), PLL2 266 (OCTOSPI2), PLL3 48 (USB)
 
   // Bring up the external OCTOSPI2 flash in memory-mapped mode.
-  uint8_t jedec[3] = {0};
-  int ospi_ok = octospi2_init(jedec);
+  g_ospi_ok = octospi2_init(g_jedec);
+  build_alt0_str();
 
   // Read the app vector through the memory-mapped window: a valid image has its MSP
-  // in AXI-SRAM (0x24050000).  Confirms mmap reads work end-to-end.
+  // in AXI-SRAM (0x24xxxxxx).  Informational for milestone 3 (used by the boot flow
+  // in milestone 4).
   uint32_t app_msp = *(volatile uint32_t *)0x70000000u;
-  int mmap_ok = ((app_msp & 0xFF000000u) == 0x24000000u);
+  g_app_present = ((app_msp & 0xFF000000u) == 0x24000000u);
 
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  GPIO_InitTypeDef led = {0};
-  led.Pin   = LED_PIN;
-  led.Mode  = GPIO_MODE_OUTPUT_PP;
-  led.Pull  = GPIO_NOPULL;
-  led.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOC, &led);
+  led_init();
+  usb_hw_init();
+  tusb_rhport_init_t dev_init = { .role = TUSB_ROLE_DEVICE, .speed = TUSB_SPEED_AUTO };
+  tusb_init(BOARD_TUD_RHPORT, &dev_init);
+  setvbuf(stdout, NULL, _IONBF, 0);   // unbuffered: each printf reaches _write
 
-  // Milestone-2 verdict on PC13:  1 Hz slow = clock + OCTOSPI2 mmap both OK;
-  // ~10 Hz fast strobe = OCTOSPI2 init failed (JEDEC != EF or mmap read wrong).
-  uint32_t period = (ospi_ok && mmap_ok) ? 500u : 50u;
-  for (;;)
-  {
-    HAL_GPIO_TogglePin(GPIOC, LED_PIN);
-    HAL_Delay(period);
-  }
+  for (;;) { tud_task(); led_task(); console_task(); }
 }
+
+//--------------------------------------------------------------------+
+void tud_mount_cb(void)                    { blink_interval_ms = BLINK_MOUNTED; }
+void tud_umount_cb(void)                   { blink_interval_ms = BLINK_NOT_MOUNTED; }
+void tud_suspend_cb(bool remote_wakeup_en) { (void) remote_wakeup_en; blink_interval_ms = BLINK_SUSPENDED; }
+void tud_resume_cb(void)                   { blink_interval_ms = tud_mounted() ? BLINK_MOUNTED : BLINK_NOT_MOUNTED; }

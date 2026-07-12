@@ -18,6 +18,8 @@
 
 // CCR field encodings (1-line SPI for the setup commands).
 #define CCR_IMODE_1   (1u << OCTOSPI_CCR_IMODE_Pos)
+#define CCR_ADMODE_1  (1u << OCTOSPI_CCR_ADMODE_Pos)
+#define CCR_ADSIZE_24 (2u << OCTOSPI_CCR_ADSIZE_Pos)   // 24-bit address (W25Q128)
 #define CCR_DMODE_1   (1u << OCTOSPI_CCR_DMODE_Pos)
 #define FMODE_WRITE   (0u << OCTOSPI_CR_FMODE_Pos)
 #define FMODE_READ    (1u << OCTOSPI_CR_FMODE_Pos)
@@ -25,6 +27,12 @@
 // CR base (from the dump) minus FMODE: EN | FSEL | FTHRES=3 | APMS.
 #define CR_BASE       (0x30400381u & ~OCTOSPI_CR_FMODE_Msk)
 #define CR_MMAP       0x30400381u
+
+// Memory-mapped 0xEB Quad I/O read config (from the dump); re-applied to re-enter
+// mmap after an erase/program leaves it for indirect commands.
+#define MMAP_CCR      0x03032301u
+#define MMAP_TCR      0x00000004u
+#define MMAP_IR       0x000000EBu
 
 #define SPIN 0x00100000u
 
@@ -136,9 +144,9 @@ int octospi2_init(uint8_t jedec[3])
   ensure_qe();                         // set Quad-Enable if needed
 
   // Configure the 0xEB Quad I/O read and switch to memory-mapped mode.
-  OCTOSPI2->CCR = 0x03032301u;
-  OCTOSPI2->TCR = 0x00000004u;
-  OCTOSPI2->IR  = 0x000000EBu;
+  OCTOSPI2->CCR = MMAP_CCR;
+  OCTOSPI2->TCR = MMAP_TCR;
+  OCTOSPI2->IR  = MMAP_IR;
   OCTOSPI2->ABR = 0x00000000u;
   __DSB();
   OCTOSPI2->CR  = CR_MMAP;             // FMODE=11 memory-mapped
@@ -146,4 +154,96 @@ int octospi2_init(uint8_t jedec[3])
   __ISB();
 
   return (jedec[0] == 0xEFu);
+}
+
+//--------------------------------------------------------------------+
+// Erase / program (standalone: this code runs from internal flash, so unlike the
+// app-first RAM driver it can leave OCTOSPI2 in indirect mode normally -- nothing
+// executes from or speculatively reads 0x70000000 while mmap is off, caches are off,
+// and IRQ handlers live in internal flash).  W25Q128 1-line commands, 24-bit address:
+// WREN 0x06, sector-erase-4K 0x20, page-program 0x02, RDSR1 0x05 (WIP = bit 0).
+//--------------------------------------------------------------------+
+
+// Leave memory-mapped mode for indirect commands (RM0468: abort, then reconfigure).
+static void abort_to_indirect(void)
+{
+  __DSB();
+  OCTOSPI2->CR |= OCTOSPI_CR_ABORT;
+  { uint32_t n = SPIN; while ((OCTOSPI2->CR & OCTOSPI_CR_ABORT) && n) n--; }  // self-clears
+  wait_not_busy();
+  OCTOSPI2->FCR = OCTOSPI_FCR_CTCF | OCTOSPI_FCR_CTEF;
+  OCTOSPI2->CR  = CR_BASE;             // FMODE=00 indirect write
+}
+
+// Re-apply the 0xEB Quad I/O read config and re-enter memory-mapped mode.
+static void restore_mmap(void)
+{
+  wait_not_busy();
+  OCTOSPI2->FCR = OCTOSPI_FCR_CTCF | OCTOSPI_FCR_CTEF;
+  OCTOSPI2->CCR = MMAP_CCR;
+  OCTOSPI2->TCR = MMAP_TCR;
+  OCTOSPI2->IR  = MMAP_IR;
+  OCTOSPI2->ABR = 0x00000000u;
+  __DSB();
+  OCTOSPI2->CR  = CR_MMAP;
+  __DSB();
+  __ISB();
+}
+
+static void erase_4k(uint32_t addr)
+{
+  cmd_only(0x06u);                     // WREN
+  wait_not_busy();
+  OCTOSPI2->FCR = OCTOSPI_FCR_CTCF | OCTOSPI_FCR_CTEF;
+  MODIFY_REG(OCTOSPI2->CR, OCTOSPI_CR_FMODE, FMODE_WRITE);
+  OCTOSPI2->TCR = 0;
+  OCTOSPI2->CCR = CCR_IMODE_1 | CCR_ADMODE_1 | CCR_ADSIZE_24;
+  OCTOSPI2->IR  = 0x20u;
+  OCTOSPI2->AR  = addr;                // writing AR triggers
+  wait_flag(OCTOSPI_SR_TCF);
+  OCTOSPI2->FCR = OCTOSPI_FCR_CTCF;
+  wait_wip();
+}
+
+// Program up to 256 bytes within a single page.
+static void program_page(uint32_t addr, const uint8_t *data, uint32_t n)
+{
+  cmd_only(0x06u);                     // WREN
+  wait_not_busy();
+  OCTOSPI2->FCR = OCTOSPI_FCR_CTCF | OCTOSPI_FCR_CTEF;
+  MODIFY_REG(OCTOSPI2->CR, OCTOSPI_CR_FMODE, FMODE_WRITE);
+  OCTOSPI2->DLR = n - 1u;
+  OCTOSPI2->TCR = 0;
+  OCTOSPI2->CCR = CCR_IMODE_1 | CCR_ADMODE_1 | CCR_ADSIZE_24 | CCR_DMODE_1;
+  OCTOSPI2->IR  = 0x02u;
+  OCTOSPI2->AR  = addr;                // triggers; data pulled through the FIFO
+  for (uint32_t i = 0; i < n; i++) { wait_flag(OCTOSPI_SR_FTF); *(volatile uint8_t *)&OCTOSPI2->DR = data[i]; }
+  wait_flag(OCTOSPI_SR_TCF);
+  OCTOSPI2->FCR = OCTOSPI_FCR_CTCF;
+  wait_wip();
+}
+
+// Erase the 4 KB sector containing `addr` (flash-internal offset), restore mmap.
+void octospi2_erase_sector(uint32_t addr)
+{
+  abort_to_indirect();
+  erase_4k(addr & ~0xFFFu);
+  restore_mmap();
+}
+
+// Program `len` bytes at `addr` (flash-internal offset), splitting on 256 B pages,
+// then restore mmap.  Caller erases the covering sector(s) first.
+void octospi2_program(uint32_t addr, const uint8_t *data, uint32_t len)
+{
+  abort_to_indirect();
+  uint32_t off = 0;
+  while (off < len)
+  {
+    uint32_t page_off = (addr + off) & 0xFFu;
+    uint32_t chunk = 256u - page_off;
+    if (chunk > (len - off)) chunk = len - off;
+    program_page(addr + off, data + off, chunk);
+    off += chunk;
+  }
+  restore_mmap();
 }
