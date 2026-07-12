@@ -45,10 +45,16 @@ PJ/PK: bogus (read-back pattern; H725AEI does not bond these) -- ignore
 - The flash also needs its Quad-Enable (QE) bit set (already set by TinyUF2; the
   standalone init must issue the W25Q QE write if starting from reset).
 
-## OCTOSPI2 flash pins (from schematic 733260648, nets "OSPI1_*" = OCTOSPIM Port 1)
-  CLK=PF10(AF9)  CS=PG6(AF10)  IO0=PF8  IO1=PF9  IO2=PF7  IO3=PF6 (AF10), speed=VERY_HIGH.
-  (PSRAM on OCTOSPI1 @0x90000000 uses the "QSPI2_*" nets: PF4/PG0/PG1/PG10/PG11 -- not
-  needed by the bootloader.)
+## OCTOSPI2 flash pins -- CORRECTED (schematic sheet 6 review, 2026-07-12)
+**The W25Q128 app flash is on the "QSPI2_*" nets = OCTOSPIM Port 2**:
+  CLK=PF4(AF9)  NCS=PG12(AF3)  IO4-7=PG0(AF9)/PG1(AF9)/PG10(AF3)/PG11(AF9)
+  (quad data rides the P2 HIGH nibble IO[7:4]; P2CR reset 0x07050333 maps it), VERY_HIGH.
+  Cross-checked against the captured AFRs: PF4 nibble=9, PG0/PG1=9, PG10=3, PG11=9, PG12=3.
+**The "OSPI1_*" nets are the PSRAM (APS6408L on OCTOSPI1/Port 1)**: PF6-PF10, PG6, PB2 etc.
+  (An earlier revision of this table had the two swapped -- net names do not match
+  peripheral numbers.  The bootloader code was never affected: it replays GPIO banks
+  F and G verbatim, which covers both pin sets.)  Flash CS has a 10K pull-up (R90),
+  so the W25Q stays deselected from reset until mmap init.
 
 ## OCTOSPIM routing -- RESOLVED
 Re-dumped with the IOMNGR clock on: **OCTOSPIM_CR=0 (MUXEN=0), P1CR=0x03010111,

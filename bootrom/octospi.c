@@ -127,9 +127,18 @@ int octospi2_init(uint8_t jedec[3])
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
   __HAL_RCC_OSPI2_CLK_ENABLE();
+  // OCTOSPI1 is clocked too (captured AHB3ENR has OSPI1EN set): the bank replay below
+  // routes the PSRAM's Port-1 pins (PF6-10, PG6) to OCTOSPI1 in AF mode, and an AF pin
+  // should not hang off an unclocked peripheral.  Idle OCTOSPI1 keeps its NCS high, so
+  // the PSRAM (external pull-up too) stays deselected -- same state TinyUF2 left.
+  __HAL_RCC_OSPI1_CLK_ENABLE();
   __HAL_RCC_OCTOSPIM_CLK_ENABLE();
 
-  // Replay TinyUF2's exact GPIO for the OCTOSPI banks (Port-2 flash pins included).
+  // Replay TinyUF2's exact GPIO for the OCTOSPI banks.  This covers the W25Q128 app
+  // flash on OCTOSPIM Port 2 -- PF4=CLK(AF9), PG12=NCS(AF3), PG0/PG1/PG10/PG11=
+  // IO4-7(AF9/AF3, quad data on the P2 high nibble) per schematic sheet 6 ("QSPI2_*"
+  // nets) -- and the PSRAM's Port-1 pins (PF6-10, PG6, "OSPI1_*" nets).  Net names do
+  // NOT match peripheral numbers; replaying both banks verbatim sidesteps that trap.
   gpio_replay(GPIOF, 0xFFEAAEF3u, 0x00000000u, 0x003FF300u, 0x00000004u, 0xAA090000u, 0x000009AAu);
   gpio_replay(GPIOG, 0xFEAFEFFAu, 0x00000000u, 0x03F0300Fu, 0x00000000u, 0x0A000099u, 0x00039300u);
 

@@ -209,6 +209,8 @@ static int app_valid(void)
 static void jump_to_app(void)
 {
   volatile uint32_t const *vec = (volatile uint32_t const *)0x70000000u;
+  uint32_t app_msp   = vec[0];
+  uint32_t app_reset = vec[1];
 
   __disable_irq();
   // HAL_Init started SysTick; stop it and clear any pending exception so it can't fire
@@ -222,14 +224,18 @@ static void jump_to_app(void)
   __DSB();
   __ISB();
 
-  __set_MSP(vec[0]);
-  __set_PSP(vec[0]);
-  __enable_irq();                     // reset-state PRIMASK=0 for the app
-
-  // Branch to the reset vector, reading it from flash (not a stack spill) after the
-  // stack pointer has moved.
-  __asm volatile ("bx %0" :: "r" (vec[1]));
-  for (;;) { }
+  // MSP/PSP switch + PRIMASK restore + branch as ONE asm block with register-only
+  // operands: once MSP moves, no compiler-scheduled stack access (spill/reload) can
+  // sneak in between -- robust against optimizer/compiler changes, not just verified
+  // on one build.  cpsie i restores the reset-state PRIMASK=0 for the app; nothing is
+  // pending (checked above) and no NVIC source is enabled on this path.
+  __asm volatile (
+      "msr msp, %0\n\t"
+      "msr psp, %0\n\t"
+      "cpsie i\n\t"
+      "bx %1\n\t"
+      :: "r" (app_msp), "r" (app_reset) : "memory");
+  __builtin_unreachable();
 }
 
 int main(void)
