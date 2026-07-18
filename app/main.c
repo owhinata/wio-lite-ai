@@ -22,6 +22,7 @@
 #include "cli_backend_usbcdc.h"
 #include "timebase.h"   /* timebase_init: DWT cycle counter for udelay (usleep) */
 #include "log.h"        /* log_init: reset-persistent RAM log (dmesg / crash record) */
+#include "iwdg.h"       /* IWDG petter (issue #4): armed from its own thread entry */
 #include "app.h"
 
 /* --- interactive shell over USB CDC ------------------------------------- */
@@ -40,6 +41,30 @@ static void led_init_off(void);
  * The shell instance's own thread/stack come from CLI_INSTANCE_DEFINE. */
 static TX_THREAD usb_thread;
 static UCHAR     usb_stack[4096] __attribute__((aligned(8)));  /* tud_task + printf headroom */
+
+#if BSP_ENABLE_IWDG
+/* IWDG petter (issue #4).  Static objects; the thread is created in
+ * tx_application_define but ARMS the watchdog from its own entry -- after the
+ * scheduler starts -- because H7 HAL_IWDG_Init() polls the PR/RLR update with a
+ * HAL_GetTick() timeout, so SysTick must be live (it is not yet inside
+ * tx_application_define, which runs with interrupts masked).  Priority 5 preempts
+ * usb(8)/cli(16)/bg(17), so the petter keeps feeding through a ~12 s CoreMark run
+ * and only stops on a whole-system stall (scheduler/tick death, IRQ-off lockup,
+ * OCTOSPI2 XIP fetch stall) -> the IWDG then resets the board. */
+static TX_THREAD iwdg_thread;
+static UCHAR     iwdg_stack[IWDG_PETTER_STACK_SIZE] __attribute__((aligned(8)));
+
+static void iwdg_entry(ULONG arg)
+{
+  (void) arg;
+  iwdg_init();      /* arm now: SysTick / HAL_GetTick are running */
+  iwdg_refresh();   /* pet before the first sleep: minimise the init->pet window */
+  for (;;) {
+    tx_thread_sleep(IWDG_PETTER_PERIOD_MS);
+    iwdg_refresh();
+  }
+}
+#endif
 
 void tx_application_define(void *first_unused_memory)
 {
@@ -60,6 +85,16 @@ void tx_application_define(void *first_unused_memory)
                    8, 8, TX_NO_TIME_SLICE, TX_AUTO_START);
 
   led_init_off();               /* configure PC13 and hold the red LED off */
+
+#if BSP_ENABLE_IWDG
+  /* IWDG petter thread (priority 5).  Created before the timer is enabled so it is
+   * the first thread the scheduler runs; its entry arms the watchdog (see above).
+   * Fail-soft: if the create fails the watchdog is simply never armed. */
+  tx_thread_create(&iwdg_thread, "iwdg", iwdg_entry, 0,
+                   iwdg_stack, sizeof(iwdg_stack),
+                   IWDG_PETTER_PRIORITY, IWDG_PETTER_PRIORITY,
+                   TX_NO_TIME_SLICE, TX_AUTO_START);
+#endif
 
   /* Timer lists exist now -> let the SysTick ISR drive the ThreadX scheduler. */
   tx_glue_timer_enable();

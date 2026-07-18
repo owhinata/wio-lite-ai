@@ -220,6 +220,7 @@ set(SHELL_SOURCES
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_devmem.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_dmesg.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_crash.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_wdt.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_coremark.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_membench.c"
     "${CMAKE_SOURCE_DIR}/svc/fmt.c"
@@ -262,12 +263,19 @@ endif()
 configure_file("${CMAKE_SOURCE_DIR}/cmake/cli_version.h.in"
                "${GEN_DIR}/cli_version.h" @ONLY)
 
+# IWDG watchdog (issue #4): ON builds in the IWDG1 arming + priority-5 petter thread
+# + the `wdt` starve test; OFF compiles them out entirely (`wdt info` then reports
+# "disabled (build)").  Turn OFF for SWD sessions that must hold a breakpoint longer
+# than the ~3 s IWDG timeout (the app does not touch DBGMCU to freeze it under debug).
+option(BSP_ENABLE_IWDG "Enable the IWDG watchdog and wdt shell command" ON)
+
 add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/main.c"
     "${CMAKE_SOURCE_DIR}/app/usb_cdc.c"
     "${CMAKE_SOURCE_DIR}/app/usb_descriptors.c"
     "${CMAKE_SOURCE_DIR}/app/retarget.c"
     "${CMAKE_SOURCE_DIR}/app/fault.c"
+    "${CMAKE_SOURCE_DIR}/app/iwdg.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
     "${CMAKE_SOURCE_DIR}/src/system_stm32h7xx.c"
     "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"
@@ -295,7 +303,8 @@ target_compile_definitions(shell PRIVATE
     CLI_ENABLE_DANGEROUS_CMDS=1        # reboot / devmem / crash
     CLI_INSTANCE_STACK_SIZE=4096       # headroom for cli_print + coremark
     CLI_BG_JOB_STACK_SIZE=4096
-    CLI_USBCDC_TX_BUFFER_SIZE=4096)    # holds a full CoreMark report burst
+    CLI_USBCDC_TX_BUFFER_SIZE=4096     # holds a full CoreMark report burst
+    BSP_ENABLE_IWDG=$<BOOL:${BSP_ENABLE_IWDG}>)  # issue #4: IWDG1 arm + petter + wdt
 target_compile_options(shell PRIVATE -O2)
 
 firmware_finalize(shell)

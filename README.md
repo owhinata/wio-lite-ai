@@ -17,19 +17,26 @@ and the app **inherits its clock tree** — see *Key design points*.
 ## What it does
 
 Presents a `wio> ` prompt on **`/dev/ttyACM0`** (USB CDC, `0483:5740`, "CDC in FS
-Mode") with line editing, history, and Tab completion. 17 commands:
+Mode") with line editing, history, and Tab completion. 18 commands:
 
 | Group | Commands |
 |---|---|
 | system | `version` · `uptime` · `reboot` · `free` · `thread` |
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
-| diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) |
+| diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) |
 | benchmarks | `coremark` · `membench` |
 
 - **`dmesg` / `crash`** — a reset-persistent RAM log in DTCM records faults
   (HardFault/MemManage/BusFault/UsageFault) before a reset; `dmesg` replays them
   after the board comes back. `crash` deliberately triggers a fault to test it.
+- **`wdt`** — the IWDG1 independent watchdog (LSI-clocked, ~3 s) auto-recovers from a
+  *non-faulting* hang (scheduler/tick stall, IRQ-off lockup, OCTOSPI2 XIP fetch stall);
+  a priority-5 petter thread feeds it every ~1 s. `wdt info` shows state / timeout /
+  last reset cause; `wdt starve` stops feeding to prove the reset (afterwards `dmesg`
+  and `wdt info` report `reset cause: IWDG`). Build `-DBSP_ENABLE_IWDG=OFF` to compile
+  it out — e.g. for SWD sessions that hold a breakpoint past the timeout (the app does
+  not touch DBGMCU to freeze it under debug).
 - **`coremark`** — EEMBC CoreMark. **≈2333 (4.24 CoreMark/MHz)** with both L1 caches on.
 - **`membench`** — DWT-cycle-precise read/write/copy bandwidth + pointer-chase
   latency for DTCM / AXI-SRAM (cached vs refill) / internal + external flash.

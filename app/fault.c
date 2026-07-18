@@ -31,6 +31,7 @@
 #include <stdint.h>
 
 #include "stm32h7xx_hal.h"
+#include "iwdg.h"        /* BSP_ENABLE_IWDG gate for the debugger-halt IWDG1 pet */
 
 /* ---- init -------------------------------------------------------------- */
 
@@ -64,8 +65,15 @@ static int addr_in_ram(uint32_t a)
 static void fault_rest(void)
 {
 	if (CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk) {
-		for (;;)
-			;                       /* busy loop (not WFI): old ST-Link can attach */
+		for (;;) {                  /* busy loop (not WFI): old ST-Link can attach */
+#if BSP_ENABLE_IWDG
+			/* Pet the IWDG1 directly (no HAL handle -- fault context, IRQs off) so
+			 * the board survives at the fault until a human attaches over SWD.  Once
+			 * they halt the core the pet stops and the IWDG resets (~timeout), but
+			 * the crash is already in the reset-persistent RAM log (dmesg). */
+			IWDG1->KR = 0x0000AAAAu;
+#endif
+		}
 	}
 	NVIC_SystemReset();             /* does not return */
 	for (;;)
