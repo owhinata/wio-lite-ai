@@ -158,8 +158,9 @@ SECTIONS
    * touches it: the bytes carry over every *system* reset (reboot / fault /
    * NRST), letting `dmesg` replay a crash after the board comes back.  A *power*
    * reset (POR/BOR) loses them, which log_init() detects via its magic word.
-   * DTCM (not AXI-SRAM) so a fault-context write bypasses the D-cache and commits
-   * to SRAM immediately.  Kept out of .bss so it is not zero-filled at boot. */
+   * DTCM (not AXI-SRAM) so a write bypasses the D-cache; but a bare store does NOT
+   * durably land until it is read back (svc/log.c persist_*, issue #13).  Kept out
+   * of .bss so it is not zero-filled at boot. */
   .log_noinit (NOLOAD) :
   {
     . = ALIGN(4);
