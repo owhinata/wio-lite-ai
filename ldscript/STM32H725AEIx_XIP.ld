@@ -178,6 +178,10 @@ SECTIONS
     *(.dtcm_bench)
     *(.dtcm_bench*)
     . = ALIGN(4);
+    _dtcm_used_end = .;   /* DTCM high-water mark for the `free` command; keep
+                           * .dtcm_bench the last DTCM section so this stays the top
+                           * of the resident block (issue #11).  Passive symbol -- no
+                           * bytes emitted, no section moves. */
   } >DTCM
 
   .ARM.attributes 0 : { *(.ARM.attributes) }

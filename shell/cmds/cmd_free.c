@@ -8,7 +8,8 @@
  *
  * A runtime, dynamic counterpart to the build-time `size` output.  Ported to the
  * Wio Lite AI (STM32H725) memory map: the app runs XIP from external OCTOSPI2
- * flash at 0x70000000 with RAM in AXI-SRAM (D1); DTCM is currently unused.  Pure
+ * flash at 0x70000000 with RAM in AXI-SRAM (D1); DTCM holds the reset-persistent
+ * log ring (.log_noinit) and the membench scratch (.dtcm_bench).  Pure
  * introspection -- it reads linker-provided boundary symbols and the C library's
  * malloc accounting; it changes no state and touches only the shell instance
  * passed to it, so it stays reentrant across instances (req §10).
@@ -20,7 +21,10 @@
  *   RAM    static = _end - ORIGIN(RAM) (.data + .bss + ThreadX stacks/objects);
  *          the heap grows up from _end and the MSP/ISR stack grows down from
  *          _estack, so used = (heap break) - ORIGIN(RAM), free = _estack - break.
- *   DTCM   unused by the app (no resident) -> 0 used.
+ *   DTCM   used = _dtcm_used_end - ORIGIN(DTCM).  The resident block (.log_noinit
+ *          then .dtcm_bench) is bump-placed from ORIGIN, so its high-water mark
+ *          _dtcm_used_end (emitted at the end of the last DTCM section) is the used
+ *          count -- read from the linker, not the log/membench internals.
  *
  * Region ORIGIN/LENGTH are compile-time constants mirroring the linker MEMORY
  * block (single source of truth: the .ld).
@@ -56,6 +60,7 @@ extern uint8_t _sidata[];            /* .data load image in FLASH */
 extern uint8_t _end[];               /* top of static RAM = heap base */
 extern uint8_t _estack[];            /* top of RAM (initial MSP)      */
 extern uint8_t _Min_Stack_Size[];    /* reserved main-stack bytes     */
+extern uint8_t _dtcm_used_end[];     /* top of the DTCM resident block */
 
 static uint32_t sym(const uint8_t s[])
 {
@@ -87,6 +92,8 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 	uint32_t heap_break = heap_base + heap_arena;
 	uint32_t ram_used   = heap_break - RAM_ORIGIN;        /* static + heap */
 
+	uint32_t dtcm_used  = sym(_dtcm_used_end) - DTCM_ORIGIN;  /* .log_noinit + .dtcm_bench */
+
 	(void)argc;
 	(void)argv;
 
@@ -96,8 +103,8 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 	             ".isr/.text/.rodata/.data (XIP)");
 	print_region(sh, "RAM",   RAM_ORIGIN,   RAM_LENGTH,   ram_used,
 	             ".data/.bss + ThreadX stacks + heap");
-	print_region(sh, "DTCM",  DTCM_ORIGIN,  DTCM_LENGTH,  0u,
-	             "(unused)");
+	print_region(sh, "DTCM",  DTCM_ORIGIN,  DTCM_LENGTH,  dtcm_used,
+	             ".log_noinit (dmesg) + .dtcm_bench (membench)");
 
 	cli_print(sh, "\r\n");
 	cli_print(sh, "heap:  base 0x%08lX  arena %lu  in-use %lu  free-pool %lu\r\n",
