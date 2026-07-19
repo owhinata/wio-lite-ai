@@ -60,7 +60,15 @@ Mode") with line editing, history, and Tab completion. 18 commands:
   both `HAL_IncTick` and `_tx_timer_interrupt` (`port/threadx/tx_glue.c`).
 - **USB CDC console** = USB1_OTG_HS driven as **FS (internal PHY)**; TinyUSB dwc2
   `rhport0` aliased to the `OTG_HS` base + `OTG_HS_IRQHandler`. A single USB thread
-  owns `tud_task()` / `tud_cdc_*`; `_write`/`printf` are retargeted to the CDC.
+  owns `tud_task()` / `tud_cdc_*` **and brings up the stack** (`tusb_init`) from its
+  own entry; `_write`/`printf` are retargeted to the CDC.
+- **Interrupts are armed only after their ThreadX objects exist.** ThreadX init runs
+  with interrupts enabled (no `__disable_irq`, matching the reference port); each
+  source is instead gated until its state is ready — SysTick only calls `HAL_IncTick`
+  until `tx_glue_timer_enable()` opens the ThreadX-tick gate, and `OTG_HS_IRQn` stays
+  NVIC-disabled until the USB thread's `tusb_init()` (after `cli_init` created the
+  shell's event flags). The IWDG is likewise armed from `tx_application_define` once
+  its petter thread exists.
 - **Static allocation** (no heap for the shell); each thread owns its stack.
 
 ## Layout

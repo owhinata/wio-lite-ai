@@ -15,6 +15,10 @@
 /* USB1_OTG_HS interrupt -> TinyUSB device stack (rhport 0). */
 void OTG_HS_IRQHandler(void) { tud_int_handler(0); }
 
+/* Bring up the OTG_HS pins/clock only (no NVIC, no stack init): called from main()
+ * before the kernel starts.  The device stack (tusb_init) is brought up later, in
+ * the owning usb thread's entry, so the OTG_HS interrupt is not enabled until the
+ * ThreadX objects its ISR path can reach already exist (issue #12). */
 void usb_hw_init(void)
 {
   __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -34,6 +38,18 @@ void usb_hw_init(void)
 void usb_thread_entry(ULONG arg)
 {
   struct cli_transport *tr = (struct cli_transport *) arg;
+
+  /* Bring up the device stack from its owning thread (issue #12): tusb_init()
+   * enables OTG_HS_IRQn internally (dwc2 dcd_int_enable -> NVIC_EnableIRQ), so it
+   * must run only after cli_init() created the shell's event flags -- which it did,
+   * back in tx_application_define, before this thread was ever scheduled.  Set the
+   * IRQ priority first (OTG_HS above SysTick(14)/PendSV(15); a PRIMASK critical
+   * section masks it anyway), then init. */
+  NVIC_SetPriority(OTG_HS_IRQn, 6);
+  tusb_rhport_init_t dev_init = { .role  = TUSB_ROLE_DEVICE,
+                                  .speed = TUSB_SPEED_AUTO };
+  tusb_init(BOARD_TUD_RHPORT, &dev_init);
+
   for (;;)
   {
     tud_task();                /* service the USB device stack */

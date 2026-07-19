@@ -47,11 +47,11 @@ extern "C" {
  * corner).  HAL_IWDG_Init() performs the first refresh itself and turns on the LSI
  * automatically (no RCC write, so the inherited clock tree is untouched).
  *
- * Call ONCE from the iwdg petter thread entry, AFTER the ThreadX scheduler has
- * started (tx_glue_timer_enable()).  HAL_IWDG_Init() polls the PR/RLR update with a
- * HAL_GetTick() timeout, so SysTick must already be running -- calling it from
- * tx_application_define() (interrupts still masked, tick not driving) would freeze
- * that timeout loop.  Compiled to nothing when BSP_ENABLE_IWDG == 0.
+ * Call ONCE from tx_application_define(), right after the petter thread is created
+ * (issue #12).  HAL_IWDG_Init() polls the PR/RLR update with a HAL_GetTick() timeout,
+ * so SysTick must be running: it is, because tx_application_define() now runs with
+ * interrupts enabled (no __disable_irq) and SysTick_Handler calls HAL_IncTick()
+ * unconditionally.  Compiled to nothing when BSP_ENABLE_IWDG == 0.
  */
 void iwdg_init(void);
 

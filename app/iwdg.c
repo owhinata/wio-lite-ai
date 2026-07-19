@@ -15,8 +15,10 @@
  * survives CoreMark (~12 s in the priority-16 shell thread) without any extra pet --
  * the petter preempts it.
  *
- * iwdg_init() is called from the petter thread entry, AFTER the scheduler starts, so
- * HAL_IWDG_Init()'s HAL_GetTick()-based PR/RLR poll runs with SysTick live.
+ * iwdg_init() is called from tx_application_define(), right after the petter thread is
+ * created (issue #12).  HAL_IWDG_Init()'s HAL_GetTick()-based PR/RLR poll runs with
+ * SysTick live because tx_application_define now runs with interrupts enabled (no
+ * __disable_irq) and SysTick_Handler calls HAL_IncTick() unconditionally.
  *
  * The whole file compiles to nothing when BSP_ENABLE_IWDG == 0, so no IWDG symbol
  * (and no LSI dependency) reaches the image.

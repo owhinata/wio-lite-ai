@@ -15,7 +15,6 @@
 #include <stdio.h>
 #include "stm32h7xx_hal.h"
 #include "tx_api.h"
-#include "tusb.h"
 #include "tx_glue.h"
 #include "cli.h"
 #include "cli_instance.h"
@@ -43,22 +42,22 @@ static TX_THREAD usb_thread;
 static UCHAR     usb_stack[4096] __attribute__((aligned(8)));  /* tud_task + printf headroom */
 
 #if BSP_ENABLE_IWDG
-/* IWDG petter (issue #4).  Static objects; the thread is created in
- * tx_application_define but ARMS the watchdog from its own entry -- after the
- * scheduler starts -- because H7 HAL_IWDG_Init() polls the PR/RLR update with a
- * HAL_GetTick() timeout, so SysTick must be live (it is not yet inside
- * tx_application_define, which runs with interrupts masked).  Priority 5 preempts
- * usb(8)/cli(16)/bg(17), so the petter keeps feeding through a ~12 s CoreMark run
- * and only stops on a whole-system stall (scheduler/tick death, IRQ-off lockup,
- * OCTOSPI2 XIP fetch stall) -> the IWDG then resets the board. */
+/* IWDG petter (issue #4).  Static objects; the thread only refreshes -- the watchdog
+ * is armed by iwdg_init() in tx_application_define (issue #12), after this thread is
+ * created.  H7 HAL_IWDG_Init() polls the PR/RLR update with a HAL_GetTick() timeout,
+ * so SysTick must be live: it is, because tx_application_define now runs with
+ * interrupts enabled (no __disable_irq) and SysTick_Handler calls HAL_IncTick()
+ * unconditionally.  Priority 5 preempts usb(8)/cli(16)/bg(17), so the petter keeps
+ * feeding through a ~12 s CoreMark run and only stops on a whole-system stall
+ * (scheduler/tick death, IRQ-off lockup, OCTOSPI2 XIP fetch stall) -> the IWDG then
+ * resets the board. */
 static TX_THREAD iwdg_thread;
 static UCHAR     iwdg_stack[IWDG_PETTER_STACK_SIZE] __attribute__((aligned(8)));
 
 static void iwdg_entry(ULONG arg)
 {
   (void) arg;
-  iwdg_init();      /* arm now: SysTick / HAL_GetTick are running */
-  iwdg_refresh();   /* pet before the first sleep: minimise the init->pet window */
+  iwdg_refresh();   /* pet before the first sleep: minimise the arm->pet window */
   for (;;) {
     tx_thread_sleep(IWDG_PETTER_PERIOD_MS);
     iwdg_refresh();
@@ -87,13 +86,17 @@ void tx_application_define(void *first_unused_memory)
   led_init_off();               /* configure PC13 and hold the red LED off */
 
 #if BSP_ENABLE_IWDG
-  /* IWDG petter thread (priority 5).  Created before the timer is enabled so it is
-   * the first thread the scheduler runs; its entry arms the watchdog (see above).
-   * Fail-soft: if the create fails the watchdog is simply never armed. */
-  tx_thread_create(&iwdg_thread, "iwdg", iwdg_entry, 0,
-                   iwdg_stack, sizeof(iwdg_stack),
-                   IWDG_PETTER_PRIORITY, IWDG_PETTER_PRIORITY,
-                   TX_NO_TIME_SLICE, TX_AUTO_START);
+  /* IWDG petter thread (priority 5), then arm the watchdog (issue #12: arm here, not
+   * in the entry, matching f746).  HAL_IWDG_Init()'s HAL_GetTick() timeout works
+   * because interrupts are enabled and SysTick is ticking (HAL_IncTick) throughout
+   * tx_application_define.  Fail-soft: arm ONLY if the petter was created -- an armed
+   * watchdog with nothing to refresh it would just reset the board. */
+  UINT iwdg_rc = tx_thread_create(&iwdg_thread, "iwdg", iwdg_entry, 0,
+                                  iwdg_stack, sizeof(iwdg_stack),
+                                  IWDG_PETTER_PRIORITY, IWDG_PETTER_PRIORITY,
+                                  TX_NO_TIME_SLICE, TX_AUTO_START);
+  if (iwdg_rc == TX_SUCCESS)
+    iwdg_init();                /* arm now; the petter (above) will refresh it */
 #endif
 
   /* Timer lists exist now -> let the SysTick ISR drive the ThreadX scheduler. */
@@ -148,18 +151,18 @@ int main(void)
   HAL_Init();   /* NVIC grouping + SysTick from SystemCoreClock (550 MHz); no PLL touch */
   timebase_init();   /* DWT cycle counter for usleep's udelay (CoreDebug/DWT only, no RCC) */
 
-  usb_hw_init();
-  /* OTG_HS above SysTick(14)/PendSV(15); PRIMASK critical sections mask it anyway. */
-  NVIC_SetPriority(OTG_HS_IRQn, 6);
-  tusb_rhport_init_t dev_init = { .role  = TUSB_ROLE_DEVICE,
-                                  .speed = TUSB_SPEED_AUTO };
-  tusb_init(BOARD_TUD_RHPORT, &dev_init);
+  usb_hw_init();   /* OTG_HS pins/clock only; the device stack (tusb_init, which
+                    * enables OTG_HS_IRQn) comes up later in the usb thread entry so
+                    * no interrupt is armed before its ThreadX objects exist (#12). */
   setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered so printf reaches _write */
 
-  /* ThreadX initialization assumes interrupts are locked out; mask them until the
-   * scheduler starts (the Cortex-M7 GNU port re-enables interrupts when it
-   * schedules the first thread).  SysTick/OTG_HS events simply queue until then. */
-  __disable_irq();
+  /* No __disable_irq() here (issue #12): interrupts stay enabled through ThreadX
+   * init, matching f746.  This is safe because every interrupt source is gated until
+   * its ThreadX objects exist -- SysTick only calls HAL_IncTick() until
+   * tx_glue_timer_enable() opens the tx_timer_active gate, and OTG_HS_IRQn stays
+   * disabled at the NVIC until the usb thread calls tusb_init().  Threads created in
+   * tx_application_define() are merely READY; the scheduler does not run them until
+   * _tx_thread_schedule() after define returns. */
   tx_kernel_enter();   /* does not return */
   return 0;
 }
