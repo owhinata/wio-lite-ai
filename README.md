@@ -69,7 +69,12 @@ Mode") with line editing, history, and Tab completion. 18 commands:
   NVIC-disabled until the USB thread's `tusb_init()` (after `cli_init` created the
   shell's event flags). The IWDG is likewise armed from `tx_application_define` once
   its petter thread exists.
-- **Static allocation** (no heap for the shell); each thread owns its stack.
+- **Static allocation** for the shell engine (no heap); each thread owns its stack.
+  The `membench`/`coremark` benchmarks are the only heap users — they `malloc` their
+  working buffers on demand and free them after (nothing reserved when idle). The
+  newlib heap is made **thread-safe** with a ThreadX mutex (`app/malloc_lock.c` backs
+  `__malloc_lock`/`__malloc_unlock`), so a backgrounded benchmark and a foreground
+  one can allocate concurrently without corrupting the arena.
 
 ## Layout
 

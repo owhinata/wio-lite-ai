@@ -24,7 +24,7 @@
  *    *bandwidth* stays high even out-of-cache (burst line-refills), so the cache
  *    step shows mainly in the dependent-load *latency* rows.  DTCM is TCM (bypasses
  *    the D-cache, always the raw rate) and Flash is the read-only XIP window.
- *  - Regions: DTCM (16 KB, .dtcm_bench), AXI-SRAM (64 KB, malloc'd on demand),
+ *  - Regions: DTCM (4 KB, .dtcm_bench), AXI-SRAM (64 KB, malloc'd on demand),
  *    Flash int = embedded flash via AXIM 0x08000000, Flash ext = OCTOSPI2 XIP window
  *    0x70000000 (both read-only: measure the flash read rate; a read of the boot
  *    region is harmless -- no write/erase, so no brick risk).
@@ -53,9 +53,14 @@
 #include <string.h>          /* strcpy */
 
 /* Per-region benchmark buffers.  DTCM needs a dedicated NOLOAD section (the region
- * otherwise holds only the log ring).  The SRAM buffer is malloc'd on demand and
- * freed on exit rather than permanently reserving .bss for a rarely-run command. */
-#define DTCM_BENCH_BYTES   (16u * 1024u)
+ * otherwise holds only the log ring); it is the only permanently-reserved bench
+ * buffer (malloc returns AXI-SRAM, never DTCM, so a DTCM-resident buffer must be
+ * static).  Kept to 4 KB (issue #14): DTCM is uncached TCM with no cache cliff, so a
+ * small working set measures the same raw bandwidth/latency as a large one, and it
+ * matches SRAM_CACHED_BYTES for an apples-to-apples DTCM-raw vs SRAM-L1-hit compare.
+ * The SRAM buffer is malloc'd on demand and freed on exit rather than permanently
+ * reserving .bss for a rarely-run command. */
+#define DTCM_BENCH_BYTES   ( 4u * 1024u)
 #define SRAM_BENCH_BYTES   (64u * 1024u)   /* > 512 D-cache lines @64B stride -> refill */
 #define SRAM_CACHED_BYTES  ( 4u * 1024u)   /* fits in the 16 KB L1 D-cache */
 #define FLASH_BENCH_BYTES  (64u * 1024u)
@@ -417,7 +422,7 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 	cli_print(sh, "%-24s %8s %8s %8s\r\n", "bandwidth (MB/s)", "read", "write", "copy");
 	if (do_dtcm) {
 		if (cli_cancel_requested(sh)) goto done;
-		bw_row(sh, "DTCM   (16KB)", dtcm_bench_buf, DTCM_BENCH_BYTES / 4u, clk, 1);
+		bw_row(sh, "DTCM   ( 4KB)", dtcm_bench_buf, DTCM_BENCH_BYTES / 4u, clk, 1);
 	}
 	if (do_sram) {
 		if (cli_cancel_requested(sh)) goto done;
@@ -440,7 +445,7 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 			if (cli_cancel_requested(sh)) goto done;
 			char d[12];
 			fmt_ns(d, sizeof d, lat_ns10(dtcm_bench_buf, DTCM_BENCH_BYTES, clk));
-			cli_print(sh, "  %-22s %8s\r\n", "DTCM   (16KB)", d);
+			cli_print(sh, "  %-22s %8s\r\n", "DTCM   ( 4KB)", d);
 		}
 		if (do_sram) {
 			if (cli_cancel_requested(sh)) goto done;

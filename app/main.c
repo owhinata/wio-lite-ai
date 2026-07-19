@@ -69,6 +69,12 @@ void tx_application_define(void *first_unused_memory)
 {
   (void) first_unused_memory;
 
+  /* Make the newlib heap thread-safe before any thread runs: membench/coremark/bg
+   * jobs and per-thread printf(%f) all allocate, and the stock malloc lock is a
+   * no-op (see app/malloc_lock.c).  Created here (single-threaded, pre-scheduler) so
+   * the mutex exists before the first concurrent malloc. */
+  malloc_lock_init();
+
   /* Shell instance: create its ThreadX objects + backend, then spawn its thread.
    * Fail-soft -- a failed cli_init just skips the shell; the usb/led threads and
    * the rest still run. */

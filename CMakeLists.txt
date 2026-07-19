@@ -231,8 +231,10 @@ set(SHELL_SOURCES
 # Built once at -O3 -funroll-loops and linked into the shell firmware below;
 # cmd_coremark.c calls coremark_main().  core_main.c is compiled with
 # -Dmain=coremark_main so its main() does not clash with the app main() in
-# app/main.c.  MEM_METHOD=MEM_STATIC keeps the TOTAL_DATA_SIZE block in .bss (off
-# the shell thread stack).  ITERATIONS=0 -> CoreMark auto-calibrates the run time.
+# app/main.c.  MEM_METHOD=MEM_MALLOC (issue #14) malloc's the TOTAL_DATA_SIZE (2 KB)
+# working set from the newlib heap at each run's start and frees it at the end (off
+# both the shell thread stack and permanent .bss); cmd_coremark.c pre-flights the
+# alloc.  ITERATIONS=0 -> CoreMark auto-calibrates the run time.
 set(CMK_DIR "${CMAKE_SOURCE_DIR}/lib/coremark")
 add_library(coremark_obj OBJECT
     "${CMK_DIR}/core_list_join.c"
@@ -245,7 +247,7 @@ target_link_libraries(coremark_obj PUBLIC bsp_iface)   # HAL_GetTick for timing
 target_include_directories(coremark_obj PRIVATE
     "${CMK_DIR}" "${CMAKE_SOURCE_DIR}/port/coremark")
 target_compile_definitions(coremark_obj PRIVATE
-    ITERATIONS=0 MEM_METHOD=MEM_STATIC MEM_LOCATION="STATIC")
+    ITERATIONS=0 MEM_METHOD=MEM_MALLOC MEM_LOCATION="HEAP")
 target_compile_options(coremark_obj PRIVATE -O3 -funroll-loops)
 # Rename the benchmark entry so it does not collide with the app main().
 set_source_files_properties("${CMK_DIR}/core_main.c" PROPERTIES
@@ -276,6 +278,7 @@ add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/retarget.c"
     "${CMAKE_SOURCE_DIR}/app/fault.c"
     "${CMAKE_SOURCE_DIR}/app/iwdg.c"
+    "${CMAKE_SOURCE_DIR}/app/malloc_lock.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
     "${CMAKE_SOURCE_DIR}/src/system_stm32h7xx.c"
     "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"

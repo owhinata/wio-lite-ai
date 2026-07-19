@@ -16,4 +16,8 @@ void usb_thread_entry(ULONG arg);
  * the crash-recording fault handlers (see app/fault.c).  Call after log_init(). */
 void fault_init(void);
 
+/* Create the mutex that makes the newlib heap thread-safe (see app/malloc_lock.c).
+ * Call once from tx_application_define(), before any thread runs. */
+void malloc_lock_init(void);
+
 #endif /* APP_H */

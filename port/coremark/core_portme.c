@@ -9,6 +9,10 @@
 #include "coremark.h"
 #include "stm32h7xx_hal.h"
 
+#if (MEM_METHOD == MEM_MALLOC)
+#include <stdlib.h>   /* newlib malloc/free for the on-demand working set */
+#endif
+
 #ifndef ITERATIONS
 #define ITERATIONS 0   /* 0 -> CoreMark auto-calibrates to run 10..100 s */
 #endif
@@ -75,3 +79,21 @@ void portable_fini(core_portable *p)
 {
     p->portable_id = 0;
 }
+
+#if (MEM_METHOD == MEM_MALLOC)
+/* MEM_MALLOC (issue #14): CoreMark obtains its ~2 KB working set from the newlib
+ * heap (AXI-SRAM) at the start of each run and frees it at the end (core_main.c),
+ * so the shell reserves no permanent .bss for a rarely-run benchmark.  The heap is
+ * D-cache-backed but single-CPU with no DMA master, so it is self-coherent.  The
+ * `coremark` command pre-flights the allocation (cmd_coremark.c), since CoreMark
+ * itself does not NULL-check portable_malloc. */
+void *portable_malloc(ee_size_t size)
+{
+    return malloc(size);
+}
+
+void portable_free(void *p)
+{
+    free(p);
+}
+#endif
