@@ -187,6 +187,9 @@ file(GLOB TX_CORE "${TX_DIR}/common/src/*.c")
 list(FILTER TX_CORE EXCLUDE REGEX "tx_misra\\.c$")
 file(GLOB TX_ASM  "${TX_PORT}/src/*.S")
 list(FILTER TX_ASM  EXCLUDE REGEX "tx_misra\\.S$")
+# Execution Profile Kit (issue #2: `thread` cpu%).  It lives under utility/, not
+# common/src, so the TX_CORE glob above does not pick it up -- add it explicitly.
+set(TX_EPK "${TX_DIR}/utility/execution_profile_kit/tx_execution_profile.c")
 
 # CDC-only TinyUSB device subset (the boot set minus the DFU class).
 set(APP_TINYUSB_SOURCES
@@ -270,6 +273,10 @@ configure_file("${CMAKE_SOURCE_DIR}/cmake/cli_version.h.in"
 # "disabled (build)").  Turn OFF for SWD sessions that must hold a breakpoint longer
 # than the ~3 s IWDG timeout (the app does not touch DBGMCU to freeze it under debug).
 option(BSP_ENABLE_IWDG "Enable the IWDG watchdog and wdt shell command" ON)
+# issue #2: ThreadX idle WFI sleep (TX_ENABLE_WFI in tx_user.h).  Default ON; build
+# with -DBSP_ENABLE_WFI=OFF for a busy-idle (no-sleep) variant that is easier to
+# attach over SWD (a WFI-sleeping core needs connect-under-reset).
+option(BSP_ENABLE_WFI "Enable ThreadX idle WFI power saving" ON)
 
 add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/main.c"
@@ -284,7 +291,7 @@ add_executable(shell
     "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"
     ${SHELL_SOURCES}
     ${APP_TINYUSB_SOURCES}
-    ${TX_CORE} ${TX_ASM}
+    ${TX_CORE} ${TX_ASM} ${TX_EPK}
     ${HAL_SOURCES})
 target_link_libraries(shell PRIVATE bsp_iface coremark_obj)
 # CoreMark's canonical report prints its score with %f; pull in newlib's float
@@ -299,6 +306,7 @@ target_include_directories(shell PRIVATE
     "${CMAKE_SOURCE_DIR}/svc"
     "${TUSB_DIR}"
     "${TX_DIR}/common/inc"
+    "${TX_DIR}/utility/execution_profile_kit"   # issue #2: tx_execution_profile.h
     "${TX_PORT}/inc")
 target_compile_definitions(shell PRIVATE
     CFG_TUSB_MCU=OPT_MCU_STM32H7
@@ -307,7 +315,8 @@ target_compile_definitions(shell PRIVATE
     CLI_INSTANCE_STACK_SIZE=4096       # headroom for cli_print + coremark
     CLI_BG_JOB_STACK_SIZE=4096
     CLI_USBCDC_TX_BUFFER_SIZE=4096     # holds a full CoreMark report burst
-    BSP_ENABLE_IWDG=$<BOOL:${BSP_ENABLE_IWDG}>)  # issue #4: IWDG1 arm + petter + wdt
+    BSP_ENABLE_IWDG=$<BOOL:${BSP_ENABLE_IWDG}>   # issue #4: IWDG1 arm + petter + wdt
+    BSP_ENABLE_WFI=$<BOOL:${BSP_ENABLE_WFI}>)    # issue #2: gates TX_ENABLE_WFI (tx_user.h)
 target_compile_options(shell PRIVATE -O2)
 
 firmware_finalize(shell)

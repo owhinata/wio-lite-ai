@@ -10,10 +10,18 @@
 #include "tx_api.h"
 #include "tusb.h"
 #include "cli_backend_usbcdc.h"
+#include "tx_glue.h"
 #include "app.h"
 
-/* USB1_OTG_HS interrupt -> TinyUSB device stack (rhport 0). */
-void OTG_HS_IRQHandler(void) { tud_int_handler(0); }
+/* USB1_OTG_HS interrupt -> TinyUSB device stack (rhport 0).  Bracketed by the EPK
+ * ISR hooks (issue #2) so the kit charges this handler's time to the (isr) row of
+ * `thread` instead of the interrupted thread; both no-op until profiling is armed. */
+void OTG_HS_IRQHandler(void)
+{
+  tx_glue_isr_enter();
+  tud_int_handler(0);
+  tx_glue_isr_exit();
+}
 
 /* Bring up the OTG_HS pins/clock only (no NVIC, no stack init): called from main()
  * before the kernel starts.  The device stack (tusb_init) is brought up later, in
@@ -49,6 +57,10 @@ void usb_thread_entry(ULONG arg)
   tusb_rhport_init_t dev_init = { .role  = TUSB_ROLE_DEVICE,
                                   .speed = TUSB_SPEED_AUTO };
   tusb_init(BOARD_TUD_RHPORT, &dev_init);
+
+  /* The scheduler and _tx_execution_initialize() have run by the time any thread
+   * entry executes, so it is safe to arm the EPK ISR hooks now (issue #2). */
+  tx_glue_profile_enable();
 
   for (;;)
   {

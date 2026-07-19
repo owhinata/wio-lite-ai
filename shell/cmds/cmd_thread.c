@@ -94,8 +94,8 @@ static ULONG stack_peak_used(const TX_THREAD *t)
 
 #ifdef TX_EXECUTION_PROFILE_ENABLE
 /*
- * "top"-style cpu% (issue #19).  The ThreadX Execution Profile Kit accumulates,
- * per thread and globally, busy time in TIM2 ticks (see tx_user.h / svc/timebase.c).  We
+ * "top"-style cpu% (issue #2).  The ThreadX Execution Profile Kit accumulates,
+ * per thread and globally, busy time in TIM2 ticks (see tx_user.h / port/threadx/tx_glue.c).  We
  * show each thread's share of the *window since the previous `thread` run*:
  * cpu% = delta_thread / window, where window = delta(all threads + isr + idle).
  * The previous snapshot lives here (threads are static and never deleted, so a

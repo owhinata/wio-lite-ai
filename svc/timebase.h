@@ -6,11 +6,11 @@
  * @file    timebase.h
  * @brief   Microsecond busy-wait via the Cortex-M7 DWT cycle counter (svc/ layer).
  *
- * Ported to the Wio Lite AI (STM32H725): the stm32f746g-disco version used a
- * free-running TIM2 (108 MHz) because its ThreadX execution-profile kit read
- * TIM2->CNT and DWT freezes under WFI.  This port drops the EPK and WFI, so DWT
- * (running at the CPU clock, SystemCoreClock = 550 MHz) is a simpler, RCC-free
- * time base for udelay().
+ * Ported to the Wio Lite AI (STM32H725): udelay() runs on the DWT cycle counter
+ * (CPU clock, SystemCoreClock = 550 MHz).  A foreground busy-wait never runs while
+ * the core is asleep, so DWT freezing under WFI does not affect it, and it needs no
+ * peripheral or RCC touch.  The ThreadX execution-profile kit (issue #2) reads a
+ * free-running, WFI-safe TIM2 for its time source instead (port/threadx).
  */
 #ifndef TIMEBASE_H
 #define TIMEBASE_H

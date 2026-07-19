@@ -27,6 +27,10 @@ Mode") with line editing, history, and Tab completion. 18 commands:
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) |
 | benchmarks | `coremark` · `membench` |
 
+- **`thread`** — lists the ThreadX threads with state / stack use and a **`top`-style
+  `cpu%` column** (ThreadX Execution Profile Kit): each thread's share of the window
+  since the previous `thread` run, plus `(idle)` and `(isr)` pseudo-rows that sum to
+  ~100 %. The time source is a free-running **TIM2** (not DWT — see *Key design points*).
 - **`dmesg` / `crash`** — a reset-persistent RAM log in DTCM records faults
   (HardFault/MemManage/BusFault/UsageFault) before a reset; `dmesg` replays them
   after the board comes back. `crash` deliberately triggers a fault to test it.
@@ -58,6 +62,18 @@ Mode") with line editing, history, and Tab completion. 18 commands:
 - **ThreadX**: SysTick priority **>** PendSV (PendSV lowest) so the tick can preempt
   the idle PendSV spin; PRIMASK-based critical sections. The shared SysTick feeds
   both `HAL_IncTick` and `_tx_timer_interrupt` (`port/threadx/tx_glue.c`).
+- **Idle power saving (WFI) + thread cpu%.** When no thread is ready the scheduler
+  sleeps the core with `WFI` (`TX_ENABLE_WFI`) instead of busy-spinning; any enabled
+  IRQ (SysTick, OTG_HS RX) wakes it. The `thread` cpu% column uses the ThreadX
+  Execution Profile Kit, whose time source is a **free-running TIM2** (`TIM2->CNT`,
+  started clock-tree-untouched in `_tx_initialize_low_level`, `TIM2LPEN` keeps it
+  counting through sleep) — **not** DWT/CYCCNT, which *freezes* while the core clock
+  is gated in WFI. DWT stays the `udelay`/`membench` timebase (those busy-wait in the
+  foreground and never run while asleep). The app **XIP-executes from OCTOSPI2**, which
+  keeps its clock in CSleep (`OCTO2LPEN`), so wake-path fetches resume normally. Build
+  `-DBSP_ENABLE_WFI=OFF` for a busy-idle variant — a WFI-sleeping core needs
+  connect-under-reset to attach over SWD (the app does not touch DBGMCU), so a no-sleep
+  build is handy for SWD debugging.
 - **USB CDC console** = USB1_OTG_HS driven as **FS (internal PHY)**; TinyUSB dwc2
   `rhport0` aliased to the `OTG_HS` base + `OTG_HS_IRQHandler`. A single USB thread
   owns `tud_task()` / `tud_cdc_*` **and brings up the stack** (`tusb_init`) from its
