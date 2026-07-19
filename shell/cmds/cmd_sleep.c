@@ -9,9 +9,9 @@
  * `sleep N`  -- block N seconds, cancellable with Ctrl+C.  Built on cli_sleep()
  *               (issue #16): it waits on the instance event flags, so a 0x03
  *               wakes it and the dispatcher prints "^C".
- * `usleep N` -- busy-wait N microseconds on the free-running TIM2 counter
- *               (udelay, 108 MHz).  Short, CPU-bound, NOT interruptible --
- *               capped small; use `sleep` for long delays.
+ * `usleep N` -- busy-wait N microseconds on the DWT cycle counter (udelay, CPU
+ *               clock, SystemCoreClock = 550 MHz).  Short, CPU-bound, NOT
+ *               interruptible -- capped small; use `sleep` for long delays.
  *
  * Linked into the threadx executable only (like cmd_system.c / cmd_thread.c).
  * Clean-room design; no third-party code reused.
@@ -19,7 +19,7 @@
 #include <stdint.h>
 
 #include "cli.h"
-#include "timebase.h"   /* udelay (TIM2 busy-wait) */
+#include "timebase.h"   /* udelay (DWT cycle-counter busy-wait) */
 
 /* Parse a plain decimal uint32 (no 0x, no sign).  Empty, non-digit, or 32-bit
  * overflow all fail.  No newlib strtoul (this firmware ships its own parsers). */

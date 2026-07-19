@@ -243,9 +243,10 @@ _Static_assert(CLI_ENABLE_DANGEROUS_CMDS == 0 || CLI_ENABLE_DANGEROUS_CMDS == 1,
 _Static_assert(CLI_DEVMEM_DUMP_MAX_LEN > 0, "CLI_DEVMEM_DUMP_MAX_LEN must be > 0");
 _Static_assert(CLI_SLEEP_MAX_SEC > 0 && CLI_SLEEP_MAX_SEC <= 0xFFFFFFFFu / 1000u,
                "CLI_SLEEP_MAX_SEC*1000 must fit a 32-bit ThreadX tick");
-/* usleep busy-wait multiplies us by 108 (TIM2 counts/us); keep it in uint32. */
-_Static_assert(CLI_USLEEP_MAX_US > 0 && CLI_USLEEP_MAX_US <= 0xFFFFFFFFu / 108u,
-               "CLI_USLEEP_MAX_US*108 must fit uint32 (TIM2 counts)");
+/* usleep busy-wait multiplies us by SystemCoreClock/1e6 = 550 (DWT cycles/us at
+ * 550 MHz); keep the product in uint32. */
+_Static_assert(CLI_USLEEP_MAX_US > 0 && CLI_USLEEP_MAX_US <= 0xFFFFFFFFu / 550u,
+               "CLI_USLEEP_MAX_US*550 must fit uint32 (DWT cycles)");
 _Static_assert(CLI_WATCH_DEFAULT_SEC <= CLI_WATCH_MAX_SEC,
                "CLI_WATCH_DEFAULT_SEC must be <= CLI_WATCH_MAX_SEC");
 _Static_assert(CLI_WATCH_MAX_SEC <= 0xFFFFFFFFu / 1000u,
