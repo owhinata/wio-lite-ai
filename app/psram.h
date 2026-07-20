@@ -35,27 +35,6 @@ struct psram_diag {
 	uint32_t dlyb_cr, dlyb_cfgr;
 };
 
-/* Live OCTOSPI1 + IO-manager + delay-block register snapshot (`psram snap`). */
-struct psram_regs {
-	uint32_t cr, sr, dcr1, dcr2, dcr3, dcr4;
-	uint32_t ccr, tcr, ir, ar, dlr;
-	uint32_t wccr, wtcr, wir;
-	uint32_t om_cr, om_p1cr, om_p2cr;
-	uint32_t dlyb_cr, dlyb_cfgr;
-};
-
-/* One PSRAM pin's GPIO state (`psram pins`): MODER field (2=AF), AF number,
- * pull (0=none 1=up 2=down), and the current input level. */
-struct psram_pin {
-	char        port;               /* 'B','D','E','F','G' */
-	uint8_t     pin;                /* 0..15 */
-	uint8_t     mode;
-	uint8_t     af;
-	uint8_t     pupd;
-	uint8_t     idr;
-	const char *name;               /* "IO0".."IO7","DQS","CLK","NCS" */
-};
-
 /*
  * Bring up OCTOSPI1 + the APS6408 Octal DDR PSRAM in memory-mapped mode.
  *
@@ -82,43 +61,13 @@ int psram_ready(void);
 int psram_acquire(void);
 void psram_release(void);
 
-/* Which bring-up stage failed (PSRAM_STAGE_*); PSRAM_STAGE_OK when ready. */
+/* Which bring-up stage failed (PSRAM_STAGE_*); PSRAM_STAGE_OK when ready, for
+ * the `psram info` "init: failed at ..." line. */
 uint32_t psram_init_stage(void);
 
-/* Copy of the transaction snapshot recorded at the first init failure. */
-void psram_get_init_diag(struct psram_diag *out);
-
-/* Copy of the most recent instrumented transaction's snapshot (any register
- * read or Global Reset, success or failure). */
-void psram_get_last_diag(struct psram_diag *out);
-
-/* Issue one legal 2-byte register-pair read at even mode address 0/2/4/8 with
- * the CURRENT knob settings (latency/dqse/ifmt/dlyb/refresh), even when the
- * bring-up failed, and return its full transaction snapshot.  Leaves mmap and
- * restores it afterwards when the PSRAM is up.  -1 on a bad address. */
-int psram_probe_pair(uint32_t ma, struct psram_diag *out);
-
-/* Re-issue the four-clock Global Reset (datasheet Fig.4) at any time; returns
- * 1 if the transaction completed (TCF).  Device registers revert to power-up
- * defaults; per the datasheet this is only legal as power-up initialization,
- * so treat a mid-session use as a diagnostic. */
-int psram_global_reset_cmd(void);
-
-/* DQS-gated data capture for the indirect register-read path (default 1).
- * 0 samples with the internal clock instead: if a probe then returns ANY
- * non-0xFF data the device is answering and the DQS path is the problem. */
+/* DQS-gate / DCR4.REFRESH values for `psram info` (set at bring-up). */
 uint32_t psram_get_dqse(void);
-void psram_set_dqse(int en);
-
-/* DCR4.REFRESH transaction limiter (0 disables; nonzero must exceed one whole
- * minimum transaction).  Applied with the OCTOSPI disabled. */
 uint32_t psram_get_refresh(void);
-void psram_set_refresh(uint32_t r);
-
-/* Live register + pin snapshots for `psram snap` / `psram pins`.
- * psram_snap_pins fills up to `max` entries, returns the count. */
-void psram_snap_regs(struct psram_regs *out);
-uint32_t psram_snap_pins(struct psram_pin *out, uint32_t max);
 
 /* OCTOSPI1 device clock in Hz (kernel / prescaler). */
 uint32_t psram_clock_hz(void);
@@ -126,9 +75,6 @@ uint32_t psram_clock_hz(void);
 /* Change the device-clock prescaler at runtime (clock = 266MHz/(presc+1); e.g.
  * 2=88.7MHz, 7=33.3MHz).  Diagnostic knob (`psram clk`). */
 void psram_set_prescaler(uint32_t presc);
-
-/* Bypass (1) / engage (0) the read delay block at the current phase/unit. */
-void psram_dlyb_bypass(int bypass);
 
 /* The two ID/mode-register bytes read at bring-up (vendor/density), for `psram
  * info`.  id[0]=MR1, id[1]=MR2 as read back (0xFF/0x00 => nothing answered). */
@@ -141,10 +87,8 @@ void psram_get_latency(uint32_t *rd_dcyc, uint32_t *wr_dcyc);
  * the APS6408 latency on hardware without a reflash (`psram set` command). */
 void psram_set_latency(uint32_t rd_dcyc, uint32_t wr_dcyc);
 
-/* Select instruction framing while keeping address/data in DTR: 0 = official
- * APS6408 8-bit SDR instruction, 1 = doubled 16-bit DTR diagnostic form. */
+/* Instruction framing (0 = 8-bit SDR, the shipped form), for `psram info`. */
 uint32_t psram_get_instruction_dtr(void);
-void psram_set_instruction_dtr(int dtr);
 
 /* Delay-block (read data-eye) sampling phase: getter + runtime override, to
  * sweep the DLYB phase without a reflash (`psram phase` command). */

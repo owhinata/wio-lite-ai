@@ -665,13 +665,6 @@ void psram_set_latency(uint32_t rd_dcyc, uint32_t wr_dcyc)
 
 uint32_t psram_get_instruction_dtr(void) { return psram_inst_dtr; }
 
-void psram_set_instruction_dtr(int dtr)
-{
-	psram_inst_dtr = dtr ? 1u : 0u;
-	if (psram_up)
-		psram_mmap_enter(psram_rd_dcyc, psram_wr_dcyc);
-}
-
 /* Current DLYB phase select + delay-line length. */
 void psram_get_phase(uint32_t *sel, uint32_t *unit)
 {
@@ -710,22 +703,6 @@ void psram_set_mr0(uint32_t val)
 	psram_pause();
 	ospi1_reg_write(APS6408_MR0, (uint8_t)val);
 	psram_mr0_cur = val;
-	psram_resume();
-}
-
-/* Bypass (1) or engage (0) the read delay block at runtime, at the currently
- * applied phase/unit.  DCR1.DLYBYP is only ever written with the OCTOSPI
- * DISABLED -- the earlier crash came from toggling it with EN=1 under an
- * active memory-mapped window (RM0468: DCR1 is config-while-disabled).
- * Usable in NOT-ready state for `psram probe` sweeps. */
-void psram_dlyb_bypass(int bypass)
-{
-	psram_pause();
-	OCTOSPI1->CR = 0u;                       /* EN=0: DCR1 writable */
-	if (bypass)
-		OCTOSPI1->DCR1 |= OCTOSPI_DCR1_DLYBYP;
-	else
-		OCTOSPI1->DCR1 &= ~OCTOSPI_DCR1_DLYBYP;
 	psram_resume();
 }
 
@@ -803,127 +780,11 @@ uint32_t psram_wtune(uint32_t off, uint32_t reps)
  * ------------------------------------------------------------------ */
 uint32_t psram_init_stage(void) { return psram_stage; }
 
-void psram_get_init_diag(struct psram_diag *out)
-{
-	if (out)
-		*out = psram_fail_diag;
-}
-
-void psram_get_last_diag(struct psram_diag *out)
-{
-	if (out)
-		*out = psram_last_diag;
-}
-
-/* One legal MA-pair read with the current knobs, full snapshot returned.
- * Works whether or not the bring-up succeeded (the controller is always left
- * configured by psram_hw_init, even on failure). */
-int psram_probe_pair(uint32_t ma, struct psram_diag *out)
-{
-	uint8_t pair[2];
-
-	if (ma != 0u && ma != 2u && ma != 4u && ma != 8u)
-		return -1;
-	psram_pause();
-	(void)ospi1_reg_read((uint8_t)ma, pair, 2u);
-	if (out)
-		*out = psram_last_diag;
-	psram_resume();
-	return 0;
-}
-
-/* Manually re-issue the Global Reset (`psram grst`).  1 = TCF completed. */
-int psram_global_reset_cmd(void)
-{
-	int ok;
-
-	psram_pause();
-	ok = ospi1_global_reset();
-	psram_resume();
-	return ok;
-}
-
 uint32_t psram_get_dqse(void) { return psram_reg_dqse; }
-void     psram_set_dqse(int en) { psram_reg_dqse = en ? 1u : 0u; }
 
 uint32_t psram_get_refresh(void)
 {
 	return OCTOSPI1->DCR4;
-}
-
-void psram_set_refresh(uint32_t r)
-{
-	psram_pause();
-	OCTOSPI1->CR = 0u;                       /* EN=0 while changing DCR4 */
-	OCTOSPI1->DCR4 = (r << OCTOSPI_DCR4_REFRESH_Pos);
-	psram_resume();
-}
-
-void psram_snap_regs(struct psram_regs *out)
-{
-	if (out == NULL)
-		return;
-	out->cr   = OCTOSPI1->CR;
-	out->sr   = OCTOSPI1->SR;
-	out->dcr1 = OCTOSPI1->DCR1;
-	out->dcr2 = OCTOSPI1->DCR2;
-	out->dcr3 = OCTOSPI1->DCR3;
-	out->dcr4 = OCTOSPI1->DCR4;
-	out->ccr  = OCTOSPI1->CCR;
-	out->tcr  = OCTOSPI1->TCR;
-	out->ir   = OCTOSPI1->IR;
-	out->ar   = OCTOSPI1->AR;
-	out->dlr  = OCTOSPI1->DLR;
-	out->wccr = OCTOSPI1->WCCR;
-	out->wtcr = OCTOSPI1->WTCR;
-	out->wir  = OCTOSPI1->WIR;
-	out->om_cr   = OCTOSPIM->CR;
-	out->om_p1cr = OCTOSPIM->PCR[0];
-	out->om_p2cr = OCTOSPIM->PCR[1];
-	out->dlyb_cr   = DLYB_OCTOSPI1->CR;
-	out->dlyb_cfgr = DLYB_OCTOSPI1->CFGR;
-}
-
-/* GPIO state of every PSRAM pin (mode/AF/pull/input level), so a wrong or
- * bootloader-dependent pin config shows up without an oscilloscope. */
-uint32_t psram_snap_pins(struct psram_pin *out, uint32_t max)
-{
-	static GPIO_TypeDef *const gpio[] = {
-		GPIOF, GPIOF, GPIOF, GPIOF, GPIOD, GPIOD,
-		GPIOE, GPIOD, GPIOB, GPIOF, GPIOG
-	};
-	static const char port[] = {
-		'F', 'F', 'F', 'F', 'D', 'D', 'E', 'D', 'B', 'F', 'G'
-	};
-	static const uint8_t pin[] = { 8, 9, 7, 6, 4, 5, 9, 7, 2, 10, 6 };
-	static const char *const name[] = {
-		"IO0", "IO1", "IO2", "IO3", "IO4", "IO5",
-		"IO6", "IO7", "DQS", "CLK", "NCS"
-	};
-	uint32_t i, n = sizeof pin / sizeof pin[0];
-
-	if (out == NULL)
-		return 0u;
-	__HAL_RCC_GPIOB_CLK_ENABLE();
-	__HAL_RCC_GPIOD_CLK_ENABLE();
-	__HAL_RCC_GPIOE_CLK_ENABLE();
-	__HAL_RCC_GPIOF_CLK_ENABLE();
-	__HAL_RCC_GPIOG_CLK_ENABLE();
-	if (n > max)
-		n = max;
-	for (i = 0u; i < n; i++) {
-		GPIO_TypeDef *g = gpio[i];
-		uint32_t p = pin[i];
-
-		out[i].port = port[i];
-		out[i].pin  = (uint8_t)p;
-		out[i].mode = (uint8_t)((g->MODER >> (2u * p)) & 3u);
-		out[i].af   = (uint8_t)((g->AFR[p >> 3] >> (4u * (p & 7u))) & 0xFu);
-		out[i].pupd = (uint8_t)((g->PUPDR >> (2u * p)) & 3u);
-		out[i].idr  = (uint8_t)((g->IDR >> p) & 1u);
-		out[i].name = name[i];
-	}
-	return n;
 }
 
 /* ------------------------------------------------------------------ *

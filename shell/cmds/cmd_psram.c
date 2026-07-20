@@ -75,45 +75,6 @@ static const char *psram_stage_name(uint32_t s)
 	}
 }
 
-/* Decode one OCTOSPI SR sample: flags + FIFO level. */
-static void psram_print_sr(struct cli_instance *sh, const char *tag, uint32_t sr)
-{
-	cli_print(sh, "  %-7s: 0x%08lX%s%s%s%s%s%s flevel=%lu\r\n",
-	          tag, (unsigned long)sr,
-	          (sr & 0x01u) ? " TEF"  : "",
-	          (sr & 0x02u) ? " TCF"  : "",
-	          (sr & 0x04u) ? " FTF"  : "",
-	          (sr & 0x08u) ? " SMF"  : "",
-	          (sr & 0x10u) ? " TOF"  : "",
-	          (sr & 0x20u) ? " BUSY" : "",
-	          (unsigned long)((sr >> 8) & 0x3Fu));
-}
-
-/* Print one transaction snapshot (init failure or probe result). */
-static void psram_print_diag(struct cli_instance *sh, const struct psram_diag *d)
-{
-	cli_print(sh, "  stage  : %s -> %s, %u data byte(s)",
-	          psram_stage_name(d->stage), d->ok ? "completed" : "FAILED",
-	          d->ndata);
-	if (d->ndata >= 1u)
-		cli_print(sh, "  D0=0x%02X", d->data[0]);
-	if (d->ndata >= 2u)
-		cli_print(sh, " D1=0x%02X", d->data[1]);
-	cli_print(sh, "\r\n");
-	psram_print_sr(sh, "sr pre", d->sr_pre);
-	psram_print_sr(sh, "sr data", d->sr_data);
-	psram_print_sr(sh, "sr end", d->sr_end);
-	cli_print(sh, "  cfg    : CR=0x%08lX CCR=0x%08lX TCR=0x%08lX\r\n",
-	          (unsigned long)d->cr, (unsigned long)d->ccr, (unsigned long)d->tcr);
-	cli_print(sh, "         : IR=0x%02lX AR=0x%08lX DLR=0x%lX\r\n",
-	          (unsigned long)d->ir, (unsigned long)d->ar, (unsigned long)d->dlr);
-	cli_print(sh, "  dcr    : 1=0x%08lX 2=0x%08lX 3=0x%08lX 4=0x%08lX\r\n",
-	          (unsigned long)d->dcr1, (unsigned long)d->dcr2,
-	          (unsigned long)d->dcr3, (unsigned long)d->dcr4);
-	cli_print(sh, "  dlyb   : CR=0x%08lX CFGR=0x%08lX\r\n",
-	          (unsigned long)d->dlyb_cr, (unsigned long)d->dlyb_cfgr);
-}
-
 static int cmd_psram_info(struct cli_instance *sh, int argc, char **argv)
 {
 	uint8_t id[2];
@@ -149,223 +110,6 @@ static int cmd_psram_info(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
-/* psram probe [ma]: one legal 2-byte MA-pair read with the current knobs,
- * ALLOWED while NOT ready, with the full SR/config snapshot.  Distinguishes
- * "no data ever arrives" (FTF timeout: sr data lacks FTF, flevel=0 -- the
- * device/DQS path returned nothing) from a completed-but-wrong read. */
-static int cmd_psram_probe(struct cli_instance *sh, int argc, char **argv)
-{
-	uint32_t ma = 0u;
-	struct psram_diag d;
-
-	int rc;
-
-	if (argc >= 2 && parse_u32(argv[1], &ma) != 0) {
-		cli_error(sh, "psram: bad MA '%s'\r\n", argv[1]);
-		return 1;
-	}
-	if (psram_guard(sh))
-		return 1;
-	rc = psram_probe_pair(ma, &d);
-	psram_release();
-	if (rc != 0) {
-		cli_error(sh, "psram: MA must be 0, 2, 4 or 8 (even pairs)\r\n");
-		return 1;
-	}
-	cli_print(sh, "psram probe MA%lu (expect MA0=09 0D, MA2=93 E0 at power-up):\r\n",
-	          (unsigned long)ma);
-	psram_print_diag(sh, &d);
-	return 0;
-}
-
-/* psram init: re-run the full bring-up (Global Reset + MR pair reads + mmap
- * entry) with the LIVE knob values -- so `psram set`/`psram dqs`/... sweeps can
- * retry initialization without a reflash or power cycle. */
-static int cmd_psram_init(struct cli_instance *sh, int argc, char **argv)
-{
-	int ok;
-
-	(void)argc; (void)argv;
-	if (psram_guard(sh))
-		return 1;
-	ok = psram_hw_init();
-	psram_release();
-	if (ok)
-		cli_print(sh, "psram init: ready (mmap); run `psram test 4096`\r\n");
-	else
-		cli_error(sh, "psram init: FAILED at %s (see `psram snap`)\r\n",
-		          psram_stage_name(psram_init_stage()));
-	return psram_ready() ? 0 : 1;
-}
-
-/* psram grst: manually re-issue the 4-clock Global Reset (datasheet allows it
- * only as power-up init; mid-session use is a diagnostic). */
-static int cmd_psram_grst(struct cli_instance *sh, int argc, char **argv)
-{
-	struct psram_diag d;
-	int ok;
-
-	(void)argc; (void)argv;
-	if (psram_guard(sh))
-		return 1;
-	ok = psram_global_reset_cmd();
-	psram_get_last_diag(&d);
-	psram_release();
-	cli_print(sh, "psram grst: %s\r\n", ok ? "TCF completed" : "TCF TIMEOUT");
-	psram_print_diag(sh, &d);
-	if (ok)
-		cli_print(sh, "device registers reverted to power-up defaults; "
-		          "now `psram probe 0`\r\n");
-	return 0;
-}
-
-/* psram snap: init-failure snapshot + live controller registers. */
-static int cmd_psram_snap(struct cli_instance *sh, int argc, char **argv)
-{
-	struct psram_regs r;
-
-	(void)argc; (void)argv;
-	if (!psram_ready()) {
-		struct psram_diag d;
-
-		psram_get_init_diag(&d);
-		cli_print(sh, "init failure snapshot:\r\n");
-		psram_print_diag(sh, &d);
-	} else {
-		cli_print(sh, "init: OK (no failure snapshot)\r\n");
-	}
-	psram_snap_regs(&r);
-	cli_print(sh, "live OCTOSPI1:\r\n");
-	cli_print(sh, "  CR=0x%08lX SR=0x%08lX\r\n",
-	          (unsigned long)r.cr, (unsigned long)r.sr);
-	cli_print(sh, "  DCR1=0x%08lX DCR2=0x%08lX DCR3=0x%08lX DCR4=0x%08lX\r\n",
-	          (unsigned long)r.dcr1, (unsigned long)r.dcr2,
-	          (unsigned long)r.dcr3, (unsigned long)r.dcr4);
-	cli_print(sh, "  CCR=0x%08lX TCR=0x%08lX IR=0x%02lX AR=0x%08lX DLR=0x%lX\r\n",
-	          (unsigned long)r.ccr, (unsigned long)r.tcr,
-	          (unsigned long)r.ir, (unsigned long)r.ar, (unsigned long)r.dlr);
-	cli_print(sh, "  WCCR=0x%08lX WTCR=0x%08lX WIR=0x%02lX\r\n",
-	          (unsigned long)r.wccr, (unsigned long)r.wtcr,
-	          (unsigned long)r.wir);
-	cli_print(sh, "  OCTOSPIM CR=0x%08lX P1CR=0x%08lX P2CR=0x%08lX\r\n",
-	          (unsigned long)r.om_cr, (unsigned long)r.om_p1cr,
-	          (unsigned long)r.om_p2cr);
-	cli_print(sh, "  DLYB CR=0x%08lX CFGR=0x%08lX\r\n",
-	          (unsigned long)r.dlyb_cr, (unsigned long)r.dlyb_cfgr);
-	return 0;
-}
-
-/* psram pins: GPIO mode/AF/pull/input of every PSRAM pin. */
-static int cmd_psram_pins(struct cli_instance *sh, int argc, char **argv)
-{
-	struct psram_pin p[16];
-	uint32_t i, n;
-	static const char *const mode_name[4] = { "IN ", "OUT", "AF ", "ANA" };
-	static const char *const pupd_name[4] = { "-", "up", "down", "?" };
-
-	(void)argc; (void)argv;
-	n = psram_snap_pins(p, 16u);
-	for (i = 0u; i < n; i++)
-		cli_print(sh, "  %-3s P%c%-2u %s AF%-2u pull=%-4s in=%u\r\n",
-		          p[i].name, p[i].port, p[i].pin,
-		          mode_name[p[i].mode & 3u], p[i].af,
-		          pupd_name[p[i].pupd & 3u], p[i].idr);
-	cli_print(sh, "expected: all AF mode; IO/DQS/NCS AF10, CLK AF9; DQS pull-down\r\n");
-	return 0;
-}
-
-/* psram dqs <0|1>: DQS-gated capture on the register/probe read path.  0 =
- * sample with the internal clock instead -- if a probe then returns any
- * non-FF data, the device answers and the DQS input path is the fault. */
-static int cmd_psram_dqs(struct cli_instance *sh, int argc, char **argv)
-{
-	uint32_t en;
-
-	(void)argc;
-	if (parse_u32(argv[1], &en) != 0 || en > 1u) {
-		cli_error(sh, "psram: use 1 (DQS-gated) or 0 (internal clock)\r\n");
-		return 1;
-	}
-	psram_set_dqse((int)en);
-	cli_print(sh, "psram: probe/register reads %s\r\n",
-	          en ? "DQS-gated" : "internal-clock sampled");
-	return 0;
-}
-
-/* psram pscan [ma]: sweep ifmt x dlyb x dqse x refresh x dcyc over one MA-pair
- * probe each and list every combination that produced ANY data.  The handover
- * plan's step 4: answers "does any configuration make the device respond at
- * all" in one command, without a reflash.  Restores the knobs afterwards. */
-static int cmd_psram_pscan(struct cli_instance *sh, int argc, char **argv)
-{
-	uint32_t ma = 0u;
-	uint32_t rd0, wr0, dqse0, ref0, ifmt0;
-	uint32_t ifmt, dly, dq, refi, dcyc, hits = 0u, done = 0;
-	static const uint32_t refs[2] = { 320u, 0u };
-
-	if (argc >= 2 && (parse_u32(argv[1], &ma) != 0 ||
-	    (ma != 0u && ma != 2u && ma != 4u && ma != 8u))) {
-		cli_error(sh, "psram: MA must be 0, 2, 4 or 8\r\n");
-		return 1;
-	}
-	if (psram_guard(sh))               /* held across the whole get/sweep/restore */
-		return 1;
-	psram_get_latency(&rd0, &wr0);
-	dqse0 = psram_get_dqse();
-	ref0  = psram_get_refresh();
-	ifmt0 = psram_get_instruction_dtr();
-
-	cli_print(sh, "pscan MA%lu: ifmt{8sdr,16dtr} x dlyb{on,byp} x dqse{1,0} "
-	          "x ref{320,0} x dcyc 0..10\r\n", (unsigned long)ma);
-	for (ifmt = 0u; ifmt <= 1u && !done; ifmt++) {
-		psram_set_instruction_dtr((int)ifmt);
-		for (dly = 0u; dly <= 1u && !done; dly++) {
-			psram_dlyb_bypass((int)dly);
-			for (dq = 0u; dq <= 1u && !done; dq++) {
-				psram_set_dqse((int)(1u - dq));
-				for (refi = 0u; refi < 2u && !done; refi++) {
-					psram_set_refresh(refs[refi]);
-					for (dcyc = 0u; dcyc <= 10u; dcyc++) {
-						struct psram_diag d;
-
-						psram_set_latency(dcyc, wr0);
-						if (psram_probe_pair(ma, &d) != 0)
-							continue;
-						if (d.ndata != 0u) {
-							hits++;
-							cli_print(sh,
-							          "  HIT ifmt=%lu dlyb=%s dqse=%lu ref=%-3lu "
-							          "dcyc=%-2lu %s D0=0x%02X D1=0x%02X\r\n",
-							          (unsigned long)ifmt, dly ? "byp" : "on ",
-							          (unsigned long)(1u - dq),
-							          (unsigned long)refs[refi],
-							          (unsigned long)dcyc,
-							          d.ok ? "ok  " : "part",
-							          d.data[0], d.data[1]);
-						}
-						if (cli_cancel_requested(sh)) {
-							cli_print(sh, "\r\npscan: canceled\r\n");
-							done = 1;
-							break;
-						}
-					}
-				}
-			}
-		}
-	}
-	/* Restore the pre-scan knobs (delay block re-engaged). */
-	psram_set_instruction_dtr((int)ifmt0);
-	psram_dlyb_bypass(0);
-	psram_set_dqse((int)dqse0);
-	psram_set_refresh(ref0);
-	psram_set_latency(rd0, wr0);
-	psram_release();
-	cli_print(sh, "pscan: %lu responding combination(s)%s\r\n",
-	          (unsigned long)hits,
-	          hits ? "" : " -- device never drove data (init/power/HW level)");
-	return 0;
-}
-
 /* psram clk <presc>: device clock = 266MHz/(presc+1).  2=88.7M, 7=33.3M. */
 static int cmd_psram_clk(struct cli_instance *sh, int argc, char **argv)
 {
@@ -387,25 +131,6 @@ static int cmd_psram_clk(struct cli_instance *sh, int argc, char **argv)
 	 * the shipped point -- CSBOUND=32B releases NCS long before the refresh
 	 * limiter or tCEM -- but a diagnostic caveat for the `psram clk` sweep. */
 	cli_print(sh, "  note: DCR4 refresh not re-tuned for this clock (diagnostic)\r\n");
-	return 0;
-}
-
-/* psram dlyb <1|0>: enable (un-bypass, at current phase/unit) or bypass the
- * read delay block. */
-static int cmd_psram_dlyb(struct cli_instance *sh, int argc, char **argv)
-{
-	uint32_t en;
-
-	(void)argc;
-	if (parse_u32(argv[1], &en) != 0 || en > 1u) {
-		cli_error(sh, "psram: use 1 (enable) or 0 (bypass)\r\n");
-		return 1;
-	}
-	if (psram_guard(sh))
-		return 1;
-	psram_dlyb_bypass(en == 0u);
-	psram_release();
-	cli_print(sh, "psram: delay block %s\r\n", en ? "enabled" : "bypassed");
 	return 0;
 }
 
@@ -673,13 +398,6 @@ static int cmd_psram_wtune(struct cli_instance *sh, int argc, char **argv)
 
 CLI_SUBCMD_SET_CREATE(psram_subcmds,
 	CLI_CMD_ARG(info, NULL, "show PSRAM state/clock/id/latency", cmd_psram_info, 1, 0),
-	CLI_CMD_ARG(init, NULL, "re-run bring-up with live knobs",     cmd_psram_init, 1, 0),
-	CLI_CMD_ARG(probe, NULL, "MA-pair read + SR snapshot [0|2|4|8]", cmd_psram_probe, 1, 1),
-	CLI_CMD_ARG(pscan, NULL, "sweep knobs, list responding combos [ma]", cmd_psram_pscan, 1, 1),
-	CLI_CMD_ARG(grst, NULL, "re-issue Global Reset (diagnostic)",  cmd_psram_grst, 1, 0),
-	CLI_CMD_ARG(snap, NULL, "init-failure + live register snapshot", cmd_psram_snap, 1, 0),
-	CLI_CMD_ARG(pins, NULL, "GPIO mode/AF/pull of PSRAM pins",     cmd_psram_pins, 1, 0),
-	CLI_CMD_ARG(dqs,  NULL, "probe-read DQS gating <1|0>",         cmd_psram_dqs,  2, 0),
 	CLI_CMD_ARG(test, NULL, "write/verify patterns [bytes]",     cmd_psram_test, 1, 1),
 	CLI_CMD_ARG(set,  NULL, "set mmap latency <rd> <wr> cycles", cmd_psram_set,  3, 0),
 	CLI_CMD_ARG(mr0,  NULL, "write device MR0 latency reg <hex>", cmd_psram_mr0,  2, 0),
@@ -687,7 +405,6 @@ CLI_SUBCMD_SET_CREATE(psram_subcmds,
 	CLI_CMD_ARG(mmapscan, NULL, "reset-persistent mmap DLYB sweep <start|show|stop>", cmd_psram_mmapscan, 2, 1),
 	CLI_CMD_ARG(wtune, NULL, "sweep mmap write dummy 0..15 [addr]", cmd_psram_wtune, 1, 1),
 	CLI_CMD_ARG(clk,  NULL, "set device clock prescaler <0..255>", cmd_psram_clk,   2, 0),
-	CLI_CMD_ARG(dlyb, NULL, "delay block bypass off/on <1|0>",     cmd_psram_dlyb,  2, 0),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(psram, psram_subcmds,

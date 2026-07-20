@@ -24,7 +24,7 @@ Mode") with line editing, history, and Tab completion. 19 commands:
 | system | `version` · `uptime` · `reboot` · `free` · `thread` |
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
-| diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/probe/…) |
+| diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
 | benchmarks | `coremark` · `membench` |
 
 - **`thread`** — lists the ThreadX threads with state / stack use and a **`top`-style
@@ -46,13 +46,11 @@ Mode") with line editing, history, and Tab completion. 19 commands:
   latency for DTCM / AXI-SRAM (cached vs refill) / PSRAM / internal + external flash.
 - **`psram`** — the on-board **8 MB APS6408 Octal DDR PSRAM** on OCTOSPI1, memory-mapped
   at `0x90000000`, running **133 MHz Fixed Latency** (≈113 read / 154 write MB/s; see
-  *Key design points*). `psram info` shows the bring-up state, `psram test [bytes]`
-  write/verifies patterns over the window (default all 8 MB), and a set of
-  bring-up/diagnostic subcommands (`probe`/`pscan`/`snap`/`pins`/`mmapscan`/
-  `wtune`/`set`/`phase`/`mr0`/`clk`/…) sweep latency, delay-block phase, mode registers,
-  and clock without a reflash — they work even when the bring-up failed (fail-soft,
-  `psram init` retries it). `mmapscan` maps the true memory-mapped read eye across
-  auto-reboots (issue #16).
+  *Key design points*). `psram info` shows the operating state, `psram test [bytes]`
+  write/verifies patterns over the window (default all 8 MB), and a set of tuning
+  subcommands (`clk`/`set`/`mr0`/`phase`/`wtune`/`mmapscan`) re-derive an operating
+  point at a different clock without a reflash. `mmapscan` maps the true
+  memory-mapped read eye across IWDG-recovered auto-reboots (issue #16).
 
 ## Key design points
 
