@@ -13,7 +13,8 @@
  * on top of the #17 rtl8720 UART driver (app/rtl8720.c) and never touches the RCC
  * clock tree, so it is XIP-safe.
  *
- * Wire format (reference: _ref/seeed-ambd-firmware, git-ignored):
+ * Wire format (reference: https://github.com/Seeed-Studio/seeed-ambd-firmware,
+ * branch Wio-Lite-AI):
  *   - Frame  = {u16 messageSize, u16 crc} (LE, 4 B) + body[messageSize].
  *              CRC is over the body only.  (erpc_framed_transport.cpp)
  *   - CRC16  = init 0xEF4A, poly 0x1021, MSB-first, no reflection. (erpc_crc16.cpp)
