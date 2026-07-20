@@ -10,3 +10,7 @@ __pycache__/
 # Reference material (schematics, datasheets, vendor SDK zips, flash backups) --
 # large binaries, not source. Kept locally only.
 /_ref/
+
+# Editor swap / backup files (Vim .*.swp/.swo, emacs/gedit ~ backups)
+*.sw[a-p]
+*~
