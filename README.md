@@ -25,7 +25,7 @@ Mode") with line editing, history, and Tab completion. 20 commands:
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
-| wireless | `wifi` (info/on/off/reset/log/probe/rpc) |
+| wireless | `wifi` (info/on/off/reset/log/probe/rpc · connect/status/disconnect) |
 | benchmarks | `coremark` · `membench` |
 
 - **`thread`** — lists the ThreadX threads with state / stack use and a **`top`-style
@@ -63,9 +63,18 @@ Mode") with line editing, history, and Tab completion. 20 commands:
   `wifi rpc [baud]` (default 2 Mbaud) is the **eRPC link test** (issue #5): the
   factory firmware is Seeed's eRPC image (UART @2 Mbaud on its `Serial3` = USART1),
   and this round-trips a byte through `rpc_system_ack` — a valid CRC-framed echo
-  proves the eRPC transport end to end. It is the foundation for the WiFi/BLE
-  (NetXDuo) work: a hand-written clean-room C eRPC client (`app/erpc.c`) speaking the
-  firmware's exact wire format (FramedTransport + BasicCodec + CRC16/0xEF4A).
+  proves the eRPC transport end to end. The eRPC path is a hand-written clean-room C
+  client (`app/erpc.c`, FramedTransport + BasicCodec + CRC16/0xEF4A) with typed
+  WiFi/tcpip wrappers (`app/wifi_rpc.c`) — no C++ eRPC runtime.
+  `wifi connect <ssid> [password] [security_hex]` then actually **joins an AP**
+  (issue #5): it brings up the module's lwIP stack (the factory firmware leaves it
+  uninitialised at boot), switches to STA mode, associates, runs the DHCP client and
+  prints the leased `ip`/`mask`/`gw`. `wifi status` reports connected state, RSSI, IP
+  config and MAC; `wifi disconnect` drops the association. connect/DHCP block on the
+  module for seconds, so those calls carry a long timeout and a Ctrl+C abort hook; the
+  eRPC subcommands take the console (`cli_console_claim`) for single-owner access to
+  the SPSC RX ring. Register-only on the STM32 side (GPIO + UART clock gates, baud from
+  the inherited PCLK2 = 137.5 MHz) — it never touches the RCC clock tree.
 
 ## Key design points
 

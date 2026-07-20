@@ -56,36 +56,58 @@ static int erpc_expired(ULONG deadline)
 	return (int32_t)(tx_time_get() - deadline) >= 0;
 }
 
-/* Read exactly @n bytes into @buf by the @deadline; 0 on success, -1 on timeout. */
-static int erpc_recv_exact(uint8_t *buf, uint16_t n, ULONG deadline)
+/*
+ * One receive-loop yield: check the optional abort hook first (so a caller's
+ * Ctrl+C interrupts a multi-second wait promptly), then the deadline, then sleep
+ * ~1 ms to let the bytes arrive / other threads run.  Returns 0 to continue,
+ * -1 on timeout, -2 on abort.  @should_abort may be NULL (never aborts).
+ */
+static int erpc_yield(ULONG deadline, int (*should_abort)(void *), void *ctx)
+{
+	if (should_abort != NULL && should_abort(ctx))
+		return -2;
+	if (erpc_expired(deadline))
+		return -1;
+	tx_thread_sleep(1);
+	return 0;
+}
+
+/* Read exactly @n bytes into @buf by @deadline; 0 ok, -1 timeout, -2 aborted. */
+static int erpc_recv_exact(uint8_t *buf, uint16_t n, ULONG deadline,
+                           int (*should_abort)(void *), void *ctx)
 {
 	uint16_t got = 0u;
 
 	while (got < n) {
+		int y;
+
 		got += (uint16_t)rtl8720_uart_read(buf + got, (size_t)(n - got));
 		if (got >= n)
 			break;
-		if (erpc_expired(deadline))
-			return -1;
-		tx_thread_sleep(1);          /* yield ~1 ms while the bytes arrive */
+		y = erpc_yield(deadline, should_abort, ctx);
+		if (y != 0)
+			return y;                /* -1 timeout / -2 abort */
 	}
 	return 0;
 }
 
-/* Discard @count incoming bytes (resync after an oversize frame); 0 / -1 timeout. */
-static int erpc_drain(uint32_t count, ULONG deadline)
+/* Discard @count incoming bytes (resync after oversize); 0 ok, -1 timeout, -2 abort. */
+static int erpc_drain(uint32_t count, ULONG deadline,
+                      int (*should_abort)(void *), void *ctx)
 {
 	uint8_t tmp[64];
 
 	while (count != 0u) {
 		uint16_t chunk = (count < sizeof(tmp)) ? (uint16_t)count : (uint16_t)sizeof(tmp);
 		uint16_t r = (uint16_t)rtl8720_uart_read(tmp, chunk);
+		int y;
+
 		count -= r;
 		if (count == 0u)
 			break;
-		if (erpc_expired(deadline))
-			return -1;
-		tx_thread_sleep(1);
+		y = erpc_yield(deadline, should_abort, ctx);
+		if (y != 0)
+			return y;
 	}
 	return 0;
 }
@@ -121,6 +143,17 @@ int erpc_call(uint8_t service, uint8_t request,
               const uint8_t *req, uint16_t req_len,
               uint8_t *out, uint16_t out_cap, uint32_t timeout_ms,
               struct erpc_diag *diag)
+{
+	/* Backwards-compatible wrapper: no abort hook (never cancelled early). */
+	return erpc_call_ex(service, request, req, req_len, out, out_cap,
+	                    timeout_ms, diag, NULL, NULL);
+}
+
+int erpc_call_ex(uint8_t service, uint8_t request,
+                 const uint8_t *req, uint16_t req_len,
+                 uint8_t *out, uint16_t out_cap, uint32_t timeout_ms,
+                 struct erpc_diag *diag,
+                 int (*should_abort)(void *ctx), void *abort_ctx)
 {
 	uint8_t frame_hdr[4];
 	uint32_t msg_hdr;
@@ -158,8 +191,11 @@ int erpc_call(uint8_t service, uint8_t request,
 	for (;;) {
 		uint16_t rsize, rcrc;
 		uint32_t rhdr, rseq;
+		int rr;
 
-		if (erpc_recv_exact(frame_hdr, 4u, deadline)) {
+		rr = erpc_recv_exact(frame_hdr, 4u, deadline, should_abort, abort_ctx);
+		if (rr != 0) {
+			if (rr == -2) return -4;        /* aborted by caller */
 			if (diag) diag->timeout++;
 			return -2;
 		}
@@ -168,13 +204,17 @@ int erpc_call(uint8_t service, uint8_t request,
 
 		if (rsize > ERPC_RX_SCRATCH) {          /* too big: drain to resync */
 			if (diag) diag->oversize++;
-			if (erpc_drain(rsize, deadline)) {
+			rr = erpc_drain(rsize, deadline, should_abort, abort_ctx);
+			if (rr != 0) {
+				if (rr == -2) return -4;
 				if (diag) diag->timeout++;
 				return -2;
 			}
 			continue;
 		}
-		if (erpc_recv_exact(erpc_scratch, rsize, deadline)) {
+		rr = erpc_recv_exact(erpc_scratch, rsize, deadline, should_abort, abort_ctx);
+		if (rr != 0) {
+			if (rr == -2) return -4;
 			if (diag) diag->timeout++;
 			return -2;
 		}

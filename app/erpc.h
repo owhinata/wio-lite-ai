@@ -58,12 +58,35 @@ uint16_t erpc_crc16(const uint8_t *d, uint16_t n);
  *
  * The reply payload (bytes after the 8-byte reply header) is copied into @out,
  * truncated to @out_cap.  Returns the full payload length (>=0) on a matched reply,
- * or a negative value on timeout / send failure / no open UART.
+ * or negative on failure:
+ *   -1 request too large / bad args     -2 timeout waiting for the reply
+ *   -4 aborted by @should_abort (erpc_call_ex only)
+ * A negative return may also come from a send with no open UART.
+ *
+ * NOTE: abort/timeout only stops the HOST-side wait; the RTL8720DN keeps executing
+ * an in-flight call (e.g. connect / DHCP).  Because its eRPC server is single-
+ * threaded it will not service the next request until that finishes -- a subsequent
+ * call resyncs via the leading rx-flush + strict (type,service,request,seq) match,
+ * which drains the module's late reply.  Callers should serialise calls (one owner
+ * at a time; the shell uses cli_console_claim) since the RX ring is strict SPSC.
  */
 int erpc_call(uint8_t service, uint8_t request,
               const uint8_t *req, uint16_t req_len,
               uint8_t *out, uint16_t out_cap, uint32_t timeout_ms,
               struct erpc_diag *diag);
+
+/*
+ * As erpc_call(), plus an optional cancellation hook: @should_abort(@abort_ctx) is
+ * polled on each receive-loop yield; if it returns non-zero the call returns -4
+ * without waiting out the timeout.  Used for the multi-second connect / DHCP calls
+ * so Ctrl+C can interrupt them.  @should_abort == NULL behaves exactly like erpc_call.
+ * erpc.c stays shell-agnostic: the shell passes a thunk over cli_cancel_requested().
+ */
+int erpc_call_ex(uint8_t service, uint8_t request,
+                 const uint8_t *req, uint16_t req_len,
+                 uint8_t *out, uint16_t out_cap, uint32_t timeout_ms,
+                 struct erpc_diag *diag,
+                 int (*should_abort)(void *ctx), void *abort_ctx);
 
 /* rpc_system_ack(c): round-trips one byte through the firmware (service 1, req 2).
  * On success returns 0 and stores the echoed byte in *echoed; negative on failure. */
