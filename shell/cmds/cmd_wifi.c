@@ -11,13 +11,13 @@
  *   wifi reset         power-cycle CHIP_EN (Low 80 ms -> High)
  *   wifi log           bridge the LOG UART (UART9 @115200) <-> console
  *   wifi probe         reset the module and capture its boot log from t=0
- *   wifi at [baud]     bridge the AT/HS UART (USART1) <-> console (AT default 38400)
  *   wifi rpc [baud]    eRPC link test: round-trip rpc_system_ack (default 2 Mbaud, #5)
  *
- * The bridge takes over the console (issue #50 raw API): RTL8720DN RX bytes stream
- * to the CDC console and console keystrokes go to the module's TX, so the operator
- * reads the boot banner (identifying eRPC / AT / raw Realtek firmware) and can hand-
- * type AT commands.  Ctrl+C exits.  Foreground only.
+ * The log/probe bridge takes over the console (issue #50 raw API): RTL8720DN RX
+ * bytes stream to the CDC console and console keystrokes go to the module's TX, so
+ * the operator reads the boot banner.  Ctrl+C exits.  Foreground only.  (The AT/HS
+ * UART = USART1 carries binary eRPC, not ASCII, so it is driven via `wifi rpc` / the
+ * app/erpc.c client rather than a terminal bridge.)
  *
  * Clean-room design; no third-party code reused.
  */
@@ -164,18 +164,6 @@ static int cmd_wifi_probe(struct cli_instance *sh, int argc, char **argv)
 	return wifi_bridge_run(sh, RTL8720_UART_LOG, 115200u, true);
 }
 
-static int cmd_wifi_at(struct cli_instance *sh, int argc, char **argv)
-{
-	uint32_t baud = 38400u;             /* RTL8720DN AT-firmware default */
-
-	if (argc >= 2 && (parse_u32(argv[1], &baud) != 0 ||
-	    baud < 2400u || baud > 2000000u)) {
-		cli_error(sh, "wifi: bad baud (2400..2000000)\r\n");
-		return 1;
-	}
-	return wifi_bridge_run(sh, RTL8720_UART_AT, baud, false);
-}
-
 /* wifi rpc [baud]: eRPC link bring-up (issue #5).  Power on the RTL8720DN, open the
  * eRPC UART (USART1, default 2 Mbaud = the factory firmware's Serial3) and round-trip
  * a byte through rpc_system_ack -- a valid CRC-framed echo proves the eRPC link
@@ -240,7 +228,6 @@ CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(reset, NULL, "power-cycle CHIP_EN (low 80ms -> high)",    cmd_wifi_reset, 1, 0),
 	CLI_CMD_ARG(log,   NULL, "bridge LOG UART (UART9 @115200)",           cmd_wifi_log,   1, 0),
 	CLI_CMD_ARG(probe, NULL, "reset + capture boot log from t=0",         cmd_wifi_probe, 1, 0),
-	CLI_CMD_ARG(at,    NULL, "bridge AT UART (USART1) [baud, default 38400]", cmd_wifi_at, 1, 1),
 	CLI_CMD_ARG(rpc,   NULL, "eRPC link test (rpc_system_ack) [baud, default 2M]", cmd_wifi_rpc, 1, 1),
 	CLI_SUBCMD_SET_END);
 

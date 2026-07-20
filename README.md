@@ -25,7 +25,7 @@ Mode") with line editing, history, and Tab completion. 20 commands:
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
-| wireless | `wifi` (info/on/off/reset/log/probe/at/rpc) |
+| wireless | `wifi` (info/on/off/reset/log/probe/rpc) |
 | benchmarks | `coremark` · `membench` |
 
 - **`thread`** — lists the ThreadX threads with state / stack use and a **`top`-style
@@ -57,8 +57,7 @@ Mode") with line editing, history, and Tab completion. 20 commands:
   (UART9 PD14/PD15) and an **AT/HS UART** (USART1 PA10/PB14); the module is held
   powered-off (PC3 low) at boot. `wifi probe` powers it up and streams its boot log
   to the console from `t=0` to identify the factory firmware (eRPC / AT / raw
-  Realtek); `wifi at [baud]` (default 38400) is an interactive terminal to hand-type
-  `AT` commands; `wifi on`/`off`/`reset`/`log` control power and open a live bridge.
+  Realtek); `wifi on`/`off`/`reset`/`log` control power and open a live bridge.
   Register-only (GPIO + UART9/USART1 clock gates); the baud is derived from the
   inherited PCLK2 = 137.5 MHz — it never touches the RCC clock tree.
   `wifi rpc [baud]` (default 2 Mbaud) is the **eRPC link test** (issue #5): the
