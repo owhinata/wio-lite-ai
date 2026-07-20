@@ -22,6 +22,7 @@
 #include "timebase.h"   /* timebase_init: DWT cycle counter for udelay (usleep) */
 #include "log.h"        /* log_init: reset-persistent RAM log (dmesg / crash record) */
 #include "iwdg.h"       /* IWDG petter (issue #4): armed from its own thread entry */
+#include "rtl8720.h"    /* onboard RTL8720DN CHIP_EN hold-off (issue #17) */
 #include "app.h"
 #if BSP_PSRAM_INIT_IN_APP
 #include "psram.h"      /* app-first OCTOSPI1 APS6408 bring-up (issue #3) */
@@ -93,6 +94,11 @@ void tx_application_define(void *first_unused_memory)
                    8, 8, TX_NO_TIME_SLICE, TX_AUTO_START);
 
   led_init_off();               /* configure PC13 and hold the red LED off */
+
+  /* Hold the onboard RTL8720DN in power-off (CHIP_EN=PC3 driven low) before any
+   * `wifi` command runs, so the module never floats after reset (issue #17).
+   * Register-only GPIO; safe here (pre-scheduler), like led_init_off(). */
+  rtl8720_init();
 
 #if BSP_ENABLE_IWDG
   /* IWDG petter thread (priority 5), then arm the watchdog (issue #12: arm here, not

@@ -17,7 +17,7 @@ and the app **inherits its clock tree** — see *Key design points*.
 ## What it does
 
 Presents a `wio> ` prompt on **`/dev/ttyACM0`** (USB CDC, `0483:5740`, "CDC in FS
-Mode") with line editing, history, and Tab completion. 19 commands:
+Mode") with line editing, history, and Tab completion. 20 commands:
 
 | Group | Commands |
 |---|---|
@@ -25,6 +25,7 @@ Mode") with line editing, history, and Tab completion. 19 commands:
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
+| wireless | `wifi` (info/on/off/reset/log/probe/at) |
 | benchmarks | `coremark` · `membench` |
 
 - **`thread`** — lists the ThreadX threads with state / stack use and a **`top`-style
@@ -51,6 +52,15 @@ Mode") with line editing, history, and Tab completion. 19 commands:
   subcommands (`clk`/`set`/`mr0`/`phase`/`wtune`/`mmapscan`) re-derive an operating
   point at a different clock without a reflash. `mmapscan` maps the true
   memory-mapped read eye across IWDG-recovered auto-reboots (issue #16).
+- **`wifi`** — an investigation probe for the on-board **RTL8720DN** Wi-Fi/BLE
+  companion (issue #17). The host reaches it over `CHIP_EN` (PC3), a **LOG UART**
+  (UART9 PD14/PD15) and an **AT/HS UART** (USART1 PA10/PB14); the module is held
+  powered-off (PC3 low) at boot. `wifi probe` powers it up and streams its boot log
+  to the console from `t=0` to identify the factory firmware (eRPC / AT / raw
+  Realtek); `wifi at [baud]` (default 38400) is an interactive terminal to hand-type
+  `AT` commands; `wifi on`/`off`/`reset`/`log` control power and open a live bridge.
+  Register-only (GPIO + UART9/USART1 clock gates); the baud is derived from the
+  inherited PCLK2 = 137.5 MHz — it never touches the RCC clock tree.
 
 ## Key design points
 
