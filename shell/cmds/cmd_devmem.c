@@ -40,6 +40,10 @@
 #include <stdint.h>
 #include <string.h>
 
+#if BSP_ENABLE_PSRAM
+#include "psram.h"           /* psram_ready() gate for the 0x90000000 window (#3) */
+#endif
+
 #if CLI_ENABLE_DANGEROUS_CMDS
 
 /* Allowed access widths, as a bitmask carried per region. */
@@ -54,6 +58,7 @@ struct devmem_region {
 	uint8_t     read;       /* 1 = peek/dump allowed */
 	uint8_t     write;      /* 1 = poke allowed */
 	uint8_t     widths;     /* bitmask of permitted access widths (W8/W16/W32) */
+	uint8_t     psram;      /* 1 = gate on psram_ready() (unbacked window hangs) */
 	const char *name;       /* shown in range/width error messages */
 };
 
@@ -67,12 +72,15 @@ struct devmem_region {
  * (Peripheral windows can be added once the fault handler lands.)
  */
 static const struct devmem_region devmem_map[] = {
-	{ 0x00000000u, 0x00010000u, 1, 1, WALL, "ITCM"      }, /* 64 KB               */
-	{ 0x08000000u, 0x00080000u, 1, 0, WALL, "IntFlash"  }, /* 512 KB int, RO (boot) */
-	{ 0x20000000u, 0x00020000u, 1, 1, WALL, "DTCM"      }, /* 128 KB              */
-	{ 0x24000000u, 0x00050000u, 1, 1, WALL, "AXI-SRAM"  }, /* 320 KB (D1)         */
-	{ 0x70000000u, 0x00800000u, 1, 0, WALL, "XIP-Flash" }, /* ext OCTOSPI2 XIP, RO */
-	{ 0xE0000000u, 0x00100000u, 1, 1, W32,  "PPB"       }, /* SCB/NVIC/SysTick/DWT */
+	{ 0x00000000u, 0x00010000u, 1, 1, WALL, 0, "ITCM"      }, /* 64 KB               */
+	{ 0x08000000u, 0x00080000u, 1, 0, WALL, 0, "IntFlash"  }, /* 512 KB int, RO (boot) */
+	{ 0x20000000u, 0x00020000u, 1, 1, WALL, 0, "DTCM"      }, /* 128 KB              */
+	{ 0x24000000u, 0x00050000u, 1, 1, WALL, 0, "AXI-SRAM"  }, /* 320 KB (D1)         */
+	{ 0x70000000u, 0x00800000u, 1, 0, WALL, 0, "XIP-Flash" }, /* ext OCTOSPI2 XIP, RO */
+#if BSP_ENABLE_PSRAM
+	{ 0x90000000u, 0x00800000u, 1, 1, WALL, 1, "PSRAM"     }, /* ext OCTOSPI1 APS6408 (#3); gated on psram_ready() */
+#endif
+	{ 0xE0000000u, 0x00100000u, 1, 1, W32,  0, "PPB"       }, /* SCB/NVIC/SysTick/DWT */
 };
 
 /*
@@ -160,6 +168,16 @@ static int devmem_check(struct cli_instance *sh, uint32_t addr, uint32_t span,
 			          (unsigned long)(elem_bytes * 8u), r->name);
 			return -1;
 		}
+#if BSP_ENABLE_PSRAM
+		/* The PSRAM window is memory-mapped only after psram_hw_init() succeeds.
+		 * Before that (or after a diagnostic wedged the device) a CPU access at
+		 * 0x90000000 is an unbounded DQS-gated OCTOSPI1 transaction that stalls
+		 * the AXI bus until the IWDG resets -- devmem must not attempt it. */
+		if (r->psram && !psram_ready()) {
+			cli_error(sh, "devmem: PSRAM not ready; use `psram info`/`psram probe`\r\n");
+			return -1;
+		}
+#endif
 		return 0;
 	}
 	cli_error(sh, "devmem: 0x%08lx (%lu bytes) not in an allowed region\r\n",
@@ -219,9 +237,36 @@ static int parse_addr_width(struct cli_instance *sh, const char *addr_s,
 	return 0;
 }
 
+/*
+ * PSRAM accesses share the single OCTOSPI1 controller with the `psram`/`membench`
+ * commands, so a raw devmem poke/peek/dump at 0x90000000 must hold the same guard
+ * or a concurrent `psram` command (run via `cmd &`) can ABORT / leave mmap /
+ * change DCR mid-access and corrupt the data or stall the AXI bus.  Returns 1 if
+ * the guard was taken (release with psram_release()), 0 if the access does not
+ * touch PSRAM, -1 if PSRAM but the guard is busy (reject the command).
+ */
+#if BSP_ENABLE_PSRAM
+static int devmem_psram_lock(struct cli_instance *sh, uint32_t addr, uint32_t span)
+{
+	if (addr < PSRAM_BASE_ADDR ||
+	    (uint64_t)addr + span > (uint64_t)PSRAM_BASE_ADDR + PSRAM_SIZE_BYTES)
+		return 0;                               /* not the PSRAM window */
+	if (!psram_acquire()) {
+		cli_error(sh, "devmem: PSRAM busy (a psram command holds OCTOSPI1)\r\n");
+		return -1;
+	}
+	return 1;
+}
+#define devmem_psram_unlock()  psram_release()
+#else
+#define devmem_psram_lock(sh, addr, span)  0
+#define devmem_psram_unlock()              ((void)0)
+#endif
+
 static int cmd_devmem_peek(struct cli_instance *sh, int argc, char **argv)
 {
 	uint32_t addr, width;
+	int plk;
 
 	if (parse_addr_width(sh, argv[1], argc >= 3 ? argv[2] : NULL,
 	                     &addr, &width) != 0)
@@ -229,7 +274,12 @@ static int cmd_devmem_peek(struct cli_instance *sh, int argc, char **argv)
 	if (devmem_check(sh, addr, width, width, 0) != 0)
 		return 1;
 
+	plk = devmem_psram_lock(sh, addr, width);
+	if (plk < 0)
+		return 1;
 	print_cell(sh, addr, width, mem_read(addr, width));
+	if (plk > 0)
+		devmem_psram_unlock();
 	return 0;
 }
 
@@ -237,6 +287,7 @@ static int cmd_devmem_poke(struct cli_instance *sh, int argc, char **argv)
 {
 	uint32_t addr, width, value;
 	uintptr_t a;
+	int plk;
 
 	if (parse_u32(argv[2], &value) != 0) {
 		cli_error(sh, "devmem: bad value '%s'\r\n", argv[2]);
@@ -253,6 +304,9 @@ static int cmd_devmem_poke(struct cli_instance *sh, int argc, char **argv)
 	if (devmem_check(sh, addr, width, width, 1) != 0)
 		return 1;
 
+	plk = devmem_psram_lock(sh, addr, width);
+	if (plk < 0)
+		return 1;
 	a = (uintptr_t)addr;
 	switch (width) {
 	case 1:  *(volatile uint8_t  *)a = (uint8_t)value;  break;
@@ -261,6 +315,8 @@ static int cmd_devmem_poke(struct cli_instance *sh, int argc, char **argv)
 	}
 
 	print_cell(sh, addr, width, mem_read(addr, width));     /* read-back */
+	if (plk > 0)
+		devmem_psram_unlock();
 	return 0;
 }
 
@@ -287,8 +343,17 @@ static int cmd_devmem_dump(struct cli_instance *sh, int argc, char **argv)
 	if (devmem_check(sh, addr, len, 1, 0) != 0)
 		return 1;
 
-	return cli_hexdump_base(sh, (const void *)(uintptr_t)addr, len, addr) == 0
-	               ? 0 : 1;
+	{
+		int plk = devmem_psram_lock(sh, addr, len);
+		int rc;
+
+		if (plk < 0)
+			return 1;
+		rc = cli_hexdump_base(sh, (const void *)(uintptr_t)addr, len, addr);
+		if (plk > 0)
+			devmem_psram_unlock();
+		return rc == 0 ? 0 : 1;
+	}
 }
 
 CLI_SUBCMD_SET_CREATE(devmem_subcmds,

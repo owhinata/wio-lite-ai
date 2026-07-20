@@ -27,7 +27,9 @@
  *  - Regions: DTCM (4 KB, .dtcm_bench), AXI-SRAM (64 KB, malloc'd on demand),
  *    Flash int = embedded flash via AXIM 0x08000000, Flash ext = OCTOSPI2 XIP window
  *    0x70000000 (both read-only: measure the flash read rate; a read of the boot
- *    region is harmless -- no write/erase, so no brick risk).
+ *    region is harmless -- no write/erase, so no brick risk), PSRAM = OCTOSPI1
+ *    APS6408 mmap window 0x90000000 (writable scratch, MPU non-cacheable ->
+ *    raw octal-DTR rate; skipped when the bring-up failed).
  *
  * Timing: DWT CYCCNT.  Each timed run is sized to ~0.3 ms (< one 1 kHz SysTick
  * period) via a calibration pass, run up to MEMBENCH_TRIALS times; runs during
@@ -47,6 +49,10 @@
 
 #include "stm32h7xx_hal.h"   /* DWT/CoreDebug/SCB, SystemCoreClock, HAL_GetTick, __DSB/__ISB */
 
+#if BSP_ENABLE_PSRAM
+#include "psram.h"           /* PSRAM_BASE_ADDR + psram_ready() (issue #3) */
+#endif
+
 #include <stdint.h>
 #include <stdlib.h>          /* malloc / free for the on-demand SRAM buffer */
 #include <stdio.h>           /* snprintf for table cells */
@@ -64,6 +70,7 @@
 #define SRAM_BENCH_BYTES   (64u * 1024u)   /* > 512 D-cache lines @64B stride -> refill */
 #define SRAM_CACHED_BYTES  ( 4u * 1024u)   /* fits in the 16 KB L1 D-cache */
 #define FLASH_BENCH_BYTES  (64u * 1024u)
+#define PSRAM_BENCH_BYTES  (64u * 1024u)   /* scratch at PSRAM base (non-cacheable mmap) */
 #define EFLASH_BENCH_BASE  0x70000000u   /* external: OCTOSPI2 XIP window (read-only) */
 #define IFLASH_BENCH_BASE  0x08000000u   /* internal: embedded flash via AXIM (read-only).
                                           * This is the DFU bootloader's region, but a READ
@@ -367,7 +374,7 @@ static uint32_t lat_ns10(uint32_t *buf, uint32_t wss_bytes, uint32_t clk)
 
 static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 {
-	int do_dtcm = 1, do_sram = 1, do_flash = 1;
+	int do_dtcm = 1, do_sram = 1, do_flash = 1, do_psram = 1;
 	uint32_t clk;
 	void     *sram_raw = NULL;         /* malloc base (freed on every exit via `done`) */
 	uint32_t *sram_bench_buf = NULL;   /* 32-byte-aligned working pointer */
@@ -376,13 +383,14 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 	if (argc >= 2) {
 		const char *r = argv[1];
 
-		do_dtcm = do_sram = do_flash = 0;
-		if (!strcmp(r, "all"))        do_dtcm = do_sram = do_flash = 1;
+		do_dtcm = do_sram = do_flash = do_psram = 0;
+		if (!strcmp(r, "all"))        do_dtcm = do_sram = do_flash = do_psram = 1;
 		else if (!strcmp(r, "dtcm"))  do_dtcm = 1;
 		else if (!strcmp(r, "sram"))  do_sram = 1;
 		else if (!strcmp(r, "flash")) do_flash = 1;
+		else if (!strcmp(r, "psram")) do_psram = 1;
 		else {
-			cli_error(sh, "membench: unknown region '%s' (dtcm|sram|flash|all)\r\n", r);
+			cli_error(sh, "membench: unknown region '%s' (dtcm|sram|flash|psram|all)\r\n", r);
 			return 1;
 		}
 	}
@@ -437,6 +445,25 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 		bw_row(sh, "Flash  ext (64KB)", (uint32_t *)EFLASH_BENCH_BASE,
 		       FLASH_BENCH_BYTES / 4u, clk, 0);
 	}
+#if BSP_ENABLE_PSRAM
+	/* PSRAM is scratch RAM (writable) behind the MPU non-cacheable window, so
+	 * both directions measure the raw OCTOSPI1 rate -- no cache step. */
+	if (do_psram) {
+		if (cli_cancel_requested(sh)) goto done;
+		/* Hold the OCTOSPI1 guard for the duration of the mmap benchmark so a
+		 * concurrent `psram` command cannot re-enter mmap / abort mid-access
+		 * (would corrupt the numbers or stall the AXI bus). */
+		if (!psram_ready())
+			cli_warn(sh, "membench: PSRAM not ready; skipping\r\n");
+		else if (!psram_acquire())
+			cli_warn(sh, "membench: PSRAM busy (a psram command holds it); skipping\r\n");
+		else {
+			bw_row(sh, "PSRAM  (64KB)", (uint32_t *)PSRAM_BASE_ADDR,
+			       PSRAM_BENCH_BYTES / 4u, clk, 1);
+			psram_release();
+		}
+	}
+#endif
 
 	/* latency (DTCM/SRAM only; Flash is read-only so it has no pointer-chase row) */
 	if (do_dtcm || do_sram) {
@@ -456,6 +483,18 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 			cli_print(sh, "  %-22s %8s\r\n", "SRAM   (64KB, refill)", sr);
 		}
 	}
+#if BSP_ENABLE_PSRAM
+	if (do_psram && psram_ready()) {
+		if (cli_cancel_requested(sh)) goto done;
+		if (psram_acquire()) {
+			char pl[12];
+			fmt_ns(pl, sizeof pl, lat_ns10((uint32_t *)PSRAM_BASE_ADDR,
+			                               PSRAM_BENCH_BYTES, clk));
+			psram_release();
+			cli_print(sh, "  %-22s %8s\r\n", "PSRAM  (64KB)", pl);
+		}
+	}
+#endif
 
 done:
 	free(sram_raw);        /* NULL when SRAM was not benched (free(NULL) is a no-op) */

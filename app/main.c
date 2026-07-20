@@ -23,6 +23,9 @@
 #include "log.h"        /* log_init: reset-persistent RAM log (dmesg / crash record) */
 #include "iwdg.h"       /* IWDG petter (issue #4): armed from its own thread entry */
 #include "app.h"
+#if BSP_PSRAM_INIT_IN_APP
+#include "psram.h"      /* app-first OCTOSPI1 APS6408 bring-up (issue #3) */
+#endif
 
 /* --- interactive shell over USB CDC ------------------------------------- */
 CLI_BACKEND_USBCDC_DEFINE(cdc_tr);
@@ -140,10 +143,14 @@ int main(void)
    * disables the caches in HW, and the app persists no cacheable-SRAM state across
    * a reset, so the boot handoff is unchanged.
    *
-   * FUTURE: when a DMA peripheral is added (PSRAM/OCTOSPI1, DCMI camera, SDMMC,
-   * Ethernet, or USB in DMA mode), its DMA buffers MUST be made non-cacheable via
-   * the MPU (or clean/invalidate around each transfer) or D-cache will corrupt them. */
+   * DMA coherency (issue #3): mpu_config() (below, between the two cache enables)
+   * marks the OCTOSPI1 PSRAM window at 0x90000000 Normal non-cacheable, so DMA
+   * buffers placed there stay coherent under the D-cache.  Future DMA peripherals
+   * (DCMI camera, SDMMC, Ethernet, USB in DMA mode) add their buffer regions to
+   * mpu_regions[] in app/mpu.c rather than clean/invalidating around each transfer. */
   SCB_EnableICache();
+  mpu_config();       /* PSRAM non-cacheable region; MUST sit between I- and D-cache
+                       * enable (PM0253 sec 4.6.8 barriers).  See app/mpu.c. */
   SCB_EnableDCache();
 
   /* RAM log first: validate the reset-persistent DTCM ring and record the reset
@@ -160,6 +167,16 @@ int main(void)
   usb_hw_init();   /* OTG_HS pins/clock only; the device stack (tusb_init, which
                     * enables OTG_HS_IRQn) comes up later in the usb thread entry so
                     * no interrupt is armed before its ThreadX objects exist (#12). */
+
+#if BSP_PSRAM_INIT_IN_APP
+  /* App-first OCTOSPI1 APS6408 PSRAM bring-up (issue #3): register-only, touches
+   * neither OCTOSPI2/OCTOSPIM nor the RCC, so it is XIP-safe.  Fail-soft -- a
+   * failed bring-up just leaves `psram` reporting "not ready".  Once the register
+   * values are validated on hardware this moves into the bootloader (Phase B) and
+   * this call is disabled (-DBSP_PSRAM_INIT_IN_APP=OFF). */
+  psram_hw_init();
+#endif
+
   setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered so printf reaches _write */
 
   /* No __disable_irq() here (issue #12): interrupts stay enabled through ThreadX

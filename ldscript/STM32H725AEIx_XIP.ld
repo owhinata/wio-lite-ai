@@ -32,6 +32,7 @@ MEMORY
   RAM   (xrw) : ORIGIN = 0x24000000, LENGTH = 320K   /* AXI-SRAM (D1) */
   DTCM  (xrw) : ORIGIN = 0x20000000, LENGTH = 128K
   FLASH (rx)  : ORIGIN = 0x70000000, LENGTH = 8M     /* external OCTOSPI2 XIP */
+  PSRAM (xrw) : ORIGIN = 0x90000000, LENGTH = 8M     /* external OCTOSPI1 APS6408 (issue #3) */
 }
 
 SECTIONS
@@ -184,5 +185,27 @@ SECTIONS
                            * bytes emitted, no section moves. */
   } >DTCM
 
+  /* External OCTOSPI1 APS6408 PSRAM window (issue #3), 8 MB @ 0x90000000.  The DFU
+   * bootloader brings the PSRAM up in memory-mapped mode (or, during app-first
+   * bring-up, app/psram.c does); the MPU marks this window Normal non-cacheable
+   * (app/mpu.c) so future DMA buffers stay coherent under the D-cache.  NOLOAD:
+   * volatile external RAM -- never part of the .bin, never loaded or zeroed at boot.
+   * Empty for v1 (no named PSRAM residents yet); named buffers land in .psram* as
+   * consumers (#5 SD / #6 LCD / #7 camera) arrive.  _psram_start/_psram_end bound
+   * the free pool for a future PSRAM allocator. */
+  .psram_noinit (NOLOAD) :
+  {
+    . = ALIGN(32);
+    _psram_start = .;
+    *(.psram_noinit)
+    *(.psram_noinit*)
+    . = ALIGN(4);
+    _psram_end = .;
+  } >PSRAM
+
   .ARM.attributes 0 : { *(.ARM.attributes) }
+
+  /* Anything placed in PSRAM must fit inside the 8 MB OCTOSPI1 window. */
+  ASSERT(_psram_end <= ORIGIN(PSRAM) + LENGTH(PSRAM),
+         ".psram_noinit overflows the 8 MB OCTOSPI1 PSRAM window")
 }

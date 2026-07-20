@@ -221,6 +221,7 @@ set(SHELL_SOURCES
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_watch.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_jobs.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_devmem.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_psram.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_dmesg.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_crash.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_wdt.c"
@@ -277,6 +278,12 @@ option(BSP_ENABLE_IWDG "Enable the IWDG watchdog and wdt shell command" ON)
 # with -DBSP_ENABLE_WFI=OFF for a busy-idle (no-sleep) variant that is easier to
 # attach over SWD (a WFI-sleeping core needs connect-under-reset).
 option(BSP_ENABLE_WFI "Enable ThreadX idle WFI power saving" ON)
+# issue #3: OCTOSPI1 APS6408 8 MB PSRAM at 0x90000000.  BSP_ENABLE_PSRAM builds the
+# MPU non-cacheable window + `psram` command; BSP_PSRAM_INIT_IN_APP does the OCTOSPI1
+# bring-up app-side (app-first validation).  Once the register values are validated
+# the bring-up moves into the bootloader and BSP_PSRAM_INIT_IN_APP is turned OFF.
+option(BSP_ENABLE_PSRAM "Enable OCTOSPI1 APS6408 PSRAM (MPU window + psram command)" ON)
+option(BSP_PSRAM_INIT_IN_APP "Bring up OCTOSPI1 PSRAM app-side (app-first validation)" ON)
 
 add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/main.c"
@@ -286,6 +293,8 @@ add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/fault.c"
     "${CMAKE_SOURCE_DIR}/app/iwdg.c"
     "${CMAKE_SOURCE_DIR}/app/malloc_lock.c"
+    "${CMAKE_SOURCE_DIR}/app/mpu.c"
+    "${CMAKE_SOURCE_DIR}/app/psram.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
     "${CMAKE_SOURCE_DIR}/src/system_stm32h7xx.c"
     "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"
@@ -316,7 +325,9 @@ target_compile_definitions(shell PRIVATE
     CLI_BG_JOB_STACK_SIZE=4096
     CLI_USBCDC_TX_BUFFER_SIZE=4096     # holds a full CoreMark report burst
     BSP_ENABLE_IWDG=$<BOOL:${BSP_ENABLE_IWDG}>   # issue #4: IWDG1 arm + petter + wdt
-    BSP_ENABLE_WFI=$<BOOL:${BSP_ENABLE_WFI}>)    # issue #2: gates TX_ENABLE_WFI (tx_user.h)
+    BSP_ENABLE_WFI=$<BOOL:${BSP_ENABLE_WFI}>      # issue #2: gates TX_ENABLE_WFI (tx_user.h)
+    BSP_ENABLE_PSRAM=$<BOOL:${BSP_ENABLE_PSRAM}>          # issue #3: PSRAM window + psram cmd
+    BSP_PSRAM_INIT_IN_APP=$<BOOL:${BSP_PSRAM_INIT_IN_APP}>) # issue #3: app-side OCTOSPI1 bring-up
 target_compile_options(shell PRIVATE -O2)
 
 firmware_finalize(shell)

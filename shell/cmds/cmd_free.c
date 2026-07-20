@@ -49,6 +49,8 @@
 #define RAM_LENGTH    (320u * 1024u)
 #define DTCM_ORIGIN   0x20000000u
 #define DTCM_LENGTH   (128u * 1024u)
+#define PSRAM_ORIGIN  0x90000000u          /* external OCTOSPI1 APS6408 (issue #3) */
+#define PSRAM_LENGTH  (8u * 1024u * 1024u)
 
 /*
  * Linker boundary symbols.  Their *addresses* carry the values; _Min_Stack_Size
@@ -61,6 +63,7 @@ extern uint8_t _end[];               /* top of static RAM = heap base */
 extern uint8_t _estack[];            /* top of RAM (initial MSP)      */
 extern uint8_t _Min_Stack_Size[];    /* reserved main-stack bytes     */
 extern uint8_t _dtcm_used_end[];     /* top of the DTCM resident block */
+extern uint8_t _psram_end[];         /* top of PSRAM residents (.psram_noinit) */
 
 static uint32_t sym(const uint8_t s[])
 {
@@ -105,6 +108,9 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 	             ".data/.bss + ThreadX stacks + heap");
 	print_region(sh, "DTCM",  DTCM_ORIGIN,  DTCM_LENGTH,  dtcm_used,
 	             ".log_noinit (dmesg) + .dtcm_bench (membench)");
+	print_region(sh, "PSRAM", PSRAM_ORIGIN, PSRAM_LENGTH,
+	             sym(_psram_end) - PSRAM_ORIGIN,          /* .psram_noinit residents */
+	             "ext OCTOSPI1 APS6408 (free scratch pool)");
 
 	cli_print(sh, "\r\n");
 	cli_print(sh, "heap:  base 0x%08lX  arena %lu  in-use %lu  free-pool %lu\r\n",
