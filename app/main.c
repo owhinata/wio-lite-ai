@@ -175,6 +175,10 @@ int main(void)
    * values are validated on hardware this moves into the bootloader (Phase B) and
    * this call is disabled (-DBSP_PSRAM_INIT_IN_APP=OFF). */
   psram_hw_init();
+  /* mmapscan (issue #16): if a DLYB sweep is in progress, test the next unit
+   * against real mmap access and either record + reset, or (on a hang) let the
+   * IWDG reset -- headless, before the shell.  No-op when no sweep is active. */
+  psram_mmapscan_boot();
 #endif
 
   setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered so printf reaches _write */

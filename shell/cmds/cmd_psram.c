@@ -431,6 +431,32 @@ static int cmd_psram_phase(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
+/* psram mr0 <hex>: write the APS6408 MR0 read-latency register (#16 diagnostic).
+ * 0x09 = power-up default (Variable LC5); 0x24 = Fixed Latency LC8 (ST U585
+ * reference -- pair with `psram set 8 <wr>`).  Verify with `psram probe 0`. */
+static int cmd_psram_mr0(struct cli_instance *sh, int argc, char **argv)
+{
+	uint32_t v;
+
+	(void)argc;
+	if (!psram_ready()) {
+		cli_error(sh, "psram: not ready\r\n");
+		return 1;
+	}
+	if (parse_u32(argv[1], &v) != 0 || v > 0xFFu) {
+		cli_error(sh, "psram: bad MR0 value (0..0xFF)\r\n");
+		return 1;
+	}
+	if (psram_guard(sh))
+		return 1;
+	psram_set_mr0(v);
+	psram_release();
+	cli_print(sh, "psram: MR0<=0x%02lX; set matching read dummy (`psram set`), "
+	          "verify `psram probe 0`, then `psram test 4096`\r\n",
+	          (unsigned long)v);
+	return 0;
+}
+
 /* psram set <read_dcyc> <write_dcyc>: re-enter mmap with new latencies to sweep
  * for values that pass `psram test` without a reflash. */
 static int cmd_psram_set(struct cli_instance *sh, int argc, char **argv)
@@ -523,36 +549,95 @@ static int cmd_psram_test(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
-/* psram eye: score all DLYB points with repeated full reads of a 32-byte
- * high-transition marker.  Leaves the best phase/unit applied. */
-static int cmd_psram_eye(struct cli_instance *sh, int argc, char **argv)
+/* psram mmapscan <start [phase]|show|stop>: reset-persistent DLYB sweep
+ * validated against real memory-mapped access (issue #16).  `start` captures the
+ * current clock/latency/MR0 and sweeps DLYB units 0..124 (step 4) on `phase`
+ * (default 3), auto-rebooting per unit -- the console drops during the sweep and
+ * returns when it completes; then `show` prints which units passed mmap. */
+static int cmd_psram_mmapscan(struct cli_instance *sh, int argc, char **argv)
 {
-	uint32_t counts[13] = {0};
-	uint32_t best, i;
-	const uint32_t trials = 8u;
+	struct psram_scan_state st;
+	uint32_t phase = 3u, ulo, ustep, ncand, idx, ci;
+	int state;
 
-	(void)argc; (void)argv;
-	if (!psram_ready()) {
-		cli_error(sh, "psram: not ready\r\n");
+	if (argc < 2) {
+		cli_error(sh, "psram: usage mmapscan <start [phase]|show|stop>\r\n");
 		return 1;
 	}
-	if (psram_guard(sh))
+	if (strcmp(argv[1], "stop") == 0) {
+		psram_mmapscan_stop();
+		cli_print(sh, "psram mmapscan: stopped\r\n");
+		return 0;
+	}
+	if (strcmp(argv[1], "show") == 0) {
+		state = psram_mmapscan_get(&st);
+		if (state == 0) {
+			cli_print(sh, "psram mmapscan: no sweep recorded\r\n");
+			return 0;
+		}
+		ulo   = st.rng & 0xFFu;
+		ustep = (st.rng >> 8) & 0xFFu;
+		ncand = (st.rng >> 16) & 0xFFu;
+		idx   = (st.rng >> 24) & 0xFFu;
+		cli_print(sh, "psram mmapscan: %s  phase %lu  presc %lu (%lu Hz)  "
+		          "rd %lu wr %lu  mr0 0x%02lX\r\n",
+		          (state == 2) ? "COMPLETE" : "running",
+		          (unsigned long)((st.cfg >> 8) & 0xFFu),
+		          (unsigned long)(st.cfg & 0xFFu),
+		          (unsigned long)(266000000u / ((st.cfg & 0xFFu) + 1u)),
+		          (unsigned long)((st.cfg >> 16) & 0xFFu),
+		          (unsigned long)((st.cfg >> 24) & 0xFFu),
+		          (unsigned long)st.mr0);
+		cli_print(sh, "  mmap eye (P pass / x fail / . untested), "
+		          "unit %lu..%lu step %lu:\r\n", (unsigned long)ulo,
+		          (unsigned long)(ulo + (ncand - 1u) * ustep), (unsigned long)ustep);
+		cli_print(sh, "  |");
+		for (ci = 0u; ci < ncand; ci++)
+			cli_print(sh, "%c", (st.passed & (1u << ci)) ? 'P'
+			          : (st.tested & (1u << ci)) ? 'x' : '.');
+		cli_print(sh, "|  (%lu/%lu tested)\r\n",
+		          (unsigned long)(idx < ncand ? idx : ncand), (unsigned long)ncand);
+		for (ci = 0u; ci < ncand; ci++)
+			if (st.passed & (1u << ci))
+				cli_print(sh, "  PASS unit %lu\r\n",
+				          (unsigned long)(ulo + ci * ustep));
+		return 0;
+	}
+	if (strcmp(argv[1], "start") == 0) {
+#if !BSP_ENABLE_IWDG
+		/* The sweep relies on the IWDG to recover a hanging mmap read at a bad
+		 * DLYB point; without it a hang is unrecoverable (a permanent lock). */
+		cli_error(sh, "psram: mmapscan needs the IWDG (built -DBSP_ENABLE_IWDG=OFF)\r\n");
 		return 1;
-	best = psram_scan_eye(counts, trials);
-	psram_release();
-	for (i = 1u; i <= 12u; i++)
-		cli_print(sh, "  phase %2lu: %lu / %lu (unit %lu)%s\r\n",
-		          (unsigned long)i, (unsigned long)(counts[i] & 0xFFu),
-		          (unsigned long)trials, (unsigned long)((counts[i] >> 8) & 0xFFu),
-		          (i == best) ? "  <= best" : "");
-	if (best != 0u)
-		cli_print(sh, "psram eye: best phase %lu applied; next `psram wtune`\r\n",
-		          (unsigned long)best);
-	else
-		cli_print(sh, "psram eye: no phase scored; reverted to bypass\r\n");
-	cli_print(sh, "NB: eye scores can diverge from post-scan behavior (issue #16); "
-	          "if mmap tests fail now, restore `psram phase 3 64`\r\n");
-	return 0;
+#else
+		if (!psram_ready()) {
+			cli_error(sh, "psram: not ready\r\n");
+			return 1;
+		}
+		if (argc >= 3 && (parse_u32(argv[2], &phase) != 0 ||
+		    phase < 1u || phase > 12u)) {
+			cli_error(sh, "psram: bad phase (1..12)\r\n");
+			return 1;
+		}
+		/* Serialize the config snapshot against a backgrounded psram/membench
+		 * command so we capture a coherent clock/latency/MR0 (start does not
+		 * return on success, so no release needed then). */
+		if (psram_guard(sh))
+			return 1;
+		cli_print(sh, "psram mmapscan: sweeping phase %lu, unit 0..124 step 4 at "
+		          "the current clock/latency; the board will auto-reboot per unit "
+		          "(console drops). Reconnect when it stops, then `psram mmapscan "
+		          "show`.\r\n", (unsigned long)phase);
+		/* Does not return on success (system reset into the boot loop). */
+		if (!psram_mmapscan_start(phase, 0u, PSRAM_SCAN_STEP, PSRAM_SCAN_COLS)) {
+			psram_release();
+			cli_error(sh, "psram: mmapscan start rejected\r\n");
+		}
+		return 1;
+#endif
+	}
+	cli_error(sh, "psram: usage mmapscan <start [phase]|show|stop>\r\n");
+	return 1;
 }
 
 /* psram wtune [addr]: sweep the mmap write dummy 0..15 with write+readback
@@ -597,8 +682,9 @@ CLI_SUBCMD_SET_CREATE(psram_subcmds,
 	CLI_CMD_ARG(dqs,  NULL, "probe-read DQS gating <1|0>",         cmd_psram_dqs,  2, 0),
 	CLI_CMD_ARG(test, NULL, "write/verify patterns [bytes]",     cmd_psram_test, 1, 1),
 	CLI_CMD_ARG(set,  NULL, "set mmap latency <rd> <wr> cycles", cmd_psram_set,  3, 0),
+	CLI_CMD_ARG(mr0,  NULL, "write device MR0 latency reg <hex>", cmd_psram_mr0,  2, 0),
 	CLI_CMD_ARG(phase, NULL, "set dlyb read phase <sel> [units]", cmd_psram_phase, 2, 1),
-	CLI_CMD_ARG(eye,  NULL, "auto-scan DLYB read phases",         cmd_psram_eye,   1, 0),
+	CLI_CMD_ARG(mmapscan, NULL, "reset-persistent mmap DLYB sweep <start|show|stop>", cmd_psram_mmapscan, 2, 1),
 	CLI_CMD_ARG(wtune, NULL, "sweep mmap write dummy 0..15 [addr]", cmd_psram_wtune, 1, 1),
 	CLI_CMD_ARG(clk,  NULL, "set device clock prescaler <0..255>", cmd_psram_clk,   2, 0),
 	CLI_CMD_ARG(dlyb, NULL, "delay block bypass off/on <1|0>",     cmd_psram_dlyb,  2, 0),

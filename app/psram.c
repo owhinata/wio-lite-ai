@@ -1,8 +1,10 @@
 /*
  * Wio Lite AI (STM32H725AEI6) -- OCTOSPI1 APS6408L-3OBM-BA Octal DDR PSRAM
- * app-side bring-up (issue #3).  Indirect operations are bounded and fail-soft
- * so a missing PSRAM response does not stop USB.  Validated on board #2 at
- * 53.2 MHz, full-8MB test pass (bring-up story: issue #3 comments).
+ * app-side bring-up (issue #3) + clock/eye characterisation (issue #16).
+ * Indirect operations are bounded and fail-soft so a missing PSRAM response does
+ * not stop USB.  Ships at 133 MHz Fixed Latency (read 113 / write 154 MB/s),
+ * validated on board #2 with a full-8MB test pass; the operating-point table and
+ * the two-stage bring-up are documented at the PSRAM_* defines below.
  *
  * WHY THIS IS SAFE TO RUN FROM XIP: OCTOSPI1 and OCTOSPI2 sit on separate
  * OCTOSPIM ports (P1 vs P2, un-muxed) and separate register blocks, sharing only
@@ -34,28 +36,48 @@
  *  Tunable bring-up parameters (validate / adjust on board #2)
  * ------------------------------------------------------------------ */
 
-/* Device clock = OSPI kernel (PLL2R 266 MHz) / (PRESCALER+1).  Operating
- * point validated on board #2: 53.2 MHz, full-8MB test pass with rd=5/wr=4
- * and DLYB phase3/unit64.  The next steps up were rejected on measurement:
- * 66.5 MHz shows single-bit read errors (0x90000000 -> 0x94000000) and at
- * 88.7 MHz register reads and linear reads need DIFFERENT DLYB settings
- * (margin collapse).  26.6 MHz (presc 9) is the known-good fallback. */
+/* Device clock = OSPI kernel (PLL2R 266 MHz) / (PRESCALER+1).
+ *
+ * Three operating points were characterised on board #2 (issue #16, mmapscan
+ * memory-mapped read-eye + membench), all full-8MB `psram test` clean:
+ *
+ *   presc MR0    rd wr DLYB  clock     read/write MB/s  mmap eye (DLYB units)
+ *     4   0x09    5  4  u64  53.2 MHz   51 / 62         [16..68]  widest
+ *     2   0x24    8  4  u16  88.7 MHz   78 / 103        [0..32]
+ *   > 1   0x24    8  4  u8   133  MHz  113 / 154        [0..20]   narrow (max BW)
+ *
+ * SHIPPED: 133 MHz Fixed Latency -- 2.4x the 53.2 MHz point.  High clocks
+ * REQUIRE Fixed Latency (MR0=0x24, LC8): with the power-up variable latency the
+ * refresh push-out jitter collapses the read eye to nothing at 133 MHz (mmapscan
+ * shows zero passing DLYB units).  To ship a different point, replace the
+ * PSRAM_PRESCALER / PSRAM_MR0_OP / PSRAM_READ_DCYC / PSRAM_DLYB_UNIT values with
+ * the matching row above.
+ *
+ * TWO-STAGE BRING-UP: the Global Reset, mode-register reads AND the MR0
+ * Fixed-Latency write must all run at a clock where register transactions are
+ * reliable (register writes at 133 MHz corrupt).  psram_hw_init() therefore
+ * brings the device up at the safe INIT clock (53.2 MHz), writes MR0, and only
+ * then raises the clock and re-centres the DLYB for the operating point. */
 #define PSRAM_KERNEL_HZ    266000000u
-#define PSRAM_PRESCALER    4u              /* DCR2.PRESCALER -> /5 = 53.2 MHz */
 
-/* Keep the APS6408 power-up configuration.  The earlier mode-register writes
- * were diagnosed through invalid one-byte DTR reads and changed the wrong
- * register pair.  MR0 reset value is variable LC5 with 1/4 drive strength. */
+/* Safe bring-up point: reliable Global Reset + MR reads + MR0 write. */
+#define PSRAM_INIT_PRESCALER  4u   /* 53.2 MHz */
+#define PSRAM_INIT_READ_DCYC  5u   /* DQS-gated LC = 5 (device power-up default, */
+                                   /*   NOT the ST LC-1: LC-1 opens the capture   */
+                                   /*   window a clock early and misses the burst) */
+#define PSRAM_INIT_DLYB_UNIT  64u  /* reads MRs cleanly at 53.2 MHz */
+
+/* Operating point: 133 MHz Fixed Latency (shipped default). */
+#define PSRAM_PRESCALER    1u      /* DCR2.PRESCALER -> /2 = 133 MHz */
+#define PSRAM_MR0_OP       0x24u   /* Fixed Latency LC8, 1/2 drive (ST U585 ref) */
+#define PSRAM_READ_DCYC    8u      /* matches Fixed LC8 */
+#define PSRAM_WRITE_DCYC   4u      /* WLC-1; psram_wtune confirms 4 at 133 MHz */
+#define PSRAM_DLYB_SEL     3u
+#define PSRAM_DLYB_UNIT    8u      /* centre of the 133 MHz mmap eye [0..20] */
+
+/* APS6408 power-up default MR0 (variable LC5, 1/4 drive) -- what the device
+ * holds after a Global Reset, before the Fixed-Latency MR0 write. */
 #define PSRAM_MR0_RESET    0x09u
-
-/* Read DCYC = LC = 5, NOT the ST driver's LatencyCode-1 convention: board #2
- * pscan (26.6 MHz, cold boot) showed DQS-gated reads return ZERO bytes (BUSY
- * wedge) at DCYC=4 and clean stable data at DCYC=5..10 -- the LC-1 value made
- * the DQS capture window open one clock early and miss the burst entirely.
- * Write latency has no DQS feedback; WLC5-1=4 kept until psram_wtune says
- * otherwise. */
-#define PSRAM_READ_DCYC    5u
-#define PSRAM_WRITE_DCYC   4u
 
 /* Split mmap transactions every 32 bytes.  This stays below tCEM and prevents
  * the device's mandatory 1 KB row wrap from aliasing linear CPU accesses. */
@@ -68,14 +90,6 @@
 
 /* AP Memory IO6 alternate function. */
 #define PSRAM_IO6_AF       GPIO_AF10_OCTOSPIM_P1
-
-/* Validated read-sampling point at 26.6 AND 53.2 MHz (full 8MB pass).  NB:
- * `psram eye` consistently SCORES unit 8 as best, but the unit-8 state it
- * then applies breaks subsequent mmap traffic at the same clock (in-scan vs
- * post-scan discrepancy, unexplained -- see PSRAM_DEBUG_HANDOVER.md).  Do
- * not replace this point from an eye run without a full `psram test` pass. */
-#define PSRAM_DLYB_SEL     3u
-#define PSRAM_DLYB_UNIT    64u
 
 /* ------------------------------------------------------------------ *
  *  APS6408 opcodes + OCTOSPI field shorthands
@@ -340,39 +354,28 @@ static int ospi1_reg_read(uint8_t reg, uint8_t *buf, uint32_t n)
 	return 1;
 }
 
-/* Indirect linear read used by DLYB tuning.  It avoids CPU/store-buffer effects
- * and exercises exactly the same DQS-gated DTR read path as mmap. */
-/* Indirect-mode memory write driven through the FIFO (same DTR address/data
- * framing as mmap write).  Used by psram_scan_eye to lay down the read-eye
- * reference marker.  `dqse` selects whether the controller drives DQS (= the
- * APS6408's data-mask pin) during the data phase. */
-static void ospi1_mem_write_ind(uint32_t off, const uint8_t *d, uint32_t n,
-                                uint8_t opcode, int dqse)
+/* Mode-register write (0xC0): reg number in the address, one value byte sent as
+ * the DTR pair (register writes are latency 1, APS6408 datasheet Fig.13). */
+static void ospi1_reg_write(uint8_t reg, uint8_t val)
 {
-	uint32_t i;
-
 	ospi1_wait_not_busy();
 	OCTOSPI1->FCR = OCTOSPI_FCR_CTCF | OCTOSPI_FCR_CTEF;
 	MODIFY_REG(OCTOSPI1->CR, OCTOSPI_CR_FMODE, CR_FMODE_IND_W);
-	OCTOSPI1->DLR = n - 1u;
-	OCTOSPI1->TCR = (psram_wr_dcyc << OCTOSPI_TCR_DCYC_Pos) | OCTOSPI_TCR_DHQC;
-	OCTOSPI1->CCR = ospi1_ccr_opi_addr() | (dqse ? OCTOSPI_CCR_DQSE : 0u);
-	OCTOSPI1->IR  = ospi1_instruction(opcode);
-	OCTOSPI1->AR  = off;
-	/* Feed the FIFO in 32-bit words (little-endian), not bytes: the octal-DTR
-	 * serializer consumes 2 bytes/clock and byte-granular DR pushes are a
-	 * candidate source of byte-lane scramble. */
-	for (i = 0u; i < n; i += 4u) {
-		uint32_t w = 0u, k;
-		for (k = 0u; k < 4u && (i + k) < n; k++)
-			w |= (uint32_t)d[i + k] << (8u * k);
-		ospi1_wait_flag(OCTOSPI_SR_FTF);
-		*(volatile uint32_t *)&OCTOSPI1->DR = w;
-	}
+	OCTOSPI1->DLR = 1u;                     /* 2 bytes (DTR pair) */
+	OCTOSPI1->TCR = 0u;                     /* register write latency 1 */
+	OCTOSPI1->CCR = ospi1_ccr_opi_addr();
+	OCTOSPI1->IR  = ospi1_instruction(APS6408_WRITE_REG_CMD);
+	OCTOSPI1->AR  = reg;
+	ospi1_wait_flag(OCTOSPI_SR_FTF);
+	*(volatile uint8_t *)&OCTOSPI1->DR = val;
+	ospi1_wait_flag(OCTOSPI_SR_FTF);
+	*(volatile uint8_t *)&OCTOSPI1->DR = val;
 	ospi1_wait_flag(OCTOSPI_SR_TCF);
 	OCTOSPI1->FCR = OCTOSPI_FCR_CTCF;
 }
 
+/* Indirect linear read used by DLYB tuning.  It avoids CPU/store-buffer effects
+ * and exercises exactly the same DQS-gated DTR read path as mmap. */
 static int ospi1_mem_read_ind(uint32_t off, uint8_t *d, uint32_t n)
 {
 	uint32_t i;
@@ -435,8 +438,9 @@ static void psram_gpio_init(void)
 /* ------------------------------------------------------------------ *
  *  OCTOSPI1 delay block (DLYB) -- centres the read data-eye sampling
  * ------------------------------------------------------------------ */
-#define DLYB_SELECTS  12u                /* phase taps (DLYB_MAX_SELECT) */
-#define DLYB_UNITS    128u               /* delay-line units (DLYB_MAX_UNIT) */
+#define DLYB_SELECTS  12u                /* phase taps (DLYB_MAX_SELECT).  The
+                                          * unit axis is swept by `psram mmapscan`
+                                          * over PSRAM_SCAN_COLS*PSRAM_SCAN_STEP. */
 
 static uint32_t dlyb_sel;                /* live phase select [1..12] */
 static uint32_t dlyb_unit;               /* live delay-line length [0..127] */
@@ -458,7 +462,8 @@ static void dlyb_apply(uint32_t sel, uint32_t unit)
  * block's INPUT is the DQS line itself (RM0468 ch.27), so an FRCK-based length
  * measurement has nothing to measure (the earlier scan ran with a dead unit=0
  * line and scored 0 everywhere).  The only workable tuning is exhaustive:
- * sweep (phase, unit) and score each point by real reads (psram_scan_eye). */
+ * sweep (phase, unit) and validate each by real memory-mapped reads
+ * (`psram mmapscan`). */
 
 /* Leave any active memory-mapped mode, then (re)program the memory-mapped read
  * (CCR/IR/TCR) and write (WCCR/WIR/WTCR) configs with the given dummy-cycle
@@ -501,7 +506,20 @@ static void psram_mmap_enter(uint32_t rd_dcyc, uint32_t wr_dcyc)
  * ------------------------------------------------------------------ */
 int psram_hw_init(void)
 {
+	uint8_t pair[2];
+
 	psram_gpio_init();
+
+	/* Stage 1 -- bring up at the safe INIT clock (53.2 MHz).  Reset the live
+	 * knobs to the INIT/power-up values so a `psram init` re-run after a
+	 * diagnostic sweep starts from a clean, deterministic state. */
+	psram_rd_dcyc  = PSRAM_INIT_READ_DCYC;
+	psram_wr_dcyc  = PSRAM_WRITE_DCYC;
+	psram_presc    = PSRAM_INIT_PRESCALER;
+	psram_mr0_cur  = PSRAM_MR0_RESET;
+	psram_rd_extra = OCTOSPI_TCR_DHQC;
+	psram_inst_dtr = 0u;
+	psram_reg_dqse = 1u;
 
 	/* OCTOSPI1 device config.  MTYP = AP Memory (RM0468 sec 25.7.2), DEVSIZE=22
 	 * (2^23 = 8 MB), and DLYB engaged for DQS input sampling. */
@@ -512,10 +530,10 @@ int psram_hw_init(void)
 	                                                         * > APS6408 tCPH, write-
 	                                                         * recovery insurance */
 	               ;
-	OCTOSPI1->DCR2 = (PSRAM_PRESCALER << OCTOSPI_DCR2_PRESCALER_Pos);
+	OCTOSPI1->DCR2 = (PSRAM_INIT_PRESCALER << OCTOSPI_DCR2_PRESCALER_Pos);
 	OCTOSPI1->DCR3 = (PSRAM_CSBOUND << OCTOSPI_DCR3_CSBOUND_Pos);
 	OCTOSPI1->DCR4 = (PSRAM_REFRESH << OCTOSPI_DCR4_REFRESH_Pos);
-	dlyb_apply(PSRAM_DLYB_SEL, PSRAM_DLYB_UNIT);
+	dlyb_apply(PSRAM_DLYB_SEL, PSRAM_INIT_DLYB_UNIT);
 	OCTOSPI1->CR   = CR_BASE;               /* enable, indirect mode */
 
 	/* R13 is DNP, so PG2 cannot drive the PSRAM RESET# pin.  Use the official
@@ -528,35 +546,47 @@ int psram_hw_init(void)
 		return 0;
 	}
 
-	/* Keep the power-up mode registers and read an even-addressed register pair.
+	/* Read an even-addressed register pair (device present + vendor/density).
 	 * H72x ES0491 2.8.4 clears AR[0] and DLR[0] for DTR indirect reads, so
-	 * one-byte reads and odd mode-register addresses are not valid. */
-	{
-		uint8_t pair[2];
-		if (!ospi1_reg_read(APS6408_MR0, pair, 2u)) {
-			psram_stage = PSRAM_STAGE_MR0;
-			psram_fail_diag = psram_last_diag;
-			psram_up = 0;
-			return 0;
-		}
-		psram_mr0_cur = pair[0];
-		psram_id[0] = pair[1];
-		if (!ospi1_reg_read(APS6408_MR2, pair, 2u)) {
-			psram_stage = PSRAM_STAGE_MR2;
-			psram_fail_diag = psram_last_diag;
-			psram_up = 0;
-			return 0;
-		}
-		psram_id[1] = pair[0];
+	 * one-byte reads and odd mode-register addresses are not valid.  These reads
+	 * run at 53.2 MHz on the power-up variable latency (matches INIT_READ_DCYC). */
+	if (!ospi1_reg_read(APS6408_MR0, pair, 2u)) {
+		psram_stage = PSRAM_STAGE_MR0;
+		psram_fail_diag = psram_last_diag;
+		psram_up = 0;
+		return 0;
 	}
+	psram_mr0_cur = pair[0];
+	psram_id[0] = pair[1];
+	if (!ospi1_reg_read(APS6408_MR2, pair, 2u)) {
+		psram_stage = PSRAM_STAGE_MR2;
+		psram_fail_diag = psram_last_diag;
+		psram_up = 0;
+		return 0;
+	}
+	psram_id[1] = pair[0];
 	psram_stage = PSRAM_STAGE_OK;
 
-	/* Configure + enter memory-mapped mode with the LIVE latency values (equal to
-	 * the defaults at boot) so a `psram set` + `psram init` retry sequence works
-	 * without a reflash. */
-	psram_mmap_enter(psram_rd_dcyc, psram_wr_dcyc);
-
+	/* Enter mmap at the INIT point, then flag ready so the operating-point
+	 * switch below can use the psram_set_* helpers (they gate on psram_up). */
+	psram_mmap_enter(PSRAM_INIT_READ_DCYC, PSRAM_WRITE_DCYC);
 	psram_up = 1;
+
+	/* Stage 2 -- switch to the operating point.  ORDER MATTERS: write MR0 while
+	 * still at the safe 53.2 MHz clock (a register write at 133 MHz corrupts),
+	 * THEN raise the clock, set the matching controller latency, and re-centre
+	 * the DLYB.  The intermediate (wrong-DLYB) states are never read -- the first
+	 * mmap access after psram_set_phase() sees the fully-applied operating point.
+	 * This mirrors psram_mmapscan_boot()'s clean per-unit apply. */
+#if PSRAM_MR0_OP != PSRAM_MR0_RESET
+	psram_set_mr0(PSRAM_MR0_OP);
+#endif
+#if PSRAM_PRESCALER != PSRAM_INIT_PRESCALER
+	psram_set_prescaler(PSRAM_PRESCALER);
+#endif
+	psram_set_latency(PSRAM_READ_DCYC, PSRAM_WRITE_DCYC);
+	psram_set_phase(PSRAM_DLYB_SEL, PSRAM_DLYB_UNIT);
+
 	return 1;
 }
 
@@ -668,8 +698,20 @@ uint32_t psram_get_read_flags(void)
 }
 
 /* Re-write the APS6408 read-latency register MR0 (device-side latency code) and
- * re-enter mmap, to sweep the device latency without a reflash. */
+ * re-enter mmap, to sweep the device latency without a reflash.  E.g. #16 tries
+ * the ST U585 reference config MR0=0x24 (Fixed Latency LC8, matches read dummy
+ * 8) to remove the variable-latency refresh-pushout jitter at high clock. */
 uint32_t psram_get_mr0(void) { return psram_mr0_cur; }
+
+void psram_set_mr0(uint32_t val)
+{
+	if (!psram_up)
+		return;
+	psram_pause();
+	ospi1_reg_write(APS6408_MR0, (uint8_t)val);
+	psram_mr0_cur = val;
+	psram_resume();
+}
 
 /* Bypass (1) or engage (0) the read delay block at runtime, at the currently
  * applied phase/unit.  DCR1.DLYBYP is only ever written with the OCTOSPI
@@ -687,97 +729,7 @@ void psram_dlyb_bypass(int bypass)
 	psram_resume();
 }
 
-/* Read-eye exhaustive tuning.  A 32-byte high-transition marker catches data
- * errors that a single-register check misses.  counts[sel] packs the best
- * full-marker pass count in bits[7:0] and its unit in bits[15:8].  The globally
- * best (phase, unit) remains applied.  NB (issue #16): the scan reliably SCORES
- * a low unit as best, but applying it can break subsequent mmap traffic at the
- * same clock (unexplained in-scan vs post-scan discrepancy) -- do not adopt an
- * eye result as the operating point without a full `psram test` pass. */
-uint32_t psram_scan_eye(uint32_t counts[13], uint32_t trials)
-{
-	static const uint8_t marker[32] = {
-		0x10,0x23,0x45,0x67,0x89,0xAB,0xCD,0xEF,
-		0x00,0xFF,0x55,0xAA,0x96,0x69,0x3C,0xC3,
-		0x7E,0x81,0x18,0xE7,0x42,0xBD,0x24,0xDB,
-		0x0F,0xF0,0x33,0xCC,0x5A,0xA5,0x66,0x99
-	};
-	static uint8_t eye_nonce;
-	uint8_t expect[sizeof marker];
-	uint8_t got[sizeof marker];
-	const uint32_t off = PSRAM_SIZE_BYTES - 64u;
-	uint32_t sel, u, t, i, n;
-	uint32_t best = 0u, best_cnt = 0u, best_score = 0u, best_unit = 0u;
-
-	if (!psram_up || trials == 0u)
-		return 0u;
-
-	/* Fold a per-run nonce into the marker: the scan writes the SAME offset
-	 * every run, so without it a silently-failing write reads back the stale
-	 * marker from an earlier (slower-clock) run and fakes a perfect eye. */
-	eye_nonce += 0x35u;
-	for (i = 0u; i < sizeof marker; i++)
-		expect[i] = marker[i] ^ eye_nonce;
-
-	/* Leave mmap and engage DLYB.  Write the reference once; changing DLYB affects
-	 * only the DQS input path, so every candidate reads identical device data. */
-	__DSB();
-	OCTOSPI1->CR |= OCTOSPI_CR_ABORT;
-	n = SPIN; while ((OCTOSPI1->CR & OCTOSPI_CR_ABORT) && n) n--;
-	ospi1_wait_not_busy();
-	OCTOSPI1->FCR = OCTOSPI_FCR_CTCF | OCTOSPI_FCR_CTEF;
-	OCTOSPI1->CR = 0u;
-	OCTOSPI1->DCR1 &= ~OCTOSPI_DCR1_DLYBYP;
-	OCTOSPI1->CR = CR_BASE;
-	ospi1_mem_write_ind(off, expect, sizeof expect,
-	                    APS6408_WRITE_LINEAR_CMD, 1);
-
-	for (sel = 1u; sel <= DLYB_SELECTS; sel++) {
-		uint32_t sel_cnt = 0u, sel_score = 0u, sel_unit = 0u;
-		for (u = 0u; u < DLYB_UNITS; u += 8u) {
-			uint32_t cnt = 0u, score = 0u;
-			OCTOSPI1->CR = 0u;
-			dlyb_apply(sel, u);
-			OCTOSPI1->CR = CR_BASE;
-			for (t = 0u; t < trials; t++) {
-				uint32_t match = 0u;
-				if (ospi1_mem_read_ind(off, got, sizeof got))
-					for (i = 0u; i < sizeof marker; i++)
-						if (got[i] == expect[i])
-							match++;
-				score += match;
-				if (match == sizeof marker)
-					cnt++;
-			}
-			if (cnt > sel_cnt || (cnt == sel_cnt && score > sel_score)) {
-				sel_cnt = cnt;
-				sel_score = score;
-				sel_unit = u;
-			}
-			if (cnt > best_cnt || (cnt == best_cnt && score > best_score)) {
-				best_cnt = cnt;
-				best_score = score;
-				best = sel;
-				best_unit = u;
-			}
-		}
-		counts[sel] = (sel_cnt & 0xFFu) | ((sel_unit & 0xFFu) << 8);
-	}
-
-	OCTOSPI1->CR = 0u;
-	if (best_score != 0u) {
-		dlyb_apply(best, best_unit);
-	} else {
-		OCTOSPI1->DCR1 |= OCTOSPI_DCR1_DLYBYP;
-		dlyb_sel = 0u;
-		best = 0u;
-	}
-	OCTOSPI1->CR = CR_BASE;
-	psram_mmap_enter(psram_rd_dcyc, psram_wr_dcyc);
-	return best;
-}
-
-/* Write-latency tuner: once the read eye is trusted (psram_scan_eye), sweep the
+/* Write-latency tuner: once the read eye is trusted (`psram mmapscan`), sweep the
  * memory-mapped write dummy count 0..15, writing two marker words per setting
  * and reading them back (DSB drains the M7 store buffer so the readback really
  * comes from the device, not store-forwarding).  Repeats each setting `reps`
@@ -972,4 +924,181 @@ uint32_t psram_snap_pins(struct psram_pin *out, uint32_t max)
 		out[i].name = name[i];
 	}
 	return n;
+}
+
+/* ------------------------------------------------------------------ *
+ *  mmapscan: reset-persistent DLYB sweep validated against MEMORY-MAPPED
+ *  access (issue #16)
+ * ------------------------------------------------------------------ *
+ * An indirect-read DLYB eye is both non-predictive of the mmap eye
+ * AND corrupts the DLYB across a full unit sweep (RM0468 sec 27: SEN-pulsing the
+ * uncalibrated delay line decalibrates it).  The only authoritative validator is
+ * a real mmap read, but a wrong DLYB stalls the AXI bus with no timeout -> hang.
+ *
+ * mmapscan sidesteps both problems: it tests ONE DLYB unit per boot, applied
+ * from the just-run psram_hw_init clean state (a single, clean dlyb_apply), and
+ * persists its progress in reset-persistent DTCM.  A PASS records the bit and
+ * software-resets to the next unit; a HANG is caught by the IWDG (armed here)
+ * whose reset lands back in this function, where the un-passed-but-tested bit
+ * marks the unit FAILED before advancing.  The whole unit axis is thus swept
+ * across auto-reboots, mapping the true mmap eye without a reflash or a hang that
+ * needs human intervention.  Runs in main() before tx_kernel_enter (headless:
+ * the sweep boots never reach USB/shell). */
+#define PSRAM_SCAN_MAGIC_ACTIVE  0x50534D31u   /* "PSM1" -- sweep running */
+#define PSRAM_SCAN_MAGIC_DONE    0x50534D30u   /* "PSM0" -- sweep complete */
+
+#if BSP_ENABLE_IWDG
+extern void iwdg_init(void);                   /* app/iwdg.c: arm IWDG1 (~3 s) */
+#endif
+
+/* Reset-persistent (DTCM NOLOAD, survives a system reset, lost on POR). */
+static struct psram_scan_state psram_scan
+	__attribute__((section(".log_noinit.psram_scan")));
+
+/* DTCM stores need a read-back to durably land across a reset (issue #13). */
+static void psram_scan_persist(void)
+{
+	volatile uint32_t *p = (volatile uint32_t *)&psram_scan;
+	uint32_t i;
+
+	__DSB();
+	for (i = 0u; i < sizeof psram_scan / 4u; i++)
+		(void)p[i];
+	__DSB();
+}
+
+/* 4 KB memory-mapped write/verify: returns 1 on a clean round-trip, 0 on a
+ * mismatch.  A DLYB that cannot sample the read data stalls the AXI bus here --
+ * that hang is the expected "unit fails" signal, caught by the IWDG. */
+static uint32_t psram_scan_mmap_ok(void)
+{
+	volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)PSRAM_BASE_ADDR;
+	uint32_t i;
+
+	for (i = 0u; i < 1024u; i++)
+		p[i] = PSRAM_BASE_ADDR + i * 4u;
+	__DSB();
+	for (i = 0u; i < 1024u; i++)
+		if (p[i] != PSRAM_BASE_ADDR + i * 4u)
+			return 0u;
+	for (i = 0u; i < 1024u; i++)
+		p[i] = (i & 1u) ? 0xAAAAAAAAu : 0x55555555u;
+	__DSB();
+	for (i = 0u; i < 1024u; i++)
+		if (p[i] != ((i & 1u) ? 0xAAAAAAAAu : 0x55555555u))
+			return 0u;
+	return 1u;
+}
+
+void psram_mmapscan_boot(void)
+{
+	uint32_t presc, phase, rd, wr, ulo, ustep, ncand, idx, unit;
+
+	if (psram_scan.magic != PSRAM_SCAN_MAGIC_ACTIVE)
+		return;                          /* no sweep in progress */
+	if (!psram_up) {                     /* device didn't come up: abort sweep */
+		psram_scan.magic = PSRAM_SCAN_MAGIC_DONE;
+		psram_scan_persist();
+		return;
+	}
+
+	presc = psram_scan.cfg & 0xFFu;
+	phase = (psram_scan.cfg >> 8) & 0xFFu;
+	rd    = (psram_scan.cfg >> 16) & 0xFFu;
+	wr    = (psram_scan.cfg >> 24) & 0xFFu;
+	ulo   = psram_scan.rng & 0xFFu;
+	ustep = (psram_scan.rng >> 8) & 0xFFu;
+	ncand = (psram_scan.rng >> 16) & 0xFFu;
+	idx   = (psram_scan.rng >> 24) & 0xFFu;
+
+	/* A tested-but-not-passed current candidate means it hung last boot (a PASS
+	 * would have advanced idx before resetting): it is already recorded FAILED,
+	 * so step past it. */
+	if (idx < ncand && (psram_scan.tested & (1u << idx)) &&
+	    !(psram_scan.passed & (1u << idx)))
+		idx++;
+
+	if (idx >= ncand) {                  /* complete: keep results, boot normally */
+		psram_scan.magic = PSRAM_SCAN_MAGIC_DONE;
+		psram_scan.rng = (psram_scan.rng & 0x00FFFFFFu) | (idx << 24);
+		psram_scan_persist();
+		return;
+	}
+
+	/* Apply this candidate.  psram_hw_init() has already raised the clock to the
+	 * shipped operating point, so FIRST drop back to the safe INIT clock -- a
+	 * register (MR0) write at a high clock corrupts -- then write the scan's
+	 * intended MR0 (always, so a variable-latency 0x09 scan is reproducible, not
+	 * just the shipped Fixed 0x24), then raise to the scan clock, set the
+	 * controller dummy, and centre the DLYB (a single clean dlyb_apply). */
+	psram_set_prescaler(PSRAM_INIT_PRESCALER);
+	psram_set_mr0(psram_scan.mr0);
+	if (presc != PSRAM_INIT_PRESCALER)
+		psram_set_prescaler(presc);
+	psram_set_latency(rd, wr);
+	unit = ulo + idx * ustep;
+	psram_set_phase(phase, unit);
+
+	/* Record "testing idx" BEFORE the risky access: a hang's IWDG reset returns
+	 * here with tested[idx] set and passed[idx] clear. */
+	psram_scan.tested |= (1u << idx);
+	psram_scan.rng = (psram_scan.rng & 0x00FFFFFFu) | (idx << 24);
+	psram_scan_persist();
+
+#if BSP_ENABLE_IWDG
+	iwdg_init();                         /* ~3 s: recovers a hanging mmap read */
+#endif
+
+	if (psram_scan_mmap_ok())
+		psram_scan.passed |= (1u << idx);
+	psram_scan.rng = (psram_scan.rng & 0x00FFFFFFu) | ((idx + 1u) << 24);
+	psram_scan_persist();
+
+	NVIC_SystemReset();                  /* clean-state boot for the next unit */
+}
+
+/* Start a sweep at the CURRENT clock/latency/MR0 over DLYB units
+ * [ulo .. ulo+(ncand-1)*ustep] on `phase`.  Persists the plan and resets into
+ * psram_mmapscan_boot() -- does not return.  0 on bad params (returns then). */
+int psram_mmapscan_start(uint32_t phase, uint32_t ulo, uint32_t ustep,
+                         uint32_t ncand)
+{
+	if (!psram_up || phase < 1u || phase > 12u || ustep == 0u ||
+	    ncand == 0u || ncand > 32u ||
+	    ulo + (ncand - 1u) * ustep > 127u)
+		return 0;
+
+	psram_scan.cfg = (psram_presc & 0xFFu)
+	               | ((phase & 0xFFu) << 8)
+	               | ((psram_rd_dcyc & 0xFFu) << 16)
+	               | ((psram_wr_dcyc & 0xFFu) << 24);
+	psram_scan.rng = (ulo & 0xFFu) | ((ustep & 0xFFu) << 8)
+	               | ((ncand & 0xFFu) << 16) | (0u << 24);   /* idx = 0 */
+	psram_scan.tested = 0u;
+	psram_scan.passed = 0u;
+	/* Store the FULL current MR0 (0x24 Fixed, 0x09 variable, ...); the boot loop
+	 * re-writes it verbatim at the safe clock every candidate, so any latency
+	 * mode is reproducible. */
+	psram_scan.mr0 = psram_mr0_cur & 0xFFu;
+	psram_scan.magic = PSRAM_SCAN_MAGIC_ACTIVE;
+	psram_scan_persist();
+	NVIC_SystemReset();
+	return 1;                            /* not reached */
+}
+
+void psram_mmapscan_stop(void)
+{
+	psram_scan.magic = 0u;
+	psram_scan_persist();
+}
+
+int psram_mmapscan_get(struct psram_scan_state *out)
+{
+	if (out == NULL)
+		return 0;
+	if (psram_scan.magic != PSRAM_SCAN_MAGIC_ACTIVE &&
+	    psram_scan.magic != PSRAM_SCAN_MAGIC_DONE)
+		return 0;
+	*out = psram_scan;
+	return (psram_scan.magic == PSRAM_SCAN_MAGIC_DONE) ? 2 : 1;
 }

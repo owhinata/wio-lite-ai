@@ -43,13 +43,16 @@ Mode") with line editing, history, and Tab completion. 19 commands:
   not touch DBGMCU to freeze it under debug).
 - **`coremark`** — EEMBC CoreMark. **≈2333 (4.24 CoreMark/MHz)** with both L1 caches on.
 - **`membench`** — DWT-cycle-precise read/write/copy bandwidth + pointer-chase
-  latency for DTCM / AXI-SRAM (cached vs refill) / internal + external flash.
+  latency for DTCM / AXI-SRAM (cached vs refill) / PSRAM / internal + external flash.
 - **`psram`** — the on-board **8 MB APS6408 Octal DDR PSRAM** on OCTOSPI1, memory-mapped
-  at `0x90000000` (see *Key design points*). `psram info` shows the bring-up state,
-  `psram test [bytes]` write/verifies patterns over the window (default all 8 MB), and a
-  set of bring-up/diagnostic subcommands (`probe`/`pscan`/`snap`/`pins`/`eye`/`wtune`/
-  `set`/`phase`/`clk`/…) sweep latency, delay-block phase, and clock without a reflash —
-  they work even when the bring-up failed (fail-soft, `psram init` retries it).
+  at `0x90000000`, running **133 MHz Fixed Latency** (≈113 read / 154 write MB/s; see
+  *Key design points*). `psram info` shows the bring-up state, `psram test [bytes]`
+  write/verifies patterns over the window (default all 8 MB), and a set of
+  bring-up/diagnostic subcommands (`probe`/`pscan`/`snap`/`pins`/`mmapscan`/
+  `wtune`/`set`/`phase`/`mr0`/`clk`/…) sweep latency, delay-block phase, mode registers,
+  and clock without a reflash — they work even when the bring-up failed (fail-soft,
+  `psram init` retries it). `mmapscan` maps the true memory-mapped read eye across
+  auto-reboots (issue #16).
 
 ## Key design points
 
@@ -67,17 +70,23 @@ Mode") with line editing, history, and Tab completion. 19 commands:
   configured between I- and D-cache enable), so future DMA peripherals
   (camera/SD/eth) can place their buffers there coherently — new regions go in
   `mpu_regions[]` rather than per-transfer cache maintenance.
-- **PSRAM (issue #3)**: `app/psram.c` brings up the **APS6408L Octal DDR PSRAM on
-  OCTOSPI1** (memory-mapped 8 MB @ `0x90000000`) without touching OCTOSPI2/OCTOSPIM/
-  RCC, so it is XIP-safe. Board-validated operating point: **53.2 MHz** (kernel
-  266 MHz / 5), read dummy **5 = latency code LC** (the ST driver's LC−1 convention
-  makes the DQS-gated capture window open a clock early and miss the whole burst),
-  write dummy 4, DLYB phase 3 / unit 64, power-up default mode registers (no MR
-  writes). Init uses the datasheet 4-clock Global Reset (RESET# is not wired on
-  this board) and is fail-soft: bounded polls, no unbounded mmap reads on an
-  unresponsive device (an unanswered DQS-gated mmap read stalls the AXI bus until
-  the IWDG resets — the diagnostic sweeps read back via the abortable indirect
-  path instead).
+- **PSRAM (issues #3 / #16)**: `app/psram.c` brings up the **APS6408L Octal DDR PSRAM
+  on OCTOSPI1** (memory-mapped 8 MB @ `0x90000000`) without touching OCTOSPI2/OCTOSPIM/
+  RCC, so it is XIP-safe. Shipped operating point: **133 MHz Fixed Latency** (kernel
+  266 MHz / 2), MR0 = 0x24 (Fixed LC8), read dummy 8, write dummy 4, DLYB phase 3 /
+  unit 8 — ≈2.4× the 53.2 MHz point (113 read / 154 write MB/s). High clocks *require*
+  Fixed Latency: the power-up variable latency's refresh push-out jitter collapses the
+  read eye to nothing at 133 MHz. Because register writes are only reliable at low
+  clock, `psram_hw_init()` is **two-stage**: Global Reset + mode-register reads + the
+  MR0 write all run at a safe 53.2 MHz, then it raises the clock and re-centres the
+  DLYB. Read dummy = the datasheet latency code LC (not the ST driver's LC−1, which
+  opens the DQS-gated capture window a clock early and misses the burst). Init uses the
+  datasheet 4-clock Global Reset (RESET# is not wired) and is fail-soft: bounded polls,
+  no unbounded mmap reads on an unresponsive device (an unanswered DQS-gated mmap read
+  stalls the AXI bus until the IWDG resets — diagnostics read back via the abortable
+  indirect path, and `psram mmapscan` maps the true mmap eye across IWDG-recovered
+  auto-reboots). Two lower points (88.7 MHz, 53.2 MHz) are documented at the `PSRAM_*`
+  defines for a wider-margin rebuild.
 - **ThreadX**: SysTick priority **>** PendSV (PendSV lowest) so the tick can preempt
   the idle PendSV spin; PRIMASK-based critical sections. The shared SysTick feeds
   both `HAL_IncTick` and `_tx_timer_interrupt` (`port/threadx/tx_glue.c`).
@@ -137,7 +146,7 @@ boot/       standalone USB DFU bootloader (internal 0x08000000) — see boot/REA
 | Region | Address | Notes |
 |---|---|---|
 | FLASH (XIP) | `0x70000000` | external OCTOSPI2. Chip is 16 MB; the **app owns the first 8 MB** (boot validates writes there), the upper 8 MB is reserved for a future filesystem. |
-| PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 53.2 MHz; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). |
+| PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). |
 | AXI-SRAM (D1) | `0x24000000` | 320 KB; `_estack = 0x24050000` (the MSP the bootloader loads). |
 | DTCM | `0x20000000` | 128 KB; holds the reset-persistent `.log_noinit` crash-log ring + `membench` scratch (bypasses the D-cache). |
 | ITCM | `0x00000000` | 64 KB. |

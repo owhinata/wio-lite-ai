@@ -154,16 +154,51 @@ void psram_set_phase(uint32_t sel, uint32_t unit);
 /* Read-path timing flags (bit0=SSHIFT, bit1=DHQC), for `psram info`. */
 uint32_t psram_get_read_flags(void);
 
-/* APS6408 read-latency register MR0 (device-side latency code), for `psram
- * info`.  Reflects the power-up default unless a diagnostic changed it. */
+/* APS6408 read-latency register MR0 (device-side latency code): getter for
+ * `psram info`, and a diagnostic writer (`psram mr0`) to try e.g. Fixed Latency
+ * LC8 (0x24) -- deterministic read timing to widen the eye at high clock (#16).
+ * Verify with `psram probe 0` (MA0 D0 = MR0). */
 uint32_t psram_get_mr0(void);
+void psram_set_mr0(uint32_t val);
 
-/* Read-eye scan: write one 32-byte marker, then score all DLYB points through
- * repeated full-marker reads.  Fills counts[1..12], leaves the best phase/unit
- * applied (reverts to bypass when nothing scores), and returns its phase.
- * See the note in psram.c: an eye result must survive `psram test` before being
- * adopted as the operating point (issue #16). */
-uint32_t psram_scan_eye(uint32_t counts[13], uint32_t trials);
+/* mmapscan (issue #16): reset-persistent DLYB sweep validated against real
+ * memory-mapped access.  cfg/rng pack the plan and progress into two words so
+ * the whole struct is a handful of DTCM words (read-back-persisted, #13):
+ *   cfg = presc[7:0] | phase[15:8] | rd_dcyc[23:16] | wr_dcyc[31:24]
+ *   rng = unit_lo[7:0] | unit_step[15:8] | ncand[23:16] | idx[31:24]
+ * tested/passed are per-candidate bitmaps; mr0 is the device MR0 to write (0 =
+ * keep the power-up default). */
+struct psram_scan_state {
+	uint32_t magic;
+	uint32_t cfg;
+	uint32_t rng;
+	uint32_t tested;
+	uint32_t passed;
+	uint32_t mr0;
+};
+
+/* Boot hook: run one sweep step (called from main() after psram_hw_init(),
+ * before tx_kernel_enter()).  Returns immediately unless a sweep is active. */
+void psram_mmapscan_boot(void);
+
+/* Start a sweep at the CURRENT clock/latency/MR0 over `ncand` DLYB units
+ * [ulo .. ulo+(ncand-1)*ustep] on `phase`; persists and system-resets into the
+ * boot loop (does not return on success).  Returns 0 on bad params. */
+int psram_mmapscan_start(uint32_t phase, uint32_t ulo, uint32_t ustep,
+                         uint32_t ncand);
+
+/* Abort a sweep so the next boot comes up normally. */
+void psram_mmapscan_stop(void);
+
+/* Copy the sweep state for `psram mmapscan show`.  0 = no sweep recorded,
+ * 1 = active, 2 = complete. */
+int psram_mmapscan_get(struct psram_scan_state *out);
+
+/* Read-eye scan granularity: DLYB unit is swept 0..(COLS-1)*STEP in STEP-sized
+ * columns (issue #16).  32 columns of step 4 span the full 0..124 unit range at
+ * 4-unit resolution -- fine enough to locate the passing window's centre. */
+#define PSRAM_SCAN_STEP  4u
+#define PSRAM_SCAN_COLS  32u
 
 /* Write-latency tuner: sweep mmap write dummy 0..15 with marker write+readback
  * (x`reps` each); returns a pass bitmask (bit d = dummy d round-tripped) and
