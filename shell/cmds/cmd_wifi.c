@@ -12,6 +12,7 @@
  *   wifi log           bridge the LOG UART (UART9 @115200) <-> console
  *   wifi probe         reset the module and capture its boot log from t=0
  *   wifi at [baud]     bridge the AT/HS UART (USART1) <-> console (AT default 38400)
+ *   wifi rpc [baud]    eRPC link test: round-trip rpc_system_ack (default 2 Mbaud, #5)
  *
  * The bridge takes over the console (issue #50 raw API): RTL8720DN RX bytes stream
  * to the CDC console and console keystrokes go to the module's TX, so the operator
@@ -22,6 +23,7 @@
  */
 #include "cli.h"
 #include "rtl8720.h"
+#include "erpc.h"
 
 #include <stdint.h>
 
@@ -174,6 +176,63 @@ static int cmd_wifi_at(struct cli_instance *sh, int argc, char **argv)
 	return wifi_bridge_run(sh, RTL8720_UART_AT, baud, false);
 }
 
+/* wifi rpc [baud]: eRPC link bring-up (issue #5).  Power on the RTL8720DN, open the
+ * eRPC UART (USART1, default 2 Mbaud = the factory firmware's Serial3) and round-trip
+ * a byte through rpc_system_ack -- a valid CRC-framed echo proves the eRPC link
+ * (transport + framing + codec + the Serial3<->USART1 mapping) end to end. */
+static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
+{
+	uint32_t baud = 2000000u;
+	uint8_t echoed = 0u;
+	struct erpc_diag diag = {0}, total = {0};
+	int rc = -1, tries;
+
+	if (argc >= 2 && (parse_u32(argv[1], &baud) != 0 ||
+	    baud < 2400u || baud > 2000000u)) {
+		cli_error(sh, "wifi: bad baud (2400..2000000)\r\n");
+		return 1;
+	}
+	if (!rtl8720_powered()) {
+		cli_print(sh, "wifi: powering on RTL8720DN, waiting ~1.5s for boot...\r\n");
+		rtl8720_power(true);
+		if (cli_sleep(sh, 1500u))          /* cancellable boot wait */
+			return 1;
+	}
+	if (rtl8720_uart_open(RTL8720_UART_AT, baud) != 0) {
+		cli_error(sh, "wifi: USART1 @%lu did not come ready\r\n", (unsigned long)baud);
+		return 1;
+	}
+	cli_print(sh, "wifi: eRPC link test (USART1 @%lu, rpc_system_ack 0x5A)...\r\n",
+	          (unsigned long)baud);
+
+	for (tries = 0; tries < 5; tries++) {
+		rc = erpc_system_ack(0x5Au, &echoed, &diag);
+		total.crc_fail               += diag.crc_fail;
+		total.oversize               += diag.oversize;
+		total.timeout                += diag.timeout;
+		total.skipped_reply          += diag.skipped_reply;
+		total.unsupported_invocation += diag.unsupported_invocation;
+		if (rc == 0 && echoed == 0x5Au)
+			break;
+		if (cli_sleep(sh, 50u))            /* brief gap; Ctrl+C aborts */
+			break;
+	}
+	rtl8720_uart_close();
+
+	if (rc == 0 && echoed == 0x5Au) {
+		cli_print(sh, "wifi: eRPC OK -- ack 0x5A -> 0x%02X, link up @%lu (%d tries)\r\n",
+		          echoed, (unsigned long)baud, tries + 1);
+	} else {
+		cli_error(sh, "wifi: eRPC FAILED -- ack 0x5A -> 0x%02X (rc %d)\r\n", echoed, rc);
+	}
+	cli_print(sh, "  diag: crc_fail %u oversize %u timeout %u skipped %u unsupported %u\r\n",
+	          total.crc_fail, total.oversize, total.timeout, total.skipped_reply,
+	          total.unsupported_invocation);
+	if (!(rc == 0 && echoed == 0x5Au))
+		cli_print(sh, "  hint: try `wifi rpc 614400`, or `wifi probe` to confirm boot\r\n");
+	return (rc == 0 && echoed == 0x5Au) ? 0 : 1;
+}
+
 CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(info,  NULL, "show RTL8720 wiring + CHIP_EN state",       cmd_wifi_info,  1, 0),
 	CLI_CMD_ARG(on,    NULL, "CHIP_EN high (power on RTL8720)",           cmd_wifi_on,    1, 0),
@@ -182,6 +241,7 @@ CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(log,   NULL, "bridge LOG UART (UART9 @115200)",           cmd_wifi_log,   1, 0),
 	CLI_CMD_ARG(probe, NULL, "reset + capture boot log from t=0",         cmd_wifi_probe, 1, 0),
 	CLI_CMD_ARG(at,    NULL, "bridge AT UART (USART1) [baud, default 38400]", cmd_wifi_at, 1, 1),
+	CLI_CMD_ARG(rpc,   NULL, "eRPC link test (rpc_system_ack) [baud, default 2M]", cmd_wifi_rpc, 1, 1),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(wifi, wifi_subcmds,

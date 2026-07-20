@@ -297,6 +297,7 @@ add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/mpu.c"
     "${CMAKE_SOURCE_DIR}/app/psram.c"
     "${CMAKE_SOURCE_DIR}/app/rtl8720.c"
+    "${CMAKE_SOURCE_DIR}/app/erpc.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
     "${CMAKE_SOURCE_DIR}/src/system_stm32h7xx.c"
     "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"

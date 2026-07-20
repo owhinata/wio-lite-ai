@@ -25,7 +25,7 @@ Mode") with line editing, history, and Tab completion. 20 commands:
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
-| wireless | `wifi` (info/on/off/reset/log/probe/at) |
+| wireless | `wifi` (info/on/off/reset/log/probe/at/rpc) |
 | benchmarks | `coremark` · `membench` |
 
 - **`thread`** — lists the ThreadX threads with state / stack use and a **`top`-style
@@ -61,6 +61,12 @@ Mode") with line editing, history, and Tab completion. 20 commands:
   `AT` commands; `wifi on`/`off`/`reset`/`log` control power and open a live bridge.
   Register-only (GPIO + UART9/USART1 clock gates); the baud is derived from the
   inherited PCLK2 = 137.5 MHz — it never touches the RCC clock tree.
+  `wifi rpc [baud]` (default 2 Mbaud) is the **eRPC link test** (issue #5): the
+  factory firmware is Seeed's eRPC image (UART @2 Mbaud on its `Serial3` = USART1),
+  and this round-trips a byte through `rpc_system_ack` — a valid CRC-framed echo
+  proves the eRPC transport end to end. It is the foundation for the WiFi/BLE
+  (NetXDuo) work: a hand-written clean-room C eRPC client (`app/erpc.c`) speaking the
+  firmware's exact wire format (FramedTransport + BasicCodec + CRC16/0xEF4A).
 
 ## Key design points
 
