@@ -17,7 +17,7 @@ and the app **inherits its clock tree** — see *Key design points*.
 ## What it does
 
 Presents a `wio> ` prompt on **`/dev/ttyACM0`** (USB CDC, `0483:5740`, "CDC in FS
-Mode") with line editing, history, and Tab completion. 20 commands:
+Mode") with line editing, history, and Tab completion. 21 commands:
 
 | Group | Commands |
 |---|---|
@@ -25,7 +25,7 @@ Mode") with line editing, history, and Tab completion. 20 commands:
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
-| wireless | `wifi` (info/on/off/reset/log/probe/rpc · connect/status/disconnect) |
+| wireless | `wifi` (L2: info/on/off/reset/log/probe/rpc · connect/status/disconnect) · `net` (L3: info/ip/dhcp/ping) |
 | benchmarks | `coremark` · `membench` |
 
 - **`thread`** — lists the ThreadX threads with state / stack use and a **`top`-style
@@ -75,6 +75,18 @@ Mode") with line editing, history, and Tab completion. 20 commands:
   eRPC subcommands take the console (`cli_console_claim`) for single-owner access to
   the SPSC RX ring. Register-only on the STM32 side (GPIO + UART clock gates, baud from
   the inherited PCLK2 = 137.5 MHz) — it never touches the RCC clock tree.
+- **`net`** — the IPv4 (L3) layer on top of a `wifi connect` association (issue #5),
+  the Wio port of `../stm32f746g-disco`'s `net` command. Where f746 drives NetX Duo over
+  the on-chip Ethernet MAC, here the backend is the RTL8720DN's **eRPC socket-offload**
+  (`app/wifi_rpc.c`) — the module runs lwIP internally, so `net` is L3-only and the L2
+  side (power + association) stays in `wifi`. `net info` shows link + MAC + IP/mask/gw
+  (and dhcp-vs-static); `net ip <a.b.c.d/mask> [gw]` sets a static address (stops DHCP);
+  `net dhcp` (re)acquires a lease; `net ping <a.b.c.d> [count]` sends **real ICMP echoes**
+  over a raw socket (`rpc_lwip_socket(SOCK_RAW, IPPROTO_ICMP)`) — the shell builds the
+  ICMP message + checksum itself, and reports a **host-observed RTT** (it includes the
+  two eRPC UART round-trips, not just the network path). ip/dhcp/ping require an active
+  association (they never power the module) and share the same single-owner eRPC session
+  as `wifi`. Pure marshalling on the STM32 side — no RCC/register work.
 
 ## Key design points
 

@@ -35,6 +35,7 @@
 #include "rtl8720.h"
 #include "erpc.h"
 #include "wifi_rpc.h"
+#include "rtl_link.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -65,66 +66,13 @@ static int parse_u32(const char *s, uint32_t *out)
 	return 0;
 }
 
-/* Abort thunk handed to erpc_call_ex(): non-zero once the user pressed Ctrl+C. */
-static int wifi_abort_cb(void *ctx)
-{
-	return cli_cancel_requested((struct cli_instance *)ctx) ? 1 : 0;
-}
-
-/* wifi_link_begin() result. */
-enum { WLINK_READY = 0, WLINK_ERR = 1, WLINK_OFF = 2 };
-
-/* Whether the module's lwIP stack (tcpip_adapter_init = LwIP_Init) has been brought
- * up since its last power-on.  The factory firmware does NOT init lwIP at boot, so
- * the host must -- once per CHIP_EN power cycle (lwIP state survives wifi off/on but
- * not a power cycle).  Reset whenever the module is powered off / reset / freshly
- * powered on, set after a successful wifi_rpc_tcpip_init(). */
-static bool g_wifi_tcpip_inited;
-
 /*
- * Claim the console (single owner of the SPSC RX ring / one eRPC call in flight),
- * ensure the module is powered, and open the eRPC UART (USART1 @2 Mbaud).
- *   @power_on true : power the module and wait for boot if it is off (for `connect`).
- *   @power_on false: if the module is off, release and return WLINK_OFF so the
- *                    caller can report "powered off" without powering it (status /
- *                    disconnect are pure queries).
- * Returns WLINK_READY with the console claimed + UART open (caller must
- * wifi_link_end()), WLINK_OFF (nothing claimed), or WLINK_ERR (nothing claimed,
- * message already printed).
+ * The RTL8720DN eRPC session helpers (rtl_link_begin/end), the Ctrl+C abort thunk
+ * (rtl_abort_cb) and the module's host-tracked lwIP / IP-mode lifecycle state live in
+ * rtl_link.{c,h} so the `net` (L3) command shares one console/RX-ring owner and one
+ * copy of that state with `wifi` (L2).  This file keeps only the L2 (power /
+ * association / probe) commands.
  */
-static int wifi_link_begin(struct cli_instance *sh, bool power_on)
-{
-	if (cli_console_claim(sh) != 0) {              /* bg-reject / single owner */
-		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
-		return WLINK_ERR;
-	}
-	if (!rtl8720_powered()) {
-		if (!power_on) {
-			cli_console_release(sh);
-			return WLINK_OFF;
-		}
-		cli_print(sh, "wifi: powering on RTL8720DN, waiting ~1.5s for boot...\r\n");
-		rtl8720_power(true);
-		g_wifi_tcpip_inited = false;           /* fresh boot: lwIP not yet up */
-		if (cli_sleep(sh, 1500u)) {            /* cancellable boot wait */
-			cli_console_release(sh);
-			return WLINK_ERR;
-		}
-	}
-	if (rtl8720_uart_open(RTL8720_UART_AT, 2000000u) != 0) {
-		cli_console_release(sh);
-		cli_error(sh, "wifi: USART1 @2000000 did not come ready\r\n");
-		return WLINK_ERR;
-	}
-	return WLINK_READY;
-}
-
-/* Tear down a wifi_link_begin() session (close the UART, release the console). */
-static void wifi_link_end(struct cli_instance *sh)
-{
-	rtl8720_uart_close();
-	cli_console_release(sh);
-}
 
 /*
  * Open one RTL8720DN UART and run a bidirectional bridge to the console until the
@@ -159,7 +107,8 @@ static int wifi_bridge_run(struct cli_instance *sh, enum rtl8720_uart which,
 	          name, (unsigned long)baud, do_reset ? " (reset first)" : "");
 	if (do_reset) {
 		rtl8720_reset();                        /* Low->High edge AFTER we listen */
-		g_wifi_tcpip_inited = false;            /* power-cycled: lwIP must be re-inited */
+		rtl_tcpip_set_inited(false);            /* power-cycled: lwIP must be re-inited */
+		rtl_set_ip_mode(RTL_IP_UNKNOWN);        /* and any address is gone */
 	}
 	cli_rx_flush(sh);                               /* drop console type-ahead */
 
@@ -218,8 +167,10 @@ static int cmd_wifi_on(struct cli_instance *sh, int argc, char **argv)
 	(void)argc; (void)argv;
 	if (wifi_power_claim(sh))
 		return 1;
-	if (!rtl8720_powered())
-		g_wifi_tcpip_inited = false;           /* fresh power-on: lwIP not yet up */
+	if (!rtl8720_powered()) {
+		rtl_tcpip_set_inited(false);           /* fresh power-on: lwIP not yet up */
+		rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	}
 	rtl8720_power(true);
 	cli_console_release(sh);
 	cli_print(sh, "wifi: CHIP_EN high (RTL8720DN powered on)\r\n");
@@ -232,7 +183,8 @@ static int cmd_wifi_off(struct cli_instance *sh, int argc, char **argv)
 	if (wifi_power_claim(sh))
 		return 1;
 	rtl8720_power(false);
-	g_wifi_tcpip_inited = false;               /* module state lost on power-off */
+	rtl_tcpip_set_inited(false);               /* module state lost on power-off */
+	rtl_set_ip_mode(RTL_IP_UNKNOWN);
 	cli_console_release(sh);
 	cli_print(sh, "wifi: CHIP_EN low (RTL8720DN powered off)\r\n");
 	return 0;
@@ -244,7 +196,8 @@ static int cmd_wifi_reset(struct cli_instance *sh, int argc, char **argv)
 	if (wifi_power_claim(sh))
 		return 1;
 	rtl8720_reset();
-	g_wifi_tcpip_inited = false;               /* power-cycled: lwIP must be re-inited */
+	rtl_tcpip_set_inited(false);               /* power-cycled: lwIP must be re-inited */
+	rtl_set_ip_mode(RTL_IP_UNKNOWN);
 	cli_console_release(sh);
 	cli_print(sh, "wifi: reset (CHIP_EN low 80 ms -> high)\r\n");
 	return 0;
@@ -287,7 +240,8 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 	if (!rtl8720_powered()) {
 		cli_print(sh, "wifi: powering on RTL8720DN, waiting ~1.5s for boot...\r\n");
 		rtl8720_power(true);
-		g_wifi_tcpip_inited = false;       /* fresh boot: lwIP not yet up */
+		rtl_tcpip_set_inited(false);       /* fresh boot: lwIP not yet up */
+		rtl_set_ip_mode(RTL_IP_UNKNOWN);
 		if (cli_sleep(sh, 1500u)) {         /* cancellable boot wait */
 			cli_console_release(sh);
 			return 1;
@@ -355,10 +309,10 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 		security = pass ? WIFI_RPC_SEC_WPA2_AES_PSK : WIFI_RPC_SEC_OPEN;
 	}
 
-	if (wifi_link_begin(sh, true) != WLINK_READY)
+	if (rtl_link_begin(sh, true) != RTL_LINK_READY)
 		return 1;
 
-	o.should_abort = wifi_abort_cb;
+	o.should_abort = rtl_abort_cb;
 	o.abort_ctx    = sh;
 	o.diag         = &diag;
 
@@ -366,7 +320,7 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 	 * WiFi driver (re)binds in step 1: the factory firmware never inits lwIP at boot
 	 * (setup() only calls wifi_init()), so without this the STA netif never exists and
 	 * LwIP_DHCP(DHCP_START) blocks forever.  Once per power-on (state survives off/on). */
-	if (!g_wifi_tcpip_inited) {
+	if (!rtl_tcpip_inited()) {
 		o.timeout_ms = 5000u;
 		rc = wifi_rpc_tcpip_init(&o, &result);
 		if (rc || result != WIFI_RPC_OK) {
@@ -374,7 +328,7 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 			          rc, (long)result);
 			goto fail;
 		}
-		g_wifi_tcpip_inited = true;
+		rtl_tcpip_set_inited(true);
 	}
 
 	/* 1) STA mode.  Boot leaves WiFi running in RTW_MODE_NONE, and wifi_on() then
@@ -418,6 +372,7 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "wifi: DHCP failed (rc %d, result %ld)\r\n", rc, (long)result);
 		goto fail;
 	}
+	rtl_set_ip_mode(RTL_IP_DHCP);               /* address obtained via DHCP */
 
 	/* 4) read back the assigned address. */
 	o.timeout_ms = 3000u;
@@ -427,7 +382,7 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 		goto fail;
 	}
 
-	wifi_link_end(sh);
+	rtl_link_end(sh);
 	cli_print(sh, "wifi: connected\r\n");
 	cli_print(sh, "  ip   %u.%u.%u.%u\r\n", ip.ip[0], ip.ip[1], ip.ip[2], ip.ip[3]);
 	cli_print(sh, "  mask %u.%u.%u.%u\r\n",
@@ -436,7 +391,7 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 
 fail:
-	wifi_link_end(sh);
+	rtl_link_end(sh);
 	cli_print(sh, "  diag: crc_fail %u oversize %u timeout %u skipped %u unsupported %u\r\n",
 	          diag.crc_fail, diag.oversize, diag.timeout, diag.skipped_reply,
 	          diag.unsupported_invocation);
@@ -453,20 +408,20 @@ static int cmd_wifi_disconnect(struct cli_instance *sh, int argc, char **argv)
 	int rc, link;
 
 	(void)argc; (void)argv;
-	link = wifi_link_begin(sh, false);
-	if (link == WLINK_OFF) {
+	link = rtl_link_begin(sh, false);
+	if (link == RTL_LINK_OFF) {
 		cli_print(sh, "wifi: powered off (nothing to disconnect)\r\n");
 		return 0;
 	}
-	if (link != WLINK_READY)
+	if (link != RTL_LINK_READY)
 		return 1;
 
-	o.should_abort = wifi_abort_cb;
+	o.should_abort = rtl_abort_cb;
 	o.abort_ctx    = sh;
 	o.diag         = &diag;
 	o.timeout_ms   = 5000u;
 	rc = wifi_rpc_disconnect(&o, &result);
-	wifi_link_end(sh);
+	rtl_link_end(sh);
 
 	if (rc || result != WIFI_RPC_OK) {
 		cli_error(sh, "wifi: disconnect failed (rc %d, result %ld)\r\n",
@@ -476,6 +431,7 @@ static int cmd_wifi_disconnect(struct cli_instance *sh, int argc, char **argv)
 		          diag.unsupported_invocation);
 		return 1;
 	}
+	rtl_set_ip_mode(RTL_IP_UNKNOWN);            /* association dropped: no address */
 	cli_print(sh, "wifi: disconnected\r\n");
 	return 0;
 }
@@ -491,15 +447,15 @@ static int cmd_wifi_status(struct cli_instance *sh, int argc, char **argv)
 	int rc, link;
 
 	(void)argc; (void)argv;
-	link = wifi_link_begin(sh, false);
-	if (link == WLINK_OFF) {
+	link = rtl_link_begin(sh, false);
+	if (link == RTL_LINK_OFF) {
 		cli_print(sh, "wifi: powered off (`wifi connect <ssid> ...` to bring up)\r\n");
 		return 0;
 	}
-	if (link != WLINK_READY)
+	if (link != RTL_LINK_READY)
 		return 1;
 
-	o.should_abort = wifi_abort_cb;
+	o.should_abort = rtl_abort_cb;
 	o.abort_ctx    = sh;
 	o.diag         = &diag;
 	o.timeout_ms   = 3000u;
@@ -507,7 +463,7 @@ static int cmd_wifi_status(struct cli_instance *sh, int argc, char **argv)
 	rc = wifi_rpc_is_connected(&o, &connected);
 	if (rc) {
 		cli_error(sh, "wifi: query failed (rc %d)\r\n", rc);
-		wifi_link_end(sh);
+		rtl_link_end(sh);
 		return 1;
 	}
 	cli_print(sh, "wifi: %s\r\n",
@@ -528,7 +484,7 @@ static int cmd_wifi_status(struct cli_instance *sh, int argc, char **argv)
 			          ip.gw[0], ip.gw[1], ip.gw[2], ip.gw[3]);
 		}
 	}
-	wifi_link_end(sh);
+	rtl_link_end(sh);
 	return 0;
 }
 

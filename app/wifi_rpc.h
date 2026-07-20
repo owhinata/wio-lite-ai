@@ -93,7 +93,46 @@ int wifi_rpc_get_rssi(const struct wifi_rpc_opts *o, int32_t *rssi, int32_t *res
 int wifi_rpc_get_mac(const struct wifi_rpc_opts *o, char mac[18], int32_t *result);
 int wifi_rpc_tcpip_init(const struct wifi_rpc_opts *o, int32_t *result);
 int wifi_rpc_dhcpc_start(const struct wifi_rpc_opts *o, uint32_t itf, int32_t *result);
+int wifi_rpc_dhcpc_stop(const struct wifi_rpc_opts *o, uint32_t itf, int32_t *result);
 int wifi_rpc_get_ip(const struct wifi_rpc_opts *o, uint32_t itf,
                     struct wifi_ip_info *ip, int32_t *result);
+/* Set a static address (rpc_tcpip_adapter_set_ip_info); @ip fields are network byte
+ * order (as get_ip returns them).  Stop DHCP first so it will not overwrite it. */
+int wifi_rpc_set_ip_info(const struct wifi_rpc_opts *o, uint32_t itf,
+                         const struct wifi_ip_info *ip, int32_t *result);
+
+/*
+ * ---- raw BSD-socket offload (rpc_wifi_lwip, service 16), for `net ping` ----
+ *
+ * DIFFERENT return convention from the calls above: these mirror lwIP's own syscall
+ * return, NOT the module int32 `result`.  The @fd / @ret out-parameter holds the
+ * syscall's value directly -- fd >= 0 or a byte count on success, < 0 on error (call
+ * wifi_rpc_lwip_errno() for the reason).  The function's int return is still the
+ * transport code: 0 (round-trip ok, @fd/@ret valid), a negative erpc_call_ex code
+ * (-1/-2/-4) or WIFI_RPC_EDECODE (malformed reply).
+ */
+int wifi_rpc_lwip_socket(const struct wifi_rpc_opts *o, int32_t domain, int32_t type,
+                         int32_t protocol, int32_t *fd);
+/* Set a socket option (rpc_lwip_setsockopt).  @level / @optname are passed straight to
+ * the module's lwip_setsockopt(), so use lwIP's numeric constants (e.g. SOL_SOCKET
+ * 0xfff, SO_RCVTIMEO 0x1006 with a 4-byte int millisecond @optval).  NOTE: the factory
+ * rpc_lwip_recv/recvfrom IGNORE their timeout argument and block, so a caller that
+ * needs a bounded receive MUST set SO_RCVTIMEO here first (else a no-reply recv wedges
+ * the module's single-threaded eRPC server until `wifi reset`). */
+int wifi_rpc_lwip_setsockopt(const struct wifi_rpc_opts *o, int32_t s, int32_t level,
+                             int32_t optname, const uint8_t *optval, uint16_t optlen,
+                             int32_t *ret);
+int wifi_rpc_lwip_sendto(const struct wifi_rpc_opts *o, int32_t s,
+                         const uint8_t *data, uint16_t dlen, int32_t flags,
+                         const uint8_t *sa, uint16_t salen, int32_t *ret);
+/* Blocking receive up to @timeout_ms on the module side.  On a round-trip the received
+ * datagram (mem, incl. the IPv4 header for a raw socket) is copied into @buf (fails
+ * WIFI_RPC_EDECODE rather than truncating if it exceeds @buf_cap), its length in @got,
+ * and the raw recvfrom() return in @ret.  The source address is decoded and discarded. */
+int wifi_rpc_lwip_recvfrom(const struct wifi_rpc_opts *o, int32_t s,
+                           uint8_t *buf, uint16_t buf_cap, int32_t flags,
+                           uint32_t timeout_ms, uint16_t *got, int32_t *ret);
+int wifi_rpc_lwip_close(const struct wifi_rpc_opts *o, int32_t s, int32_t *ret);
+int wifi_rpc_lwip_errno(const struct wifi_rpc_opts *o, int32_t *err);
 
 #endif /* APP_WIFI_RPC_H */
