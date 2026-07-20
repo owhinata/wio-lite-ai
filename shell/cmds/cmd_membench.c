@@ -437,14 +437,6 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 		bw_row(sh, "SRAM   ( 4KB, cached)", sram_bench_buf, SRAM_CACHED_BYTES / 4u, clk, 1);
 		bw_row(sh, "SRAM   (64KB, refill)", sram_bench_buf, SRAM_BENCH_BYTES / 4u, clk, 1);
 	}
-	if (do_flash) {
-		if (cli_cancel_requested(sh)) goto done;
-		bw_row(sh, "Flash  int (64KB)", (uint32_t *)IFLASH_BENCH_BASE,
-		       FLASH_BENCH_BYTES / 4u, clk, 0);
-		if (cli_cancel_requested(sh)) goto done;
-		bw_row(sh, "Flash  ext (64KB)", (uint32_t *)EFLASH_BENCH_BASE,
-		       FLASH_BENCH_BYTES / 4u, clk, 0);
-	}
 #if BSP_ENABLE_PSRAM
 	/* PSRAM is scratch RAM (writable) behind the MPU non-cacheable window, so
 	 * both directions measure the raw OCTOSPI1 rate -- no cache step. */
@@ -464,37 +456,75 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 		}
 	}
 #endif
-
-	/* latency (DTCM/SRAM only; Flash is read-only so it has no pointer-chase row) */
-	if (do_dtcm || do_sram) {
-		cli_print(sh, "\r\nlatency (ns/access, dependent-load chain, 64B stride)\r\n");
-		if (do_dtcm) {
-			if (cli_cancel_requested(sh)) goto done;
-			char d[12];
-			fmt_ns(d, sizeof d, lat_ns10(dtcm_bench_buf, DTCM_BENCH_BYTES, clk));
-			cli_print(sh, "  %-22s %8s\r\n", "DTCM   ( 4KB)", d);
-		}
-		if (do_sram) {
-			if (cli_cancel_requested(sh)) goto done;
-			char sc[12], sr[12];
-			fmt_ns(sc, sizeof sc, lat_ns10(sram_bench_buf, SRAM_CACHED_BYTES, clk));
-			cli_print(sh, "  %-22s %8s\r\n", "SRAM   ( 4KB, cached)", sc);
-			fmt_ns(sr, sizeof sr, lat_ns10(sram_bench_buf, SRAM_BENCH_BYTES, clk));
-			cli_print(sh, "  %-22s %8s\r\n", "SRAM   (64KB, refill)", sr);
-		}
-	}
-#if BSP_ENABLE_PSRAM
-	if (do_psram && psram_ready()) {
+	if (do_flash) {
 		if (cli_cancel_requested(sh)) goto done;
-		if (psram_acquire()) {
-			char pl[12];
-			fmt_ns(pl, sizeof pl, lat_ns10((uint32_t *)PSRAM_BASE_ADDR,
-			                               PSRAM_BENCH_BYTES, clk));
-			psram_release();
-			cli_print(sh, "  %-22s %8s\r\n", "PSRAM  (64KB)", pl);
-		}
+		bw_row(sh, "Flash  int (64KB)", (uint32_t *)IFLASH_BENCH_BASE,
+		       FLASH_BENCH_BYTES / 4u, clk, 0);
+		if (cli_cancel_requested(sh)) goto done;
+		bw_row(sh, "Flash  ext (64KB)", (uint32_t *)EFLASH_BENCH_BASE,
+		       FLASH_BENCH_BYTES / 4u, clk, 0);
 	}
+
+	/* latency vs. working-set size (pointer-chase; Flash is read-only, no row).
+	 * One row per size, one column per region -- the cache cliff shows as the
+	 * SRAM column jumping from the L1-hit rate to the AXI-refill rate once the
+	 * set overflows the 16 KB D-cache, while DTCM (TCM, uncached) and PSRAM
+	 * (non-cacheable) stay flat.  DTCM stops at its 4 KB buffer. */
+	{
+		static const uint32_t sizes_kb[] = { 1u, 2u, 4u, 8u, 16u, 32u, 64u };
+		size_t si;
+		int lat_psram = 0;
+
+#if BSP_ENABLE_PSRAM
+		if (do_psram && psram_ready())
+			lat_psram = psram_acquire();   /* held across the whole column */
 #endif
+		if (do_dtcm || do_sram || lat_psram) {
+			cli_print(sh, "\r\nlatency (ns/access, pointer-chase, 64B stride)\r\n");
+			cli_print(sh, "  %6s", "wss");
+			if (do_dtcm)   cli_print(sh, " %8s", "DTCM");
+			if (do_sram)   cli_print(sh, " %8s", "SRAM");
+			if (lat_psram) cli_print(sh, " %8s", "PSRAM");
+			cli_print(sh, "\r\n");
+
+			for (si = 0u; si < sizeof sizes_kb / sizeof sizes_kb[0]; si++) {
+				uint32_t wss = sizes_kb[si] * 1024u;
+				char cell[12];
+
+				if (cli_cancel_requested(sh)) {
+#if BSP_ENABLE_PSRAM
+					if (lat_psram) psram_release();
+#endif
+					goto done;
+				}
+				cli_print(sh, "  %4lu KB", (unsigned long)sizes_kb[si]);
+				if (do_dtcm) {
+					if (wss <= DTCM_BENCH_BYTES) {
+						fmt_ns(cell, sizeof cell,
+						       lat_ns10(dtcm_bench_buf, wss, clk));
+						cli_print(sh, " %8s", cell);
+					} else
+						cli_print(sh, " %8s", "--");
+				}
+				if (do_sram) {
+					fmt_ns(cell, sizeof cell,
+					       lat_ns10(sram_bench_buf, wss, clk));
+					cli_print(sh, " %8s", cell);
+				}
+#if BSP_ENABLE_PSRAM
+				if (lat_psram) {
+					fmt_ns(cell, sizeof cell,
+					       lat_ns10((uint32_t *)PSRAM_BASE_ADDR, wss, clk));
+					cli_print(sh, " %8s", cell);
+				}
+#endif
+				cli_print(sh, "\r\n");
+			}
+		}
+#if BSP_ENABLE_PSRAM
+		if (lat_psram) psram_release();
+#endif
+	}
 
 done:
 	free(sram_raw);        /* NULL when SRAM was not benched (free(NULL) is a no-op) */
