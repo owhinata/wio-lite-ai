@@ -33,6 +33,7 @@
  */
 #include "cli.h"
 #include "rtl8720.h"
+#include "rtl8720_flash.h"
 #include "erpc.h"
 #include "wifi_rpc.h"
 #include "rtl_link.h"
@@ -488,6 +489,80 @@ static int cmd_wifi_status(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
+/* wifi flashprobe [hold_us] (issue #19, M1): prove RTL8720DN UART download-mode ENTRY
+ * without touching flash.  Drives the strap (PD14) + reset (PC3) to enter download mode,
+ * then issues the read-only download read-word command and checks for the framed reply.
+ * Tries raw framing first (matches the pvvx reference tool), then SLIP as an exploratory
+ * probe.  ALWAYS power-cycles the module back to its normal eRPC firmware on exit.  No
+ * erase / no write -- fully reversible (the mask-ROM download mode is re-enterable). */
+static int cmd_wifi_flashprobe(struct cli_instance *sh, int argc, char **argv)
+{
+	uint32_t hold_us = 30000u;                 /* board #2: 2ms too short, 20ms latches (M1) */
+	struct rtl_dl_result res_raw, res_slip;
+	const struct rtl_dl_result *hit = NULL;
+	int rc, slip_tried = 0, i;
+
+	if (argc >= 2 && (parse_u32(argv[1], &hold_us) != 0 || hold_us > 50000u)) {
+		cli_error(sh, "wifi: bad hold_us (0..50000)\r\n");
+		return 1;
+	}
+	if (cli_console_claim(sh) != 0) {          /* bg-reject / single owner, HW untouched */
+		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+		return 1;
+	}
+
+	cli_print(sh, "wifi: entering RTL8720 UART download mode "
+	          "(strap PD14 low / reset PC3, hold %luus)...\r\n", (unsigned long)hold_us);
+	rc = rtl_dl_enter(hold_us, rtl_abort_cb, sh);
+	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto recover; }
+	if (rc != 0)  { cli_error(sh, "wifi: UART9 did not come ready (rc %d)\r\n", rc); goto recover; }
+
+	rc = rtl_dl_probe(0, 500u, rtl_abort_cb, sh, &res_raw);   /* raw first (pvvx-style) */
+	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto recover; }
+	if (res_raw.entered) {
+		hit = &res_raw;
+	} else {
+		slip_tried = 1;                    /* exploratory: is the framing SLIP? */
+		rc = rtl_dl_probe(1, 500u, rtl_abort_cb, sh, &res_slip);
+		if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto recover; }
+		if (res_slip.entered)
+			hit = &res_slip;
+	}
+
+	if (hit) {
+		cli_print(sh, "wifi: DOWNLOAD MODE ENTERED (%s framing)\r\n",
+		          hit->slip ? "SLIP" : "raw");
+		cli_print(sh, "  read-word @0x00082000 = 0x%08lX%s\r\n", (unsigned long)hit->word,
+		          hit->word == 0x00082021u ? "  (flashloader stub already resident)" : "");
+	} else {
+		cli_print(sh, "wifi: download mode NOT entered (no framed reply)\r\n");
+		cli_print(sh, "  hint: retry with a longer strap hold, e.g. `wifi flashprobe 50000`\r\n");
+	}
+	cli_print(sh, "  raw rx (%d B):", res_raw.raw_len);
+	for (i = 0; i < res_raw.raw_len; i++)
+		cli_print(sh, " %02X", res_raw.raw[i]);
+	cli_print(sh, "\r\n");
+	if (slip_tried) {
+		cli_print(sh, "  slip rx (%d B):", res_slip.raw_len);
+		for (i = 0; i < res_slip.raw_len; i++)
+			cli_print(sh, " %02X", res_slip.raw[i]);
+		cli_print(sh, "\r\n");
+	}
+	if (res_raw.overflows)
+		cli_print(sh, "  uart9 overflows: %lu\r\n", (unsigned long)res_raw.overflows);
+
+recover:
+	/* Always: close UART9, power-cycle the module back to its normal eRPC firmware, and
+	 * invalidate the host-tracked lwIP / IP state (the module rebooted). */
+	rtl8720_uart_close();
+	rtl8720_reset();
+	rtl_tcpip_set_inited(false);
+	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	cli_console_release(sh);
+	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
+	return hit ? 0 : 1;
+}
+
 CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(info,  NULL, "show RTL8720 wiring + CHIP_EN state",       cmd_wifi_info,  1, 0),
 	CLI_CMD_ARG(on,    NULL, "CHIP_EN high (power on RTL8720)",           cmd_wifi_on,    1, 0),
@@ -499,6 +574,7 @@ CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(connect,    NULL, "associate + DHCP: connect <ssid> [pw] [sec_hex]", cmd_wifi_connect,    2, 2),
 	CLI_CMD_ARG(disconnect, NULL, "drop the current WiFi association",     cmd_wifi_disconnect, 1, 0),
 	CLI_CMD_ARG(status,     NULL, "show connection state / RSSI / IP / MAC", cmd_wifi_status, 1, 0),
+	CLI_CMD_ARG(flashprobe, NULL, "probe RTL8720 UART download-mode entry [hold_us]", cmd_wifi_flashprobe, 1, 1),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(wifi, wifi_subcmds,

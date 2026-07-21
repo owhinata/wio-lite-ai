@@ -299,6 +299,7 @@ add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/mpu.c"
     "${CMAKE_SOURCE_DIR}/app/psram.c"
     "${CMAKE_SOURCE_DIR}/app/rtl8720.c"
+    "${CMAKE_SOURCE_DIR}/app/rtl8720_flash.c"
     "${CMAKE_SOURCE_DIR}/app/erpc.c"
     "${CMAKE_SOURCE_DIR}/app/wifi_rpc.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
