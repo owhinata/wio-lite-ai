@@ -272,6 +272,30 @@ endif()
 configure_file("${CMAKE_SOURCE_DIR}/cmake/cli_version.h.in"
                "${GEN_DIR}/cli_version.h" @ONLY)
 
+# RTL8720DN download flashloader stub (issue #19 M2): the on-device flasher
+# (app/rtl8720_flash.c) uploads this Realtek AmebaD ROM flashloader into the module's
+# SRAM.  It is a Realtek-proprietary blob, so it is NOT committed -- embed it at
+# configure time from _ref/ambd/ (git-ignored) into GEN_DIR.  Fail loudly if absent
+# rather than building a non-functional flasher.
+set(RTL_FLASHLOADER_BIN "${CMAKE_SOURCE_DIR}/_ref/ambd/imgtool_flashloader_amebad.bin")
+if(NOT EXISTS "${RTL_FLASHLOADER_BIN}")
+    message(FATAL_ERROR
+        "Missing ${RTL_FLASHLOADER_BIN}\n"
+        "  Place imgtool_flashloader_amebad.bin (4688 B AmebaD flashloader, load 0x00082000)\n"
+        "  there, e.g. from github.com/Seeed-Studio/ambd_flash_tool or\n"
+        "  github.com/openshwprojects/SharpRTL872xTool (issue #19).")
+endif()
+file(READ "${RTL_FLASHLOADER_BIN}" _RTL_FL_HEX HEX)
+string(LENGTH "${_RTL_FL_HEX}" _RTL_FL_HEXLEN)
+math(EXPR _RTL_FL_LEN "${_RTL_FL_HEXLEN} / 2")
+string(REGEX REPLACE "(..)" "0x\\1," _RTL_FL_ARRAY "${_RTL_FL_HEX}")
+file(WRITE "${GEN_DIR}/rtl8720_flashloader_data.c"
+"/* AUTO-GENERATED at configure time from _ref/ambd/imgtool_flashloader_amebad.bin.\n"
+" * Do NOT edit and do NOT commit -- it is a Realtek-proprietary blob (issue #19 M2). */\n"
+"#include <stdint.h>\n"
+"const uint8_t rtl8720_flashloader[] = { ${_RTL_FL_ARRAY} };\n"
+"const uint32_t rtl8720_flashloader_len = ${_RTL_FL_LEN};\n")
+
 # IWDG watchdog (issue #4): ON builds in the IWDG1 arming + priority-5 petter thread
 # + the `wdt` starve test; OFF compiles them out entirely (`wdt info` then reports
 # "disabled (build)").  Turn OFF for SWD sessions that must hold a breakpoint longer
@@ -300,6 +324,7 @@ add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/psram.c"
     "${CMAKE_SOURCE_DIR}/app/rtl8720.c"
     "${CMAKE_SOURCE_DIR}/app/rtl8720_flash.c"
+    "${GEN_DIR}/rtl8720_flashloader_data.c"
     "${CMAKE_SOURCE_DIR}/app/erpc.c"
     "${CMAKE_SOURCE_DIR}/app/wifi_rpc.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"

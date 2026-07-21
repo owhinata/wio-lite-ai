@@ -264,3 +264,280 @@ int rtl_dl_probe(int use_slip, uint32_t timeout_ms,
 	}
 	return 0;
 }
+
+/* ================================================================== *
+ *  M2: flashloader stub upload + flash READ (issue #19)
+ *
+ *  NON-DESTRUCTIVE: this section writes only the module SRAM (the flashloader stub at
+ *  0x00082000) and READS flash (0x20).  It sends NO flash-erase (0x17) and NO flash
+ *  block-write.  The block-transfer helper (dl_send_sram) is private and refuses any
+ *  destination outside the flashloader SRAM window, so no code path here can write flash.
+ *  Protocol reference: pvvx SharpRTL872xTool Program.cs (cited per function).
+ * ================================================================== */
+
+/* Flashloader stub, embedded at build time from _ref/ambd/imgtool_flashloader_amebad.bin
+ * (see CMakeLists.txt; the Realtek blob is not committed). */
+extern const uint8_t  rtl8720_flashloader[];
+extern const uint32_t rtl8720_flashloader_len;
+
+#define RTL_DL_ACK          0x06u
+#define RTL_DL_CAN          0x18u
+#define RTL_DL_SOH          0x01u   /* 128-byte block */
+#define RTL_DL_STX          0x02u   /* 1024-byte block */
+#define RTL_DL_EOT          0x04u
+#define RTL_DL_XMD_START    0x07u
+#define RTL_DL_SETBAUD      0x05u
+#define RTL_DL_READFLASH    0x20u
+#define RTL_DL_STUB_ADDR    0x00082000u
+#define RTL_DL_STUB_ENTRY   0x00082021u   /* read-word @STUB_ADDR when the stub is resident */
+#define RTL_DL_BAUD_IDX_115200   0x0Du
+#define RTL_DL_BAUD_IDX_1500000  0x18u
+
+/* Read bytes, skipping any that are not @want, until @want is seen (WaitResp).
+ * 0 = found, -1 = timeout, -2 = aborted. */
+static int dl_wait_byte(uint8_t want, uint32_t timeout_ms, int (*ab)(void *), void *ctx)
+{
+	ULONG deadline = tx_time_get() + (ULONG)timeout_ms;
+	uint8_t b;
+
+	for (;;) {
+		if (rtl8720_uart_read(&b, 1u) == 1u) {
+			if (b == want)
+				return 0;
+			continue;
+		}
+		if (ab != NULL && ab(ctx))
+			return -2;
+		if ((int32_t)(tx_time_get() - deadline) >= 0)
+			return -1;
+		tx_thread_sleep(1);
+	}
+}
+
+/* Read exactly @n bytes (ReadBytes).  0 ok, -1 timeout, -2 aborted. */
+static int dl_read_exact(uint8_t *buf, uint32_t n, uint32_t timeout_ms,
+                         int (*ab)(void *), void *ctx)
+{
+	ULONG deadline = tx_time_get() + (ULONG)timeout_ms;
+	uint32_t got = 0u;
+
+	while (got < n) {
+		got += (uint32_t)rtl8720_uart_read(buf + got, (size_t)(n - got));
+		if (got >= n)
+			break;
+		if (ab != NULL && ab(ctx))
+			return -2;
+		if ((int32_t)(tx_time_get() - deadline) >= 0)
+			return -1;
+		tx_thread_sleep(1);
+	}
+	return 0;
+}
+
+/* Send @cmd then wait for the ACK 0x06 (WriteCmd).  0 ok, -1 timeout, -2 aborted. */
+static int dl_send_wait_ack(const uint8_t *cmd, uint32_t n, uint32_t timeout_ms,
+                            int (*ab)(void *), void *ctx)
+{
+	rtl8720_uart_write(cmd, (size_t)n);
+	return dl_wait_byte(RTL_DL_ACK, timeout_ms, ab, ctx);
+}
+
+/* read-word @addr (ReadRegs, Program.cs:603-641): 0x31 + addr(u32 LE) -> 0x31 + data + 0x15.
+ * Reads exactly the framed reply (skip to the 0x31 echo, then 5 bytes).  Read-only.
+ * 0 ok (*out set), negative on failure. */
+static int dl_read_word(uint32_t addr, uint32_t *out, int (*ab)(void *), void *ctx)
+{
+	uint8_t cmd[5], rp[5], junk[64];
+	int rr;
+
+	while (rtl8720_uart_read(junk, sizeof(junk)) > 0u)   /* start from a clean boundary */
+		;
+	cmd[0] = 0x31u;
+	cmd[1] = (uint8_t)addr;        cmd[2] = (uint8_t)(addr >> 8);
+	cmd[3] = (uint8_t)(addr >> 16); cmd[4] = (uint8_t)(addr >> 24);
+	rtl8720_uart_write(cmd, sizeof(cmd));
+
+	rr = dl_wait_byte(0x31u, 500u, ab, ctx);
+	if (rr)
+		return rr;                          /* -1 timeout / -2 aborted (propagate) */
+	rr = dl_read_exact(rp, 5u, 500u, ab, ctx);
+	if (rr)
+		return rr;
+	if (rp[4] != 0x15u)
+		return -1;
+	*out = (uint32_t)rp[0] | ((uint32_t)rp[1] << 8) |
+	       ((uint32_t)rp[2] << 16) | ((uint32_t)rp[3] << 24);
+	return 0;
+}
+
+/*
+ * PRIVATE, SRAM-ONLY block transfer (SendXmodem, Program.cs:783-868): 0x07 -> blocks -> 0x04.
+ * block = [cmd][seq][~seq][addr:4LE][data:N(0xFF pad)][csum], csum = (addr4+data) & 0xFF.
+ *
+ * SAFETY (M2 non-destructive): @sram_addr is validated to be exactly the flashloader SRAM
+ * window and MUST NOT carry the flash base (0x08000000).  This function therefore cannot
+ * write flash; the flash-destination block-write is deliberately NOT implemented in M2.
+ * 0 ok, -1 bad args, -2 aborted, -3 no ACK.
+ */
+static int dl_send_sram(const uint8_t *data, uint32_t len, uint32_t sram_addr,
+                        int (*ab)(void *), void *ctx)
+{
+	static uint8_t pkt[3 + 4 + 1024 + 1];   /* function-static: off the 4 KB shell stack */
+	uint8_t start = RTL_DL_XMD_START, eot = RTL_DL_EOT;
+	uint32_t off = 0u;
+	uint8_t seq = 1u;
+
+	if (sram_addr != RTL_DL_STUB_ADDR)          /* only the flashloader SRAM window */
+		return -1;
+	if ((sram_addr & 0x08000000u) != 0u)        /* never a flash address */
+		return -1;
+	if (len == 0u || len > 0x10000u)            /* the stub is ~4.7 KB */
+		return -1;
+
+	if (dl_send_wait_ack(&start, 1u, 500u, ab, ctx))
+		return -2;
+
+	while (off < len) {
+		uint32_t rem  = len - off;
+		uint32_t N    = (rem > 128u) ? 1024u : 128u;
+		uint32_t take = (rem < N) ? rem : N;
+		uint32_t addr = sram_addr + off;
+		uint32_t i, sum = 0u;
+		int rr;
+
+		pkt[0] = (rem > 128u) ? RTL_DL_STX : RTL_DL_SOH;
+		pkt[1] = seq;
+		pkt[2] = (uint8_t)(0xFFu - seq);
+		pkt[3] = (uint8_t)addr;         pkt[4] = (uint8_t)(addr >> 8);
+		pkt[5] = (uint8_t)(addr >> 16); pkt[6] = (uint8_t)(addr >> 24);
+		for (i = 0u; i < N; i++)
+			pkt[7 + i] = (i < take) ? data[off + i] : 0xFFu;
+		for (i = 3u; i < 7u + N; i++)   /* csum over addr(4) + data(N) */
+			sum += pkt[i];
+		pkt[7 + N] = (uint8_t)(sum & 0xFFu);
+
+		rr = dl_send_wait_ack(pkt, 7u + N + 1u, 1000u, ab, ctx);
+		if (rr)
+			return (rr == -2) ? -2 : -3;
+		seq = (uint8_t)(seq + 1u);
+		off += take;
+	}
+
+	if (dl_send_wait_ack(&eot, 1u, 1000u, ab, ctx))
+		return -2;
+	return 0;
+}
+
+int rtl_dl_set_baud(uint32_t baud)
+{
+	uint8_t pkt[2];
+
+	pkt[0] = RTL_DL_SETBAUD;
+	if (baud == 115200u)
+		pkt[1] = RTL_DL_BAUD_IDX_115200;
+	else if (baud == 1500000u)
+		pkt[1] = RTL_DL_BAUD_IDX_1500000;
+	else
+		return -1;                          /* only-board policy: 115200 / 1500000 only */
+
+	/* The ACK comes back at the OLD baud, so wait for it before reopening at the new baud. */
+	if (dl_send_wait_ack(pkt, 2u, 500u, NULL, NULL))
+		return -2;
+	if (rtl8720_uart_open(RTL8720_UART_LOG, baud) != 0)
+		return -3;
+	return 0;
+}
+
+int rtl_dl_load_flashloader(uint32_t target_baud, int (*ab)(void *), void *ctx)
+{
+	uint32_t word = 0u;
+	int rc;
+
+	if (target_baud != 115200u && target_baud != 1500000u)
+		return -1;
+
+	/* Raise to the working baud.  Skip when the target is 115200: we entered download at
+	 * 115200 and the ROM does not ACK a same-baud set (pvvx omits it too). */
+	if (target_baud != 115200u && rtl_dl_set_baud(target_baud))
+		return -2;
+
+	rc = dl_read_word(RTL_DL_STUB_ADDR, &word, ab, ctx);
+	if (rc == -2)
+		return -7;                              /* aborted */
+	if (rc == 0 && word == RTL_DL_STUB_ENTRY)
+		return 0;                               /* stub already resident */
+
+	/* Upload the stub to SRAM (writes SRAM only), then it reboots to 115200. */
+	if (dl_send_sram(rtl8720_flashloader, rtl8720_flashloader_len, RTL_DL_STUB_ADDR, ab, ctx))
+		return -3;
+	if (rtl8720_uart_open(RTL8720_UART_LOG, 115200u) != 0)
+		return -4;
+	tx_thread_sleep(50);                            /* let the stub boot + re-init its UART */
+	if (target_baud != 115200u && rtl_dl_set_baud(target_baud))
+		return -5;
+
+	rc = dl_read_word(RTL_DL_STUB_ADDR, &word, ab, ctx);
+	if (rc == -2)
+		return -7;
+	if (rc != 0 || word != RTL_DL_STUB_ENTRY)
+		return -6;                              /* stub did not come up resident */
+	return 0;
+}
+
+int rtl_dl_read_flash(uint32_t offset, uint32_t nsectors, uint8_t *buf, uint32_t buf_cap,
+                      int (*ab)(void *), void *ctx)
+{
+	static uint8_t blk[2 + 1024 + 1];   /* seq + ~seq + 1024 data + csum (off the stack) */
+	uint8_t hdr[6], junk[64];
+	uint32_t total_blocks, i, copied = 0u;
+
+	if ((offset & 0xFFFu) != 0u || offset > 0x00FFFFFFu)   /* 4 KB-aligned, 24-bit */
+		return -1;
+	if (nsectors == 0u || nsectors > 0x10000u)
+		return -1;
+	total_blocks = nsectors * 4u;                          /* module streams 4 x 1024 / sector */
+
+	while (rtl8720_uart_read(junk, sizeof(junk)) > 0u)      /* clean boundary */
+		;
+	hdr[0] = RTL_DL_READFLASH;
+	hdr[1] = (uint8_t)offset;  hdr[2] = (uint8_t)(offset >> 8);  hdr[3] = (uint8_t)(offset >> 16);
+	hdr[4] = (uint8_t)nsectors; hdr[5] = (uint8_t)(nsectors >> 8);
+	rtl8720_uart_write(hdr, sizeof(hdr));
+
+	for (i = 0u; i < total_blocks; i++) {
+		uint32_t j, sum = 0u, chunk;
+
+		if (dl_wait_byte(RTL_DL_STX, 2000u, ab, ctx))          /* 0x02 block header */
+			return -2;
+		if (dl_read_exact(blk, 2u + 1024u + 1u, 2000u, ab, ctx))  /* seq,~seq,1024,csum */
+			return -2;
+		if (blk[0] != (uint8_t)((i + 1u) & 0xFFu) ||
+		    blk[1] != (uint8_t)(blk[0] ^ 0xFFu))
+			return -3;                                     /* bad block sequence */
+		for (j = 0u; j < 1024u; j++)
+			sum += blk[2 + j];
+		if ((uint8_t)(sum & 0xFFu) != blk[2 + 1024u]) {
+			uint8_t can = RTL_DL_CAN;
+			rtl8720_uart_write(&can, 1u);                  /* abort the stream */
+			return -3;
+		}
+
+		if (copied < buf_cap && buf != NULL) {                 /* keep leading buf_cap bytes */
+			chunk = buf_cap - copied;
+			if (chunk > 1024u)
+				chunk = 1024u;
+			memcpy(buf + copied, blk + 2, chunk);
+			copied += chunk;
+		}
+
+		if (i + 1u < total_blocks) {
+			uint8_t ack = RTL_DL_ACK;
+			rtl8720_uart_write(&ack, 1u);                  /* continue: bare ACK, no wait */
+		} else {
+			uint8_t can = RTL_DL_CAN;                       /* last block: CAN, wait its ACK */
+			if (dl_send_wait_ack(&can, 1u, 1000u, ab, ctx))
+				return -2;
+		}
+	}
+	return (int)copied;
+}

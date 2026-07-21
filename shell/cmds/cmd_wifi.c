@@ -40,6 +40,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 
 /* Parse a 32-bit unsigned: 0x-hex or decimal.  Returns 0 on success. */
 static int parse_u32(const char *s, uint32_t *out)
@@ -563,6 +564,67 @@ recover:
 	return hit ? 0 : 1;
 }
 
+/* wifi flashload [hold_us] [baud] (issue #19, M2): NON-DESTRUCTIVE proof of the next
+ * download-protocol layer.  Enters download mode (M1), uploads the AmebaD flashloader
+ * stub into the module SRAM + raises the link baud, then READS flash sector 0 and checks
+ * the km0_boot magic.  It writes NO flash (SRAM stub + flash read only), so it stays
+ * fully reversible.  ALWAYS power-cycles the module back to its normal eRPC firmware. */
+static int cmd_wifi_flashload(struct cli_instance *sh, int argc, char **argv)
+{
+	static const uint8_t km0_magic[8] = { 0x99, 0x99, 0x96, 0x96, 0x3f, 0xcc, 0x66, 0xfc };
+	uint32_t hold_us = 30000u, baud = 1500000u;
+	uint8_t sect0[128];
+	int rc, ok = 0;
+
+	if (argc >= 2 && (parse_u32(argv[1], &hold_us) != 0 || hold_us > 50000u)) {
+		cli_error(sh, "wifi: bad hold_us (0..50000)\r\n");
+		return 1;
+	}
+	if (argc >= 3 && (parse_u32(argv[2], &baud) != 0 ||
+	    (baud != 115200u && baud != 1500000u))) {
+		cli_error(sh, "wifi: bad baud (115200 or 1500000)\r\n");
+		return 1;
+	}
+	if (cli_console_claim(sh) != 0) {
+		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+		return 1;
+	}
+
+	cli_print(sh, "wifi: download + flashloader (hold %luus, baud %lu, NON-DESTRUCTIVE)...\r\n",
+	          (unsigned long)hold_us, (unsigned long)baud);
+	rc = rtl_dl_enter(hold_us, rtl_abort_cb, sh);
+	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto recover; }
+	if (rc != 0)  { cli_error(sh, "wifi: UART9 did not come ready (rc %d)\r\n", rc); goto recover; }
+
+	rc = rtl_dl_load_flashloader(baud, rtl_abort_cb, sh);
+	if (rc != 0) {
+		cli_error(sh, "wifi: flashloader load failed (rc %d) -- block xfer / baud issue\r\n", rc);
+		goto recover;
+	}
+	cli_print(sh, "wifi: flashloader resident @0x00082000 (read-word 0x00082021), link @%lu\r\n",
+	          (unsigned long)baud);
+
+	rc = rtl_dl_read_flash(0u, 1u, sect0, sizeof(sect0), rtl_abort_cb, sh);
+	if (rc < 0) {
+		cli_error(sh, "wifi: flash read failed (rc %d)\r\n", rc);
+		goto recover;
+	}
+	ok = (rc >= 8 && memcmp(sect0, km0_magic, 8) == 0);
+	cli_print(sh, "wifi: read %d B of flash @0x0; km0_boot magic %s\r\n",
+	          rc, ok ? "OK (99 99 96 96 3f cc 66 fc)" : "MISMATCH");
+	cli_hexdump(sh, sect0, (rc < 64) ? (size_t)rc : 64u);
+
+recover:
+	/* Always: close UART9, power-cycle back to the normal eRPC firmware, invalidate state. */
+	rtl8720_uart_close();
+	rtl8720_reset();
+	rtl_tcpip_set_inited(false);
+	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	cli_console_release(sh);
+	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
+	return ok ? 0 : 1;
+}
+
 CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(info,  NULL, "show RTL8720 wiring + CHIP_EN state",       cmd_wifi_info,  1, 0),
 	CLI_CMD_ARG(on,    NULL, "CHIP_EN high (power on RTL8720)",           cmd_wifi_on,    1, 0),
@@ -575,6 +637,7 @@ CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(disconnect, NULL, "drop the current WiFi association",     cmd_wifi_disconnect, 1, 0),
 	CLI_CMD_ARG(status,     NULL, "show connection state / RSSI / IP / MAC", cmd_wifi_status, 1, 0),
 	CLI_CMD_ARG(flashprobe, NULL, "probe RTL8720 UART download-mode entry [hold_us]", cmd_wifi_flashprobe, 1, 1),
+	CLI_CMD_ARG(flashload,  NULL, "load flashloader + read flash sector0 (non-destructive) [hold] [baud]", cmd_wifi_flashload, 1, 2),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(wifi, wifi_subcmds,

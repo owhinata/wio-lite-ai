@@ -12,8 +12,9 @@
  * a read-only handshake -- it performs the strap+reset sequence, then issues the
  * download protocol's read-word command and checks for the framed reply.  It does NOT
  * erase or write any flash (fully reversible; the RTL8720 mask-ROM download mode is
- * re-enterable, so this cannot brick it).  M2 (protocol body: flashloader upload +
- * erase/write/verify) and M3 (image from microSD) will extend this file.
+ * re-enterable, so this cannot brick it).  M2 adds the flashloader stub upload + flash
+ * READ (still non-destructive -- SRAM write + flash read only); M3 adds erase/write/verify;
+ * M4 adds the microSD image source.
  *
  * Layering: HAL/CMSIS <- rtl8720.c (basic UART/power) <- rtl8720_flash.c (download
  * protocol) <- cmd_wifi.c (shell).  It never touches the RCC clock tree -- only GPIO
@@ -75,5 +76,36 @@ int rtl_dl_enter(uint32_t hold_us, int (*should_abort)(void *ctx), void *abort_c
 int rtl_dl_probe(int use_slip, uint32_t timeout_ms,
                  int (*should_abort)(void *ctx), void *abort_ctx,
                  struct rtl_dl_result *r);
+
+/* ---- M2: flashloader stub + flash read (non-destructive: SRAM write + flash READ) ---- */
+
+/*
+ * Raise the download-link baud.  ONLY 115200 or 1500000 are accepted (the only-board
+ * policy -- not the full AmebaD baud table).  Sends the set-baud command (its ACK
+ * arrives at the OLD baud, so it is read before switching) then reopens UART9 at @baud.
+ * Returns 0 on success, negative on a bad baud / no ACK / reopen failure.
+ */
+int rtl_dl_set_baud(uint32_t baud);
+
+/*
+ * Ensure the AmebaD flashloader stub is resident in the module SRAM at 0x00082000 and
+ * the link runs at @target_baud (115200 or 1500000).  Raises the baud; if the stub is
+ * not already resident (read-word @0x00082000 != 0x00082021) it uploads it via the ROM
+ * SRAM block-transfer (writes SRAM only -- NEVER flash), drops to 115200 for the stub's
+ * reboot, re-raises the baud, and re-verifies residency.  Returns 0 on a verified-
+ * resident stub, negative on failure.  @should_abort (may be NULL) is polled to cancel.
+ */
+int rtl_dl_load_flashloader(uint32_t target_baud,
+                            int (*should_abort)(void *ctx), void *abort_ctx);
+
+/*
+ * Read @nsectors 4 KB flash sectors from @offset (4 KB-aligned, 24-bit) using the
+ * flashloader block-read (call rtl_dl_load_flashloader first).  The whole stream is
+ * consumed off the wire; the leading min(nsectors*4096, @buf_cap) bytes are copied into
+ * @buf.  READ-ONLY -- it never erases or writes flash.  Returns the number of bytes
+ * copied into @buf (>=0) on success, or negative on failure / abort.
+ */
+int rtl_dl_read_flash(uint32_t offset, uint32_t nsectors, uint8_t *buf, uint32_t buf_cap,
+                      int (*should_abort)(void *ctx), void *abort_ctx);
 
 #endif /* APP_RTL8720_FLASH_H */
