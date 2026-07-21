@@ -293,6 +293,13 @@ extern const uint32_t rtl8720_flashloader_len;
 #define RTL_DL_BAUD_IDX_115200   0x0Du
 #define RTL_DL_BAUD_IDX_1500000  0x18u
 
+/* M3: flash erase/write bounds (destructive -- see rtl_dl_flash_selftest). */
+#define RTL_DL_ERASE             0x17u
+#define RTL_DL_FLASH_BASE        0x08000000u   /* a block's addr carries this base for flash */
+#define RTL_DL_FLASH_MAX         0x00200000u   /* conservative 2 MB cap: chip size unknown, avoid
+                                                * past-die wrap onto boot (M4 backup refines it) */
+#define RTL_DL_SELFTEST_MIN      0x00100000u   /* flashtest sector must sit past the app (~0xE2000) */
+
 /* Read bytes, skipping any that are not @want, until @want is seen (WaitResp).
  * 0 = found, -1 = timeout, -2 = aborted. */
 static int dl_wait_byte(uint8_t want, uint32_t timeout_ms, int (*ab)(void *), void *ctx)
@@ -342,16 +349,39 @@ static int dl_send_wait_ack(const uint8_t *cmd, uint32_t n, uint32_t timeout_ms,
 	return dl_wait_byte(RTL_DL_ACK, timeout_ms, ab, ctx);
 }
 
+/* Drain RX until it has been quiet for @quiet_ms (bounded by @max_ms).  Unlike an
+ * instantaneous drain this also absorbs late chatter -- e.g. a flashloader still emitting
+ * bytes just after a flash program completes -- and gives the flash a moment to settle,
+ * so the NEXT command starts from a truly clean boundary.  Call it BEFORE sending a
+ * command (never after, or it would eat the reply). */
+static void dl_drain_quiet(uint32_t quiet_ms, uint32_t max_ms)
+{
+	uint8_t junk[64];
+	ULONG start = tx_time_get();
+	ULONG last  = start;
+
+	for (;;) {
+		if (rtl8720_uart_read(junk, sizeof(junk)) > 0u) {
+			last = tx_time_get();
+		} else {
+			if ((int32_t)(tx_time_get() - last) >= (int32_t)quiet_ms)
+				return;
+			if ((int32_t)(tx_time_get() - start) >= (int32_t)max_ms)
+				return;
+			tx_thread_sleep(1);
+		}
+	}
+}
+
 /* read-word @addr (ReadRegs, Program.cs:603-641): 0x31 + addr(u32 LE) -> 0x31 + data + 0x15.
  * Reads exactly the framed reply (skip to the 0x31 echo, then 5 bytes).  Read-only.
  * 0 ok (*out set), negative on failure. */
 static int dl_read_word(uint32_t addr, uint32_t *out, int (*ab)(void *), void *ctx)
 {
-	uint8_t cmd[5], rp[5], junk[64];
+	uint8_t cmd[5], rp[5];
 	int rr;
 
-	while (rtl8720_uart_read(junk, sizeof(junk)) > 0u)   /* start from a clean boundary */
-		;
+	dl_drain_quiet(10u, 200u);              /* start from a clean, quiet boundary */
 	cmd[0] = 0x31u;
 	cmd[1] = (uint8_t)addr;        cmd[2] = (uint8_t)(addr >> 8);
 	cmd[3] = (uint8_t)(addr >> 16); cmd[4] = (uint8_t)(addr >> 24);
@@ -371,28 +401,19 @@ static int dl_read_word(uint32_t addr, uint32_t *out, int (*ab)(void *), void *c
 }
 
 /*
- * PRIVATE, SRAM-ONLY block transfer (SendXmodem, Program.cs:783-868): 0x07 -> blocks -> 0x04.
+ * PRIVATE block-transfer core (SendXmodem, Program.cs:783-868): 0x07 -> blocks -> 0x04.
  * block = [cmd][seq][~seq][addr:4LE][data:N(0xFF pad)][csum], csum = (addr4+data) & 0xFF.
- *
- * SAFETY (M2 non-destructive): @sram_addr is validated to be exactly the flashloader SRAM
- * window and MUST NOT carry the flash base (0x08000000).  This function therefore cannot
- * write flash; the flash-destination block-write is deliberately NOT implemented in M2.
- * 0 ok, -1 bad args, -2 aborted, -3 no ACK.
+ * @addr32 is the full destination address of the FIRST byte (SRAM as-is, or flash with the
+ * 0x08000000 base); each block uses addr32 + off.  Callers (dl_send_sram / dl_send_flash)
+ * own the destination validation -- this core does none.  0 ok, -2 aborted, -3 no ACK.
  */
-static int dl_send_sram(const uint8_t *data, uint32_t len, uint32_t sram_addr,
-                        int (*ab)(void *), void *ctx)
+static int dl_send_blocks(const uint8_t *data, uint32_t len, uint32_t addr32,
+                          int (*ab)(void *), void *ctx)
 {
 	static uint8_t pkt[3 + 4 + 1024 + 1];   /* function-static: off the 4 KB shell stack */
 	uint8_t start = RTL_DL_XMD_START, eot = RTL_DL_EOT;
 	uint32_t off = 0u;
 	uint8_t seq = 1u;
-
-	if (sram_addr != RTL_DL_STUB_ADDR)          /* only the flashloader SRAM window */
-		return -1;
-	if ((sram_addr & 0x08000000u) != 0u)        /* never a flash address */
-		return -1;
-	if (len == 0u || len > 0x10000u)            /* the stub is ~4.7 KB */
-		return -1;
 
 	if (dl_send_wait_ack(&start, 1u, 500u, ab, ctx))
 		return -2;
@@ -401,7 +422,7 @@ static int dl_send_sram(const uint8_t *data, uint32_t len, uint32_t sram_addr,
 		uint32_t rem  = len - off;
 		uint32_t N    = (rem > 128u) ? 1024u : 128u;
 		uint32_t take = (rem < N) ? rem : N;
-		uint32_t addr = sram_addr + off;
+		uint32_t addr = addr32 + off;
 		uint32_t i, sum = 0u;
 		int rr;
 
@@ -425,6 +446,68 @@ static int dl_send_sram(const uint8_t *data, uint32_t len, uint32_t sram_addr,
 
 	if (dl_send_wait_ack(&eot, 1u, 1000u, ab, ctx))
 		return -2;
+	return 0;
+}
+
+/* PRIVATE, SRAM-ONLY (M2): refuse any address but the flashloader SRAM window -- so this
+ * path can never write flash.  0 ok, -1 bad args, else dl_send_blocks code. */
+static int dl_send_sram(const uint8_t *data, uint32_t len, uint32_t sram_addr,
+                        int (*ab)(void *), void *ctx)
+{
+	if (sram_addr != RTL_DL_STUB_ADDR)          /* only the flashloader SRAM window */
+		return -1;
+	if (len == 0u || len > 0x10000u)            /* the stub is ~4.7 KB */
+		return -1;
+	return dl_send_blocks(data, len, sram_addr, ab, ctx);
+}
+
+/*
+ * Central, overflow-safe range validator for every flash op (read / erase / write).
+ * Requires @off and @len 4 KB-aligned, non-zero @len, and off + len <= RTL_DL_FLASH_MAX
+ * (the last check written as `len <= MAX - off` so it cannot wrap).  Returns 1 if OK.
+ */
+static int dl_flash_range_ok(uint32_t off, uint32_t len)
+{
+	if ((off & 0xFFFu) != 0u || (len & 0xFFFu) != 0u || len == 0u)
+		return 0;
+	if (off >= RTL_DL_FLASH_MAX)
+		return 0;
+	if (len > RTL_DL_FLASH_MAX - off)           /* overflow-safe off + len <= MAX */
+		return 0;
+	return 1;
+}
+
+/* PRIVATE flash block-write (M3): the block-transfer with the flash base OR'd into the
+ * address.  Bounded by dl_flash_range_ok.  No public general flash-write API exists -- the
+ * only caller is rtl_dl_flash_selftest, which additionally gates on an erasable sector. */
+static int dl_send_flash(const uint8_t *data, uint32_t len, uint32_t flash_off,
+                         int (*ab)(void *), void *ctx)
+{
+	if (!dl_flash_range_ok(flash_off, len))
+		return -1;
+	return dl_send_blocks(data, len, (flash_off & 0x00FFFFFFu) | RTL_DL_FLASH_BASE, ab, ctx);
+}
+
+/* PRIVATE flash erase (M3, EraseSectorsFlash Program.cs:371-398): one 0x17 command per 4 KB
+ * sector.  Bounded by dl_flash_range_ok.  0 ok, -1 bad args, -2 aborted / no ACK. */
+static int dl_erase_sectors(uint32_t offset, uint32_t nsectors, int (*ab)(void *), void *ctx)
+{
+	uint32_t i;
+
+	if (nsectors == 0u || nsectors > 0x10000u)          /* bound the multiply below */
+		return -1;
+	if (!dl_flash_range_ok(offset, nsectors * 4096u))
+		return -1;
+	for (i = 0u; i < nsectors; i++) {
+		uint32_t off = offset + i * 4096u;
+		uint8_t pkt[6];
+
+		pkt[0] = RTL_DL_ERASE;
+		pkt[1] = (uint8_t)off; pkt[2] = (uint8_t)(off >> 8); pkt[3] = (uint8_t)(off >> 16);
+		pkt[4] = 0x01u; pkt[5] = 0x00u;                 /* count = 1 (u16 LE) */
+		if (dl_send_wait_ack(pkt, sizeof(pkt), 2000u, ab, ctx))
+			return -2;
+	}
 	return 0;
 }
 
@@ -488,17 +571,16 @@ int rtl_dl_read_flash(uint32_t offset, uint32_t nsectors, uint8_t *buf, uint32_t
                       int (*ab)(void *), void *ctx)
 {
 	static uint8_t blk[2 + 1024 + 1];   /* seq + ~seq + 1024 data + csum (off the stack) */
-	uint8_t hdr[6], junk[64];
+	uint8_t hdr[6];
 	uint32_t total_blocks, i, copied = 0u;
 
-	if ((offset & 0xFFFu) != 0u || offset > 0x00FFFFFFu)   /* 4 KB-aligned, 24-bit */
+	if (nsectors == 0u || nsectors > 0x10000u)             /* bound the multiply */
 		return -1;
-	if (nsectors == 0u || nsectors > 0x10000u)
+	if (!dl_flash_range_ok(offset, nsectors * 4096u))      /* 4 KB-aligned, off + len <= MAX */
 		return -1;
 	total_blocks = nsectors * 4u;                          /* module streams 4 x 1024 / sector */
 
-	while (rtl8720_uart_read(junk, sizeof(junk)) > 0u)      /* clean boundary */
-		;
+	dl_drain_quiet(10u, 200u);                             /* clean, quiet boundary */
 	hdr[0] = RTL_DL_READFLASH;
 	hdr[1] = (uint8_t)offset;  hdr[2] = (uint8_t)(offset >> 8);  hdr[3] = (uint8_t)(offset >> 16);
 	hdr[4] = (uint8_t)nsectors; hdr[5] = (uint8_t)(nsectors >> 8);
@@ -540,4 +622,105 @@ int rtl_dl_read_flash(uint32_t offset, uint32_t nsectors, uint8_t *buf, uint32_t
 		}
 	}
 	return (int)copied;
+}
+
+int rtl_dl_flash_selftest(uint32_t offset, uint32_t hold_us, struct rtl_dl_selftest *r,
+                          int (*ab)(void *), void *ctx)
+{
+	static uint8_t buf[4096];   /* one sector; function-static, off the 4 KB shell stack */
+	uint32_t i;
+	int rc, all_ff, all_pat, attempt;
+
+	memset(r, 0, sizeof(*r));
+
+	/* Range gate: only a 4 KB-aligned sector in [SELFTEST_MIN, FLASH_MAX) -- past the app,
+	 * within the conservative 2 MB cap.  `offset > MAX - 4096` is overflow-safe. */
+	if ((offset & 0xFFFu) != 0u ||
+	    offset < RTL_DL_SELFTEST_MIN ||
+	    offset > RTL_DL_FLASH_MAX - 4096u)
+		return -1;
+
+	/* Phase 1: enter download + load the flashloader (this routine owns the session). */
+	if (rtl_dl_enter(hold_us, ab, ctx) != 0 ||
+	    rtl_dl_load_flashloader(1500000u, ab, ctx) != 0)
+		return -2;
+
+	/* Content gate: read the whole sector; only proceed if it is erasable -- all 0xFF
+	 * (unused) or exactly our own test pattern (a previous DIRTY run then self-heals).
+	 * Any foreign data => refuse to erase/write (protects boot/app/other data). */
+	rc = rtl_dl_read_flash(offset, 1u, buf, sizeof(buf), ab, ctx);
+	if (rc < (int)sizeof(buf))
+		return -2;
+	memcpy(r->found, buf, sizeof(r->found));
+	all_ff = 1; all_pat = 1;
+	for (i = 0u; i < sizeof(buf); i++) {
+		if (buf[i] != 0xFFu)               all_ff = 0;
+		if (buf[i] != (uint8_t)(i & 0xFFu)) all_pat = 0;
+	}
+	if (!all_ff && !all_pat)
+		return -3;                          /* foreign data */
+	r->gate_ok = 1;
+	r->gate_was_ff = all_ff;
+
+	/* Erase -> verify all 0xFF. */
+	if (dl_erase_sectors(offset, 1u, ab, ctx))
+		return -4;
+	rc = rtl_dl_read_flash(offset, 1u, buf, sizeof(buf), ab, ctx);
+	if (rc < (int)sizeof(buf))
+		return -4;
+	for (i = 0u; i < sizeof(buf); i++)
+		if (buf[i] != 0xFFu)
+			return -4;
+	r->erase_ok = 1;
+
+	/* Write the i&0xFF test pattern -> read back -> verify.  From here the sector holds
+	 * data, so any failure marks it dirty (re-running flashtest self-heals via the pattern
+	 * gate).  Distinct codes split the sub-steps: -5 send, -7 read-back, -8 mismatch. */
+	for (i = 0u; i < sizeof(buf); i++)
+		buf[i] = (uint8_t)(i & 0xFFu);
+	if (dl_send_flash(buf, sizeof(buf), offset, ab, ctx)) {
+		r->dirty = 1;
+		return -5;
+	}
+	r->dirty = 1;                               /* pattern now on flash */
+
+	/* Phase 2: the flashloader goes unresponsive after a flash program (only a power-cycle
+	 * revives it), so re-enter download + reload the stub.  The flash content persists
+	 * across the reset; then read it back to verify. */
+	if (rtl_dl_enter(hold_us, ab, ctx) != 0 ||
+	    rtl_dl_load_flashloader(1500000u, ab, ctx) != 0)
+		return -7;
+	rc = rtl_dl_read_flash(offset, 1u, buf, sizeof(buf), ab, ctx);
+	r->rc_detail = rc;
+	r->read_attempts = 1;
+	if (rc < (int)sizeof(buf)) {
+		r->dirty = 1;
+		return -7;
+	}
+	for (i = 0u; i < sizeof(buf); i++)
+		if (buf[i] != (uint8_t)(i & 0xFFu)) {
+			r->dirty = 1;
+			return -8;
+		}
+	r->write_ok = 1;
+
+	/* Restore: re-erase back to all 0xFF (retry once). */
+	for (attempt = 0; attempt < 2; attempt++) {
+		if (dl_erase_sectors(offset, 1u, ab, ctx))
+			continue;
+		rc = rtl_dl_read_flash(offset, 1u, buf, sizeof(buf), ab, ctx);
+		if (rc < (int)sizeof(buf))
+			continue;
+		all_ff = 1;
+		for (i = 0u; i < sizeof(buf); i++)
+			if (buf[i] != 0xFFu) { all_ff = 0; break; }
+		if (all_ff) {
+			r->restore_ok = 1;
+			break;
+		}
+	}
+	if (!r->restore_ok)
+		return -6;                          /* left with data; re-running flashtest self-heals */
+	r->dirty = 0;                               /* sector restored to 0xFF */
+	return 0;
 }

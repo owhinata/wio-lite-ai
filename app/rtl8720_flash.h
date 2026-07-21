@@ -108,4 +108,39 @@ int rtl_dl_load_flashloader(uint32_t target_baud,
 int rtl_dl_read_flash(uint32_t offset, uint32_t nsectors, uint8_t *buf, uint32_t buf_cap,
                       int (*should_abort)(void *ctx), void *abort_ctx);
 
+/* ---- M3: flash erase / write / verify (DESTRUCTIVE, gated to one unused sector) ---- */
+
+/* Per-step result of rtl_dl_flash_selftest (fields are 0/1 unless noted). */
+struct rtl_dl_selftest {
+	int     gate_ok;      /* the sector was erasable (all 0xFF, or our own test pattern) */
+	int     gate_was_ff;  /* 1 = all 0xFF (fresh), 0 = our leftover pattern (self-heal) */
+	int     erase_ok;     /* erase + read-back all 0xFF */
+	int     write_ok;     /* test-pattern write + read-back verify */
+	int     restore_ok;   /* final re-erase + read-back all 0xFF (sector restored) */
+	int     dirty;        /* 1 = sector left NOT all 0xFF (restore failed -- re-run to heal) */
+	int     rc_detail;    /* read-back-after-write: the rtl_dl_read_flash return (diagnostic) */
+	int     read_attempts;/* read-back-after-write: attempts made (retry diagnostic) */
+	uint8_t found[16];    /* first 16 bytes read at the gate (diagnostic on a foreign-data refusal) */
+};
+
+/*
+ * DESTRUCTIVE self-test of the flash erase/write/verify path on ONE 4 KB sector at @offset.
+ * Owns the whole flow: it enters download mode (strap+reset, @hold_us), loads the flashloader,
+ * gates, erases, writes the test pattern, then -- because the flashloader goes unresponsive
+ * after a flash program (only a power-cycle revives it) -- POWER-CYCLES and re-enters to
+ * read-back verify and re-erase (restore).  So the caller only needs cli_console_claim +
+ * a final rtl8720_reset; do NOT rtl_dl_enter/load before calling.
+ *
+ * Safe on the only board because it is hard-gated: @offset must be 4 KB-aligned and in
+ * [0x00100000, 0x00200000) (past the app, within a conservative 2 MB cap), AND the sector
+ * must read back erasable -- all 0xFF (unused) or exactly this routine's own i&0xFF test
+ * pattern (a previous DIRTY run self-heals); any other content is refused.  A passing run
+ * restores 0xFF and never touches boot/app.  All erase/write primitives are private and
+ * range-checked; this is the ONLY public entry that writes flash.  Fills @r with per-step
+ * results.  Returns 0 on full pass (restored), negative otherwise (@r.dirty marks a sector
+ * left with data -- re-running self-heals).  @should_abort (may be NULL) is polled to cancel.
+ */
+int rtl_dl_flash_selftest(uint32_t offset, uint32_t hold_us, struct rtl_dl_selftest *r,
+                          int (*should_abort)(void *ctx), void *abort_ctx);
+
 #endif /* APP_RTL8720_FLASH_H */

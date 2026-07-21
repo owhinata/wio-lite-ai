@@ -625,6 +625,140 @@ recover:
 	return ok ? 0 : 1;
 }
 
+/* wifi flashread <offset> [nsectors] (issue #19, M3): NON-DESTRUCTIVE flash survey -- read
+ * sectors and show whether each looks erased (helps pick an unused sector for flashtest). */
+static int cmd_wifi_flashread(struct cli_instance *sh, int argc, char **argv)
+{
+	uint32_t offset, nsectors = 1u, s;
+	uint8_t buf[128];
+	int rc, ok = 0;
+
+	if (parse_u32(argv[1], &offset) != 0 || (offset & 0xFFFu) != 0u) {
+		cli_error(sh, "wifi: bad offset (4KB-aligned hex, e.g. 0x180000)\r\n");
+		return 1;
+	}
+	if (argc >= 3 && (parse_u32(argv[2], &nsectors) != 0 || nsectors == 0u || nsectors > 64u)) {
+		cli_error(sh, "wifi: bad nsectors (1..64)\r\n");
+		return 1;
+	}
+	if (cli_console_claim(sh) != 0) {
+		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+		return 1;
+	}
+
+	cli_print(sh, "wifi: reading flash (NON-DESTRUCTIVE)...\r\n");
+	rc = rtl_dl_enter(30000u, rtl_abort_cb, sh);
+	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto recover; }
+	if (rc != 0)  { cli_error(sh, "wifi: UART9 did not come ready (rc %d)\r\n", rc); goto recover; }
+	rc = rtl_dl_load_flashloader(1500000u, rtl_abort_cb, sh);
+	if (rc != 0) { cli_error(sh, "wifi: flashloader load failed (rc %d)\r\n", rc); goto recover; }
+
+	ok = 1;
+	for (s = 0u; s < nsectors; s++) {
+		uint32_t off = offset + s * 4096u;
+		int i, allff = 1;
+
+		rc = rtl_dl_read_flash(off, 1u, buf, sizeof(buf), rtl_abort_cb, sh);
+		if (rc < 0) {
+			cli_error(sh, "wifi: read @0x%lX failed (rc %d)\r\n", (unsigned long)off, rc);
+			ok = 0;
+			break;
+		}
+		for (i = 0; i < rc; i++)
+			if (buf[i] != 0xFFu) { allff = 0; break; }
+		cli_print(sh, "0x%06lX: first %d B %s\r\n", (unsigned long)off, rc,
+		          allff ? "all 0xFF (looks erased)" : "has data");
+		cli_hexdump_base(sh, buf, (rc < 64) ? (size_t)rc : 64u, off);
+	}
+
+recover:
+	rtl8720_uart_close();
+	rtl8720_reset();
+	rtl_tcpip_set_inited(false);
+	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	cli_console_release(sh);
+	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
+	return ok ? 0 : 1;
+}
+
+/* wifi flashtest <offset> confirm (issue #19, M3): DESTRUCTIVE erase/write/verify self-test
+ * on ONE unused (all-0xFF) 4 KB sector, restored to 0xFF afterwards.  Hard-gated in
+ * rtl_dl_flash_selftest (range [0x100000,0x200000) + erasable-content check), and requires
+ * the literal `confirm` token.  Never touches boot/app.  Always resets the module back. */
+static int cmd_wifi_flashtest(struct cli_instance *sh, int argc, char **argv)
+{
+	struct rtl_dl_selftest r;
+	uint32_t offset;
+	int rc, i, ok = 0;
+
+	if (parse_u32(argv[1], &offset) != 0) {
+		cli_error(sh, "wifi: bad offset (hex, e.g. 0x180000)\r\n");
+		return 1;
+	}
+	if (argc < 3 || strcmp(argv[2], "confirm") != 0) {
+		cli_error(sh, "wifi: DESTRUCTIVE (erases+writes a flash sector). "
+		          "Re-run `wifi flashtest 0x%lX confirm` to proceed.\r\n", (unsigned long)offset);
+		return 1;
+	}
+	if (cli_console_claim(sh) != 0) {
+		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+		return 1;
+	}
+
+	cli_print(sh, "wifi: flash erase/write/verify self-test @0x%lX "
+	          "(DESTRUCTIVE; power-cycles the module to verify)...\r\n", (unsigned long)offset);
+	rc = rtl_dl_flash_selftest(offset, 30000u, &r, rtl_abort_cb, sh);
+	if (rc == -1) {
+		cli_error(sh, "wifi: offset outside the safe test range "
+		          "[0x100000, 0x200000), 4KB-aligned\r\n");
+		goto recover;
+	}
+	if (rc == -2) {
+		cli_error(sh, "wifi: download / flashloader setup failed (rc %d)\r\n", rc);
+		goto recover;
+	}
+	if (rc == -3) {
+		cli_error(sh, "wifi: refusing -- sector 0x%lX is not erased/unused (foreign data)\r\n",
+		          (unsigned long)offset);
+		cli_print(sh, "  first 16 B:");
+		for (i = 0; i < 16; i++)
+			cli_print(sh, " %02X", r.found[i]);
+		cli_print(sh, "\r\n  pick an all-0xFF sector (use `wifi flashread`)\r\n");
+		goto recover;
+	}
+	cli_print(sh, "  gate:    %s\r\n", r.gate_ok ?
+	          (r.gate_was_ff ? "erasable (all 0xFF)" : "erasable (our leftover pattern)") : "FAIL");
+	cli_print(sh, "  erase:   %s\r\n", r.erase_ok ? "OK (all 0xFF)" : "FAIL");
+	cli_print(sh, "  write:   %s\r\n",
+	          r.write_ok ? "OK (pattern verified after re-enter)" :
+	          (rc == -5) ? "FAIL (block send)" :
+	          (rc == -7) ? "FAIL (verify read after re-enter)" :
+	          (rc == -8) ? "FAIL (verify mismatch)" : "-");
+	if (rc == -7 || rc == -8)
+		cli_print(sh, "           (read rc %d)\r\n", r.rc_detail);
+	cli_print(sh, "  restore: %s\r\n", r.restore_ok ? "OK (re-erased to 0xFF)" :
+	          (r.dirty ? "FAIL -- sector DIRTY" : "-"));
+	if (rc == 0) {
+		cli_print(sh, "wifi: PASSED -- erase/write/verify OK, sector restored to 0xFF\r\n");
+		ok = 1;
+	} else {
+		cli_error(sh, "wifi: FAILED (rc %d)\r\n", rc);
+		if (r.dirty)
+			cli_print(sh, "  note: sector 0x%lX left with data; re-run "
+			          "`wifi flashtest 0x%lX confirm` to heal, or pick another offset\r\n",
+			          (unsigned long)offset, (unsigned long)offset);
+	}
+
+recover:
+	rtl8720_uart_close();
+	rtl8720_reset();
+	rtl_tcpip_set_inited(false);
+	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	cli_console_release(sh);
+	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
+	return ok ? 0 : 1;
+}
+
 CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(info,  NULL, "show RTL8720 wiring + CHIP_EN state",       cmd_wifi_info,  1, 0),
 	CLI_CMD_ARG(on,    NULL, "CHIP_EN high (power on RTL8720)",           cmd_wifi_on,    1, 0),
@@ -638,6 +772,8 @@ CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(status,     NULL, "show connection state / RSSI / IP / MAC", cmd_wifi_status, 1, 0),
 	CLI_CMD_ARG(flashprobe, NULL, "probe RTL8720 UART download-mode entry [hold_us]", cmd_wifi_flashprobe, 1, 1),
 	CLI_CMD_ARG(flashload,  NULL, "load flashloader + read flash sector0 (non-destructive) [hold] [baud]", cmd_wifi_flashload, 1, 2),
+	CLI_CMD_ARG(flashread,  NULL, "read flash <offset> [nsectors] (non-destructive survey)", cmd_wifi_flashread, 2, 1),
+	CLI_CMD_ARG(flashtest,  NULL, "DESTRUCTIVE erase/write/verify test <offset> confirm", cmd_wifi_flashtest, 2, 1),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(wifi, wifi_subcmds,
