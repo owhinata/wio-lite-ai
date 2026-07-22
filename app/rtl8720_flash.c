@@ -288,6 +288,8 @@ extern const uint32_t rtl8720_flashloader_len;
 #define RTL_DL_XMD_START    0x07u
 #define RTL_DL_SETBAUD      0x05u
 #define RTL_DL_READFLASH    0x20u
+#define RTL_DL_GETSTATUS    0x21u   /* M4: SPI status/ID read -- see dl_spi_read */
+#define RTL_DL_CHKSUM       0x27u   /* M4: device-side checksum -- see rtl_dl_flash_chksum */
 #define RTL_DL_STUB_ADDR    0x00082000u
 #define RTL_DL_STUB_ENTRY   0x00082021u   /* read-word @STUB_ADDR when the stub is resident */
 #define RTL_DL_BAUD_IDX_115200   0x0Du
@@ -296,9 +298,22 @@ extern const uint32_t rtl8720_flashloader_len;
 /* M3: flash erase/write bounds (destructive -- see rtl_dl_flash_selftest). */
 #define RTL_DL_ERASE             0x17u
 #define RTL_DL_FLASH_BASE        0x08000000u   /* a block's addr carries this base for flash */
-#define RTL_DL_FLASH_MAX         0x00200000u   /* conservative 2 MB cap: chip size unknown, avoid
-                                                * past-die wrap onto boot (M4 backup refines it) */
 #define RTL_DL_SELFTEST_MIN      0x00100000u   /* flashtest sector must sit past the app (~0xE2000) */
+
+/*
+ * Flash range caps.  READ and WRITE are deliberately DIFFERENT (issue #19 M4):
+ *
+ *  - WRITE_MAX stays at the original conservative 2 MB.  Every destructive path
+ *    (dl_erase_sectors / dl_send_flash / rtl_dl_flash_selftest) keeps exactly the
+ *    bounds it had before M4 -- the chip may be smaller than we think, and a write
+ *    that wrapped past the die onto the boot image would be unrecoverable.
+ *  - READ_MAX is the protocol's own ceiling: the read/erase/checksum commands carry
+ *    a 24-bit offset, so 16 MB is everything that is addressable at all.  Reads are
+ *    harmless (a read past the die just wraps), and M4 has to read past 2 MB both to
+ *    detect the real capacity by wrap and to back the whole chip up.
+ */
+#define RTL_DL_FLASH_READ_MAX    0x01000000u
+#define RTL_DL_FLASH_WRITE_MAX   0x00200000u
 
 /* Read bytes, skipping any that are not @want, until @want is seen (WaitResp).
  * 0 = found, -1 = timeout, -2 = aborted. */
@@ -463,16 +478,20 @@ static int dl_send_sram(const uint8_t *data, uint32_t len, uint32_t sram_addr,
 
 /*
  * Central, overflow-safe range validator for every flash op (read / erase / write).
- * Requires @off and @len 4 KB-aligned, non-zero @len, and off + len <= RTL_DL_FLASH_MAX
- * (the last check written as `len <= MAX - off` so it cannot wrap).  Returns 1 if OK.
+ * Requires @off and @len 4 KB-aligned, non-zero @len, and off + len <= @max (the last
+ * check written as `len <= max - off` so it cannot wrap).  Returns 1 if OK.
+ *
+ * @max is passed in rather than hard-coded so the destructive callers keep the
+ * conservative RTL_DL_FLASH_WRITE_MAX while reads may use RTL_DL_FLASH_READ_MAX --
+ * every call site names its own ceiling, and a read cap can never widen a write.
  */
-static int dl_flash_range_ok(uint32_t off, uint32_t len)
+static int dl_flash_range_ok(uint32_t off, uint32_t len, uint32_t max)
 {
 	if ((off & 0xFFFu) != 0u || (len & 0xFFFu) != 0u || len == 0u)
 		return 0;
-	if (off >= RTL_DL_FLASH_MAX)
+	if (off >= max)
 		return 0;
-	if (len > RTL_DL_FLASH_MAX - off)           /* overflow-safe off + len <= MAX */
+	if (len > max - off)                        /* overflow-safe off + len <= max */
 		return 0;
 	return 1;
 }
@@ -483,7 +502,7 @@ static int dl_flash_range_ok(uint32_t off, uint32_t len)
 static int dl_send_flash(const uint8_t *data, uint32_t len, uint32_t flash_off,
                          int (*ab)(void *), void *ctx)
 {
-	if (!dl_flash_range_ok(flash_off, len))
+	if (!dl_flash_range_ok(flash_off, len, RTL_DL_FLASH_WRITE_MAX))
 		return -1;
 	return dl_send_blocks(data, len, (flash_off & 0x00FFFFFFu) | RTL_DL_FLASH_BASE, ab, ctx);
 }
@@ -496,7 +515,7 @@ static int dl_erase_sectors(uint32_t offset, uint32_t nsectors, int (*ab)(void *
 
 	if (nsectors == 0u || nsectors > 0x10000u)          /* bound the multiply below */
 		return -1;
-	if (!dl_flash_range_ok(offset, nsectors * 4096u))
+	if (!dl_flash_range_ok(offset, nsectors * 4096u, RTL_DL_FLASH_WRITE_MAX))
 		return -1;
 	for (i = 0u; i < nsectors; i++) {
 		uint32_t off = offset + i * 4096u;
@@ -567,6 +586,180 @@ int rtl_dl_load_flashloader(uint32_t target_baud, int (*ab)(void *), void *ctx)
 	return 0;
 }
 
+/* ================================================================== *
+ *  M4: capacity detection + device checksum + SPI status/ID (issue #19)
+ *
+ *  READ-ONLY.  Nothing here erases or writes flash: the only commands issued are
+ *  0x20 (block read, already proven in M2), 0x21 (SPI status/ID read) and 0x27
+ *  (device-side checksum).  The 0x21 SPI opcodes used (0x05/0x35/0x15 RDSR1..3 and
+ *  0x9F RDID) are all read-only opcodes, so even a mis-framed 0x21 cannot modify
+ *  flash -- the worst case is a garbage reply.
+ * ================================================================== */
+
+/*
+ * SPI status/ID read (0x21, GetFlashStatus Program.cs:426-455): [0x21][opcode][n]
+ * -> ACK byte 0x21 -> @n bytes.
+ *
+ * CONFIDENCE: the reference tool only ever issues this with n == 1 and opcode
+ * 0x05/0x35/0x15 (RDSR1/2/3), so ONLY that shape is confirmed.  Whether byte 2 is a
+ * raw SPI opcode (making 0x9F/RDID work) and whether byte 3 is really a length are
+ * NOT established by the reference -- callers must treat anything else as an
+ * experimental probe whose failure ends the session (see rtl_dl_flash_jedec).
+ * 0 ok, -1 timeout / no ACK, -2 aborted.
+ */
+static int dl_spi_read(uint8_t opcode, uint8_t *out, uint32_t n,
+                       int (*ab)(void *), void *ctx)
+{
+	uint8_t pkt[3];
+	int rr;
+
+	if (n == 0u || n > 8u)
+		return -1;
+	dl_drain_quiet(10u, 200u);              /* start from a clean, quiet boundary */
+	pkt[0] = RTL_DL_GETSTATUS;
+	pkt[1] = opcode;
+	pkt[2] = (uint8_t)n;
+	rtl8720_uart_write(pkt, sizeof(pkt));
+
+	rr = dl_wait_byte(RTL_DL_GETSTATUS, 500u, ab, ctx);   /* the command byte is the ACK */
+	if (rr)
+		return rr;
+	return dl_read_exact(out, n, 500u, ab, ctx);
+}
+
+int rtl_dl_flash_chksum(uint32_t off, uint32_t len, uint32_t timeout_ms, uint32_t *out,
+                        int (*ab)(void *), void *ctx)
+{
+	uint8_t pkt[7], rp[4];
+	int rr;
+
+	if (out == NULL)
+		return -1;
+	/* Same 4 KB-aligned, overflow-safe bounds as a read: this only reads flash. */
+	if (!dl_flash_range_ok(off, len, RTL_DL_FLASH_READ_MAX))
+		return -1;
+
+	dl_drain_quiet(10u, 200u);
+	pkt[0] = RTL_DL_CHKSUM;
+	pkt[1] = (uint8_t)off;  pkt[2] = (uint8_t)(off >> 8);  pkt[3] = (uint8_t)(off >> 16);
+	pkt[4] = (uint8_t)len;  pkt[5] = (uint8_t)(len >> 8);  pkt[6] = (uint8_t)(len >> 16);
+	rtl8720_uart_write(pkt, sizeof(pkt));
+
+	/* The module reads the whole range before replying, so @timeout_ms must cover a
+	 * full-chip digest.  A timeout here POISONS THE SESSION: the reply may still land
+	 * later and would desynchronise the next command (dl_drain_quiet only absorbs
+	 * 200 ms of late chatter), so callers must treat a non-zero return as "stop using
+	 * this flashloader session" -- close the UART and reset the module. */
+	rr = dl_wait_byte(RTL_DL_CHKSUM, timeout_ms, ab, ctx);
+	if (rr)
+		return rr;
+	rr = dl_read_exact(rp, sizeof(rp), 1000u, ab, ctx);
+	if (rr)
+		return rr;
+	*out = (uint32_t)rp[0] | ((uint32_t)rp[1] << 8) |
+	       ((uint32_t)rp[2] << 16) | ((uint32_t)rp[3] << 24);
+	return 0;
+}
+
+int rtl_dl_flash_status(uint8_t sr[3], int (*ab)(void *), void *ctx)
+{
+	/* The reference tool's exact usage: one status register per command, one byte back
+	 * (Program.cs:426-455).  This shape is confirmed, so it is safe mid-session -- it is
+	 * deliberately kept SEPARATE from the experimental RDID probe below, so a caller can
+	 * read the status registers without risking a desynchronising guess. */
+	static const uint8_t sr_op[3] = { 0x05u, 0x35u, 0x15u };
+	int i;
+
+	if (sr == NULL)
+		return -1;
+	for (i = 0; i < 3; i++)
+		if (dl_spi_read(sr_op[i], &sr[i], 1u, ab, ctx) != 0)
+			return -2;
+	return 0;
+}
+
+int rtl_dl_flash_jedec(struct rtl_dl_jedec *j, int (*ab)(void *), void *ctx)
+{
+	uint8_t b;
+
+	if (j == NULL)
+		return -1;
+	memset(j, 0, sizeof(*j));
+
+	/*
+	 * EXPERIMENTAL (see the header): RDID assumes byte 2 of the 0x21 command is a raw
+	 * SPI opcode and byte 3 a read length -- neither is established by the reference
+	 * tool.  Ask for one byte (the manufacturer ID) first; only if that looks real ask
+	 * for the full three, and keep the answer only when the two agree, so a wrong guess
+	 * about the command shape leaves j->ok == 0 instead of fabricating an ID.  Any exit
+	 * from here may leave the link desynchronised, which is why the caller must give
+	 * this probe a session of its own and end that session afterwards.
+	 */
+	if (dl_spi_read(0x9Fu, &b, 1u, ab, ctx) != 0)
+		return -2;                      /* the link did not answer at all */
+	if (b == 0x00u || b == 0xFFu)
+		return 0;                       /* not a plausible manufacturer ID */
+	if (dl_spi_read(0x9Fu, j->id, 3u, ab, ctx) != 0)
+		return 0;
+	if (j->id[0] != b)
+		return 0;                       /* n==3 not honoured / inconsistent -> discard */
+	j->ok = 1;
+	/* Capacity byte: JEDEC encodes it as log2(bytes), e.g. 0x15 = 2 MB, 0x16 = 4 MB. */
+	if (j->id[2] >= 0x10u && j->id[2] <= 0x19u)
+		j->size = 1u << j->id[2];
+	return 0;
+}
+
+int rtl_dl_detect_size(struct rtl_dl_size *s, int (*ab)(void *), void *ctx)
+{
+	/* Two reference sectors (8 KB) read in ONE command, plus the candidate's 8 KB.
+	 * Function-static: off the 4 KB shell stack. */
+	static uint8_t ref[RTL_DL_SIZE_PROBE_LEN];
+	static uint8_t cand[RTL_DL_SIZE_PROBE_LEN];
+	static const uint32_t cands[] = {
+		0x00100000u, 0x00200000u, 0x00400000u, 0x00800000u,
+	};
+	uint32_t i;
+	int rc, all_ff;
+
+	if (s == NULL)
+		return -1;
+	memset(s, 0, sizeof(s[0]));
+
+	/* Reference: the first 8 KB.  It must NOT be blank, or every candidate on a blank
+	 * chip would "match" and we would report the smallest size.  The module's km0_boot
+	 * lives here (verified on hardware in M2), so this is data in practice. */
+	rc = rtl_dl_read_flash(0u, RTL_DL_SIZE_PROBE_LEN / 4096u, ref, sizeof(ref), ab, ctx);
+	if (rc < (int)sizeof(ref))
+		return -2;
+	all_ff = 1;
+	for (i = 0u; i < sizeof(ref); i++)
+		if (ref[i] != 0xFFu) { all_ff = 0; break; }
+	if (all_ff) {
+		s->blank = 1;
+		return -3;                      /* indeterminate: nothing to match against */
+	}
+
+	/*
+	 * Wrap detection: a serial flash ignores the address bits above its capacity, so
+	 * reading at `cap` returns offset 0 again.  Walk the candidates smallest-first and
+	 * take the first full 8 KB match -- full compare, not a hash, so there is no
+	 * collision argument to make.  Reading a candidate beyond the die is harmless.
+	 */
+	for (i = 0u; i < sizeof(cands) / sizeof(cands[0]); i++) {
+		rc = rtl_dl_read_flash(cands[i], RTL_DL_SIZE_PROBE_LEN / 4096u,
+		                       cand, sizeof(cand), ab, ctx);
+		if (rc < (int)sizeof(cand))
+			return -2;
+		s->probed = i + 1u;
+		if (memcmp(ref, cand, sizeof(ref)) == 0) {
+			s->size = cands[i];
+			return 0;
+		}
+	}
+	return 0;                               /* no wrap seen: size stays 0 = unknown */
+}
+
 int rtl_dl_read_flash(uint32_t offset, uint32_t nsectors, uint8_t *buf, uint32_t buf_cap,
                       int (*ab)(void *), void *ctx)
 {
@@ -576,7 +769,11 @@ int rtl_dl_read_flash(uint32_t offset, uint32_t nsectors, uint8_t *buf, uint32_t
 
 	if (nsectors == 0u || nsectors > 0x10000u)             /* bound the multiply */
 		return -1;
-	if (!dl_flash_range_ok(offset, nsectors * 4096u))      /* 4 KB-aligned, off + len <= MAX */
+	/* READ_MAX (16 MB) rather than the destructive cap: reads are harmless, and M4's
+	 * wrap-based capacity detection + full-chip backup both need to read past 2 MB.
+	 * The range check also keeps nsectors <= 0x1000, so it always fits the u16 count
+	 * field in the command header below. */
+	if (!dl_flash_range_ok(offset, nsectors * 4096u, RTL_DL_FLASH_READ_MAX))
 		return -1;
 	total_blocks = nsectors * 4u;                          /* module streams 4 x 1024 / sector */
 
@@ -633,11 +830,12 @@ int rtl_dl_flash_selftest(uint32_t offset, uint32_t hold_us, struct rtl_dl_selft
 
 	memset(r, 0, sizeof(*r));
 
-	/* Range gate: only a 4 KB-aligned sector in [SELFTEST_MIN, FLASH_MAX) -- past the app,
-	 * within the conservative 2 MB cap.  `offset > MAX - 4096` is overflow-safe. */
+	/* Range gate: only a 4 KB-aligned sector in [SELFTEST_MIN, WRITE_MAX) -- past the app,
+	 * within the conservative 2 MB destructive cap (unchanged by M4's wider READ cap).
+	 * `offset > MAX - 4096` is overflow-safe. */
 	if ((offset & 0xFFFu) != 0u ||
 	    offset < RTL_DL_SELFTEST_MIN ||
-	    offset > RTL_DL_FLASH_MAX - 4096u)
+	    offset > RTL_DL_FLASH_WRITE_MAX - 4096u)
 		return -1;
 
 	/* Phase 1: enter download + load the flashloader (this routine owns the session). */

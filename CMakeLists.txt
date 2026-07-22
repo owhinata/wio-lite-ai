@@ -229,9 +229,11 @@ set(SHELL_SOURCES
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_membench.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_wifi.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_net.c"
+    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_xfer.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/rtl_link.c"
     "${CMAKE_SOURCE_DIR}/svc/fmt.c"
     "${CMAKE_SOURCE_DIR}/svc/timebase.c"
+    "${CMAKE_SOURCE_DIR}/svc/ymodem.c"
     "${CMAKE_SOURCE_DIR}/svc/log.c")
 
 # --- CoreMark object library (run as the shell `coremark` command) ----------

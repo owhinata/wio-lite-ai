@@ -108,6 +108,86 @@ int rtl_dl_load_flashloader(uint32_t target_baud,
 int rtl_dl_read_flash(uint32_t offset, uint32_t nsectors, uint8_t *buf, uint32_t buf_cap,
                       int (*should_abort)(void *ctx), void *abort_ctx);
 
+/* ---- M4: capacity detection + device checksum + SPI status/ID (READ-ONLY) ---- */
+
+/* Bytes compared at each candidate offset by rtl_dl_detect_size (2 sectors, one command). */
+#define RTL_DL_SIZE_PROBE_LEN  8192u
+
+/* Highest flash offset the download protocol can express: its read / erase / checksum
+ * commands all carry a 24-bit offset.  Exposed so callers can reject an out-of-range
+ * request up front instead of failing part-way through a long transfer. */
+#define RTL_DL_FLASH_LIMIT     0x01000000u
+
+/* Result of rtl_dl_detect_size(). */
+struct rtl_dl_size {
+	uint32_t size;    /* detected capacity in bytes, or 0 = not determined */
+	uint32_t probed;  /* how many candidate offsets were tried (diagnostic) */
+	int      blank;   /* 1 = the first 8 KB read all 0xFF, so wrap detection is impossible */
+};
+
+/* Result of rtl_dl_flash_jedec() -- EXPERIMENTAL, see that function. */
+struct rtl_dl_jedec {
+	uint8_t  id[3];       /* manufacturer, memory type, capacity (SPI 0x9F) */
+	int      ok;          /* 1 = the RDID probe returned a self-consistent 3-byte ID */
+	uint32_t size;        /* capacity decoded from id[2], or 0 if implausible */
+};
+
+/*
+ * Determine the real flash capacity by ADDRESS WRAP, using only the proven block-read
+ * path: a serial flash ignores address bits above its capacity, so a read at `cap`
+ * returns offset 0 again.  Reads 8 KB at offset 0 and compares it byte-for-byte against
+ * 8 KB at 1/2/4/8 MB, smallest first; the first full match is the capacity.  Read-only.
+ *
+ * This is the AUTHORITATIVE capacity source -- rtl_dl_flash_jedec()'s JEDEC ID is only a
+ * cross-check, because the 0x21 command shape it relies on is not established by the
+ * reference tool.  Returns 0 when the probe completed (@s->size == 0 means no wrap was
+ * seen up to 8 MB, i.e. unknown), -2 on a read failure, -3 if the first 8 KB is blank
+ * (nothing to match against; @s->blank set).  Call after rtl_dl_load_flashloader().
+ */
+int rtl_dl_detect_size(struct rtl_dl_size *s, int (*should_abort)(void *ctx), void *abort_ctx);
+
+/*
+ * Read the three flash status registers into @sr (SR1/SR2/SR3 = SPI 0x05/0x35/0x15).
+ * Read-only, and the ONLY 0x21 command shape the reference tool actually uses, so this
+ * is safe to call mid-session.  Returns 0 on success, negative on failure.
+ */
+int rtl_dl_flash_status(uint8_t sr[3], int (*should_abort)(void *ctx), void *abort_ctx);
+
+/*
+ * EXPERIMENTAL: probe the JEDEC ID (SPI RDID 0x9F) through the same 0x21 command.
+ * Read-only, but it ASSUMES the command's second byte is a raw SPI opcode and its third
+ * byte a read length -- neither is established by the reference tool, which only ever
+ * reads status registers one byte at a time.  It asks for one byte first and only then
+ * for three, discarding the result unless the two agree, so a wrong guess yields
+ * @j->ok == 0 rather than a plausible-looking lie.
+ *
+ * Because a mis-framed reply can leave the link desynchronised, THE CALLER MUST END THE
+ * SESSION afterwards (close the UART and reset the module) rather than issue further
+ * commands -- give this its own re-entered session.  Never size a flash operation from
+ * the result; that is rtl_dl_detect_size()'s job.  Returns 0 when the probe ran
+ * (inspect @j->ok), negative if the link did not answer at all.
+ */
+int rtl_dl_flash_jedec(struct rtl_dl_jedec *j, int (*should_abort)(void *ctx), void *abort_ctx);
+
+/*
+ * Ask the module to checksum @len bytes of flash from @off (both 4 KB-aligned, within
+ * the 16 MB protocol limit) and return its 32-bit result in @out.  Read-only.
+ *
+ * ALGORITHM (established on hardware, board #2): the digest is a plain sum of the range
+ * read as 32-bit LITTLE-ENDIAN words.  A 4 KB dump that the module digested as
+ * 0xC9AB910F matched the LE word sum of the received bytes exactly, while a byte sum,
+ * CRC-32 and Adler-32 all differed.  The host can therefore compute the same value while
+ * streaming and verify a backup (or, in M5, a freshly written image) without a re-read.
+ *
+ * The module reads the whole range before answering, so @timeout_ms must cover it (a
+ * full-chip digest takes seconds).  IMPORTANT: a non-zero return POISONS THE SESSION --
+ * a late reply would desynchronise the next command, so the caller must stop issuing
+ * commands and reset the module.  Make this the LAST operation of a session.
+ * Returns 0 on success, -1 on bad arguments, -2 if aborted, -1 on timeout.
+ */
+int rtl_dl_flash_chksum(uint32_t off, uint32_t len, uint32_t timeout_ms, uint32_t *out,
+                        int (*should_abort)(void *ctx), void *abort_ctx);
+
 /* ---- M3: flash erase / write / verify (DESTRUCTIVE, gated to one unused sector) ---- */
 
 /* Per-step result of rtl_dl_flash_selftest (fields are 0/1 unless noted). */

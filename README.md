@@ -75,6 +75,25 @@ Mode") with line editing, history, and Tab completion. 21 commands:
   eRPC subcommands take the console (`cli_console_claim`) for single-owner access to
   the SPSC RX ring. Register-only on the STM32 side (GPIO + UART clock gates, baud from
   the inherited PCLK2 = 137.5 MHz) — it never touches the RCC clock tree.
+  The `wifi flash*` subcommands are the **on-device RTL8720DN flasher** (issue #19):
+  the STM32 alone drives the module's mask-ROM **UART download mode** and speaks the
+  AmebaD download protocol itself, so its firmware can be replaced without a host PC or
+  any soldering. Entry is a strap: the ROM samples `PA[7]` (= the module's `UART_LOG_TXD`,
+  wired to our **PD14**) at reset, so PD14 is held low across the `CHIP_EN` (PC3) rising
+  edge — a hold of **≥ 20 ms** is required — and the protocol then runs on the **LOG UART
+  (UART9)**, raised to 1.5 Mbaud. `wifi flashprobe` proves download-mode entry;
+  `wifi flashload` uploads Realtek's flashloader stub to module SRAM and reads flash;
+  `wifi flashread <off> [n]` surveys sectors (erased vs data); `wifi flashinfo` reports
+  the **real chip capacity** — measured by address wrap, comparing 8 KB at offset 0
+  against 8 KB at 1/2/4/8 MB — plus the status registers and a device-side checksum;
+  `wifi flashbackup [off] [len]` streams the whole chip to the PC over **YMODEM**
+  (`svc/ymodem.c`; receive with `rz`, or `Ctrl+A Ctrl+R` in picocom) so the factory image
+  can be saved before anything is written. All of those are **read-only**. The one
+  destructive entry point, `wifi flashtest <off> confirm`, is a hard-gated erase/write/
+  verify self-test restricted to a single unused 4 KB sector in `[0x100000, 0x200000)`
+  that it restores to `0xFF`; it power-cycles the module mid-test because the flashloader
+  stops responding after a flash program. The RTL8720DN is a separate chip from the
+  STM32 and its download mode lives in mask ROM, so it stays recoverable regardless.
 - **`net`** — the IPv4 (L3) layer on top of a `wifi connect` association (issue #5),
   the Wio port of `../stm32f746g-disco`'s `net` command. Where f746 drives NetX Duo over
   the on-chip Ethernet MAC, here the backend is the RTL8720DN's **eRPC socket-offload**

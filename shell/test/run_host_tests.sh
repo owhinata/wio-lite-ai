@@ -11,8 +11,9 @@
 # (ldscript/STM32H725AEIx_XIP.ld) provides on hardware.  No firmware build is
 # involved -- this runs on the build host, not the board.
 #
-# (The stm32f746 donor also has ymodem / frame_pipeline tests; those svc modules
-# are out of scope for the Wio Lite AI v1 shell, so they are not ported here.)
+# svc/ymodem.c came over with issue #19 M4 (the RTL8720DN flash backup streams
+# over the console with YMODEM), so its test is ported too.  (The donor's
+# frame_pipeline test covers a camera module that has no counterpart here.)
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -149,5 +150,15 @@ gcc $CFLAGS -DCLI_USE_COLOR=0 -DCLI_CMD_BUFFER_SIZE=8 -DTEST_COMPLETE_SMALL_BUF 
     $glue \
     $LDFLAGS -o "$out/test_complete_smallbuf"
 "$out/test_complete_smallbuf"
+
+# #19 M4 -- clean-room YMODEM-CRC sender (svc/ymodem.c): CRC-16/CCITT vectors, block
+# framing (block 0 name+size, STX/SOH, 0x1A short-block padding, seq/~seq, CRC),
+# NAK resend, CAN abort + teardown, seq wrap mod 256, and a 1-byte-at-a-time
+# source filling full blocks.  Pure svc layer -- HAL/ThreadX/shell-free, so it
+# builds with the host gcc and needs only the svc include dir for the header.
+gcc $CFLAGS -I "$svc" \
+    "$here/test_ymodem.c" "$svc/ymodem.c" \
+    $LDFLAGS -o "$out/test_ymodem"
+"$out/test_ymodem"
 
 echo "host tests passed"

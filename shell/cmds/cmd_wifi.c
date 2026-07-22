@@ -16,6 +16,14 @@
  *   wifi disconnect               drop the current association
  *   wifi status                   connected? + RSSI + IP/mask/gw + MAC
  *
+ * RTL8720DN firmware-download subcommands (issue #19; see app/rtl8720_flash.c):
+ *   wifi flashprobe [hold_us]     M1: prove UART download-mode entry (read-only)
+ *   wifi flashload [hold] [baud]  M2: upload the flashloader + read sector 0 (read-only)
+ *   wifi flashread <off> [n]      M3: survey sectors, erased-vs-data (read-only)
+ *   wifi flashtest <off> confirm  M3: DESTRUCTIVE erase/write/verify on one unused sector
+ *   wifi flashinfo                M4: capacity (address wrap) / status regs / checksum
+ *   wifi flashbackup [off] [len]  M4: back the flash up to the PC over YMODEM (read-only)
+ *
  * The log/probe bridge takes over the console (issue #50 raw API): RTL8720DN RX
  * bytes stream to the CDC console and console keystrokes go to the module's TX, so
  * the operator reads the boot banner.  Ctrl+C exits.  Foreground only.  (The AT/HS
@@ -32,6 +40,7 @@
  * Clean-room design; no third-party code reused.
  */
 #include "cli.h"
+#include "cmd_xfer.h"
 #include "rtl8720.h"
 #include "rtl8720_flash.h"
 #include "erpc.h"
@@ -759,6 +768,335 @@ recover:
 	return ok ? 0 : 1;
 }
 
+/* ------------------------------------------------------------------ *
+ *  issue #19 M4: capacity detection + full-chip backup (READ-ONLY)
+ * ------------------------------------------------------------------ */
+
+/* Open a download session: enter download mode + load the flashloader at 1.5 Mbaud.
+ * Returns 0 on success (caller owns the session and must reach its `recover:` label). */
+static int flash_session_open(struct cli_instance *sh)
+{
+	int rc = rtl_dl_enter(30000u, rtl_abort_cb, sh);
+
+	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); return -1; }
+	if (rc != 0)  { cli_error(sh, "wifi: UART9 did not come ready (rc %d)\r\n", rc); return -1; }
+	rc = rtl_dl_load_flashloader(1500000u, rtl_abort_cb, sh);
+	if (rc != 0)  { cli_error(sh, "wifi: flashloader load failed (rc %d)\r\n", rc); return -1; }
+	return 0;
+}
+
+/* Print the detected capacity, or explain why it could not be determined.  Returns the
+ * size to use (0 = unknown). */
+static uint32_t flash_report_size(struct cli_instance *sh, const struct rtl_dl_size *sz, int rc)
+{
+	if (rc == -3) {
+		cli_warn(sh, "  capacity: UNKNOWN -- the first 8 KB reads all 0xFF, so there is "
+		          "no data to detect the address wrap against\r\n");
+		return 0u;
+	}
+	if (rc != 0) {
+		cli_error(sh, "  capacity: probe failed (rc %d)\r\n", rc);
+		return 0u;
+	}
+	if (sz->size == 0u) {
+		cli_warn(sh, "  capacity: UNKNOWN -- no address wrap up to 8 MB "
+		          "(chip is >= 16 MB, or does not wrap)\r\n");
+		return 0u;
+	}
+	cli_print(sh, "  capacity: %lu MB (0x%lX) -- address wrap at that offset, "
+	          "8 KB compared byte-for-byte\r\n",
+	          (unsigned long)(sz->size >> 20), (unsigned long)sz->size);
+	return sz->size;
+}
+
+/* wifi flashinfo (issue #19, M4): NON-DESTRUCTIVE flash identification.
+ *
+ * Runs in TWO download sessions on purpose.  Two operations each want to be last:
+ * the 0x27 checksum (a timeout may still be answered later and would desynchronise
+ * whatever follows) and the experimental RDID probe (its command shape is not
+ * established by the reference tool, so a mis-framed reply may desynchronise too).
+ * Session A therefore ends with the checksum, and the RDID probe gets a fresh session
+ * of its own -- the same "power-cycle and re-enter" pattern rtl_dl_flash_selftest uses.
+ * Only session A's wrap detection is authoritative; everything else is a diagnostic. */
+static int cmd_wifi_flashinfo(struct cli_instance *sh, int argc, char **argv)
+{
+	struct rtl_dl_size sz;
+	struct rtl_dl_jedec jd;
+	uint8_t sr[3];
+	uint32_t size, sum = 0u;
+	int rc, ok = 0;
+
+	(void)argc; (void)argv;
+
+	if (cli_console_claim(sh) != 0) {
+		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+		return 1;
+	}
+
+	cli_print(sh, "wifi: identifying RTL8720 flash (NON-DESTRUCTIVE)...\r\n");
+	if (flash_session_open(sh) != 0)
+		goto recover;
+
+	/* --- session A, step 1: capacity by address wrap (proven read path only) --- */
+	rc = rtl_dl_detect_size(&sz, rtl_abort_cb, sh);
+	size = flash_report_size(sh, &sz, rc);
+	if (rc == -2)
+		goto recover;                       /* the read path itself failed */
+	ok = (size != 0u);                          /* success == the capacity is known */
+
+	/* --- session A, step 2: status registers (reference-tool command shape only) --- */
+	rc = rtl_dl_flash_status(sr, rtl_abort_cb, sh);
+	if (rc != 0) {
+		cli_warn(sh, "  status:   read failed (rc %d)\r\n", rc);
+		goto recover;                       /* link is unhappy; do not push further */
+	}
+	cli_print(sh, "  status:   SR1 0x%02X  SR2 0x%02X  SR3 0x%02X\r\n",
+	          sr[0], sr[1], sr[2]);
+
+	/* --- session A, step 3 (LAST in this session): device-side checksum --- */
+	rc = rtl_dl_flash_chksum(0u, 0x10000u, 5000u, &sum, rtl_abort_cb, sh);
+	if (rc == 0)
+		cli_print(sh, "  chksum:   0x%08lX over the first 64 KB (device-side, 0x27)\r\n",
+		          (unsigned long)sum);
+	else
+		cli_warn(sh, "  chksum:   n/a (rc %d) -- ending the session, a late reply "
+		          "would desynchronise it\r\n", rc);
+
+	/* --- session B: the experimental RDID probe, alone in a fresh session --- */
+	rtl8720_uart_close();
+	cli_print(sh, "  (re-entering download mode for the experimental JEDEC probe)\r\n");
+	if (flash_session_open(sh) != 0)
+		goto recover;
+	rc = rtl_dl_flash_jedec(&jd, rtl_abort_cb, sh);
+	if (rc == 0 && jd.ok) {
+		cli_print(sh, "  jedec:    %02X %02X %02X", jd.id[0], jd.id[1], jd.id[2]);
+		if (jd.size != 0u)
+			cli_print(sh, " -> %lu MB", (unsigned long)(jd.size >> 20));
+		cli_print(sh, "  (experimental; cross-check only)\r\n");
+		if (jd.size != 0u && size != 0u && jd.size != size)
+			cli_warn(sh, "  NOTE: JEDEC disagrees with the wrap probe -- trusting the "
+			          "wrap probe (%lu MB)\r\n", (unsigned long)(size >> 20));
+	} else {
+		cli_print(sh, "  jedec:    not available (the 0x21 0x9F command shape is a "
+		          "hypothesis, not confirmed by the reference tool)\r\n");
+	}
+
+recover:
+	rtl8720_uart_close();
+	rtl8720_reset();
+	rtl_tcpip_set_inited(false);
+	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	cli_console_release(sh);
+	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
+	return ok ? 0 : 1;
+}
+
+/*
+ * YMODEM byte source over the RTL8720 flash (issue #19 M4).
+ *
+ * ymodem_send() pulls; rtl_dl_read_flash() streams whole sectors, so we refill a
+ * chunk-sized staging buffer and serve slices out of it.  A 32 KB chunk = 8 sectors =
+ * one read command per 32 blocks, which keeps the per-command overhead off the wire;
+ * drop RTL_BACKUP_CHUNK to 4096 to fall back to the single-sector reads proven in M2.
+ *
+ * NOTE the NULL abort hook in bak_src_read(): while ymodem_send() runs, its io_getc()
+ * is the ONLY permitted reader of the console RX ring.  rtl_abort_cb() would call
+ * cli_cancel_poll(), which drains that ring and discards every non-0x03 byte -- it
+ * would eat the receiver's ACK/'C'/CAN and break the transfer.  Ctrl+C during the
+ * transfer is handled by io_getc() instead (cmd_xfer.c).
+ */
+#define RTL_BACKUP_CHUNK  (8u * 4096u)
+
+static uint8_t s_bak_chunk[RTL_BACKUP_CHUNK];   /* static: off the 4 KB shell stack */
+
+struct rtl_bak_src {
+	uint32_t base;        /* flash offset of stream byte 0 (4 KB-aligned) */
+	uint32_t total;       /* bytes to send */
+	uint32_t pos;         /* bytes served so far */
+	uint32_t chunk_pos;   /* stream position of s_bak_chunk[0] */
+	uint32_t chunk_len;   /* valid bytes in s_bak_chunk (0 = empty) */
+	/* Running digest of everything served, in the SAME algorithm the module's 0x27
+	 * command uses -- a sum of 32-bit little-endian words.  (Identified on hardware:
+	 * a 4 KB dump whose 0x27 result was 0xC9AB910F matched the LE word sum of the
+	 * received bytes exactly, while a plain byte sum, CRC-32 and Adler-32 did not.)
+	 * Accumulated byte-wise because the source serves arbitrary-sized slices. */
+	uint32_t sum;         /* completed words */
+	uint32_t acc;         /* partial word being assembled */
+	uint32_t nacc;        /* bytes already in acc (0..3) */
+	int      failed;      /* sticky: a flash read failed */
+};
+
+static int bak_src_read(void *ctx, uint8_t *dst, uint32_t want, uint32_t *got)
+{
+	struct rtl_bak_src *s = (struct rtl_bak_src *)ctx;
+	uint32_t avail, n;
+
+	*got = 0u;
+	if (s->pos >= s->total)
+		return 0;                                   /* EOF */
+
+	if (s->chunk_len == 0u || s->pos >= s->chunk_pos + s->chunk_len) {
+		uint32_t remain = s->total - s->pos;
+		uint32_t take   = (remain > RTL_BACKUP_CHUNK) ? RTL_BACKUP_CHUNK : remain;
+		uint32_t secs   = (take + 4095u) / 4096u;   /* reads are whole sectors */
+		int rc = rtl_dl_read_flash(s->base + s->pos, secs, s_bak_chunk,
+		                           sizeof(s_bak_chunk), NULL, NULL);
+
+		if (rc < (int)take) {                       /* short/failed read */
+			s->failed = 1;
+			return -1;
+		}
+		s->chunk_pos = s->pos;
+		s->chunk_len = take;
+	}
+
+	avail = s->chunk_len - (s->pos - s->chunk_pos);
+	n = (want < avail) ? want : avail;
+	if (n > s->total - s->pos)
+		n = s->total - s->pos;
+	memcpy(dst, s_bak_chunk + (s->pos - s->chunk_pos), n);
+	for (uint32_t i = 0u; i < n; i++) {         /* 0x27's digest: sum of u32 LE words */
+		s->acc |= (uint32_t)dst[i] << (8u * s->nacc);
+		if (++s->nacc == 4u) {
+			s->sum += s->acc;
+			s->acc = 0u;
+			s->nacc = 0u;
+		}
+	}
+	s->pos += n;
+	*got = n;
+	return 0;
+}
+
+/* Append @v as @digits uppercase hex digits at @p; returns the new write position. */
+static char *bak_put_hex(char *p, uint32_t v, int digits)
+{
+	static const char hex[] = "0123456789ABCDEF";
+
+	for (int i = digits - 1; i >= 0; i--)
+		*p++ = hex[(v >> (4 * i)) & 0xFu];
+	return p;
+}
+
+/* Build the deterministic YMODEM block-0 filename "rtl8720_<off6>_<len6>.bin" into
+ * @buf (needs >= 28 bytes).  No printf: the shell has no snprintf. */
+static void bak_build_name(char *buf, uint32_t off, uint32_t len)
+{
+	const char *pre = "rtl8720_", *suf = ".bin";
+	char *p = buf;
+
+	while (*pre)
+		*p++ = *pre++;
+	p = bak_put_hex(p, off, 6);
+	*p++ = '_';
+	p = bak_put_hex(p, len, 6);
+	while (*suf)
+		*p++ = *suf++;
+	*p = '\0';
+}
+
+/* wifi flashbackup [offset] [len] (issue #19, M4): NON-DESTRUCTIVE full-chip backup.
+ * Streams the flash to the PC over the console with YMODEM (receive with `rz`).
+ * Defaults to the whole chip as detected by the address-wrap probe. */
+static int cmd_wifi_flashbackup(struct cli_instance *sh, int argc, char **argv)
+{
+	struct rtl_dl_size sz;
+	struct rtl_bak_src src_ctx;
+	struct ym_source   src;
+	char name[32];
+	uint32_t offset = 0u, len = 0u, size, devsum = 0u;
+	int rc, ok = 0;
+
+	if (argc >= 2 && (parse_u32(argv[1], &offset) != 0 || (offset & 0xFFFu) != 0u)) {
+		cli_error(sh, "wifi: bad offset (4KB-aligned, e.g. 0x0)\r\n");
+		return 1;
+	}
+	if (argc >= 3 && (parse_u32(argv[2], &len) != 0 || len == 0u || (len & 0xFFFu) != 0u)) {
+		cli_error(sh, "wifi: bad length (4KB-aligned, non-zero, e.g. 0x1000)\r\n");
+		return 1;
+	}
+	/* Reject a range the protocol cannot express (24-bit offsets) BEFORE powering
+	 * anything up: otherwise an explicit oversized range on a chip whose capacity we
+	 * failed to detect would start the YMODEM transfer and then die part-way through,
+	 * leaving the receiver holding a truncated file. */
+	if (offset >= RTL_DL_FLASH_LIMIT ||
+	    (len != 0u && len > RTL_DL_FLASH_LIMIT - offset)) {
+		cli_error(sh, "wifi: range past the protocol's 16 MB (24-bit offset) limit\r\n");
+		return 1;
+	}
+	if (cli_console_claim(sh) != 0) {
+		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+		return 1;
+	}
+
+	cli_print(sh, "wifi: flash backup (NON-DESTRUCTIVE)...\r\n");
+	if (flash_session_open(sh) != 0)
+		goto recover;
+
+	rc = rtl_dl_detect_size(&sz, rtl_abort_cb, sh);
+	size = flash_report_size(sh, &sz, rc);
+	if (rc == -2)
+		goto recover;
+	if (len == 0u) {
+		if (size == 0u) {
+			cli_error(sh, "wifi: capacity unknown -- pass an explicit length, "
+			          "e.g. `wifi flashbackup 0x0 0x200000`\r\n");
+			goto recover;
+		}
+		len = size - offset;
+	}
+	if (size != 0u && (offset >= size || len > size - offset)) {
+		cli_error(sh, "wifi: range 0x%lX+0x%lX is past the detected 0x%lX capacity\r\n",
+		          (unsigned long)offset, (unsigned long)len, (unsigned long)size);
+		goto recover;
+	}
+
+	memset(&src_ctx, 0, sizeof(src_ctx));
+	src_ctx.base = offset;
+	src_ctx.total = len;
+
+	bak_build_name(name, offset, len);
+	src.ctx = &src_ctx; src.name = name; src.size = len; src.read = bak_src_read;
+
+	cli_print(sh, "wifi: sending '%s' (%lu bytes) -- start the receiver now "
+	          "(`rz`, or Ctrl+A Ctrl+R in picocom)\r\n", name, (unsigned long)len);
+	/* From here until the transfer ends, io_getc() owns the console RX (see above). */
+	rc = xfer_send_source_locked(sh, &src);
+	if (rc != 0) {
+		if (src_ctx.failed)
+			cli_error(sh, "wifi: flash read failed %lu bytes in\r\n",
+			          (unsigned long)src_ctx.pos);
+		goto recover;
+	}
+	cli_print(sh, "  host digest:   0x%08lX (u32-LE word sum of the bytes sent)\r\n",
+	          (unsigned long)src_ctx.sum);
+
+	/* LAST operation of the session: the module's own digest over the same range, in
+	 * the same algorithm -- so this is an END-TO-END VERIFY of the backup that does not
+	 * depend on re-reading the flash.  A timeout poisons the session, so we only ever
+	 * fall through to recover from here. */
+	rc = rtl_dl_flash_chksum(offset, len, 30000u, &devsum, rtl_abort_cb, sh);
+	if (rc != 0) {
+		cli_warn(sh, "  device digest: n/a (rc %d) -- backup UNVERIFIED\r\n", rc);
+	} else if (devsum == src_ctx.sum) {
+		cli_print(sh, "  device digest: 0x%08lX -- VERIFIED (matches)\r\n",
+		          (unsigned long)devsum);
+		ok = 1;
+	} else {
+		cli_error(sh, "  device digest: 0x%08lX -- MISMATCH, the backup is NOT trustworthy\r\n",
+		          (unsigned long)devsum);
+	}
+
+recover:
+	rtl8720_uart_close();
+	rtl8720_reset();
+	rtl_tcpip_set_inited(false);
+	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	cli_console_release(sh);
+	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
+	return ok ? 0 : 1;
+}
+
 CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(info,  NULL, "show RTL8720 wiring + CHIP_EN state",       cmd_wifi_info,  1, 0),
 	CLI_CMD_ARG(on,    NULL, "CHIP_EN high (power on RTL8720)",           cmd_wifi_on,    1, 0),
@@ -774,6 +1112,8 @@ CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(flashload,  NULL, "load flashloader + read flash sector0 (non-destructive) [hold] [baud]", cmd_wifi_flashload, 1, 2),
 	CLI_CMD_ARG(flashread,  NULL, "read flash <offset> [nsectors] (non-destructive survey)", cmd_wifi_flashread, 2, 1),
 	CLI_CMD_ARG(flashtest,  NULL, "DESTRUCTIVE erase/write/verify test <offset> confirm", cmd_wifi_flashtest, 2, 1),
+	CLI_CMD_ARG(flashinfo,  NULL, "identify flash: capacity / status regs / checksum", cmd_wifi_flashinfo, 1, 0),
+	CLI_CMD_ARG(flashbackup, NULL, "back up flash to the PC over YMODEM [offset] [len]", cmd_wifi_flashbackup, 1, 2),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(wifi, wifi_subcmds,
