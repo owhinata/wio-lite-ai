@@ -87,13 +87,31 @@ Mode") with line editing, history, and Tab completion. 21 commands:
   the **real chip capacity** — measured by address wrap, comparing 8 KB at offset 0
   against 8 KB at 1/2/4/8 MB — plus the status registers and a device-side checksum;
   `wifi flashbackup [off] [len]` streams the whole chip to the PC over **YMODEM**
-  (`svc/ymodem.c`; receive with `rz`, or `Ctrl+A Ctrl+R` in picocom) so the factory image
-  can be saved before anything is written. All of those are **read-only**. The one
-  destructive entry point, `wifi flashtest <off> confirm`, is a hard-gated erase/write/
-  verify self-test restricted to a single unused 4 KB sector in `[0x100000, 0x200000)`
-  that it restores to `0xFF`; it power-cycles the module mid-test because the flashloader
-  stops responding after a flash program. The RTL8720DN is a separate chip from the
-  STM32 and its download mode lives in mask ROM, so it stays recoverable regardless.
+  (`svc/ymodem.c`; receive with `rb`, or `Ctrl+A Ctrl+R` in picocom) so the factory image
+  can be saved before anything is written. All of those are **read-only**.
+  Going the other way, `wifi imgload` **receives** an image from the PC (`sb <file>`) into
+  the PSRAM staging buffer at `0x90000000` (`app/rtl8720_img.c`; AXI-SRAM is far too small
+  for a 2 MB image), `wifi imginfo` re-verifies it against PSRAM and `wifi imgsend` streams
+  it back so a `cmp` on the host can prove byte equality. Those are read-only too — they
+  never power the module up. Use **`sb -k`**: plain `sb` sends 128-byte blocks and spends
+  most of the transfer waiting for per-block ACKs (~42 kB/s for 2 MB), while `-k` selects
+  1024-byte blocks. A transfer's post-mortem (blocks accepted, CRC/sequence/short-read
+  counts, console RX-ring drops) goes to **`dmesg`** as well as the console, because while
+  `sb`/`rb` is running it owns the terminal and eats anything the board prints.
+  There are two destructive entry points. `wifi flashtest <off> confirm` is a hard-gated
+  erase/write/verify self-test restricted to a single unused 4 KB sector in
+  `[0x100000, 0x200000)` that it restores to `0xFF`. `wifi flashwrite <off> confirm`
+  programs the staged image for real — including the module's boot sectors — and is what
+  makes the saved factory image restorable. Both power-cycle the module mid-operation,
+  because the flashloader stops responding after a flash program; `flashwrite` uses that
+  second session to verify by asking the module for its own checksum of the written range
+  (a **sum of 32-bit little-endian words**, identified on hardware) and comparing it with
+  ours, so a multi-megabyte image needs no read-back. Its gates: 4 KB alignment, a 2 MB
+  destructive cap, the chip capacity re-measured before the erase, the staged image's
+  digest re-checked against PSRAM, an explicit `confirm`, and — at offset 0 — the AmebaD
+  `km0_boot` magic, so a non-firmware blob can never land on the boot sector. The
+  RTL8720DN is a separate chip from the STM32 and its download mode lives in mask ROM, so
+  it stays recoverable regardless.
 - **`net`** — the IPv4 (L3) layer on top of a `wifi connect` association (issue #5),
   the Wio port of `../stm32f746g-disco`'s `net` command. Where f746 drives NetX Duo over
   the on-chip Ethernet MAC, here the backend is the RTL8720DN's **eRPC socket-offload**

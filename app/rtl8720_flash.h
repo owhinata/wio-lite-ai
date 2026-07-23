@@ -39,6 +39,31 @@
 
 #include <stdint.h>
 
+/*
+ * The module's own flash digest (its 0x27 command), computed incrementally on our
+ * side so a host-supplied image can be verified WITHOUT reading the flash back.
+ *
+ * ALGORITHM (established on hardware, board #2, M4): a plain sum of the range read
+ * as 32-bit LITTLE-ENDIAN words.  A 4 KB dump the module digested as 0xC9AB910F
+ * matched the LE word sum of the received bytes exactly, while a byte sum, CRC-32
+ * and Adler-32 all differed.  This single definition is shared by the backup
+ * streamer, the staged-image checker and rtl_dl_flash_program() -- do not
+ * re-implement it.  Ranges are always 4 KB multiples here, so the tail is exact.
+ *
+ * NOTE it is only a 32-bit sum: it detects corruption, not adversarial collision.
+ * Where BYTE equality has to be proven (a backup, a restored image) compare the
+ * bytes themselves on the host rather than trusting this alone.
+ */
+struct rtl_dl_digest {
+	uint32_t sum;    /* completed words */
+	uint32_t acc;    /* partial word being assembled */
+	uint8_t  nacc;   /* bytes already in acc (0..3) */
+};
+
+void     rtl_dl_digest_init(struct rtl_dl_digest *d);
+void     rtl_dl_digest_add(struct rtl_dl_digest *d, const uint8_t *p, uint32_t n);
+uint32_t rtl_dl_digest_value(const struct rtl_dl_digest *d);
+
 /* Result of an M1 download-mode probe (all diagnostic; printed by `wifi flashprobe`). */
 struct rtl_dl_result {
 	int      entered;      /* 1 if a valid read-word reply frame (0x31..0x15) was seen */
@@ -222,5 +247,72 @@ struct rtl_dl_selftest {
  */
 int rtl_dl_flash_selftest(uint32_t offset, uint32_t hold_us, struct rtl_dl_selftest *r,
                           int (*should_abort)(void *ctx), void *abort_ctx);
+
+/* ---- M5: program a host-supplied firmware image (DESTRUCTIVE, the real thing) ---- */
+
+/* First 8 bytes of an AmebaD km0_boot image -- checked before anything may be written
+ * at offset 0.  Confirmed twice: _ref/ambd/firmware/km0_boot_all.bin, and the M2 read
+ * of this board's own flash. */
+#define RTL_DL_KM0_MAGIC_LEN  8u
+extern const uint8_t rtl_dl_km0_magic[RTL_DL_KM0_MAGIC_LEN];
+
+/* Per-step result of rtl_dl_flash_program (printed by `wifi flashwrite`). */
+struct rtl_dl_program {
+	uint32_t sectors;      /* sectors the range covers */
+	uint32_t erased;       /* sectors successfully erased */
+	uint32_t written;      /* bytes handed to the block transfer */
+	uint32_t host_sum;     /* our digest of the source bytes */
+	uint32_t dev_sum;      /* the module's 0x27 digest of the written range */
+	uint32_t cap;          /* capacity detected before erasing (0 = unknown) */
+	int      cap_known;
+	int      erase_ok;
+	int      write_ok;
+	int      verify_ok;    /* dev_sum == host_sum */
+};
+
+/*
+ * DESTRUCTIVE: erase [offset, offset+len) and program @data into it, then verify.
+ * This is the only public API that can write outside rtl_dl_flash_selftest's tiny
+ * test window -- it is what actually (re)flashes the RTL8720DN's firmware, so read
+ * the gates below before changing anything here.
+ *
+ * Owns the whole session, like rtl_dl_flash_selftest: the caller only needs
+ * cli_console_claim + a final rtl8720_reset; do NOT rtl_dl_enter/load first.
+ * Two phases, because a flash program leaves the flashloader unresponsive until a
+ * power-cycle (established in M3):
+ *   Phase 1  enter -> load flashloader -> detect capacity -> erase -> block-transfer
+ *   Phase 2  power-cycle, re-enter, re-load -> 0x27 digest over the same range,
+ *            compared against our digest of @data.  Verifying by digest instead of
+ *            by read-back is what makes a multi-megabyte image practical.
+ *
+ * GATES -- all of these must hold or nothing is powered up, let alone erased:
+ *   1. @offset and @len are 4 KB-aligned, @len != 0, and offset+len <= 2 MB
+ *      (RTL_DL_FLASH_WRITE_MAX -- the conservative destructive cap, unchanged
+ *      since M3; the wider READ cap deliberately does not apply here).
+ *   2. Writing at offset 0 requires @data to start with rtl_dl_km0_magic: the one
+ *      thing that would make this module unbootable is a garbage boot image, and
+ *      the check costs nothing.
+ *   3. The capacity probe runs BEFORE the erase (while there is still data to
+ *      detect the address wrap against).  If it reports a capacity, offset+len must
+ *      fit in it; if the probe itself FAILS to read, nothing is erased.  A probe
+ *      that simply cannot determine a size (a blank chip -- the state a failed
+ *      program leaves behind, and the one that has to stay repairable) proceeds
+ *      under gate 1's 2 MB bound.
+ * The shell adds two more: an explicit `confirm` token, and a re-check of the
+ * staged image's digest immediately before the call.
+ *
+ * Returns 0 only on a full pass (erased, written, and the digests agree).  Negative
+ * otherwise: -1 bad arguments / gate 1, -2 session setup, -3 gate 2 (magic),
+ * -10 gate 3 could not read the flash to size it, -4 gate 3 says the range is past
+ * the detected capacity, -5 erase, -6 block transfer, -7 phase-2 session,
+ * -8 digest unavailable, -9 digest MISMATCH.  Nothing has been erased for any code
+ * above -5, so those are all safe failures.  On any failure from -5 on,
+ * the range is in an indeterminate state and the operation must be REPEATED (erase
+ * + write is idempotent as a whole) -- do not treat a failed verify as recoverable
+ * by rebooting the module.  @should_abort (may be NULL) is polled to cancel.
+ */
+int rtl_dl_flash_program(uint32_t offset, const uint8_t *data, uint32_t len,
+                         uint32_t hold_us, struct rtl_dl_program *r,
+                         int (*should_abort)(void *ctx), void *abort_ctx);
 
 #endif /* APP_RTL8720_FLASH_H */

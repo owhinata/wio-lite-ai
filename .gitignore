@@ -14,3 +14,9 @@ __pycache__/
 # Editor swap / backup files (Vim .*.swp/.swo, emacs/gedit ~ backups)
 *.sw[a-p]
 *~
+
+# RTL8720DN flash dumps that land here from a YMODEM receive (`wifi flashbackup` /
+# `wifi imgsend` + `rb`, which writes to the terminal's working directory -- issue
+# #19).  NEVER commit these: a full-chip image contains the factory WiFi settings
+# sector at 0x105000, and the PSK in it is in the clear.  Keep them in _ref/ambd/.
+/rtl8720_*.bin

@@ -326,6 +326,7 @@ add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/psram.c"
     "${CMAKE_SOURCE_DIR}/app/rtl8720.c"
     "${CMAKE_SOURCE_DIR}/app/rtl8720_flash.c"
+    "${CMAKE_SOURCE_DIR}/app/rtl8720_img.c"
     "${GEN_DIR}/rtl8720_flashloader_data.c"
     "${CMAKE_SOURCE_DIR}/app/erpc.c"
     "${CMAKE_SOURCE_DIR}/app/wifi_rpc.c"
@@ -358,6 +359,12 @@ target_compile_definitions(shell PRIVATE
     CLI_INSTANCE_STACK_SIZE=4096       # headroom for cli_print + coremark
     CLI_BG_JOB_STACK_SIZE=4096
     CLI_USBCDC_TX_BUFFER_SIZE=4096     # holds a full CoreMark report burst
+    # issue #19 M5: the console now RECEIVES bulk data (`wifi imgload` takes a
+    # firmware image over YMODEM).  The backend drops -- and counts -- a byte
+    # whenever this ring is full, so the default 256 B is too tight for a 1029 B
+    # YMODEM block; 4 KB makes an overrun require the shell thread to be starved
+    # for four whole blocks.  `wifi imgload` reports the drop count either way.
+    CLI_USBCDC_RX_BUFFER_SIZE=4096
     BSP_ENABLE_IWDG=$<BOOL:${BSP_ENABLE_IWDG}>   # issue #4: IWDG1 arm + petter + wdt
     BSP_ENABLE_WFI=$<BOOL:${BSP_ENABLE_WFI}>      # issue #2: gates TX_ENABLE_WFI (tx_user.h)
     BSP_ENABLE_PSRAM=$<BOOL:${BSP_ENABLE_PSRAM}>          # issue #3: PSRAM window + psram cmd

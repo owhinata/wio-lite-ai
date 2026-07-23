@@ -77,7 +77,13 @@ extern "C" {
 #define CFG_TUD_DFU_RUNTIME  0
 
 // CDC FIFO sizes (TX generous so bursty output isn't dropped).
-#define CFG_TUD_CDC_RX_BUFSIZE   64
+// RX raised from 64 for issue #19 M5: `wifi imgload` receives a multi-megabyte
+// firmware image over YMODEM, and this FIFO is what absorbs OUT packets between
+// runs of the backend pump that moves them into the shell's RX ring.  At 64 B
+// (one packet) the host is NAKed after every single packet; 512 B lets a block
+// stream in while the pump catches up.  It does not replace the ring itself --
+// see CLI_USBCDC_RX_BUFFER_SIZE in CMakeLists.txt.
+#define CFG_TUD_CDC_RX_BUFSIZE   512
 #define CFG_TUD_CDC_TX_BUFSIZE   512
 #define CFG_TUD_CDC_EP_BUFSIZE   64
 

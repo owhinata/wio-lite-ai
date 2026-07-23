@@ -58,6 +58,39 @@ int xfer_send_source_locked(struct cli_instance *sh, const struct ym_source *src
  */
 int xfer_send_source(struct cli_instance *sh, const struct ym_source *src);
 
+/**
+ * Receive a YMODEM file from the PC into @p sink over the shell's console,
+ * assuming the caller ALREADY holds it (cli_console_claim).  The mirror of
+ * xfer_send_source_locked(): flushes RX, runs ymodem_recv(), flushes RX again and
+ * prints a one-line result.  Added for issue #19 M5 (`wifi imgload`).
+ *
+ * CRITICAL -- console RX ownership: exactly as on the send side, for the duration
+ * of ymodem_recv() the ONLY permitted reader of the console RX ring is this
+ * function's io_getc_recv().  Nothing in the sink may poll cli_cancel_requested()
+ * (directly or via an abort hook): cli_cancel_poll() drains the RX ring and
+ * DISCARDS every non-0x03 byte, which here would swallow the SENDER's block data
+ * and destroy the transfer.
+ *
+ * NO LOCAL Ctrl+C, unlike the send side: while receiving, the incoming stream is
+ * the file itself, so a 0x03 is ordinary data (~1 byte in 256 of binary content,
+ * and it lands in block CRCs too) and cannot be told apart from a keypress --
+ * treating it as an abort corrupted every transfer until io_getc_recv() stopped
+ * doing so.  Abort from the PC instead (cancel the sender; lrzsz emits CAN, which
+ * the protocol core honours), or let the handshake time out.
+ *
+ * A non-zero return means the batch did NOT complete -- including the case where
+ * all the data arrived but the sender's closing block never did (ymodem_recv()
+ * reports that as YM_ERR_TIMEOUT by design).  Callers must discard whatever the
+ * sink accumulated in that case.  Returns 0 on a completed transfer, 1 otherwise.
+ */
+int xfer_recv_sink_locked(struct cli_instance *sh, const struct ym_sink *sink);
+
+/**
+ * Claim the console, call xfer_recv_sink_locked(), then release it.  Returns 0 on
+ * a completed transfer, 1 on any failure / cancel (including a bg-job rejection).
+ */
+int xfer_recv_sink(struct cli_instance *sh, const struct ym_sink *sink);
+
 #ifdef __cplusplus
 }
 #endif

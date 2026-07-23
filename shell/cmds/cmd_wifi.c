@@ -23,6 +23,10 @@
  *   wifi flashtest <off> confirm  M3: DESTRUCTIVE erase/write/verify on one unused sector
  *   wifi flashinfo                M4: capacity (address wrap) / status regs / checksum
  *   wifi flashbackup [off] [len]  M4: back the flash up to the PC over YMODEM (read-only)
+ *   wifi imgload                  M5: receive an image from the PC into PSRAM (read-only)
+ *   wifi imginfo                  M5: show + re-verify the staged image (read-only)
+ *   wifi imgsend                  M5: send the staged image back to the PC (read-only)
+ *   wifi flashwrite <off> confirm M5: DESTRUCTIVE -- program the staged image
  *
  * The log/probe bridge takes over the console (issue #50 raw API): RTL8720DN RX
  * bytes stream to the CDC console and console keystrokes go to the module's TX, so
@@ -40,9 +44,19 @@
  * Clean-room design; no third-party code reused.
  */
 #include "cli.h"
+/* cli_instance.h (ThreadX-aware) gives the full struct cli_instance, which
+ * `wifi imgload` needs for sh->rx_dropped: the console backend silently drops --
+ * and counts -- a byte when its RX ring overruns, and a bulk receive is the first
+ * thing in this firmware that can provoke that, so the count has to be reported
+ * rather than assumed to be zero.  cmd_wifi.c is firmware-only, so the ThreadX
+ * dependency it pulls in is fine (like cmd_watch.c / cmd_thread.c). */
+#include "cli_instance.h"
 #include "cmd_xfer.h"
 #include "rtl8720.h"
 #include "rtl8720_flash.h"
+#include "rtl8720_img.h"     /* #19 M5: PSRAM staging for a host-supplied image */
+#include "psram.h"           /* #19 M5: PSRAM_BASE_ADDR + the OCTOSPI1 guard */
+#include "log.h"             /* #19 M5: transfer post-mortem into the dmesg ring */
 #include "erpc.h"
 #include "wifi_rpc.h"
 #include "rtl_link.h"
@@ -915,14 +929,11 @@ struct rtl_bak_src {
 	uint32_t pos;         /* bytes served so far */
 	uint32_t chunk_pos;   /* stream position of s_bak_chunk[0] */
 	uint32_t chunk_len;   /* valid bytes in s_bak_chunk (0 = empty) */
-	/* Running digest of everything served, in the SAME algorithm the module's 0x27
-	 * command uses -- a sum of 32-bit little-endian words.  (Identified on hardware:
-	 * a 4 KB dump whose 0x27 result was 0xC9AB910F matched the LE word sum of the
-	 * received bytes exactly, while a plain byte sum, CRC-32 and Adler-32 did not.)
-	 * Accumulated byte-wise because the source serves arbitrary-sized slices. */
-	uint32_t sum;         /* completed words */
-	uint32_t acc;         /* partial word being assembled */
-	uint32_t nacc;        /* bytes already in acc (0..3) */
+	/* Running digest of everything served, in the module's own 0x27 algorithm, so the
+	 * backup can be verified against the device without re-reading the flash.  The
+	 * algorithm lives in one place (app/rtl8720_flash.c) and is shared with the M5
+	 * staged-image checker -- see struct rtl_dl_digest. */
+	struct rtl_dl_digest dg;
 	int      failed;      /* sticky: a flash read failed */
 };
 
@@ -955,14 +966,7 @@ static int bak_src_read(void *ctx, uint8_t *dst, uint32_t want, uint32_t *got)
 	if (n > s->total - s->pos)
 		n = s->total - s->pos;
 	memcpy(dst, s_bak_chunk + (s->pos - s->chunk_pos), n);
-	for (uint32_t i = 0u; i < n; i++) {         /* 0x27's digest: sum of u32 LE words */
-		s->acc |= (uint32_t)dst[i] << (8u * s->nacc);
-		if (++s->nacc == 4u) {
-			s->sum += s->acc;
-			s->acc = 0u;
-			s->nacc = 0u;
-		}
-	}
+	rtl_dl_digest_add(&s->dg, dst, n);
 	s->pos += n;
 	*got = n;
 	return 0;
@@ -1054,6 +1058,7 @@ static int cmd_wifi_flashbackup(struct cli_instance *sh, int argc, char **argv)
 	memset(&src_ctx, 0, sizeof(src_ctx));
 	src_ctx.base = offset;
 	src_ctx.total = len;
+	rtl_dl_digest_init(&src_ctx.dg);
 
 	bak_build_name(name, offset, len);
 	src.ctx = &src_ctx; src.name = name; src.size = len; src.read = bak_src_read;
@@ -1069,7 +1074,7 @@ static int cmd_wifi_flashbackup(struct cli_instance *sh, int argc, char **argv)
 		goto recover;
 	}
 	cli_print(sh, "  host digest:   0x%08lX (u32-LE word sum of the bytes sent)\r\n",
-	          (unsigned long)src_ctx.sum);
+	          (unsigned long)rtl_dl_digest_value(&src_ctx.dg));
 
 	/* LAST operation of the session: the module's own digest over the same range, in
 	 * the same algorithm -- so this is an END-TO-END VERIFY of the backup that does not
@@ -1078,7 +1083,7 @@ static int cmd_wifi_flashbackup(struct cli_instance *sh, int argc, char **argv)
 	rc = rtl_dl_flash_chksum(offset, len, 30000u, &devsum, rtl_abort_cb, sh);
 	if (rc != 0) {
 		cli_warn(sh, "  device digest: n/a (rc %d) -- backup UNVERIFIED\r\n", rc);
-	} else if (devsum == src_ctx.sum) {
+	} else if (devsum == rtl_dl_digest_value(&src_ctx.dg)) {
 		cli_print(sh, "  device digest: 0x%08lX -- VERIFIED (matches)\r\n",
 		          (unsigned long)devsum);
 		ok = 1;
@@ -1094,6 +1099,367 @@ recover:
 	rtl_set_ip_mode(RTL_IP_UNKNOWN);
 	cli_console_release(sh);
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
+	return ok ? 0 : 1;
+}
+
+/* ------------------------------------------------------------------ *
+ *  issue #19 M5: image staging (host -> PSRAM) + programming the module
+ * ------------------------------------------------------------------ */
+
+/* Print the staged-image record, re-reading PSRAM to catch a clobber.  Returns 1 when a
+ * valid image is present AND still intact, 0 otherwise (message already emitted). */
+static int img_report(struct cli_instance *sh)
+{
+	const struct rtl_img *im = rtl_img_get();
+	uint32_t              now;
+	int                   i;
+
+	if (!im->valid) {
+		cli_warn(sh, "wifi: no image staged -- run `wifi imgload` first\r\n");
+		return 0;
+	}
+	cli_print(sh, "  name:    '%s'\r\n", im->name);
+	cli_print(sh, "  size:    %lu bytes (padded to %lu = %lu sectors with 0xFF)\r\n",
+	          (unsigned long)im->len, (unsigned long)im->padded_len,
+	          (unsigned long)(im->padded_len / 4096u));
+	cli_print(sh, "  digest:  0x%08lX (device 0x27 algorithm, over the padded range)\r\n",
+	          (unsigned long)im->digest);
+	cli_print(sh, "  first16:");
+	for (i = 0; i < 16; i++)
+		cli_print(sh, " %02X", rtl_img_data()[i]);
+	cli_print(sh, "%s\r\n",
+	          memcmp(rtl_img_data(), rtl_dl_km0_magic, RTL_DL_KM0_MAGIC_LEN) == 0
+	                  ? "   (AmebaD km0_boot magic)" : "");
+
+	now = rtl_img_verify();
+	if (now != im->digest) {
+		cli_error(sh, "  RECHECK: 0x%08lX -- PSRAM was CLOBBERED since the load "
+		          "(another command used it); re-run `wifi imgload`\r\n",
+		          (unsigned long)now);
+		return 0;
+	}
+	cli_print(sh, "  recheck: 0x%08lX -- intact\r\n", (unsigned long)now);
+	return 1;
+}
+
+/*
+ * wifi imgload (issue #19, M5): receive a firmware image from the PC over YMODEM into
+ * the PSRAM staging buffer.  Touches NO RTL8720 hardware at all -- this is purely the
+ * host-to-board transfer, and it is what makes the stock backup restorable.
+ *
+ * Console RX ownership: from cli_console_claim() until xfer_recv_sink_locked() returns,
+ * the ONLY reader of the console RX ring is that helper's io_getc().  The sink must not
+ * poll cli_cancel_requested() (see cmd_xfer.h) -- here it physically cannot, since
+ * rtl_img_sink() has no abort hook to pass.
+ */
+static int cmd_wifi_imgload(struct cli_instance *sh, int argc, char **argv)
+{
+	const struct rtl_img *im;
+	uint32_t              drops0;
+	int                   rc, ok = 0;
+
+	(void)argc; (void)argv;
+
+	if (!psram_ready()) {
+		cli_error(sh, "wifi: PSRAM is not available -- nowhere to stage the image\r\n");
+		return 1;
+	}
+	if (cli_console_claim(sh) != 0) {
+		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+		return 1;
+	}
+	/* Hold the OCTOSPI1 guard for the WHOLE transfer so a backgrounded psram/membench
+	 * job cannot overwrite the staging area while it fills. */
+	if (!psram_acquire()) {
+		cli_console_release(sh);
+		cli_error(sh, "wifi: PSRAM is busy (another command holds it)\r\n");
+		return 1;
+	}
+
+	rc = rtl_img_probe();               /* invalidates, then proves PSRAM stores data */
+	if (rc != 0) {
+		cli_error(sh, "wifi: PSRAM staging self-check failed (rc %d)\r\n", rc);
+		goto out;
+	}
+
+	drops0 = sh->rx_dropped;
+	cli_print(sh, "wifi: staging an RTL8720 image in PSRAM @0x%08lX (max %lu bytes). "
+	          "NOTHING is written to the module.\r\n",
+	          (unsigned long)PSRAM_BASE_ADDR, (unsigned long)RTL_IMG_MAX);
+	/* xfer_recv_sink_locked() does not print this (its caller owns the console), but
+	 * the handshake budget is only long enough if the operator starts now. */
+	cli_print(sh, "wifi: start the sender now -- `sb <file>` (lrzsz YMODEM batch send; "
+	          "`sz` will NOT work), or Ctrl+A Ctrl+S in picocom; Ctrl+C aborts\r\n");
+	rc = xfer_recv_sink_locked(sh, rtl_img_sink());
+
+	/* Print the transfer post-mortem BEFORE branching, so a failure is as
+	 * informative as a success -- the counters say which layer broke (see
+	 * struct ym_recv_diag). */
+	{
+		const struct ym_recv_diag *d = ymodem_recv_diag();
+
+		cli_print(sh, "  ymodem: %lu blocks ok, %lu bad-crc, %lu bad-seq, "
+		          "%lu short-read, %lu header-timeouts\r\n",
+		          (unsigned long)d->blocks, (unsigned long)d->bad_crc,
+		          (unsigned long)d->bad_seq, (unsigned long)d->short_read,
+		          (unsigned long)d->timeouts);
+		if (d->first_kind >= 0)
+			cli_print(sh, "  first bad block: kind 0x%02X seq %d ~seq %d, "
+			          "body %lu/%lu B, crc want %04X got %04X\r\n",
+			          (unsigned)d->first_kind, d->first_seq, d->first_nseq,
+			          (unsigned long)d->first_got, (unsigned long)d->first_want,
+			          d->first_crc_want, d->first_crc_got);
+		/* The console backend drops -- and counts -- a byte when its RX ring
+		 * overruns.  A non-zero count here means the loss is below YMODEM. */
+		cli_print(sh, "  rx drops during the transfer: %lu%s\r\n",
+		          (unsigned long)(sh->rx_dropped - drops0),
+		          (sh->rx_dropped - drops0) ? "  <-- NOT CLEAN" : "  (clean)");
+		/* Also to the log ring: the PC's terminal is still attached to `sb` when
+		 * these lines go out, so `dmesg` is where they can actually be read. */
+		log_write((sh->rx_dropped - drops0) ? LOG_LEVEL_WRN : LOG_LEVEL_INF, "wifi",
+		          "imgload rc=%d rx_drops=%lu", rc,
+		          (unsigned long)(sh->rx_dropped - drops0));
+	}
+
+	if (rc != 0) {
+		/* Includes "all the data arrived but the batch never closed" -- not a
+		 * complete image, so it must not be left staged. */
+		rtl_img_invalidate();
+		goto out;
+	}
+	if (rtl_img_finish() != 0) {
+		cli_error(sh, "wifi: empty transfer -- nothing staged\r\n");
+		goto out;
+	}
+
+	im = rtl_img_get();
+	cli_print(sh, "wifi: staged '%s', %lu bytes\r\n",
+	          im->name, (unsigned long)im->len);
+	cli_print(sh, "  padded: %lu bytes (%lu sectors, 0xFF filled)\r\n",
+	          (unsigned long)im->padded_len, (unsigned long)(im->padded_len / 4096u));
+	cli_print(sh, "  digest: 0x%08lX -- compare with the host-side u32-LE word sum\r\n",
+	          (unsigned long)im->digest);
+	ok = 1;
+
+out:
+	psram_release();
+	cli_console_release(sh);
+	return ok ? 0 : 1;
+}
+
+/* wifi imginfo (issue #19, M5): show the staged image and re-verify it against PSRAM. */
+static int cmd_wifi_imginfo(struct cli_instance *sh, int argc, char **argv)
+{
+	int ok;
+
+	(void)argc; (void)argv;
+
+	if (!psram_acquire()) {
+		cli_error(sh, "wifi: PSRAM is busy (another command holds it)\r\n");
+		return 1;
+	}
+	ok = img_report(sh);
+	psram_release();
+	return ok ? 0 : 1;
+}
+
+/* YMODEM source over the staged PSRAM image (issue #19, M5): sends it straight back to
+ * the PC so the round trip can be checked with `cmp`, which proves BYTE equality --
+ * something the 32-bit device digest alone cannot. */
+struct rtl_img_src { uint32_t pos, total; };
+
+static int img_src_read(void *ctx, uint8_t *dst, uint32_t want, uint32_t *got)
+{
+	struct rtl_img_src *s = (struct rtl_img_src *)ctx;
+	uint32_t            n = s->total - s->pos;
+
+	if (n > want)
+		n = want;
+	memcpy(dst, rtl_img_data() + s->pos, n);
+	s->pos += n;
+	*got = n;
+	return 0;
+}
+
+/* wifi imgsend (issue #19, M5): stream the staged image back to the PC over YMODEM. */
+static int cmd_wifi_imgsend(struct cli_instance *sh, int argc, char **argv)
+{
+	const struct rtl_img *im = rtl_img_get();
+	struct rtl_img_src    src_ctx = { 0u, 0u };
+	struct ym_source      src;
+	int                   rc, ok = 0;
+
+	(void)argc; (void)argv;
+
+	if (!im->valid) {
+		cli_error(sh, "wifi: no image staged -- run `wifi imgload` first\r\n");
+		return 1;
+	}
+	if (cli_console_claim(sh) != 0) {
+		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+		return 1;
+	}
+	if (!psram_acquire()) {
+		cli_console_release(sh);
+		cli_error(sh, "wifi: PSRAM is busy (another command holds it)\r\n");
+		return 1;
+	}
+
+	/* This command exists to prove byte equality with the host's file, so sending a
+	 * silently clobbered buffer would defeat its whole purpose. */
+	if (rtl_img_verify() != im->digest) {
+		cli_error(sh, "wifi: staged image no longer matches its digest (PSRAM was "
+		          "clobbered) -- re-run `wifi imgload`\r\n");
+		goto out;
+	}
+
+	src_ctx.total = im->padded_len;
+	src.ctx = &src_ctx; src.name = im->name;
+	src.size = im->padded_len; src.read = img_src_read;
+
+	cli_print(sh, "wifi: sending the staged image '%s' (%lu bytes, padded) -- start the "
+	          "receiver now (`rb`, or Ctrl+A Ctrl+R in picocom)\r\n",
+	          im->name, (unsigned long)im->padded_len);
+	rc = xfer_send_source_locked(sh, &src);
+	ok = (rc == 0);
+
+out:
+	psram_release();
+	cli_console_release(sh);
+	return ok ? 0 : 1;
+}
+
+/*
+ * wifi flashwrite <offset> confirm (issue #19, M5): DESTRUCTIVE.  Erase and program the
+ * staged image into the RTL8720DN's flash at <offset>, then verify it with the module's
+ * own digest.  THIS IS THE COMMAND THAT CAN REWRITE THE MODULE'S BOOT SECTORS.
+ *
+ * The gates are layered on purpose (see rtl_dl_flash_program): here we require the
+ * literal `confirm` token and re-verify the staged image against PSRAM, and the protocol
+ * layer enforces alignment, the 2 MB destructive cap, the AmebaD boot magic at offset 0,
+ * and the detected chip capacity.  Recovery if this ever goes wrong: re-enter download
+ * mode (mask ROM -- always possible) and re-run with the full 2 MB stock backup staged.
+ */
+static int cmd_wifi_flashwrite(struct cli_instance *sh, int argc, char **argv)
+{
+	const struct rtl_img *im = rtl_img_get();
+	struct rtl_dl_program pr;
+	uint32_t              offset, len;
+	int                   rc, ok = 0;
+
+	if (parse_u32(argv[1], &offset) != 0) {
+		cli_error(sh, "wifi: bad offset (hex, e.g. 0x0)\r\n");
+		return 1;
+	}
+	if (!im->valid) {
+		cli_error(sh, "wifi: no image staged -- run `wifi imgload` first\r\n");
+		return 1;
+	}
+	len = im->padded_len;
+	if (argc < 3 || strcmp(argv[2], "confirm") != 0) {
+		cli_error(sh, "wifi: DESTRUCTIVE -- erases and rewrites %lu bytes of RTL8720 "
+		          "flash at 0x%lX.\r\n", (unsigned long)len, (unsigned long)offset);
+		cli_print(sh, "  re-run `wifi flashwrite 0x%lX confirm` to proceed\r\n",
+		          (unsigned long)offset);
+		return 1;
+	}
+	/* The factory WiFi-settings sector holds the SSID and a plaintext PSK; erasing it
+	 * is legitimate for a full-chip restore but must never be a surprise. */
+	if (offset <= 0x105000u && 0x105000u < offset + len)
+		cli_warn(sh, "wifi: NOTE this range covers 0x105000, the factory WiFi settings "
+		         "sector -- the stored SSID/password will be replaced\r\n");
+
+	if (cli_console_claim(sh) != 0) {
+		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+		return 1;
+	}
+	if (!psram_acquire()) {                 /* the image is read straight out of PSRAM */
+		cli_console_release(sh);
+		cli_error(sh, "wifi: PSRAM is busy (another command holds it)\r\n");
+		return 1;
+	}
+	/* Last gate before any hardware moves: the staged bytes must still be the ones we
+	 * digested at load time. */
+	if (rtl_img_verify() != im->digest) {
+		cli_error(sh, "wifi: staged image no longer matches its digest (PSRAM was "
+		          "clobbered) -- re-run `wifi imgload`\r\n");
+		goto out;
+	}
+
+	cli_print(sh, "wifi: programming '%s' -> flash 0x%lX..0x%lX (%lu sectors), "
+	          "DESTRUCTIVE; power-cycles the module to verify...\r\n",
+	          im->name, (unsigned long)offset, (unsigned long)(offset + len - 1u),
+	          (unsigned long)(len / 4096u));
+	/* erase + transfer + re-enter + digest; there is no progress output in between,
+	 * so say so rather than let a long silence look like a hang. */
+	cli_print(sh, "  (silent for roughly %lu s: erase, block transfer, power-cycle, "
+	          "digest. Ctrl+C aborts.)\r\n",
+	          (unsigned long)(10u + (len / 4096u) / 8u + (len >> 17)));
+	rc = rtl_dl_flash_program(offset, rtl_img_data(), len, 30000u, &pr,
+	                          rtl_abort_cb, sh);
+
+	switch (rc) {
+	case -1:
+		cli_error(sh, "wifi: bad range -- 4KB-aligned and within 0x%lX required\r\n",
+		          (unsigned long)0x200000u);
+		goto recover;
+	case -2:
+		cli_error(sh, "wifi: download / flashloader setup failed\r\n");
+		goto recover;
+	case -3:
+		cli_error(sh, "wifi: refusing -- writing offset 0 requires an AmebaD km0_boot "
+		          "image (magic 99 99 96 96 3F CC 66 FC)\r\n");
+		goto recover;
+	case -4:
+		cli_error(sh, "wifi: range past the detected 0x%lX capacity -- nothing "
+		          "erased\r\n", (unsigned long)pr.cap);
+		goto recover;
+	case -10:
+		cli_error(sh, "wifi: could not read the flash to size it -- nothing erased. "
+		          "Retry; if it persists, check the link with `wifi flashinfo`\r\n");
+		goto recover;
+	default:
+		break;
+	}
+
+	if (pr.cap_known)
+		cli_print(sh, "  capacity: %lu MB (address wrap)\r\n",
+		          (unsigned long)(pr.cap >> 20));
+	cli_print(sh, "  erase:  %s (%lu/%lu sectors)\r\n", pr.erase_ok ? "OK" : "FAIL",
+	          (unsigned long)pr.erased, (unsigned long)pr.sectors);
+	cli_print(sh, "  write:  %s (%lu bytes)\r\n", pr.write_ok ? "OK" : "FAIL",
+	          (unsigned long)pr.written);
+	cli_print(sh, "  host digest:   0x%08lX\r\n", (unsigned long)pr.host_sum);
+	if (rc == -8) {
+		cli_error(sh, "  device digest: n/a -- UNVERIFIED\r\n");
+	} else if (rc == -9) {
+		cli_error(sh, "  device digest: 0x%08lX -- MISMATCH\r\n",
+		          (unsigned long)pr.dev_sum);
+	} else if (rc == 0) {
+		cli_print(sh, "  device digest: 0x%08lX -- VERIFIED (matches)\r\n",
+		          (unsigned long)pr.dev_sum);
+	}
+
+	if (rc == 0) {
+		cli_print(sh, "wifi: PROGRAMMED and verified\r\n");
+		ok = 1;
+	} else {
+		cli_error(sh, "wifi: FAILED (rc %d)\r\n", rc);
+		cli_print(sh, "  the range is now INDETERMINATE. Re-run "
+		          "`wifi flashwrite 0x%lX confirm` (erase+write is idempotent); if it "
+		          "keeps failing, stage the full 2 MB backup and write it at 0x0.\r\n",
+		          (unsigned long)offset);
+	}
+
+recover:
+	rtl8720_uart_close();
+	rtl8720_reset();
+	rtl_tcpip_set_inited(false);
+	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
+out:
+	psram_release();
+	cli_console_release(sh);
 	return ok ? 0 : 1;
 }
 
@@ -1114,6 +1480,10 @@ CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(flashtest,  NULL, "DESTRUCTIVE erase/write/verify test <offset> confirm", cmd_wifi_flashtest, 2, 1),
 	CLI_CMD_ARG(flashinfo,  NULL, "identify flash: capacity / status regs / checksum", cmd_wifi_flashinfo, 1, 0),
 	CLI_CMD_ARG(flashbackup, NULL, "back up flash to the PC over YMODEM [offset] [len]", cmd_wifi_flashbackup, 1, 2),
+	CLI_CMD_ARG(imgload,    NULL, "receive a firmware image from the PC into PSRAM (YMODEM `sb`)", cmd_wifi_imgload, 1, 0),
+	CLI_CMD_ARG(imginfo,    NULL, "show + re-verify the staged firmware image",        cmd_wifi_imginfo, 1, 0),
+	CLI_CMD_ARG(imgsend,    NULL, "send the staged image back to the PC over YMODEM",  cmd_wifi_imgsend, 1, 0),
+	CLI_CMD_ARG(flashwrite, NULL, "DESTRUCTIVE program staged image: flashwrite <offset> confirm", cmd_wifi_flashwrite, 2, 1),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(wifi, wifi_subcmds,

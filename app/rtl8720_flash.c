@@ -3,8 +3,16 @@
  * Copyright (c) 2026 ThreadX Shell Project
  */
 /*
- * RTL8720DN (AmebaD) on-device UART firmware-download support -- issue #19, M1.
+ * RTL8720DN (AmebaD) on-device UART firmware-download support -- issue #19.
  * See rtl8720_flash.h for the entry mechanism, wiring and protocol references.
+ *
+ * Milestones, in the order they were proven on board #2: M1 download-mode entry,
+ * M2 flashloader stub + flash read (non-destructive), M3 erase/write/verify on one
+ * gated test sector, M4 capacity detection + full-chip backup (read-only), M5
+ * rtl_dl_flash_program() -- the real thing, which erases and rewrites firmware
+ * images including the boot sectors.  Everything destructive still funnels through
+ * the two private primitives dl_erase_sectors() / dl_send_flash() and the single
+ * range validator dl_flash_range_ok().
  *
  * M1 scope: prove UART download-mode ENTRY via a read-only handshake.  It performs
  * the strap+reset sequence (module OFF first, PD14 held low across the CHIP_EN rising
@@ -315,6 +323,48 @@ extern const uint32_t rtl8720_flashloader_len;
 #define RTL_DL_FLASH_READ_MAX    0x01000000u
 #define RTL_DL_FLASH_WRITE_MAX   0x00200000u
 
+/* Per-block ACK budgets for the block transfer (see dl_send_blocks). */
+#define RTL_DL_ACK_MS_SRAM       1000u
+#define RTL_DL_ACK_MS_FLASH      3000u
+
+/* M5: an AmebaD km0_boot image starts with this signature -- gate 2 of
+ * rtl_dl_flash_program(), so a non-firmware blob can never land at offset 0. */
+const uint8_t rtl_dl_km0_magic[RTL_DL_KM0_MAGIC_LEN] = {
+	0x99u, 0x99u, 0x96u, 0x96u, 0x3Fu, 0xCCu, 0x66u, 0xFCu
+};
+
+/* ---- the module's 0x27 digest, computed on our side (see rtl8720_flash.h) ---- */
+
+void rtl_dl_digest_init(struct rtl_dl_digest *d)
+{
+	d->sum = 0u;
+	d->acc = 0u;
+	d->nacc = 0u;
+}
+
+void rtl_dl_digest_add(struct rtl_dl_digest *d, const uint8_t *p, uint32_t n)
+{
+	uint32_t i;
+
+	/* Byte-wise because callers feed arbitrarily-sized slices (a YMODEM block, a
+	 * flash read chunk); the word boundary is carried in acc/nacc across calls. */
+	for (i = 0u; i < n; i++) {
+		d->acc |= (uint32_t)p[i] << (8u * d->nacc);
+		if (++d->nacc == 4u) {
+			d->sum += d->acc;
+			d->acc = 0u;
+			d->nacc = 0u;
+		}
+	}
+}
+
+uint32_t rtl_dl_digest_value(const struct rtl_dl_digest *d)
+{
+	/* A trailing partial word (only possible on a non-multiple-of-4 range, which the
+	 * 4 KB-aligned callers never produce) is folded in as the module would see it. */
+	return (d->nacc == 0u) ? d->sum : d->sum + d->acc;
+}
+
 /* Read bytes, skipping any that are not @want, until @want is seen (WaitResp).
  * 0 = found, -1 = timeout, -2 = aborted. */
 static int dl_wait_byte(uint8_t want, uint32_t timeout_ms, int (*ab)(void *), void *ctx)
@@ -421,9 +471,23 @@ static int dl_read_word(uint32_t addr, uint32_t *out, int (*ab)(void *), void *c
  * @addr32 is the full destination address of the FIRST byte (SRAM as-is, or flash with the
  * 0x08000000 base); each block uses addr32 + off.  Callers (dl_send_sram / dl_send_flash)
  * own the destination validation -- this core does none.  0 ok, -2 aborted, -3 no ACK.
+ *
+ * @ack_ms is the per-block ACK budget.  It is a parameter rather than a constant only so
+ * the flash path can wait longer than the SRAM path for a slow page program (M5): the
+ * block/ACK SEQUENCE ITSELF IS UNCHANGED from the M2/M3-proven code.
+ *
+ * DELIBERATELY NO RETRY, unlike the reference tool (Program.cs:399 passes retry=3).  A
+ * resent block would be harmless to the flash -- every block carries its own destination
+ * address, so re-programming identical bytes changes no cells -- but it is NOT harmless to
+ * the protocol: dl_wait_byte() returns on the first ACK it sees, so an ACK that merely
+ * arrived late would satisfy the retry, and every subsequent block would then be matched
+ * against the previous block's ACK.  A whole program run is idempotent, so the recovery
+ * for a lost ACK is to repeat the operation, not to patch it up mid-stream.  If real
+ * hardware ever shows ACK timeouts at scale, add "dl_drain_quiet() then resend" as its
+ * own reviewed change -- do not sneak it in here.
  */
 static int dl_send_blocks(const uint8_t *data, uint32_t len, uint32_t addr32,
-                          int (*ab)(void *), void *ctx)
+                          uint32_t ack_ms, int (*ab)(void *), void *ctx)
 {
 	static uint8_t pkt[3 + 4 + 1024 + 1];   /* function-static: off the 4 KB shell stack */
 	uint8_t start = RTL_DL_XMD_START, eot = RTL_DL_EOT;
@@ -452,7 +516,7 @@ static int dl_send_blocks(const uint8_t *data, uint32_t len, uint32_t addr32,
 			sum += pkt[i];
 		pkt[7 + N] = (uint8_t)(sum & 0xFFu);
 
-		rr = dl_send_wait_ack(pkt, 7u + N + 1u, 1000u, ab, ctx);
+		rr = dl_send_wait_ack(pkt, 7u + N + 1u, ack_ms, ab, ctx);
 		if (rr)
 			return (rr == -2) ? -2 : -3;
 		seq = (uint8_t)(seq + 1u);
@@ -473,7 +537,8 @@ static int dl_send_sram(const uint8_t *data, uint32_t len, uint32_t sram_addr,
 		return -1;
 	if (len == 0u || len > 0x10000u)            /* the stub is ~4.7 KB */
 		return -1;
-	return dl_send_blocks(data, len, sram_addr, ab, ctx);
+	/* 1000 ms per block: the M2-proven budget, kept exactly as it was. */
+	return dl_send_blocks(data, len, sram_addr, RTL_DL_ACK_MS_SRAM, ab, ctx);
 }
 
 /*
@@ -504,7 +569,11 @@ static int dl_send_flash(const uint8_t *data, uint32_t len, uint32_t flash_off,
 {
 	if (!dl_flash_range_ok(flash_off, len, RTL_DL_FLASH_WRITE_MAX))
 		return -1;
-	return dl_send_blocks(data, len, (flash_off & 0x00FFFFFFu) | RTL_DL_FLASH_BASE, ab, ctx);
+	/* 3000 ms per block rather than the SRAM path's 1000 ms: M3 only ever programmed
+	 * 4 KB (4 blocks), so a slow page program part-way through a megabyte-scale image
+	 * is untested territory and there is no retry to fall back on. */
+	return dl_send_blocks(data, len, (flash_off & 0x00FFFFFFu) | RTL_DL_FLASH_BASE,
+	                      RTL_DL_ACK_MS_FLASH, ab, ctx);
 }
 
 /* PRIVATE flash erase (M3, EraseSectorsFlash Program.cs:371-398): one 0x17 command per 4 KB
@@ -920,5 +989,108 @@ int rtl_dl_flash_selftest(uint32_t offset, uint32_t hold_us, struct rtl_dl_selft
 	if (!r->restore_ok)
 		return -6;                          /* left with data; re-running flashtest self-heals */
 	r->dirty = 0;                               /* sector restored to 0xFF */
+	return 0;
+}
+
+/* ------------------------------------------------------------------ *
+ *  M5: program a host-supplied firmware image (the real write path)
+ * ------------------------------------------------------------------ */
+
+/* How long to allow the module for its 0x27 digest over @len bytes.  It reads the
+ * whole range before answering (M4 measured ~30 s for the full 2 MB), so scale with
+ * the size and keep a floor for small ranges. */
+static uint32_t dl_chksum_budget_ms(uint32_t len)
+{
+	uint32_t ms = 10000u + (len >> 6);      /* 2 MB -> ~42 s */
+
+	return (ms > 120000u) ? 120000u : ms;
+}
+
+int rtl_dl_flash_program(uint32_t offset, const uint8_t *data, uint32_t len,
+                         uint32_t hold_us, struct rtl_dl_program *r,
+                         int (*ab)(void *), void *ctx)
+{
+	struct rtl_dl_digest dg;
+	struct rtl_dl_size   sz;
+	int                  rc;
+
+	memset(r, 0, sizeof(*r));
+	if (data == NULL)
+		return -1;
+
+	/* Gate 1: the same central, overflow-safe validator every destructive path uses,
+	 * against the conservative 2 MB write cap (NOT the wider read cap). */
+	if (!dl_flash_range_ok(offset, len, RTL_DL_FLASH_WRITE_MAX))
+		return -1;
+	r->sectors = len / 4096u;
+
+	/* Gate 2: refuse to put anything but an AmebaD boot image at offset 0. */
+	if (offset == 0u &&
+	    memcmp(data, rtl_dl_km0_magic, RTL_DL_KM0_MAGIC_LEN) != 0)
+		return -3;
+
+	/* Our digest of exactly the bytes we are about to write -- compared in phase 2
+	 * against the module's own, so the verify needs no read-back. */
+	rtl_dl_digest_init(&dg);
+	rtl_dl_digest_add(&dg, data, len);
+	r->host_sum = rtl_dl_digest_value(&dg);
+
+	/* --- Phase 1: session, capacity, erase, write --- */
+	if (rtl_dl_enter(hold_us, ab, ctx) != 0 ||
+	    rtl_dl_load_flashloader(1500000u, ab, ctx) != 0)
+		return -2;
+
+	/*
+	 * Gate 3: capacity, BEFORE erasing -- the wrap probe needs real data at offset 0 to
+	 * match against, so it cannot run on a chip we have already blanked.
+	 *
+	 * A READ FAILURE HERE IS FATAL (rc == -2, which also covers a Ctrl+C abort): the
+	 * link just failed to answer a read, and the very next thing this function would do
+	 * is erase.  Never erase on the strength of a probe that did not work.
+	 *
+	 * The two "capacity not determined" outcomes are allowed through, because gate 1 has
+	 * already bounded the write to 2 MB -- the capacity M4 measured on this board -- and
+	 * refusing them would break the recovery path:
+	 *   rc == -3  the first 8 KB is blank, so there is nothing to detect a wrap against.
+	 *             THIS IS EXACTLY THE STATE A FAILED PROGRAM LEAVES BEHIND, and re-running
+	 *             this function is how it is repaired.  Rejecting it would mean a botched
+	 *             write could never be fixed.
+	 *   size == 0 no wrap seen up to 8 MB, i.e. the chip is larger than anything we would
+	 *             write anyway.
+	 */
+	rc = rtl_dl_detect_size(&sz, ab, ctx);
+	if (rc == -2)
+		return -10;                     /* probe failed; nothing erased */
+	if (rc == 0 && sz.size != 0u) {
+		r->cap_known = 1;
+		r->cap = sz.size;
+		if (offset >= sz.size || len > sz.size - offset)
+			return -4;
+	}
+
+	if (dl_erase_sectors(offset, r->sectors, ab, ctx))
+		return -5;
+	r->erased = r->sectors;
+	r->erase_ok = 1;
+
+	if (dl_send_flash(data, len, offset, ab, ctx))
+		return -6;
+	r->written = len;
+	r->write_ok = 1;
+
+	/* --- Phase 2: the flashloader is wedged by the program (M3), so power-cycle,
+	 * re-enter and ask the module to digest what it now holds. --- */
+	if (rtl_dl_enter(hold_us, ab, ctx) != 0 ||
+	    rtl_dl_load_flashloader(1500000u, ab, ctx) != 0)
+		return -7;
+
+	/* LAST operation of the session: a timeout here may still be answered later and
+	 * would desynchronise anything that followed, so nothing does. */
+	if (rtl_dl_flash_chksum(offset, len, dl_chksum_budget_ms(len), &r->dev_sum,
+	                        ab, ctx) != 0)
+		return -8;
+	if (r->dev_sum != r->host_sum)
+		return -9;
+	r->verify_ok = 1;
 	return 0;
 }

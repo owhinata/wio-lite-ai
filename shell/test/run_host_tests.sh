@@ -161,4 +161,16 @@ gcc $CFLAGS -I "$svc" \
     $LDFLAGS -o "$out/test_ymodem"
 "$out/test_ymodem"
 
+# #19 M5 -- the YMODEM RECEIVER (ymodem_recv), which is what lets the board take a
+# firmware image FROM the PC (and therefore what makes the stock backup restorable).
+# Two harnesses: a pthread duplex loopback that runs ymodem_send() and ymodem_recv()
+# against each other through blocking FIFOs -- the only way to exercise the real
+# handshake, since the sender only advances on the receiver's 'C'/ACKs -- and scripted
+# transcripts for the error paths (CRC damage, duplicate/out-of-order blocks, a sink
+# that refuses the file, a batch that never closes, short-block trimming).
+gcc $CFLAGS -I "$svc" \
+    "$here/test_ymodem_recv.c" "$svc/ymodem.c" \
+    $LDFLAGS -pthread -o "$out/test_ymodem_recv"
+"$out/test_ymodem_recv"
+
 echo "host tests passed"

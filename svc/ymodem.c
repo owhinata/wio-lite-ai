@@ -4,7 +4,7 @@
  */
 /**
  * @file    ymodem.c
- * @brief   Clean-room YMODEM-CRC batch sender (svc/ layer).
+ * @brief   Clean-room YMODEM-CRC batch sender + receiver (svc/ layer).
  *
  * Sender state machine: wait for the receiver's 'C' (CRC mode request) -> send
  * block 0 (filename + decimal size) -> send 1024-byte data blocks -> EOT
@@ -15,6 +15,13 @@
  * Ported from ../stm32f746g-disco for issue #19 M4 (RTL8720DN full-chip flash backup
  * over the USB CDC console).  The only deviation from the donor is a longer initial
  * handshake budget -- see YM_HANDSHAKE_RETRIES.
+ *
+ * Issue #19 M5 added the mirror-image RECEIVER at the bottom of this file (the board
+ * has to take a firmware image FROM the PC before it may rewrite the RTL8720DN).  It
+ * shares the framing constants and ymodem_crc16() but has its OWN static block buffer,
+ * so the two directions never alias -- which is also what lets the host test drive
+ * both concurrently over a pthread loopback.  Nothing above the "RECEIVER" banner was
+ * changed by that work: the sender is the code already proven on board #2 in M4.
  */
 #include "ymodem.h"
 
@@ -288,6 +295,386 @@ static enum ym_result ym_run(const struct ym_io *io, const struct ym_source *src
 enum ym_result ymodem_send(const struct ym_io *io, const struct ym_source *src)
 {
 	enum ym_result rc = ym_run(io, src);
+	if (rc != YM_OK)
+		send_cancel(io);                /* one teardown for every error exit */
+	return rc;
+}
+
+/* ======================================================================== *
+ *  RECEIVER (issue #19 M5)
+ * ======================================================================== *
+ *
+ * Receiver state machine, the mirror of ym_run() above:
+ *   emit 'C' -> block 0 (name + size) -> sink->begin() -> ACK -> 'C' ->
+ *   data blocks (ACK each, NAK a bad one) -> EOT -> ACK -> 'C' ->
+ *   the sender's closing null block 0 -> ACK.
+ *
+ * Interoperates with ymodem_send() above and with lrzsz `sb` on the PC.
+ */
+
+/* Own block buffer -- deliberately NOT s_block (see the file banner). */
+static uint8_t s_rdata[YM_DATA_MAX];
+
+/* Diagnostics for the last run (see ymodem_recv_diag).  Single static because the
+ * receiver is already documented as non-reentrant. */
+static struct ym_recv_diag s_diag;
+
+const struct ym_recv_diag *ymodem_recv_diag(void)
+{
+	return &s_diag;
+}
+
+/* Record the first rejected block; later rejections do not overwrite it. */
+static void diag_first(int kind, int seq, int nseq, uint32_t got, uint32_t want,
+                       uint16_t crc_want, uint16_t crc_got)
+{
+	if (s_diag.first_kind >= 0)
+		return;
+	s_diag.first_kind = kind;
+	s_diag.first_seq = seq;
+	s_diag.first_nseq = nseq;
+	s_diag.first_got = got;
+	s_diag.first_want = want;
+	s_diag.first_crc_want = crc_want;
+	s_diag.first_crc_got = crc_got;
+}
+
+/* wait_hdr() results that are not a protocol byte (both outside 0..255). */
+#define YM_HDR_CANCEL (-3)      /* peer sent the double-CAN abort */
+
+/* Bound on bytes discarded while hunting for a block header / draining a bad
+ * block, so a jabbering line can never spin us forever. */
+#define YM_RECV_DISCARD_MAX 8192
+
+/* Swallow whatever is already buffered (used after a corrupt block, so the NAK'd
+ * retransmission starts from a clean boundary).  timeout_ms == 0 polls once. */
+static void recv_drain(const struct ym_io *io)
+{
+	for (int i = 0; i < YM_RECV_DISCARD_MAX; i++)
+		if (io->getc(io->ctx, 0) < 0)
+			return;
+}
+
+/*
+ * Wait for a block-start byte, discarding line noise.  Returns YM_SOH / YM_STX /
+ * YM_EOT, or YM_IO_TIMEOUT / YM_IO_ABORT / YM_HDR_CANCEL.
+ */
+static int wait_hdr(const struct ym_io *io, unsigned timeout_ms)
+{
+	for (int i = 0; i < YM_RECV_DISCARD_MAX; i++) {
+		int b = io->getc(io->ctx, timeout_ms);
+
+		if (b == (int)YM_SOH || b == (int)YM_STX || b == (int)YM_EOT)
+			return b;
+		if (b == YM_IO_TIMEOUT)
+			s_diag.timeouts++;
+		if (b == YM_IO_ABORT || b == YM_IO_TIMEOUT)
+			return b;
+		if (b == (int)YM_CAN && is_double_can(io))
+			return YM_HDR_CANCEL;
+		/* anything else: line noise / a stale ACK -- keep hunting */
+	}
+	return YM_IO_TIMEOUT;
+}
+
+/*
+ * Read the body of a block whose header byte @p kind was already consumed:
+ * seq, ~seq, data[128|1024], crc16.  Fills s_rdata + @p seq + @p datalen.
+ * Returns 0 on a good block, -1 on a corrupt one (caller NAKs), -2 on abort.
+ */
+static int read_body(const struct ym_io *io, uint8_t kind, uint8_t *seq,
+                     uint16_t *datalen)
+{
+	uint16_t n = (kind == YM_STX) ? (uint16_t)YM_DATA_MAX : (uint16_t)YM_BLOCK0_LEN;
+	uint16_t crc, got;
+	int      b, nseq;
+
+	b = io->getc(io->ctx, YM_ACK_TIMEOUT_MS);
+	if (b == YM_IO_ABORT)
+		return -2;
+	if (b < 0) {
+		s_diag.short_read++;
+		diag_first(kind, -1, -1, 0, n, 0, 0);
+		return -1;
+	}
+	*seq = (uint8_t)b;
+
+	nseq = io->getc(io->ctx, YM_ACK_TIMEOUT_MS);
+	if (nseq == YM_IO_ABORT)
+		return -2;
+	if (nseq < 0) {
+		s_diag.short_read++;
+		diag_first(kind, *seq, -1, 0, n, 0, 0);
+		return -1;
+	}
+	if ((uint8_t)nseq != (uint8_t)~*seq) {
+		s_diag.bad_seq++;
+		diag_first(kind, *seq, nseq, 0, n, 0, 0);
+		return -1;
+	}
+
+	for (uint16_t i = 0; i < n; i++) {
+		b = io->getc(io->ctx, YM_ACK_TIMEOUT_MS);
+		if (b == YM_IO_ABORT)
+			return -2;
+		if (b < 0) {
+			/* The distinguishing case: the sender is mid-block and bytes
+			 * simply stopped arriving -> the transport lost them. */
+			s_diag.short_read++;
+			diag_first(kind, *seq, nseq, i, n, 0, 0);
+			return -1;
+		}
+		s_rdata[i] = (uint8_t)b;
+	}
+
+	crc = 0;
+	for (int i = 0; i < 2; i++) {
+		b = io->getc(io->ctx, YM_ACK_TIMEOUT_MS);
+		if (b == YM_IO_ABORT)
+			return -2;
+		if (b < 0) {
+			s_diag.short_read++;
+			diag_first(kind, *seq, nseq, n + (uint32_t)i, n, 0, 0);
+			return -1;
+		}
+		crc = (uint16_t)((crc << 8) | (uint8_t)b);
+	}
+
+	got = ymodem_crc16(s_rdata, n);
+	if (got != crc) {
+		s_diag.bad_crc++;
+		diag_first(kind, *seq, nseq, n, n, crc, got);
+		return -1;
+	}
+
+	*datalen = n;
+	s_diag.blocks++;
+	return 0;
+}
+
+/*
+ * Parse block 0's payload: "name\0" "size(decimal)\0".  @p name gets at most @p cap-1
+ * chars (the field itself may be longer -- YMODEM allows up to ~100).  *@p size is 0 and
+ * *@p have_size 0 when no size was declared, which is legal.
+ *
+ * Returns 0 on a well-formed block 0, -1 on a malformed one: an unterminated name field,
+ * or a size that overflows 32 bits.  Rejecting rather than truncating matters because the
+ * size is the value every downstream bound is derived from -- a wrapped size would
+ * understate the file and slip past the sink's capacity check.
+ */
+static int parse_block0(char *name, size_t cap, uint32_t *size, int *have_size)
+{
+	size_t i = 0, n = 0;
+
+	*size = 0;
+	*have_size = 0;
+
+	while (i < YM_BLOCK0_LEN && s_rdata[i] != 0) {
+		if (n + 1 < cap)
+			name[n++] = (char)s_rdata[i];
+		i++;
+	}
+	name[n] = '\0';
+	if (i >= YM_BLOCK0_LEN)
+		return -1;                      /* name field ran off the block: malformed */
+	i++;                                    /* past the NUL */
+
+	while (i < YM_BLOCK0_LEN && s_rdata[i] >= '0' && s_rdata[i] <= '9') {
+		uint32_t d = (uint32_t)(s_rdata[i] - '0');
+
+		if (*size > (0xFFFFFFFFu - d) / 10u)
+			return -1;              /* decimal size overflows 32 bits */
+		*size = *size * 10u + d;
+		*have_size = 1;
+		i++;
+	}
+	return 0;
+}
+
+/* Emit a single protocol byte; <0 on transport failure. */
+static int put1(const struct ym_io *io, uint8_t b)
+{
+	return io->put(io->ctx, &b, 1);
+}
+
+/* Run the receive batch; teardown on error is centralised in ymodem_recv(). */
+static enum ym_result ym_recv_run(const struct ym_io *io, const struct ym_sink *sink)
+{
+	char     name[YM_BLOCK0_LEN];
+	uint32_t size = 0, remaining = 0;
+	uint16_t datalen = 0;
+	uint8_t  seq = 0, expect = 1, prompt = YM_CRC_C;
+	int      have_size = 0, attempts = 0, rc;
+
+	/* 1. handshake: poke with 'C' until block 0 shows up.  The budget matches the
+	 * sender's -- the human on the other end is starting `sb` by hand. */
+	for (;;) {
+		int h;
+
+		if (put1(io, YM_CRC_C) < 0)
+			return YM_ERR_IO;
+		h = wait_hdr(io, YM_HANDSHAKE_TIMEOUT_MS);
+		if (h == YM_IO_ABORT || h == YM_HDR_CANCEL)
+			return YM_ERR_CANCEL;
+		if (h == YM_IO_TIMEOUT) {
+			if (++attempts > YM_HANDSHAKE_RETRIES)
+				return YM_ERR_TIMEOUT;
+			continue;
+		}
+		if (h == (int)YM_EOT) {         /* stray EOT before any file */
+			(void)put1(io, YM_ACK);
+			continue;
+		}
+		rc = read_body(io, (uint8_t)h, &seq, &datalen);
+		if (rc == -2)
+			return YM_ERR_CANCEL;
+		if (rc != 0 || seq != 0) {      /* corrupt or not block 0: re-'C' */
+			recv_drain(io);
+			if (++attempts > YM_HANDSHAKE_RETRIES)
+				return YM_ERR_TIMEOUT;
+			continue;
+		}
+		break;
+	}
+
+	if (parse_block0(name, sizeof name, &size, &have_size) != 0)
+		return YM_ERR_PROTO;
+	if (name[0] == '\0') {
+		/* An immediate null block 0 = the sender closed the batch without ever
+		 * offering a file (e.g. `sb` on a missing path).  Nothing was received. */
+		(void)put1(io, YM_ACK);
+		return YM_ERR_CANCEL;
+	}
+	if (sink->begin(sink->ctx, name, size) < 0)
+		return YM_ERR_SINK;
+
+	if (put1(io, YM_ACK) < 0)               /* ACK block 0 */
+		return YM_ERR_IO;
+	if (put1(io, YM_CRC_C) < 0)             /* request data block 1 in CRC mode */
+		return YM_ERR_IO;
+	remaining = size;
+
+	/* 2. data blocks.  A good block is ACKed and the ACK itself is the prompt for
+	 * the next one; only a timeout re-prompts (with 'C' before the first data
+	 * block, NAK afterwards), and a corrupt block is NAKed for a resend. */
+	for (;;) {
+		int h;
+
+		attempts = 0;
+		for (;;) {
+			h = wait_hdr(io, YM_ACK_TIMEOUT_MS);
+			if (h != YM_IO_TIMEOUT)
+				break;
+			if (++attempts > YM_BLOCK_RETRIES)
+				return YM_ERR_TIMEOUT;
+			if (put1(io, prompt) < 0)
+				return YM_ERR_IO;
+		}
+		if (h == YM_IO_ABORT || h == YM_HDR_CANCEL)
+			return YM_ERR_CANCEL;
+		if (h == (int)YM_EOT) {
+			/* The declared size is the contract.  A sender that stops early --
+			 * a truncated file, a link that dropped blocks -- must NOT be able to
+			 * reach the closing block and be reported as success: the caller would
+			 * stage a short image and then program it.  (The batch is torn down by
+			 * ymodem_recv()'s CAN, so the sender learns too.) */
+			if (have_size && remaining != 0u)
+				return YM_ERR_PROTO;
+			if (put1(io, YM_ACK) < 0)
+				return YM_ERR_IO;
+			break;                          /* file complete */
+		}
+
+		rc = read_body(io, (uint8_t)h, &seq, &datalen);
+		if (rc == -2)
+			return YM_ERR_CANCEL;
+		if (rc != 0) {
+			recv_drain(io);
+			prompt = YM_NAK;
+			if (put1(io, YM_NAK) < 0)
+				return YM_ERR_IO;
+			continue;
+		}
+
+		if (seq == (uint8_t)(expect - 1u)) {
+			/* Our previous ACK was lost and the sender resent: re-ACK, drop. */
+			prompt = YM_NAK;
+			if (put1(io, YM_ACK) < 0)
+				return YM_ERR_IO;
+			continue;
+		}
+		if (seq != expect)
+			return YM_ERR_PROTO;            /* out of order: unrecoverable */
+
+		/* Deliver, trimming the final block's CPMEOF padding via the declared
+		 * size (authoritative, exactly as on the send side). */
+		{
+			uint32_t take = datalen;
+
+			if (have_size) {
+				if (take > remaining)
+					take = remaining;
+				remaining -= take;
+			}
+			if (take > 0u && sink->write(sink->ctx, s_rdata, take) < 0)
+				return YM_ERR_SINK;
+		}
+		expect++;
+		prompt = YM_NAK;
+		if (put1(io, YM_ACK) < 0)
+			return YM_ERR_IO;
+	}
+
+	/* 3. batch close.  Reaching the sender's closing null block 0 is REQUIRED for
+	 * success -- see the ymodem_recv() contract in ymodem.h. */
+	if (put1(io, YM_CRC_C) < 0)
+		return YM_ERR_IO;
+	attempts = 0;
+	for (;;) {
+		int h = wait_hdr(io, YM_ACK_TIMEOUT_MS);
+
+		if (h == YM_IO_ABORT || h == YM_HDR_CANCEL)
+			return YM_ERR_CANCEL;
+		if (h == YM_IO_TIMEOUT) {
+			if (++attempts > YM_BLOCK_RETRIES)
+				return YM_ERR_TIMEOUT;
+			if (put1(io, YM_CRC_C) < 0)
+				return YM_ERR_IO;
+			continue;
+		}
+		if (h == (int)YM_EOT) {                 /* sender repeated the EOT */
+			if (put1(io, YM_ACK) < 0)
+				return YM_ERR_IO;
+			continue;
+		}
+		rc = read_body(io, (uint8_t)h, &seq, &datalen);
+		if (rc == -2)
+			return YM_ERR_CANCEL;
+		if (rc != 0) {
+			recv_drain(io);
+			if (++attempts > YM_BLOCK_RETRIES)
+				return YM_ERR_TIMEOUT;
+			if (put1(io, YM_NAK) < 0)
+				return YM_ERR_IO;
+			continue;
+		}
+		if (seq != 0 || s_rdata[0] != 0)
+			return YM_ERR_PROTO;            /* a second file: batches unsupported */
+		(void)put1(io, YM_ACK);
+		return YM_OK;
+	}
+}
+
+enum ym_result ymodem_recv(const struct ym_io *io, const struct ym_sink *sink)
+{
+	enum ym_result rc;
+
+	memset(&s_diag, 0, sizeof s_diag);
+	s_diag.first_kind = -1;
+	s_diag.first_seq = -1;
+	s_diag.first_nseq = -1;
+
+	rc = ym_recv_run(io, sink);
 	if (rc != YM_OK)
 		send_cancel(io);                /* one teardown for every error exit */
 	return rc;
