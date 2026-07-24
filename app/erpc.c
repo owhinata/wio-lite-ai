@@ -22,6 +22,7 @@
 
 /* rpc_system interface (rpc_system.h). */
 #define ERPC_SYS_SERVICE     1u
+#define ERPC_SYS_VERSION_REQ 1u
 #define ERPC_SYS_ACK_REQ     2u
 
 /* Receive scratch: every frame is read here first, independent of the caller's
@@ -262,4 +263,27 @@ int erpc_system_ack(uint8_t c, uint8_t *echoed, struct erpc_diag *diag)
 	if (echoed)
 		*echoed = r;
 	return 0;
+}
+
+int erpc_system_version(char *out, uint16_t out_cap, struct erpc_diag *diag)
+{
+	uint8_t r[128];                          /* build-id strings are short; 128 is ample */
+	int n = erpc_call(ERPC_SYS_SERVICE, ERPC_SYS_VERSION_REQ, NULL, 0u,
+	                  r, (uint16_t)sizeof(r), 300u, diag);
+	uint32_t slen;
+
+	if (n < 0)
+		return n;                        /* -2 timeout / -4 aborted, forwarded as-is */
+	if (n < 4 || n > (int)sizeof(r))         /* need the u32 length; reject truncation */
+		return -3;
+	slen = get_u32le(r);                     /* BasicCodec writeString: u32 len + bytes */
+	if (slen > (uint32_t)(n - 4))            /* length word disagrees with the payload */
+		return -3;
+	if (out && out_cap) {
+		uint16_t copy = (slen < (uint32_t)(out_cap - 1u)) ? (uint16_t)slen
+		                                                  : (uint16_t)(out_cap - 1u);
+		memcpy(out, r + 4, copy);
+		out[copy] = '\0';
+	}
+	return (int)slen;
 }

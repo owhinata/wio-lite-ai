@@ -60,12 +60,17 @@ Mode") with line editing, history, and Tab completion. 21 commands:
   Realtek); `wifi on`/`off`/`reset`/`log` control power and open a live bridge.
   Register-only (GPIO + UART9/USART1 clock gates); the baud is derived from the
   inherited PCLK2 = 137.5 MHz — it never touches the RCC clock tree.
-  `wifi rpc [baud]` (default 2 Mbaud) is the **eRPC link test** (issue #5): the
+  `wifi rpc [ver] [baud]` (default 2 Mbaud) is the **eRPC link test** (issue #5): the
   factory firmware is Seeed's eRPC image (UART @2 Mbaud on its `Serial3` = USART1),
   and this round-trips a byte through `rpc_system_ack` — a valid CRC-framed echo
-  proves the eRPC transport end to end. The eRPC path is a hand-written clean-room C
-  client (`app/erpc.c`, FramedTransport + BasicCodec + CRC16/0xEF4A) with typed
-  WiFi/tcpip wrappers (`app/wifi_rpc.c`) — no C++ eRPC runtime.
+  proves the eRPC transport end to end. `wifi rpc ver` additionally reads the module's
+  firmware build id (`rpc_system_version`) and prints `fw version: …` (`2.1.3+wio-n2`
+  for the issue-#20 N2 firmware). `ver` is opt-in because the pre-N2 shim cannot answer
+  `version` safely — it corrupts the module heap (recoverable with `wifi reset`), so
+  only send it once N2 is flashed (see `fw/rtl8720/`); plain `wifi rpc` never does. The
+  eRPC path is a hand-written clean-room C client (`app/erpc.c`, FramedTransport +
+  BasicCodec + CRC16/0xEF4A) with typed WiFi/tcpip wrappers (`app/wifi_rpc.c`) — no C++
+  eRPC runtime.
   `wifi connect <ssid> [password] [security_hex]` then actually **joins an AP**
   (issue #5): it brings up the module's lwIP stack (the factory firmware leaves it
   uninitialised at boot), switches to STA mode, associates, runs the DHCP client and

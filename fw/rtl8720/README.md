@@ -111,6 +111,15 @@ The firmware source is never built in place. `build.sh` exports the pinned commi
 `_ref/seeed-ambd-firmware` stays an untouched upstream mirror. To change the firmware,
 add a patch — do not edit the mirror.
 
+**Patch application must not be swallowed.** The export lives under `out/`, which is
+git-ignored *inside the wio-lite-ai repo*. A plain `git apply` run there discovers the
+outer repo, sees the target as ignored, and silently no-ops (exit 0, nothing changed) —
+producing an unpatched image that still looks built. (N1 had no patches, so this only
+surfaced with N2.) `build.sh` defeats it two ways: it stops git's repo discovery at
+`out/` with `GIT_CEILING_DIRECTORIES` so the export is treated as the plain tree it is,
+and after each apply it runs a reverse `git apply -R --check`, which can only pass if the
+patch is actually present — turning a silent no-op into a hard failure.
+
 ## The static gates
 
 `gate.py` runs after every build (`./build.sh gate` re-runs it standalone). Each gate
@@ -276,12 +285,39 @@ fw/rtl8720/
 
 ## Roadmap
 
-- **N1** (this) — toolchain, reproducible unmodified build, flash-back and regression.
-- **N2** — bounded socket handlers: implement the IDL `timeout` on
-  `rpc_lwip_recv`/`read`/`recvfrom` via `SO_RCVTIMEO` save/set/restore, add an internal
-  cap to `rpc_lwip_connect`/`accept`, and fix the `erpc_free()` of a string literal in
-  `rpc_system_version` so the STM32 can ask which firmware is loaded. Wire format
-  unchanged, STM32 side unchanged.
+- **N1** — toolchain, reproducible unmodified build, flash-back and regression.
+- **N2** (done) — bounded socket handlers, `patches/0001` + `patches/0002`. The wire
+  format is unchanged; the one STM32-side change is additive (`wifi rpc` now prints the
+  build id). See *N2 result* below.
 - **N3** — worker dispatch on the module (receive task + worker pool, concurrency limited
   to an allow-list of socket calls) plus multi-in-flight on the STM32
   (`erpc_begin`/`erpc_wait`/`erpc_cancel`). This is where concurrent TCP becomes possible.
+
+### N2 result
+
+`patches/0001-n2-bounded-socket-handlers.patch` + `patches/0002-n2-system-version-build-id.patch`
+(both against `src/`, generated with `git diff`, applied by `build.sh`):
+
+- `rpc_lwip_recv`/`read`/`recvfrom` honour the IDL `timeout` (ms) by saving, setting and
+  restoring `SO_RCVTIMEO` (an int of ms here — `LWIP_SO_SNDRCVTIMEO_NONSTANDARD=1`,
+  clamped to `INT_MAX`). `timeout==0` keeps the socket's own value, so the existing STM32
+  caller (which sets `SO_RCVTIMEO` itself and passes a matching timeout) sees identical
+  behaviour; if a non-zero bound cannot be armed the handler returns `-1` rather than
+  blocking unbounded.
+- `rpc_lwip_connect`/`accept` (no IDL timeout) get an internal cap (`20 s` / `10 s`) via
+  `O_NONBLOCK` + `lwip_select`, restoring the original socket flags exactly. If the
+  non-blocking mode cannot be installed they fail closed (`-1`) rather than run an
+  unbounded blocking call.
+- `rpc_system_version` returns an `erpc_malloc` copy of `2.1.3+wio-n2` instead of a string
+  literal, so the shim's `erpc_free` no longer corrupts the module heap and the STM32 can
+  read the build id (`wifi rpc ver`). The generated shim `rpc_system_server.cpp` is
+  untouched.
+
+Build: `km0_km4_image2.bin` = 876544 B, **device digest `0xC325D4D3`** (was `0xFF7EA39A`
+for the N1 baseline), md5 `eb6f2a90…`, bit-reproducible from this path. Only the KM4
+part changed (the KM0 part is the core prebuilt); gate 3 still finds the boot sectors
+byte-identical to the chip, so the write stays at `0x6000` (image2 only).
+
+Acceptance beyond the N1 regression set: `wifi rpc ver` prints `fw version: 2.1.3+wio-n2`,
+and a `recvfrom(timeout=N)` on a socket with **no** `SO_RCVTIMEO` set now returns after
+`N` ms instead of wedging the module until `wifi reset`.

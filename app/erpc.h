@@ -92,4 +92,16 @@ int erpc_call_ex(uint8_t service, uint8_t request,
  * On success returns 0 and stores the echoed byte in *echoed; negative on failure. */
 int erpc_system_ack(uint8_t c, uint8_t *echoed, struct erpc_diag *diag);
 
+/* rpc_system_version(): asks the module for its firmware build-id string (service 1,
+ * req 1).  Returns the string length and writes a NUL-terminated copy to @out
+ * (truncated to @out_cap-1); negative on failure (-2 timeout / -3 malformed / -4
+ * aborted).
+ *
+ * WARNING -- only send this to issue-#20 N2+ firmware.  The factory / N1 server shim
+ * erpc_free()s a string literal when version is invoked, which corrupts the module's
+ * heap regardless of what the host does with the reply; that is why increment 1 never
+ * called it.  N2 (patch 0002) makes the shim's target a heap copy ("2.1.3+wio-n2"), so
+ * from N2 on this is safe.  The board runs N2 after issue #20's N2 milestone. */
+int erpc_system_version(char *out, uint16_t out_cap, struct erpc_diag *diag);
+
 #endif /* APP_ERPC_H */

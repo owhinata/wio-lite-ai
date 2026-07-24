@@ -199,9 +199,20 @@ do_build() {
 	else
 		for p in "${patches[@]}"; do
 			say "applying $(basename "$p")"
-			# `git apply` works fine outside a repository; the export is a plain tree.
-			( cd "$SKETCH" && git apply -p1 --whitespace=nowarn "$p" ) ||
+			# The export sits under out/, which is git-ignored *inside this repo*, so a
+			# plain `git apply` here discovers the wio-lite-ai repo, sees the target as
+			# ignored, and silently no-ops (rc 0, nothing changed) -- an unpatched image
+			# that still looks built.  Stop git's repo discovery at out/ with
+			# GIT_CEILING_DIRECTORIES so it treats the export as the plain tree it is and
+			# actually patches it.
+			( cd "$SKETCH" && GIT_CEILING_DIRECTORIES="$OUT" \
+				git apply -p1 --whitespace=nowarn "$p" ) ||
 				die "patch failed: $p"
+			# Never trust a silent success: a reverse-check can only pass if the patch is
+			# now present, so it turns the no-op above into a hard failure.
+			( cd "$SKETCH" && GIT_CEILING_DIRECTORIES="$OUT" \
+				git apply -p1 -R --check "$p" ) ||
+				die "patch reported success but did not take (path/repo issue?): $p"
 		done
 	fi
 

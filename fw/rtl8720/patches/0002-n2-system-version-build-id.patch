@@ -1,0 +1,34 @@
+diff --git a/src/erpc_setup.cpp b/src/erpc_setup.cpp
+index 04fe46c..b39defa 100644
+--- a/src/erpc_setup.cpp
++++ b/src/erpc_setup.cpp
+@@ -32,6 +32,7 @@
+ #include "erpc_transport_arbitrator.h"
+ #include "erpc_port.h"
+ #include "elog.h"
++#include <string.h>
+ 
+ using namespace erpc;
+ 
+@@ -78,7 +79,20 @@ public:
+ 
+ char * rpc_system_version(void)
+ {
+-    return "2.1.3";
++    /* The generated server shim (rpc_system_server.cpp) erpc_free()s whatever this
++     * returns, so it MUST be heap-allocated: the stock firmware returned a string
++     * literal and freeing that .rodata pointer corrupts the module heap (which is why
++     * the STM32 side never dared call rpc_system_version).  Return an erpc_malloc copy
++     * of a build id so the host can read back which firmware is loaded (`wifi rpc`).
++     * "2.1.3" keeps the upstream base version; "+wio-n2" marks the issue-#20 N2 patch
++     * set (bounded socket handlers).  A NULL here would only happen on heap exhaustion,
++     * which the stock literal never risked; the shim does not null-check, but version is
++     * called early when the heap is idle. */
++    static const char id[] = "2.1.3+wio-n2";
++    char *s = (char *)erpc_malloc(sizeof(id));
++    if (s != NULL)
++        memcpy(s, id, sizeof(id));
++    return s;
+ }
+ 
+ uint8_t rpc_system_ack(uint8_t c)

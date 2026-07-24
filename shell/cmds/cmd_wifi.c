@@ -11,7 +11,8 @@
  *   wifi reset                    power-cycle CHIP_EN (Low 80 ms -> High)
  *   wifi log                      bridge the LOG UART (UART9 @115200) <-> console
  *   wifi probe                    reset the module and capture its boot log from t=0
- *   wifi rpc [baud]               eRPC link test: rpc_system_ack (default 2 Mbaud, #5)
+ *   wifi rpc [ver] [baud]         eRPC link test: rpc_system_ack (default 2 Mbaud, #5);
+ *                                 `ver` also reads the FW build id (N2+ only, #20)
  *   wifi connect <ssid> [pw] [sec]  associate (STA) + DHCP, print the IP (#5 inc 3)
  *   wifi disconnect               drop the current association
  *   wifi status                   connected? + RSSI + IP/mask/gw + MAC
@@ -252,8 +253,20 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 	uint8_t echoed = 0u;
 	struct erpc_diag diag = {0}, total = {0};
 	int rc = -1, tries;
+	char ver[64];
+	int have_ver = 0;
+	int want_version = 0;                       /* `wifi rpc ver`: opt-in build-id query */
+	int ai = 1;                                 /* index of the optional baud argument */
 
-	if (argc >= 2 && (parse_u32(argv[1], &baud) != 0 ||
+	/* `wifi rpc ver [baud]` additionally reads the firmware build id.  It is opt-in
+	 * because the query is only safe against issue-#20 N2+ firmware: the pre-N2 shim
+	 * erpc_free()s a string literal and corrupts the module heap (recoverable with
+	 * `wifi reset`).  Plain `wifi rpc` never sends it, so it stays safe on any FW. */
+	if (argc >= 2 && strcmp(argv[1], "ver") == 0) {
+		want_version = 1;
+		ai = 2;
+	}
+	if (argc > ai && (parse_u32(argv[ai], &baud) != 0 ||
 	    baud < 2400u || baud > 2000000u)) {
 		cli_error(sh, "wifi: bad baud (2400..2000000)\r\n");
 		return 1;
@@ -292,12 +305,25 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 		if (cli_sleep(sh, 50u))            /* brief gap; Ctrl+C aborts */
 			break;
 	}
+	if (want_version && rc == 0 && echoed == 0x5Au) {
+		/* Opt-in only (see the `ver` note above): read the build id while the link is
+		 * up.  Safe here because the caller asserted N2+ firmware by typing `ver`. */
+		struct erpc_diag vdiag = {0};
+		if (erpc_system_version(ver, (uint16_t)sizeof(ver), &vdiag) >= 0)
+			have_ver = 1;
+	}
 	rtl8720_uart_close();
 	cli_console_release(sh);
 
 	if (rc == 0 && echoed == 0x5Au) {
 		cli_print(sh, "wifi: eRPC OK -- ack 0x5A -> 0x%02X, link up @%lu (%d tries)\r\n",
 		          echoed, (unsigned long)baud, tries + 1);
+		if (want_version) {
+			if (have_ver)
+				cli_print(sh, "  fw version: %s\r\n", ver);
+			else
+				cli_print(sh, "  fw version: unavailable (pre-N2 firmware, or query failed)\r\n");
+		}
 	} else {
 		cli_error(sh, "wifi: eRPC FAILED -- ack 0x5A -> 0x%02X (rc %d)\r\n", echoed, rc);
 	}
@@ -1470,7 +1496,7 @@ CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(reset, NULL, "power-cycle CHIP_EN (low 80ms -> high)",    cmd_wifi_reset, 1, 0),
 	CLI_CMD_ARG(log,   NULL, "bridge LOG UART (UART9 @115200)",           cmd_wifi_log,   1, 0),
 	CLI_CMD_ARG(probe, NULL, "reset + capture boot log from t=0",         cmd_wifi_probe, 1, 0),
-	CLI_CMD_ARG(rpc,   NULL, "eRPC link test (rpc_system_ack) [baud, default 2M]", cmd_wifi_rpc, 1, 1),
+	CLI_CMD_ARG(rpc,   NULL, "eRPC link test (rpc_system_ack) [ver] [baud, default 2M]", cmd_wifi_rpc, 1, 2),
 	CLI_CMD_ARG(connect,    NULL, "associate + DHCP: connect <ssid> [pw] [sec_hex]", cmd_wifi_connect,    2, 2),
 	CLI_CMD_ARG(disconnect, NULL, "drop the current WiFi association",     cmd_wifi_disconnect, 1, 0),
 	CLI_CMD_ARG(status,     NULL, "show connection state / RSSI / IP / MAC", cmd_wifi_status, 1, 0),

@@ -1,0 +1,232 @@
+diff --git a/src/wifi/wifi_api.c b/src/wifi/wifi_api.c
+index 549a1c6..9be0c40 100644
+--- a/src/wifi/wifi_api.c
++++ b/src/wifi/wifi_api.c
+@@ -915,11 +915,57 @@ int32_t rpc_tcpip_adapter_set_mac(uint32_t tcpip_if, const binary_t *mac)
+ 
+ //! @name rpc_wifi_lwip
+ //@{
++
++/* N2 (issue #20): bound the handlers that would otherwise block the single FreeRTOS
++ * eRPC-server task forever.  The IDL gives recv/read/recvfrom a `timeout`; connect and
++ * accept have none, so they get an internal cap.  These are the ceilings for the
++ * capped paths -- generous enough not to trip a healthy peer, short enough that a dead
++ * one cannot wedge the module until `wifi reset`. */
++#define RPC_LWIP_CONNECT_TIMEOUT_MS 20000
++#define RPC_LWIP_ACCEPT_TIMEOUT_MS  10000
++
+ int32_t rpc_lwip_accept(int32_t s, const binary_t *addr, uint32_t *addrlen)
+ {
+     log_d("called");
+     struct sockaddr *_addr = (struct sockaddr *)addr->data;
+-    return lwip_accept(s, _addr, &addr->dataLength);
++
++    /* Cap the wait: save the socket's flags, go non-blocking, wait for an incoming
++     * connection with lwip_select up to the cap, accept it, then restore the flags
++     * exactly (a future host may itself rely on O_NONBLOCK).  If the non-blocking mode
++     * cannot be installed, fail closed (-1) rather than run an unbounded blocking
++     * accept -- an unbounded wait is exactly the wedge N2 removes. */
++    int flags = lwip_fcntl(s, F_GETFL, 0);
++    if (flags < 0)
++    {
++        errno = EIO;
++        return -1;
++    }
++    if (lwip_fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0)
++    {
++        errno = EIO;
++        return -1;
++    }
++
++    fd_set rset;
++    struct timeval tv;
++    FD_ZERO(&rset);
++    FD_SET(s, &rset);
++    tv.tv_sec = RPC_LWIP_ACCEPT_TIMEOUT_MS / 1000;
++    tv.tv_usec = 0;
++
++    int32_t ret;
++    if (lwip_select(s + 1, &rset, NULL, NULL, &tv) > 0 && FD_ISSET(s, &rset))
++    {
++        ret = lwip_accept(s, _addr, &addr->dataLength);
++    }
++    else
++    {
++        errno = ETIMEDOUT;   /* timeout or select error -> report, do not block */
++        ret = -1;
++    }
++
++    lwip_fcntl(s, F_SETFL, flags);   /* restore the original blocking mode exactly */
++    return ret;
+ }
+ 
+ int32_t rpc_lwip_bind(int32_t s, const binary_t *name, uint32_t namelen)
+@@ -986,13 +1032,57 @@ int32_t rpc_lwip_connect(int32_t s, const binary_t *name, uint32_t namelen)
+ {
+     log_d("called");
+     struct sockaddr *_name = (struct sockaddr *)name->data;
+-    uint8_t *data = (struct sockaddr *)name->data;
+-    // for(uint32_t i = 0; i < namelen; i++)
+-    // {
+-    //     printf("%02x ", data[i]);
+-    // }
+-    // printf("\n\r");
+-    return lwip_connect(s, _name, namelen);
++
++    /* Cap the wait so a dead or filtered peer cannot wedge the server: save the flags,
++     * connect non-blocking, then wait for writability with lwip_select up to the cap.
++     * SO_ERROR tells success from failure once selected.  Restore the flags exactly.
++     * If the non-blocking mode cannot be installed, fail closed (-1) rather than run an
++     * unbounded blocking connect. */
++    int flags = lwip_fcntl(s, F_GETFL, 0);
++    if (flags < 0)
++    {
++        errno = EIO;
++        return -1;
++    }
++    if (lwip_fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0)
++    {
++        errno = EIO;
++        return -1;
++    }
++
++    int32_t ret = lwip_connect(s, _name, namelen);
++    if (ret < 0 && errno == EINPROGRESS)
++    {
++        fd_set wset;
++        struct timeval tv;
++        FD_ZERO(&wset);
++        FD_SET(s, &wset);
++        tv.tv_sec = RPC_LWIP_CONNECT_TIMEOUT_MS / 1000;
++        tv.tv_usec = 0;
++
++        if (lwip_select(s + 1, NULL, &wset, NULL, &tv) > 0 && FD_ISSET(s, &wset))
++        {
++            int soerr = 0;
++            socklen_t optlen = sizeof(soerr);
++            if (lwip_getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &optlen) == 0 && soerr == 0)
++            {
++                ret = 0;
++            }
++            else
++            {
++                errno = (soerr != 0) ? soerr : ETIMEDOUT;
++                ret = -1;
++            }
++        }
++        else
++        {
++            errno = ETIMEDOUT;   /* timeout or select error */
++            ret = -1;
++        }
++    }
++
++    lwip_fcntl(s, F_SETFL, flags);   /* restore the original blocking mode exactly */
++    return ret;
+ }
+ 
+ int32_t rpc_lwip_listen(int32_t s, int32_t backlog)
+@@ -1045,12 +1135,56 @@ int32_t rpc_lwip_available(int32_t s)
+     return ret;
+ }
+ 
++/* Apply the IDL `timeout` (ms) to a socket for one blocking receive, then restore.
++ * timeout==0 leaves the socket's own SO_RCVTIMEO in force (the host sets it today), so
++ * existing callers see identical behaviour.  Returns 0 on success, -1 if a non-zero
++ * bound was requested but could NOT be installed -- the caller must then NOT run an
++ * unbounded receive (that unbounded wait is exactly the wedge N2 removes).  Unlike the
++ * broken rpc_lwip_available() below, old_timeout is a correctly sized, initialised int
++ * and optlen is initialised to its size. */
++static int rpc_lwip_apply_rcvtimeo(int32_t s, uint32_t timeout, int *old_timeout, int *restore)
++{
++    *restore = 0;
++    if (timeout == 0)
++        return 0;
++
++    socklen_t optlen = sizeof(*old_timeout);
++    /* lwIP stores recv_timeout as a signed int; clamp so a huge (or malformed) timeout
++     * cannot wrap negative and turn a bounded wait into undefined behaviour. */
++    int new_timeout = (timeout > (uint32_t)0x7fffffff) ? 0x7fffffff : (int)timeout;
++    if (lwip_getsockopt(s, SOL_SOCKET, SO_RCVTIMEO, old_timeout, &optlen) != 0 ||
++        lwip_setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &new_timeout, sizeof(new_timeout)) != 0)
++    {
++        errno = EIO;   /* couldn't arm the bound -> caller reports an error, not a wedge */
++        return -1;
++    }
++
++    *restore = 1;
++    return 0;
++}
++
++static void rpc_lwip_restore_rcvtimeo(int32_t s, int old_timeout, int restore)
++{
++    if (restore)
++        lwip_setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &old_timeout, sizeof(old_timeout));
++}
++
+ int32_t rpc_lwip_recv(int32_t s, binary_t *mem, uint32_t len, int32_t flags, uint32_t timeout)
+ {
+     log_d("called: %d", len);
+     uint8_t *_mem = (uint8_t *)erpc_malloc((len + 1) * sizeof(uint8_t));
+     int32_t ret = -1;
++    int old_timeout = 0, restore = 0;
++
++    if (rpc_lwip_apply_rcvtimeo(s, timeout, &old_timeout, &restore) != 0)
++    {
++        mem->data = _mem;
++        mem->dataLength = 1;
++        return -1;
++    }
+     ret = lwip_recv(s, _mem, len, flags);
++    rpc_lwip_restore_rcvtimeo(s, old_timeout, restore);
++
+     if (ret > 0)
+     {
+         mem->data = _mem;
+@@ -1070,7 +1204,17 @@ int32_t rpc_lwip_read(int32_t s, binary_t *mem, uint32_t len, uint32_t timeout)
+     log_d("called");
+     uint8_t *_mem = (uint8_t *)erpc_malloc((len + 1) * sizeof(uint8_t));
+     int32_t ret = -1;
++    int old_timeout = 0, restore = 0;
++
++    if (rpc_lwip_apply_rcvtimeo(s, timeout, &old_timeout, &restore) != 0)
++    {
++        mem->data = _mem;
++        mem->dataLength = 1;
++        return -1;
++    }
+     ret = lwip_read(s, _mem, len);
++    rpc_lwip_restore_rcvtimeo(s, old_timeout, restore);
++
+     if (ret > 0)
+     {
+         mem->data = _mem;
+@@ -1090,7 +1234,19 @@ int32_t rpc_lwip_recvfrom(int32_t s, binary_t *mem, uint32_t len, int32_t flags,
+     uint8_t *_mem = (uint8_t *)erpc_malloc((len + 1) * sizeof(uint8_t));
+     int32_t ret = -1;
+     struct sockaddr * _from = (struct sockaddr *)erpc_malloc(sizeof(struct sockaddr));
++    int old_timeout = 0, restore = 0;
++
++    if (rpc_lwip_apply_rcvtimeo(s, timeout, &old_timeout, &restore) != 0)
++    {
++        mem->data = _mem;
++        mem->dataLength = 1;
++        from->data = (uint8_t *)_from;
++        from->dataLength = sizeof(struct sockaddr);
++        return -1;
++    }
+     ret = lwip_recvfrom(s, _mem, len, flags, _from, (socklen_t *)fromlen);
++    rpc_lwip_restore_rcvtimeo(s, old_timeout, restore);
++
+     if (ret > 0)
+     {
+         mem->data = _mem;
+@@ -1101,7 +1257,7 @@ int32_t rpc_lwip_recvfrom(int32_t s, binary_t *mem, uint32_t len, int32_t flags,
+         mem->data = _mem;
+         mem->dataLength = 1;
+     }
+-    
++
+     from->data = (uint8_t *)_from;
+     from->dataLength = sizeof(struct sockaddr);
+ 
