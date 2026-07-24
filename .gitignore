@@ -1,6 +1,11 @@
 # Build output
 /build/
 
+# RTL8720DN device firmware build (issue #20).  fw/rtl8720/build.sh exports the pinned
+# upstream commit here, compiles it and drops the images -- all reproducible from the
+# pins in build.sh, so none of it belongs in git.
+/fw/rtl8720/out/
+
 # Downloaded ARM GNU toolchain (fetched by cmake/arm-none-eabi-toolchain.cmake)
 /tools/
 

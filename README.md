@@ -210,6 +210,8 @@ cmake/      ARM GNU toolchain file (auto-downloads gcc into tools/)
 lib/        git submodules: cmsis_core/device_h7, stm32h7xx_hal_driver, tinyusb,
             threadx, coremark
 boot/       standalone USB DFU bootloader (internal 0x08000000) — see boot/README.md
+fw/rtl8720/ reproducible build of the RTL8720DN's own firmware (the eRPC server that
+            wifi/net drive) — host-side only, flashed by `wifi flashwrite`; see its README
 ```
 
 ## Memory map (`ldscript/STM32H725AEIx_XIP.ld`)
