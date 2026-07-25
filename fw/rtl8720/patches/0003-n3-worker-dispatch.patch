@@ -1,0 +1,277 @@
+diff --git a/src/erpc_setup.cpp b/src/erpc_setup.cpp
+index b39defa..3a5d4b8 100644
+--- a/src/erpc_setup.cpp
++++ b/src/erpc_setup.cpp
+@@ -33,9 +33,89 @@
+ #include "erpc_port.h"
+ #include "elog.h"
+ #include <string.h>
++#include <stdint.h>
++#include "queue.h"          /* FreeRTOS work queue (issue #20 N3) */
+ 
+ using namespace erpc;
+ 
++/*============================================================================*
++ *   issue #20 N3: worker-dispatch eRPC server
++ *============================================================================*
++ * The stock server is one FreeRTOS task looping SimpleServer::poll(): receive one
++ * request, run its handler, send the reply -- strictly serial.  A handler that blocks
++ * (a socket recv with no data) therefore stalls every other RPC until it returns, which
++ * is why the host could never keep two sockets busy at once.
++ *
++ * N3 splits that loop across threads WITHOUT modifying the vendored eRPC runtime:
++ * SimpleServer already factors its work into runInternalBegin() (receive the frame +
++ * allocate buffer/codec + parse the header) and runInternalEnd() (run the handler + send
++ * the reply + dispose).  A thin subclass exposes those protected halves; a single
++ * receive task runs Begin and hands the parsed request to a small worker pool that runs
++ * End.  Concurrency correctness rests on facts already verified in the runtime:
++ *   - MessageBufferFactory::createServerBuffer() is true, so every request gets its OWN
++ *     4 KB buffer -- in-flight requests never share one.
++ *   - FramedTransport::send()/receive() each take their own lock (ERPC_THREADS=FreeRTOS),
++ *     so workers sending replies concurrently cannot interleave frames on the UART.
++ *   - malloc/free are linker-wrapped to the thread-safe RTOS heap (platform.txt
++ *     `-Wl,-wrap,malloc`), so concurrent new/delete of buffers/codecs is safe -- the same
++ *     reason the stock multi-task firmware (WiFi/BLE/lwIP) does not corrupt its heap.
++ *   - Only ONE receive task calls TransportArbitrator::receive(), so its mutex-free
++ *     pending-client scan stays single-threaded; N3 keeps the device->host callback path
++ *     (oneway rpc_wifi_event_callback, which registers no pending client) unchanged.
++ *
++ * Only the per-socket blocking receives are actually run in parallel; every state-
++ * changing handler still takes a single serial mutex (see n3_concurrent()), so it is
++ * effectively serial exactly as before and cannot race shared WiFi/lwIP state.
++ */
++
++/* Tuning.  The pinned core has INCLUDE_uxTaskGetStackHighWaterMark=0, so stack usage
++ * cannot be measured at runtime -- stacks are sized generously instead and the always-on
++ * configCHECK_FOR_STACK_OVERFLOW=2 hook traps any shortfall.  Free heap IS observable
++ * (xPortGetFreeHeapSize), and its low-water is logged to the LOG UART (`wifi log`). */
++#ifndef N3_WORKERS
++#define N3_WORKERS       2                 /* parallel handler threads (retreat to 1) */
++#endif
++#define N3_RECV_STACK    (1024 * 6)        /* receive + header parse only */
++#define N3_WORKER_STACK  (1024 * 12)       /* runs the deepest handler (was 24K, shared) */
++#define N3_QUEUE_DEPTH   (N3_WORKERS + 2)  /* parsed requests awaiting a worker */
++#ifndef N3_INSTRUMENT
++#define N3_INSTRUMENT    1                 /* log free-heap low-water while tuning */
++#endif
++
++/* A received-and-parsed request awaiting a worker.  runInternalBegin() has already
++ * received the frame, allocated its buffer + codec and read the header; the codec owns
++ * the buffer (Codec::setBuffer copies the MessageBuffer value), so this carries all the
++ * state runInternalEnd() needs to run the handler and send the reply. */
++struct WorkItem
++{
++    Codec         *codec;
++    message_type_t msgType;
++    uint32_t       serviceId;
++    uint32_t       methodId;
++    uint32_t       sequence;
++};
++
++/* Thin SimpleServer subclass exposing the protected begin/end split so the receive task
++ * and workers can run the two halves on different threads. */
++class DispatchServer : public SimpleServer
++{
++public:
++    /* Receive + parse one request into @w (buffer/codec allocated, header read).  @buff
++     * is a scratch handle; on success the codec owns the buffer, on any error path
++     * runInternalBegin() has already disposed it. */
++    erpc_status_t recvBegin(WorkItem &w, MessageBuffer &buff)
++    {
++        return runInternalBegin(&w.codec, buff, w.msgType, w.serviceId, w.methodId, w.sequence);
++    }
++    /* Run the handler for @w, send the reply if any, and dispose its buffer + codec. */
++    erpc_status_t processEnd(WorkItem &w)
++    {
++        return runInternalEnd(w.codec, w.msgType, w.serviceId, w.methodId, w.sequence);
++    }
++    /* Dispose a work item that could not be enqueued (never leak its buffer/codec). */
++    void discard(WorkItem &w) { disposeBufferAndCodec(w.codec); }
++};
++
+ /*============================================================================*
+  *                              Constants
+  *============================================================================*/
+@@ -44,10 +124,17 @@ UartTransport g_transport(&Serial3, 2000000);
+ BasicCodecFactory g_basicCodecFactory;
+ ArbitratedClientManager *g_client;
+ TransportArbitrator g_arbitrator;
+-SimpleServer g_server;
++DispatchServer g_server;
+ Crc16 g_crc16;
+ bool FORCE_NESTCALL = false;
+ 
++/* N3 work queue (receive task -> workers) and the serial mutex that keeps every non-
++ * allow-listed handler effectively serial.  A file-scope Mutex is safe here: the stock
++ * transport already constructs Mutexes at global-init time (FramedTransport's send/
++ * receive locks). */
++static QueueHandle_t g_workQueue = NULL;
++static Mutex g_serialMutex;
++
+ /*============================================================================*
+  *                              Functions
+  *============================================================================*/
+@@ -84,11 +171,11 @@ char * rpc_system_version(void)
+      * literal and freeing that .rodata pointer corrupts the module heap (which is why
+      * the STM32 side never dared call rpc_system_version).  Return an erpc_malloc copy
+      * of a build id so the host can read back which firmware is loaded (`wifi rpc`).
+-     * "2.1.3" keeps the upstream base version; "+wio-n2" marks the issue-#20 N2 patch
+-     * set (bounded socket handlers).  A NULL here would only happen on heap exhaustion,
++     * "2.1.3" keeps the upstream base version; "+wio-n3" marks the issue-#20 N3 patch
++     * set (bounded socket handlers + worker dispatch).  A NULL here would only happen on heap exhaustion,
+      * which the stock literal never risked; the shim does not null-check, but version is
+      * called early when the heap is idle. */
+-    static const char id[] = "2.1.3+wio-n2";
++    static const char id[] = "2.1.3+wio-n3";
+     char *s = (char *)erpc_malloc(sizeof(id));
+     if (s != NULL)
+         memcpy(s, id, sizeof(id));
+@@ -127,19 +214,103 @@ void add_services(erpc::SimpleServer *server)
+     server->addService(static_cast<erpc::Service *>(create_rpc_wifi_mdns_service()));
+ }
+ 
+-/**
+- * @brief  Initialize erpc server task
+- * @return void
++/*
++ * Which handlers may run outside the serial mutex (truly in parallel).  Only the per-
++ * socket blocking receives -- bounded by the N2 timeout work -- plus the trivial system
++ * ack.  Everything else (association, tcpip/DHCP, TLS, mDNS, and even socket create /
++ * close / sendto / setsockopt) takes g_serialMutex so it stays effectively serial and
++ * cannot race the shared WiFi/lwIP state.  IDs from rpc_wifi_api.h / rpc_system.h.
+  */
+-__attribute__((noreturn)) void run_erpc_server(void *arg)
++static bool n3_concurrent(uint32_t service, uint32_t method)
++{
++    if (service == krpc_wifi_lwip_service_id)          /* 16 */
++    {
++        switch (method)
++        {
++        case krpc_wifi_lwip_rpc_lwip_accept_id:        /* 1  */
++        case krpc_wifi_lwip_rpc_lwip_connect_id:       /* 9  */
++        case krpc_wifi_lwip_rpc_lwip_recv_id:          /* 12 */
++        case krpc_wifi_lwip_rpc_lwip_read_id:          /* 13 */
++        case krpc_wifi_lwip_rpc_lwip_recvfrom_id:      /* 14 */
++            return true;
++        default:
++            return false;
++        }
++    }
++    if (service == krpc_system_service_id &&           /* 1 */
++        method == krpc_system_rpc_system_ack_id)       /* 2 */
++    {
++        return true;
++    }
++    return false;
++}
++
++/* Receive task: parse one frame at a time and hand it to a worker.  It never runs a
++ * handler, so it keeps draining the UART while workers block.  Single-threaded, so the
++ * arbitrator's mutex-free pending-client scan and its single parse codec stay safe. */
++__attribute__((noreturn)) static void n3_recv_task(void *arg)
+ {
+     (void)arg;
+-    log_i("start erpc server\n\r");
+-    /* run server */
++    log_i("[N3] erpc receive task up\n\r");
++#if N3_INSTRUMENT
++    uint32_t lo_heap = 0xffffffffu;
++#endif
+     for (;;)
+     {
+-        g_server.poll();
+-        vTaskDelay(1);
++        WorkItem w;
++        MessageBuffer buff;   /* transient handle; the codec owns the buffer on success */
++
++        erpc_status_t err = g_server.recvBegin(w, buff);
++        if (err != kErpcStatus_Success)
++        {
++            /* runInternalBegin() disposed any buffer/codec on every error path. */
++            continue;
++        }
++        /* Transfer ownership of the codec (and its 4 KB buffer) to a worker.  Block if the
++         * queue is full: back-pressure degrades to the stock serial rate, never a leak.
++         * portMAX_DELAY effectively never fails, but dispose defensively if it ever does. */
++        if (xQueueSend(g_workQueue, &w, portMAX_DELAY) != pdTRUE)
++        {
++            g_server.discard(w);
++        }
++#if N3_INSTRUMENT
++        {
++            uint32_t fh = (uint32_t)xPortGetFreeHeapSize();
++            if (fh < lo_heap)
++            {
++                lo_heap = fh;
++                log_i("[N3] free heap low-water %u B\n\r", (unsigned)fh);
++            }
++        }
++#endif
++    }
++}
++
++/* Worker task: run the handler + send the reply.  Allow-listed methods run in parallel;
++ * all others take g_serialMutex first, so state-changing handlers stay serialised. */
++__attribute__((noreturn)) static void n3_worker_task(void *arg)
++{
++    (void)arg;
++    for (;;)
++    {
++        WorkItem w;
++
++        if (xQueueReceive(g_workQueue, &w, portMAX_DELAY) != pdTRUE)
++        {
++            continue;
++        }
++        bool concurrent = n3_concurrent(w.serviceId, w.methodId);
++        if (!concurrent)
++        {
++            g_serialMutex.lock();
++        }
++        /* runInternalEnd() runs the handler, sends the reply (FramedTransport::send is
++         * lock-protected so workers cannot interleave frames) and disposes the codec. */
++        (void)g_server.processEnd(w);
++        if (!concurrent)
++        {
++            g_serialMutex.unlock();
++        }
+     }
+ }
+ 
+@@ -166,10 +337,33 @@ void erpc_system_init()
+     g_server.setTransport(&g_arbitrator);
+     g_server.setCodecFactory(&g_basicCodecFactory);
+     g_server.setMessageBufferFactory(&g_msgFactory);
+-    Thread serverThread(&run_erpc_server, tskIDLE_PRIORITY + 8, 1024*24, "erpc server");
+-    serverThread.start();
+ 
++    /* Register services before any worker can run a handler (the stock code did this
++     * after starting the server task -- a latent race we close by ordering). */
+     add_services(&g_server);
++
++    /* Replace the single poll()-loop server task with a receive task + worker pool (see
++     * the N3 block near the top).  Thread objects use static storage so they outlive this
++     * function -- erpc links them into a list that getCurrentThread() walks. */
++    g_workQueue = xQueueCreate(N3_QUEUE_DEPTH, sizeof(WorkItem));
++    if (g_workQueue == NULL)
++    {
++        log_e("[N3] could not create work queue -- eRPC server not started\n\r");
++        return;
++    }
++
++    static Thread s_recvThread;
++    static Thread s_workerThreads[N3_WORKERS];
++    s_recvThread.init(&n3_recv_task, tskIDLE_PRIORITY + 8, N3_RECV_STACK);
++    s_recvThread.start(NULL);
++    for (unsigned i = 0; i < N3_WORKERS; i++)
++    {
++        s_workerThreads[i].init(&n3_worker_task, tskIDLE_PRIORITY + 8, N3_WORKER_STACK);
++        s_workerThreads[i].start((void *)(uintptr_t)i);
++    }
++
+     g_client->setServer(&g_server);
+-    g_client->setServerThreadId(serverThread.getThreadId());
++    g_client->setServerThreadId(s_recvThread.getThreadId());
++    log_i("[N3] worker-dispatch server: %d workers, queue %d, stacks recv %d / worker %d\n\r",
++          N3_WORKERS, N3_QUEUE_DEPTH, N3_RECV_STACK, N3_WORKER_STACK);
+ }

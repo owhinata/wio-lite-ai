@@ -289,9 +289,10 @@ fw/rtl8720/
 - **N2** (done) — bounded socket handlers, `patches/0001` + `patches/0002`. The wire
   format is unchanged; the one STM32-side change is additive (`wifi rpc` now prints the
   build id). See *N2 result* below.
-- **N3** — worker dispatch on the module (receive task + worker pool, concurrency limited
-  to an allow-list of socket calls) plus multi-in-flight on the STM32
-  (`erpc_begin`/`erpc_wait`/`erpc_cancel`). This is where concurrent TCP becomes possible.
+- **N3** (built) — worker dispatch on the module (`patches/0003`: receive task + worker
+  pool, concurrency limited to an allow-list of socket calls) plus multi-in-flight on the
+  STM32 (`erpc_begin`/`erpc_wait`/`erpc_cancel`). This is where concurrent TCP becomes
+  possible. See *N3 result* below.
 
 ### N2 result
 
@@ -321,3 +322,67 @@ byte-identical to the chip, so the write stays at `0x6000` (image2 only).
 Acceptance beyond the N1 regression set: `wifi rpc ver` prints `fw version: 2.1.3+wio-n2`,
 and a `recvfrom(timeout=N)` on a socket with **no** `SO_RCVTIMEO` set now returns after
 `N` ms instead of wedging the module until `wifi reset`.
+
+### N3 result
+
+`patches/0003-n3-worker-dispatch.patch` (against `src/erpc_setup.cpp` only — the vendored
+eRPC runtime is not modified) turns the stock single poll()-loop server into a receive
+task plus a worker pool, so a blocking handler no longer stalls every other RPC:
+
+- A thin `DispatchServer : SimpleServer` exposes the runtime's own `runInternalBegin`
+  (receive frame + allocate buffer/codec + parse header) and `runInternalEnd` (run handler
+  + send reply + dispose). One receive task runs Begin and enqueues the parsed request;
+  `N3_WORKERS` (default **2**) workers run End. Each request already gets its own 4 KB
+  buffer (`createServerBuffer`), sends are lock-protected (`FramedTransport`), and
+  malloc/free are the thread-safe RTOS heap (`-Wl,-wrap,malloc`), so parallel handling is
+  buffer- and frame-safe.
+- Concurrency is **allow-listed**: only the per-socket blocking receives
+  (`rpc_lwip_accept`/`connect`/`recv`/`read`/`recvfrom`) and `rpc_system_ack` run in
+  parallel; every other handler (association, tcpip/DHCP, TLS, mDNS, socket create/close/
+  sendto/setsockopt) takes a single serial mutex and stays effectively serial, so shared
+  WiFi/lwIP state is never raced.
+- Queue-full is `xQueueSend(portMAX_DELAY)` back-pressure (degrades to the stock serial
+  rate, never leaks); the device→host callback path stays the stock oneway one, so the
+  arbitrator's mutex-free pending-client scan stays single-threaded.
+- The pinned core has `INCLUDE_uxTaskGetStackHighWaterMark=0`, so stacks cannot be measured
+  at runtime; they are sized generously (recv 6 KB, worker 12 KB — the stock shared task was
+  24 KB) and the always-on `configCHECK_FOR_STACK_OVERFLOW=2` hook traps any shortfall.
+  Free heap **is** observable and its low-water is logged to the LOG UART (`wifi log`).
+
+The wire format is unchanged; what changes is that replies may now come back **out of
+order**, which the N3 host client (`app/erpc.c` `erpc_begin`/`erpc_wait`/`erpc_cancel`)
+routes by sequence.
+
+Build: `km0_km4_image2.bin` = 880640 B (one 4 KB sector larger than N2), **device digest
+`0x48961411`**, md5 `97c12e8f…`, sha256 `53c3e308…`, bit-reproducible from this path. Only
+the KM4 part changed; gate 3 still finds the boot sectors byte-identical to the chip, so
+the write stays at `0x6000` (image2 only).
+
+Acceptance beyond the N2 regression set (`wifi rpc ver` must read `2.1.3+wio-n3`): run
+`net conc` while associated. It holds a `recvfrom` (no data) open on the module and then
+round-trips a foreground ack — on the serial stock/N2 server the ack cannot be answered
+until the receive returns (so it times out), on N3 a spare worker answers it in a few ms
+(`=> server is CONCURRENT`).
+
+#### Constraints when building real concurrent TCP on top of N3
+
+N3 is deliberately scoped to the socket-receive + ack allow-list. Two invariants must be
+kept when that scope grows (both flagged in the N3 review):
+
+1. **No non-oneway device→host callbacks.** Only one task (the receive task) calls
+   `TransportArbitrator::receive()`, whose pending-client-list scan is mutex-free, so it is
+   safe *only* while nothing else mutates that list. The stock `rpc_wifi_event_callback` is
+   `oneway` (registers no pending client), so it does not. A generated **non-oneway**
+   callback (e.g. a raw-lwIP TCP/DNS callback that waits for a host reply) would run
+   `ArbitratedClientManager::performClientRequest` → `prepareClientReceive` on a *worker*
+   thread (`m_serverThreadId` is the receive task, so a worker is not recognised as server
+   context) and mutate `m_clientList` while the receive task scans it. Before adding any
+   such callback, guard `m_clientList` with `m_clientListMutex` in `receive()`, or disable
+   the callback client path.
+2. **Serialize a socket's lifecycle per fd.** The blocking receives run outside
+   `g_serialMutex`; `close`/`setsockopt`/teardown are only serialized against each other,
+   not against a receive already blocked on the same fd. Today the STM32 host is a single
+   owner and never interleaves teardown with an in-flight receive, so this is safe. A
+   future multi-in-flight socket API must not `close`/mutate an fd while another worker is
+   blocked in `recvfrom`/`accept` on it (lwIP fd-reuse / close-wakeup semantics make that
+   racy).

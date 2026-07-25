@@ -10,6 +10,8 @@
  *   net ip <a.b.c.d/mask> [gw]   set a static address (stops DHCP)
  *   net dhcp                     (re)acquire an address via DHCP
  *   net ping <a.b.c.d> [count]   raw-ICMP echo (default 4) with host-observed RTT
+ *   net conc [ms]                concurrency probe: is the module's eRPC server serial
+ *                                or worker-dispatched (issue #20 N3)?
  *
  * This is the Wio port of ../stm32f746g-disco's `net` command.  There the backend is
  * NetX Duo over the on-chip Ethernet MAC; here it is the RTL8720DN's eRPC socket-
@@ -493,6 +495,94 @@ static int cmd_net_ping(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
+/* ---- concurrency probe (issue #20 N3) ------------------------------------ */
+
+/*
+ * Decide whether the module's eRPC server is the stock single-task serial one or the N3
+ * worker-dispatch one, using only existing wrappers.  Open a raw ICMP socket like `net
+ * ping` but never send an echo request, then issue recvfrom asynchronously: with no data
+ * arriving it blocks on the module for up to `ms`.  While it is outstanding, round-trip a
+ * foreground system-ack.  A serial server cannot answer the ack until recvfrom returns
+ * (so it times out); a worker server answers it in a few ms.
+ *
+ * WARNING: recvfrom is only bounded on N2+ firmware (which honours the timeout).  On
+ * stock / N1 firmware recvfrom blocks forever and wedges the single-task server -- the
+ * ack times out AND the module needs `wifi reset` afterwards.
+ */
+static int cmd_net_conc(struct cli_instance *sh, int argc, char **argv)
+{
+	struct wifi_rpc_opts o;
+	struct erpc_diag diag, adiag;
+	uint32_t block_ms = 3000u;
+	uint8_t rcvbuf[96];
+	uint8_t echoed = 0u;
+	int32_t fd = -1, ret = -1;
+	int token, rc, an, ack_dt;
+	uint32_t t0;
+
+	if (argc >= 2) {
+		if (parse_uint(argv[1], &block_ms) != 0 || block_ms < 500u || block_ms > 20000u) {
+			cli_error(sh, "net: bad ms '%s' (500..20000)\r\n", argv[1]);
+			return 1;
+		}
+	}
+	if (net_session_connected(sh, &o, &diag) != RTL_LINK_READY)
+		return 1;
+
+	o.timeout_ms = 5000u;
+	rc = wifi_rpc_lwip_socket(&o, NET_AF_INET, NET_SOCK_RAW, NET_IPPROTO_ICMP, &fd);
+	if (rc || fd < 0) {
+		cli_error(sh, "net: raw ICMP socket failed (rc %d, fd %ld)\r\n", rc, (long)fd);
+		rtl_link_end(sh);
+		return 1;
+	}
+
+	cli_print(sh, "net: concurrency probe -- recvfrom(%lu ms, no data) held open, "
+	          "then a foreground ack\r\n", (unsigned long)block_ms);
+	cli_print(sh, "     (stock/N1 FW would wedge here -- `wifi reset` if the ack never "
+	          "returns)\r\n");
+
+	/* Fire the blocking recvfrom (it will not reply for ~block_ms), then immediately
+	 * round-trip a system ack.  erpc_begin does NOT flush the RX while this token is in
+	 * flight, so the ack's reply and the recvfrom's reply are routed by sequence. */
+	token = wifi_rpc_lwip_recvfrom_begin(fd, 64u, 0, block_ms,
+	                                     rcvbuf, (uint16_t)sizeof(rcvbuf));
+	if (token < 0) {
+		cli_error(sh, "net: recvfrom_begin failed (%d)\r\n", token);
+		o.timeout_ms = 3000u;
+		(void)wifi_rpc_lwip_close(&o, fd, &ret);
+		rtl_link_end(sh);
+		return 1;
+	}
+
+	t0 = HAL_GetTick();
+	an = erpc_system_ack(0x5Au, &echoed, &adiag);
+	ack_dt = (int)(HAL_GetTick() - t0);
+
+	if (an == 0 && echoed == 0x5Au)
+		cli_print(sh, "  ack: echoed 0x5A in %d ms  =>  server is CONCURRENT "
+		          "(N3 worker dispatch)\r\n", ack_dt);
+	else
+		cli_print(sh, "  ack: no reply within %d ms (rc %d)  =>  server is SERIAL "
+		          "(stock/N2: ack waits behind recvfrom)\r\n", ack_dt, an);
+
+	/* Collect the recvfrom reply so the link is left clean (it returns after ~block_ms
+	 * on N2+; give the wait headroom).  The datagram itself is not decoded. */
+	rc = erpc_wait(token, block_ms + 3000u, &diag, rtl_abort_cb, sh);
+	if (rc < 0) {
+		erpc_cancel(token);
+		cli_print(sh, "  recvfrom: no reply (rc %d) -- module may be wedged; "
+		          "run `wifi reset`\r\n", rc);
+	} else {
+		cli_print(sh, "  recvfrom: returned after the ack (payload %d B)\r\n", rc);
+	}
+
+	o.timeout_ms = 3000u;
+	(void)wifi_rpc_lwip_close(&o, fd, &ret);
+	rtl_link_end(sh);
+	return 0;
+}
+
 /* ---- registration -------------------------------------------------------- */
 
 CLI_SUBCMD_SET_CREATE(net_subcmds,
@@ -500,6 +590,7 @@ CLI_SUBCMD_SET_CREATE(net_subcmds,
 	CLI_CMD_ARG(ip,   NULL, "set static <a.b.c.d/mask> [gw]",     cmd_net_ip,   2, 1),
 	CLI_CMD_ARG(dhcp, NULL, "(re)acquire an address via DHCP",    cmd_net_dhcp, 1, 0),
 	CLI_CMD_ARG(ping, NULL, "raw ICMP echo <a.b.c.d> [count]",    cmd_net_ping, 2, 1),
+	CLI_CMD_ARG(conc, NULL, "eRPC server concurrency probe [ms]", cmd_net_conc, 1, 1),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(net, net_subcmds,

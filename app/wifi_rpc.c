@@ -407,6 +407,23 @@ int wifi_rpc_lwip_recvfrom(const struct wifi_rpc_opts *o, int32_t s,
 	return 0;
 }
 
+int wifi_rpc_lwip_recvfrom_begin(int32_t s, uint32_t len, int32_t flags,
+                                 uint32_t timeout_ms, uint8_t *out, uint16_t out_cap)
+{
+	uint8_t req[20];
+
+	if (len > 1024u)                          /* keep the module's reply within a frame */
+		return -1;
+	put_u32le(req + 0,  (uint32_t)s);
+	put_u32le(req + 4,  len);                  /* len: max bytes to receive */
+	put_u32le(req + 8,  (uint32_t)flags);
+	put_u32le(req + 12, 16u);                  /* fromlen: our from-buffer size */
+	put_u32le(req + 16, timeout_ms);
+	/* Fire and reserve a token; the caller drains the reply with erpc_wait()/cancel().
+	 * The reply (mem + from + fromlen + ret) is left undecoded on purpose. */
+	return erpc_begin(SVC_WIFI_LWIP, M_LWIP_RECVFROM, req, 20u, out, out_cap);
+}
+
 int wifi_rpc_lwip_close(const struct wifi_rpc_opts *o, int32_t s, int32_t *ret)
 {
 	uint8_t req[4], rep[16];

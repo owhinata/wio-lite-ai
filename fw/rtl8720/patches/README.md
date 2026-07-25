@@ -22,3 +22,17 @@
 #       STM32 never called it.  Return an erpc_malloc copy of the build id
 #       "2.1.3+wio-n2" instead, so the host can read back which firmware is loaded.
 #       (The generated shim rpc_system_server.cpp is left untouched.)
+#
+# N3 -- worker dispatch (issue #20), wire format unchanged (reply order is not):
+#
+#   0003-n3-worker-dispatch.patch
+#       src/erpc_setup.cpp only (the vendored eRPC runtime is not modified).  Replaces
+#       the single poll()-loop server task with a receive task + a small worker pool via
+#       a thin SimpleServer subclass that exposes runInternalBegin (receive+parse) and
+#       runInternalEnd (handler+reply).  So a blocking socket receive no longer stalls
+#       every other RPC.  Only the per-socket blocking receives (lwip accept/connect/
+#       recv/read/recvfrom) plus rpc_system_ack run in parallel; every other handler
+#       takes a single serial mutex and stays effectively serial.  Queue-full is
+#       portMAX_DELAY back-pressure (degrades to the stock serial rate, never leaks).
+#       Needs the N3 host client (app/erpc.c erpc_begin/erpc_wait/erpc_cancel), which
+#       routes now-out-of-order replies by sequence.  Verify with `net conc`.

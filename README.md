@@ -126,9 +126,18 @@ Mode") with line editing, history, and Tab completion. 21 commands:
   `net dhcp` (re)acquires a lease; `net ping <a.b.c.d> [count]` sends **real ICMP echoes**
   over a raw socket (`rpc_lwip_socket(SOCK_RAW, IPPROTO_ICMP)`) — the shell builds the
   ICMP message + checksum itself, and reports a **host-observed RTT** (it includes the
-  two eRPC UART round-trips, not just the network path). ip/dhcp/ping require an active
-  association (they never power the module) and share the same single-owner eRPC session
-  as `wifi`. Pure marshalling on the STM32 side — no RCC/register work.
+  two eRPC UART round-trips, not just the network path). `net conc [ms]` is a diagnostic
+  (issue #20 N3): it holds a `recvfrom` (no data) open on the module and round-trips a
+  foreground ack while it is outstanding — a serial server (stock/N2) cannot answer the
+  ack until the receive returns, the N3 worker-dispatch server answers it in a few ms.
+  ip/dhcp/ping/conc require an active association (they never power the module) and share
+  the same single-owner eRPC session as `wifi`. Pure marshalling on the STM32 side — no
+  RCC/register work.
+
+  The RTL8720 device firmware itself is rebuilt (non-blocking socket handlers, then a
+  worker-dispatch eRPC server so multiple requests run at once) under `fw/rtl8720/`
+  (issue #20); the STM32 client keeps several requests in flight over the one link with
+  `app/erpc.c`'s `erpc_begin`/`erpc_wait`/`erpc_cancel`.
 
 ## Key design points
 

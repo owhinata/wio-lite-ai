@@ -1,0 +1,6 @@
+# The RTL8720 device-firmware patches (issue #20) are applied verbatim to Seeed's
+# upstream sources, some of which use CRLF line endings (e.g. src/erpc_setup.cpp).  The
+# patch files must therefore keep CRLF so `git apply` matches the target byte-for-byte.
+# Tell git that a CR at end-of-line is expected here, so `git diff --check` / commit hooks
+# do not flag every CRLF context line as trailing whitespace, and never normalise them.
+/fw/rtl8720/patches/*.patch -text whitespace=cr-at-eol,-trailing-space

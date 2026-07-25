@@ -132,6 +132,18 @@ int wifi_rpc_lwip_sendto(const struct wifi_rpc_opts *o, int32_t s,
 int wifi_rpc_lwip_recvfrom(const struct wifi_rpc_opts *o, int32_t s,
                            uint8_t *buf, uint16_t buf_cap, int32_t flags,
                            uint32_t timeout_ms, uint16_t *got, int32_t *ret);
+/*
+ * Asynchronous recvfrom for the `net conc` diagnostic (issue #20 N3): encode a recvfrom
+ * request and send it with erpc_begin(), returning an eRPC token (>= 0) to collect later
+ * with erpc_wait()/erpc_cancel(), or a negative erpc_begin() code (-1).  It lets the
+ * caller keep a (bounded) blocking receive outstanding on the module while it issues
+ * another request, to show the N3 server serves the second one concurrently instead of
+ * queueing behind the receive.  @out receives the raw, UNDECODED reply payload (the
+ * diagnostic only cares that the round-trips overlap) and must stay valid until the
+ * token is waited/cancelled.  @len is bounded so the module's reply fits one frame.
+ */
+int wifi_rpc_lwip_recvfrom_begin(int32_t s, uint32_t len, int32_t flags,
+                                 uint32_t timeout_ms, uint8_t *out, uint16_t out_cap);
 int wifi_rpc_lwip_close(const struct wifi_rpc_opts *o, int32_t s, int32_t *ret);
 int wifi_rpc_lwip_errno(const struct wifi_rpc_opts *o, int32_t *err);
 

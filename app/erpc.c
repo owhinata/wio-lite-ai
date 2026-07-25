@@ -9,6 +9,15 @@
  * Runs in the shell command thread (post-kernel): it uses ThreadX time/sleep for a
  * bounded, yielding receive, and the #17 rtl8720 UART driver for the raw bytes.
  * Register-agnostic (no RCC / peripheral setup here) -- XIP-safe.
+ *
+ * Concurrency model (issue #20 N3): a small slot table (erpc_slots) lets one owner
+ * thread keep several requests outstanding, so it can drive the N3 worker-dispatch
+ * firmware, whose replies may arrive out of order.  erpc_begin sends and reserves a
+ * slot; a single shared dispatcher (erpc_pump) reads one reply frame and routes it to
+ * the slot whose sequence it carries; erpc_wait drives that dispatcher until its own
+ * slot completes.  erpc_call/erpc_call_ex are begin+wait wrappers, so their behaviour
+ * is unchanged.  Everything here still runs on one thread (the console owner) -- the
+ * slot table needs no locking.
  */
 #include "tx_api.h"       /* tx_time_get / tx_thread_sleep (1 tick = 1 ms here) */
 #include "rtl8720.h"      /* rtl8720_uart_read / _write (USART1 @2 Mbaud, #17) */
@@ -32,6 +41,35 @@
 static uint8_t erpc_scratch[ERPC_RX_SCRATCH];
 
 static uint32_t erpc_seq;                /* monotonically-increasing request sequence */
+
+/*
+ * In-flight request slots (issue #20 N3).  One per outstanding erpc_begin(); the shared
+ * dispatcher stores each reply's payload straight into the caller's @out.  Static BSS in
+ * AXI-SRAM (CPU-only, D-cache coherent), a few dozen bytes -- well clear of _estack.
+ */
+struct erpc_slot {
+	uint8_t   in_use;                /* slot reserved by erpc_begin, not yet released */
+	uint8_t   done;                  /* a matching reply has been captured into out */
+	uint8_t   service;               /* expected reply service id */
+	uint8_t   request;               /* expected reply request id */
+	uint32_t  seq;                   /* sequence that identifies this call's reply */
+	uint8_t  *out;                   /* caller's reply buffer (may be NULL) */
+	uint16_t  out_cap;               /* capacity of @out */
+	uint16_t  reply_len;             /* full payload length of the captured reply */
+};
+static struct erpc_slot erpc_slots[ERPC_MAX_INFLIGHT];
+
+/* True while any slot is still outstanding (used to decide whether erpc_begin may flush
+ * the RX -- it must not when another token's reply might already be buffered). */
+static int erpc_any_in_use(void)
+{
+	int i;
+
+	for (i = 0; i < ERPC_MAX_INFLIGHT; i++)
+		if (erpc_slots[i].in_use)
+			return 1;
+	return 0;
+}
 
 uint16_t erpc_crc16(const uint8_t *d, uint16_t n)
 {
@@ -150,28 +188,35 @@ int erpc_call(uint8_t service, uint8_t request,
 	                    timeout_ms, diag, NULL, NULL);
 }
 
-int erpc_call_ex(uint8_t service, uint8_t request,
-                 const uint8_t *req, uint16_t req_len,
-                 uint8_t *out, uint16_t out_cap, uint32_t timeout_ms,
-                 struct erpc_diag *diag,
-                 int (*should_abort)(void *ctx), void *abort_ctx)
+int erpc_begin(uint8_t service, uint8_t request,
+               const uint8_t *req, uint16_t req_len,
+               uint8_t *out, uint16_t out_cap)
 {
 	uint8_t frame_hdr[4];
-	uint32_t msg_hdr;
-	uint32_t seq;
-	uint16_t body_len;
-	uint16_t crc;
-	ULONG deadline;
-
-	if (diag)
-		memset(diag, 0, sizeof(*diag));
+	uint32_t msg_hdr, seq;
+	uint16_t body_len, crc;
+	int idx = -1, i;
 
 	if (req_len > (uint16_t)(ERPC_RX_SCRATCH - 8u))   /* guard 8+req_len overflow */
 		return -1;
-	body_len = (uint16_t)(8u + req_len);
+	for (i = 0; i < ERPC_MAX_INFLIGHT; i++) {
+		if (!erpc_slots[i].in_use) {
+			idx = i;
+			break;
+		}
+	}
+	if (idx < 0)
+		return -1;                       /* no free slot: too many in flight */
 
-	/* Build the request body in the scratch (reused for RX after the send). */
+	/* Only drop stale RX when nothing else is outstanding.  With another token live,
+	 * the UART RX may already hold its reply and a flush would silently discard it. */
+	if (!erpc_any_in_use())
+		erpc_rx_flush();
+
+	/* 32-bit monotonic sequence: strictly greater than every currently-live token's
+	 * seq, so a fresh call can never collide with one still pending. */
 	seq = ++erpc_seq;
+	body_len = (uint16_t)(8u + req_len);
 	msg_hdr = ((uint32_t)ERPC_CODEC_VERSION << 24) | ((uint32_t)service << 16) |
 	          ((uint32_t)request << 8) | 0u /* kInvocationMessage */;
 	put_u32le(erpc_scratch + 0, msg_hdr);
@@ -180,75 +225,156 @@ int erpc_call_ex(uint8_t service, uint8_t request,
 		memcpy(erpc_scratch + 8, req, req_len);
 	crc = erpc_crc16(erpc_scratch, body_len);
 
-	/* Start from a clean RX boundary, then send {size,crc} header + body. */
-	erpc_rx_flush();
 	put_u16le(frame_hdr + 0, body_len);
 	put_u16le(frame_hdr + 2, crc);
 	rtl8720_uart_write(frame_hdr, 4u);
 	rtl8720_uart_write(erpc_scratch, body_len);
 
-	deadline = tx_time_get() + (ULONG)timeout_ms;   /* 1 tick = 1 ms */
+	erpc_slots[idx].in_use    = 1u;
+	erpc_slots[idx].done      = 0u;
+	erpc_slots[idx].service   = service;
+	erpc_slots[idx].request   = request;
+	erpc_slots[idx].seq       = seq;
+	erpc_slots[idx].out       = out;
+	erpc_slots[idx].out_cap   = out_cap;
+	erpc_slots[idx].reply_len = 0u;
+	return idx;
+}
 
-	for (;;) {
-		uint16_t rsize, rcrc;
-		uint32_t rhdr, rseq;
-		int rr;
+/*
+ * Read exactly one reply frame and dispatch it to the live slot whose sequence it
+ * carries (copying its payload into that slot's @out, marking it done).  Frames that
+ * match no live slot, or that are device->host invocations / malformed / oversize, are
+ * categorised into @diag and dropped.  Returns 1 when a frame was processed (matched or
+ * dropped), -1 on timeout, -2 on abort.  @diag counts only genuinely-dropped frames --
+ * a reply routed to *another* live token is neither an error nor "skipped".
+ */
+static int erpc_pump(ULONG deadline, int (*should_abort)(void *), void *ctx,
+                     struct erpc_diag *diag)
+{
+	uint8_t frame_hdr[4];
+	uint16_t rsize, rcrc;
+	uint32_t rhdr, rseq;
+	int rr, i;
 
-		rr = erpc_recv_exact(frame_hdr, 4u, deadline, should_abort, abort_ctx);
-		if (rr != 0) {
-			if (rr == -2) return -4;        /* aborted by caller */
-			if (diag) diag->timeout++;
-			return -2;
-		}
-		rsize = get_u16le(frame_hdr + 0);
-		rcrc  = get_u16le(frame_hdr + 2);
+	rr = erpc_recv_exact(frame_hdr, 4u, deadline, should_abort, ctx);
+	if (rr != 0)
+		return rr;                       /* -1 timeout / -2 abort */
+	rsize = get_u16le(frame_hdr + 0);
+	rcrc  = get_u16le(frame_hdr + 2);
 
-		if (rsize > ERPC_RX_SCRATCH) {          /* too big: drain to resync */
-			if (diag) diag->oversize++;
-			rr = erpc_drain(rsize, deadline, should_abort, abort_ctx);
-			if (rr != 0) {
-				if (rr == -2) return -4;
-				if (diag) diag->timeout++;
-				return -2;
-			}
-			continue;
-		}
-		rr = erpc_recv_exact(erpc_scratch, rsize, deadline, should_abort, abort_ctx);
-		if (rr != 0) {
-			if (rr == -2) return -4;
-			if (diag) diag->timeout++;
-			return -2;
-		}
-		if (erpc_crc16(erpc_scratch, rsize) != rcrc || rsize < 8u) {
-			if (diag) diag->crc_fail++;
-			continue;
-		}
+	if (rsize > ERPC_RX_SCRATCH) {           /* too big: drain to resync */
+		if (diag) diag->oversize++;
+		rr = erpc_drain(rsize, deadline, should_abort, ctx);
+		if (rr != 0)
+			return rr;
+		return 1;
+	}
+	rr = erpc_recv_exact(erpc_scratch, rsize, deadline, should_abort, ctx);
+	if (rr != 0)
+		return rr;
+	if (erpc_crc16(erpc_scratch, rsize) != rcrc || rsize < 8u) {
+		if (diag) diag->crc_fail++;
+		return 1;
+	}
 
-		rhdr = get_u32le(erpc_scratch + 0);
-		rseq = get_u32le(erpc_scratch + 4);
-		if (((rhdr >> 24) & 0xffu) != ERPC_CODEC_VERSION) {
-			if (diag) diag->crc_fail++;         /* wrong version = malformed */
-			continue;
-		}
-		if ((rhdr & 0xffu) != ERPC_MSGTYPE_REPLY) {
-			if (diag) diag->unsupported_invocation++;   /* device->host request */
-			continue;
-		}
-		if (((rhdr >> 16) & 0xffu) != service ||
-		    ((rhdr >> 8) & 0xffu) != request || rseq != seq) {
-			if (diag) diag->skipped_reply++;    /* reply for something else */
-			continue;
-		}
+	rhdr = get_u32le(erpc_scratch + 0);
+	rseq = get_u32le(erpc_scratch + 4);
+	if (((rhdr >> 24) & 0xffu) != ERPC_CODEC_VERSION) {
+		if (diag) diag->crc_fail++;          /* wrong version = malformed */
+		return 1;
+	}
+	if ((rhdr & 0xffu) != ERPC_MSGTYPE_REPLY) {
+		if (diag) diag->unsupported_invocation++;   /* device->host request */
+		return 1;
+	}
 
-		/* Matched reply: copy the payload after the 8-byte header. */
+	for (i = 0; i < ERPC_MAX_INFLIGHT; i++) {
+		struct erpc_slot *s = &erpc_slots[i];
+
+		if (!s->in_use || s->done || s->seq != rseq)
+			continue;
+		if (((rhdr >> 16) & 0xffu) != s->service ||
+		    ((rhdr >> 8) & 0xffu) != s->request) {
+			if (diag) diag->skipped_reply++;    /* seq matched, wrong svc/req = bad */
+			return 1;
+		}
 		{
 			uint16_t plen = (uint16_t)(rsize - 8u);
-			uint16_t copy = (plen < out_cap) ? plen : out_cap;
-			if (out && copy)
-				memcpy(out, erpc_scratch + 8, copy);
-			return (int)plen;
+			uint16_t copy = (plen < s->out_cap) ? plen : s->out_cap;
+			if (s->out && copy)
+				memcpy(s->out, erpc_scratch + 8, copy);
+			s->reply_len = plen;
+			s->done = 1u;
 		}
+		return 1;
 	}
+
+	if (diag) diag->skipped_reply++;         /* reply for an unknown / cancelled seq */
+	return 1;
+}
+
+int erpc_wait(int token, uint32_t timeout_ms, struct erpc_diag *diag,
+              int (*should_abort)(void *ctx), void *abort_ctx)
+{
+	struct erpc_slot *s;
+	ULONG deadline;
+
+	if (diag)
+		memset(diag, 0, sizeof(*diag));
+	if (token < 0 || token >= ERPC_MAX_INFLIGHT)
+		return -1;
+	s = &erpc_slots[token];
+	if (!s->in_use)
+		return -1;                       /* stale / already-released token */
+
+	deadline = tx_time_get() + (ULONG)timeout_ms;   /* 1 tick = 1 ms */
+	for (;;) {
+		int r;
+
+		if (s->done) {                   /* completed here or by an earlier wait */
+			int len = (int)s->reply_len;
+			s->in_use = 0u;
+			return len;
+		}
+		r = erpc_pump(deadline, should_abort, abort_ctx, diag);
+		if (r == -1) {
+			if (diag) diag->timeout++;
+			return -2;               /* leave the slot pending for the caller */
+		}
+		if (r == -2)
+			return -4;               /* aborted; slot stays pending */
+		/* r == 1: a frame was processed; loop and re-check s->done. */
+	}
+}
+
+void erpc_cancel(int token)
+{
+	if (token >= 0 && token < ERPC_MAX_INFLIGHT)
+		erpc_slots[token].in_use = 0u;   /* a late reply for its seq is then dropped */
+}
+
+int erpc_call_ex(uint8_t service, uint8_t request,
+                 const uint8_t *req, uint16_t req_len,
+                 uint8_t *out, uint16_t out_cap, uint32_t timeout_ms,
+                 struct erpc_diag *diag,
+                 int (*should_abort)(void *ctx), void *abort_ctx)
+{
+	int token, n;
+
+	/* Synchronous round-trip = begin + wait, so its behaviour is identical to before:
+	 * on the common single-in-flight path erpc_begin flushes stale RX exactly as the
+	 * old code did.  A timeout / abort cancels the slot so the module's late reply is
+	 * discarded by a future call's dispatcher. */
+	if (diag)
+		memset(diag, 0, sizeof(*diag));  /* keep the old contract: cleared even on -1 */
+	token = erpc_begin(service, request, req, req_len, out, out_cap);
+	if (token < 0)
+		return -1;
+	n = erpc_wait(token, timeout_ms, diag, should_abort, abort_ctx);
+	if (n < 0)
+		erpc_cancel(token);              /* -2 timeout / -4 aborted */
+	return n;
 }
 
 int erpc_system_ack(uint8_t c, uint8_t *echoed, struct erpc_diag *diag)

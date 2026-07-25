@@ -30,12 +30,25 @@
  * (rpc_system_server.cpp), which would corrupt its heap.  And device->host callbacks
  * are NOT serviced yet: the factory client waits forever for a reply, so we only use
  * APIs (ack) that trigger no callback.  A host server stub comes in a later increment.
+ *
+ * NOTE (issue #20 N3): the N3 device firmware replaces the stock single-task serial
+ * eRPC server with a receive-task + worker-pool dispatcher, so it can serve several
+ * requests at once and replies may come back OUT OF ORDER.  To use that, this client
+ * grows a small asynchronous API (erpc_begin / erpc_wait / erpc_cancel, below) that
+ * keeps up to ERPC_MAX_INFLIGHT requests outstanding from a single owner thread.  The
+ * synchronous erpc_call()/erpc_call_ex() are unchanged in behaviour -- they are now
+ * thin begin+wait wrappers over the same shared, sequence-routed receive dispatcher.
  */
 #ifndef APP_ERPC_H
 #define APP_ERPC_H
 
 #include <stdint.h>
 #include <stddef.h>
+
+/* Maximum eRPC requests that may be outstanding at once (erpc_begin without a matching
+ * erpc_wait/erpc_cancel yet).  Each live token costs one small slot (metadata + the
+ * caller's reply pointer) in AXI-SRAM static BSS. */
+#define ERPC_MAX_INFLIGHT 4
 
 /* Per-call receive diagnostics (why a link test failed / what was skipped). */
 struct erpc_diag {
@@ -87,6 +100,49 @@ int erpc_call_ex(uint8_t service, uint8_t request,
                  uint8_t *out, uint16_t out_cap, uint32_t timeout_ms,
                  struct erpc_diag *diag,
                  int (*should_abort)(void *ctx), void *abort_ctx);
+
+/*
+ * ---- Asynchronous, multi-in-flight API (issue #20 N3) --------------------------
+ *
+ * These let one owner thread keep several requests outstanding at once -- what the N3
+ * worker-dispatch firmware enables.  They are NOT thread-safe: exactly like the
+ * synchronous calls they assume a single console owner (cli_console_claim), and
+ * begin/wait/cancel must all run on that one thread.  Do not mix these with a call on
+ * another thread.
+ *
+ * Lifecycle:
+ *   int t = erpc_begin(svc, req, body, len, out, out_cap);   // send, get a token
+ *   ... optionally begin / wait other tokens ...
+ *   int n = erpc_wait(t, timeout_ms, diag, abort, ctx);      // collect t's reply
+ * erpc_wait() drives a shared receive dispatcher: it reads reply frames and routes each
+ * to whichever live token's sequence it carries (so waiting on one token still delivers
+ * another's reply into that token's @out), until @token's own reply lands or the
+ * deadline / abort fires.
+ *
+ * @out (given to erpc_begin) must stay valid and must not alias another live token's
+ * @out until the token is waited or cancelled -- the dispatcher copies the reply payload
+ * straight into it, truncated to @out_cap (erpc_wait returns the FULL payload length).
+ */
+
+/* Send an invocation and return a token >= 0 to wait on later; -1 on bad args (request
+ * larger than the scratch) or no free slot (ERPC_MAX_INFLIGHT already outstanding).
+ * Does not wait.  Unlike a fresh erpc_call, begin only flushes stale RX when nothing
+ * else is in flight, so it never discards another live token's buffered reply. */
+int erpc_begin(uint8_t service, uint8_t request,
+               const uint8_t *req, uint16_t req_len,
+               uint8_t *out, uint16_t out_cap);
+
+/* Wait for @token's reply.  Returns its payload length (>= 0; the bytes are already in
+ * the @out passed to erpc_begin, truncated to @out_cap) and releases the token; or a
+ * negative code WITHOUT releasing it: -1 invalid/stale token, -2 timeout, -4 aborted.
+ * On a negative return the caller must erpc_cancel(@token) (or erpc_wait again).
+ * @diag / @should_abort behave as in erpc_call_ex. */
+int erpc_wait(int token, uint32_t timeout_ms, struct erpc_diag *diag,
+              int (*should_abort)(void *ctx), void *abort_ctx);
+
+/* Release @token without waiting for its reply.  A reply that arrives for it afterwards
+ * is dropped by a later erpc_wait()'s dispatcher (counted as a skipped reply). */
+void erpc_cancel(int token);
 
 /* rpc_system_ack(c): round-trips one byte through the firmware (service 1, req 2).
  * On success returns 0 and stores the echoed byte in *echoed; negative on failure. */
