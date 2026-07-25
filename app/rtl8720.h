@@ -81,6 +81,41 @@ void rtl8720_uart_write(const uint8_t *buf, size_t n);
 /* RX bytes dropped by ring overflow since open (diagnostic). */
 uint32_t rtl8720_uart_overflows(void);
 
+/*
+ * RX interrupt-latency diagnostics (issue #23 U0-1), reset on every open.
+ *
+ * Since the RXFIFO is drained on a threshold interrupt, the interesting number is how
+ * much of the FIFO's remaining grace one interrupt actually consumed: @isr_max_bytes
+ * is the most bytes any single interrupt pulled out of USART_RDR (dropped ones
+ * included -- it is FIFO occupancy that measures the grace), and @isr_grace is how
+ * many it could have taken before an overrun (18 - threshold; see app/rtl8720.c).  A
+ * high-water approaching the grace means the threshold is too high or something is
+ * masking interrupts for too long.
+ *
+ * THREE different losses, do not conflate them:
+ *   @ore   the USART's own RXFIFO overran -- the byte never reached software.  This is
+ *          the failure the threshold scheme exists to prevent; it must stay 0.
+ *   @drops OUR ring was full when the ISR had a byte to store, i.e. the consumer fell
+ *          behind rather than the ISR.  Bigger ring / faster consumer.
+ *   @ferr  framing / noise errors -- a wrong or marginal baud rate on either end.
+ *
+ * @isr_max_cycles is DWT cycles at SystemCoreClock (550 MHz).  It is NOT a grace
+ * budget -- the drain loop keeps consuming bytes that arrive while it runs -- it is
+ * the per-byte drain cost, which must stay well under one byte time on the wire
+ * (see condition (b) in app/rtl8720.c).
+ */
+struct rtl8720_uart_stats {
+	uint32_t isr_count;       /* RX interrupts taken since open */
+	uint32_t isr_max_bytes;   /* most bytes pulled from RDR in one interrupt */
+	uint32_t isr_grace;       /* bytes the FIFO can still take after the threshold */
+	uint32_t isr_max_cycles;  /* longest time spent inside the ISR (DWT cycles) */
+	uint32_t drops;           /* == rtl8720_uart_overflows(): our ring overflowed */
+	uint32_t ore;             /* USART overrun: the hardware FIFO overflowed */
+	uint32_t ferr;            /* framing / noise errors (baud mismatch indicator) */
+	uint32_t ring_size;       /* RX ring capacity in bytes */
+};
+void rtl8720_uart_stats(struct rtl8720_uart_stats *out);
+
 /* Disable the open UART + its NVIC interrupt. */
 void rtl8720_uart_close(void);
 

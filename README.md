@@ -62,6 +62,14 @@ time as the USB console. 21 commands:
   Realtek); `wifi on`/`off`/`reset`/`log` control power and open a live bridge.
   Register-only (GPIO + UART9/USART1 clock gates); the baud is derived from the
   inherited PCLK2 = 137.5 MHz — it never touches the RCC clock tree.
+  RX is **FIFO-threshold driven** (issue #23): `CR3.RXFTIE` with `RXFTCFG` at half of the
+  16-deep RXFIFO plus `CR1.IDLEIE` for the tail of a burst, rather than an interrupt per
+  byte — at 6 Mbaud the latter would be ~600 k IRQ/s. The threshold is a latency budget:
+  RM0468 puts the overrun at the 18th datum, so `18 - threshold` byte times is all the
+  slack the ISR has, and `wifi rpc` / `wifi scan` print how much of it was used
+  (`max N/G B per irq`) together with the three distinct losses — `ore` (the hardware
+  FIFO overran), `ring-drops` (the consumer fell behind) and `framing` (a marginal baud).
+  The ISR runs at NVIC priority 5, above OTG_HS, so a dwc2 interrupt cannot eat that slack.
   `wifi rpc [ver] [baud]` (default 2 Mbaud) is the **eRPC link test** (issue #5): the
   factory firmware is Seeed's eRPC image (UART @2 Mbaud on its `Serial3` = USART1),
   and this round-trips a byte through `rpc_system_ack` — a valid CRC-framed echo

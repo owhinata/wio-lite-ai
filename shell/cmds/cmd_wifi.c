@@ -275,11 +275,48 @@ static int cmd_wifi_probe(struct cli_instance *sh, int argc, char **argv)
  * eRPC UART (USART1, default 2 Mbaud = the factory firmware's Serial3) and round-trip
  * a byte through rpc_system_ack -- a valid CRC-framed echo proves the eRPC link
  * (transport + framing + codec + the Serial3<->USART1 mapping) end to end. */
+/*
+ * Report the RX interrupt-latency budget and the three DIFFERENT losses (issue #23
+ * U0-1).  Snapshot @st with rtl8720_uart_stats() while the session still holds the
+ * UART: the counters survive a close but are cleared by the next open.
+ *
+ * `max N/G B per irq` is the point of the whole thing: N is the most bytes one
+ * interrupt pulled out of the RXFIFO and G is how many more it could have taken
+ * before the hardware lost one.  N == threshold means the ISR always arrived on time;
+ * N creeping towards G means it is running out of margin, which is what decides
+ * whether the threshold survives a higher baud (see app/rtl8720.c).
+ *
+ * `isr` is the per-interrupt drain cost in tenths of a microsecond -- it is NOT part of
+ * the grace budget (the drain loop absorbs bytes that land while it runs), it just has
+ * to stay well under one byte time on the wire.  NOTE the ISR runs from OCTOSPI2 XIP,
+ * so the FIRST invocation after a cold I-cache pays an external-flash fetch: on board
+ * #2 the maximum was 8.7 us over 7 interrupts (`wifi rpc`) but 3.3 us over 133
+ * (`wifi scan`), i.e. the short-exchange figure is the cold entry, not the real cost.
+ */
+static void print_rx_budget(struct cli_instance *sh,
+                            const struct rtl8720_uart_stats *st)
+{
+	uint32_t cyc_per_us = SystemCoreClock / 1000000u;
+
+	if (cyc_per_us == 0u)
+		cyc_per_us = 1u;                    /* never divide by zero */
+	cli_print(sh, "  rx: %lu irq, max %lu/%lu B per irq, isr %lu.%lu us\r\n",
+	          (unsigned long)st->isr_count,
+	          (unsigned long)st->isr_max_bytes, (unsigned long)st->isr_grace,
+	          (unsigned long)(st->isr_max_cycles / cyc_per_us),
+	          (unsigned long)((st->isr_max_cycles % cyc_per_us) * 10u / cyc_per_us));
+	cli_print(sh, "  rx err: ore %lu framing %lu ring-drops %lu (ring %lu B)%s\r\n",
+	          (unsigned long)st->ore, (unsigned long)st->ferr,
+	          (unsigned long)st->drops, (unsigned long)st->ring_size,
+	          (st->ore || st->ferr || st->drops) ? "  <-- NOT CLEAN" : "  (clean)");
+}
+
 static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 {
 	uint32_t baud = 2000000u;
 	uint8_t echoed = 0u;
 	struct erpc_diag diag = {0}, total = {0};
+	struct rtl8720_uart_stats st = {0};
 	int rc = -1, tries;
 	char ver[64];
 	int have_ver = 0;
@@ -342,6 +379,9 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 		if (erpc_system_version(ver, (uint16_t)sizeof(ver), &vdiag) >= 0)
 			have_ver = 1;
 	}
+	/* Snapshot before the unref: the counters survive the close (they are only reset
+	 * by rtl8720_uart_open) but reading them here keeps them tied to this session. */
+	rtl8720_uart_stats(&st);
 	rtl_link_uart_unref();
 	rtl_link_hw_release(sh);
 
@@ -361,6 +401,12 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 	          "stall %u\r\n",
 	          total.crc_fail, total.oversize, total.timeout, total.skipped_reply,
 	          total.unsupported_invocation, total.frame_stall);
+	/* RX interrupt-latency budget (issue #23 U0-1).  `bytes/grace` is how much of the
+	 * RXFIFO's post-threshold headroom the worst interrupt actually used -- it is the
+	 * number that says whether the threshold scheme holds at a higher baud.  Times are
+	 * in tenths of a microsecond: a single interrupt is only a few microseconds at
+	 * 550 MHz, so whole-microsecond resolution would round most of them to zero. */
+	print_rx_budget(sh, &st);
 	if (!(rc == 0 && echoed == 0x5Au))
 		cli_print(sh, "  hint: try `wifi rpc 614400`, or `wifi probe` to confirm boot\r\n");
 	return (rc == 0 && echoed == 0x5Au) ? 0 : 1;
@@ -749,6 +795,7 @@ static int cmd_wifi_scan(struct cli_instance *sh, int argc, char **argv)
 	struct wifi_rpc_opts o;
 	struct erpc_diag diag;
 	struct wifi_ap_record rec;
+	struct rtl8720_uart_stats st = {0};
 	char ssid[33], sec[SEC_NAME_CAP];
 	int32_t connected = -1, result = -1;
 	uint16_t ap_num = 0, want, got = 0, i;
@@ -846,6 +893,10 @@ static int cmd_wifi_scan(struct cli_instance *sh, int argc, char **argv)
 		goto fail;
 	}
 
+	/* The AP-record reply is the biggest receive in the tree (~2 KB), so this session
+	 * is the one that shows the STEADY-STATE interrupt cost rather than a cold-cache
+	 * first entry -- which is what the issue-#23 threshold choice rests on. */
+	rtl8720_uart_stats(&st);
 	rtl_link_end(sh);
 
 	/* 5) Report.  SSID is last so a hex fallback cannot break the column alignment. */
@@ -875,6 +926,7 @@ static int cmd_wifi_scan(struct cli_instance *sh, int argc, char **argv)
 			cli_print(sh, "\r\n");
 		}
 	}
+	print_rx_budget(sh, &st);
 	return 0;
 
 fail:
