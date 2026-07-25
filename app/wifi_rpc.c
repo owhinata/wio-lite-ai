@@ -13,6 +13,13 @@
 
 #include <string.h>
 
+/* The eRPC service thread stages a request in a per-slot buffer (issue #21 increment
+ * 8), so the largest request built here has to fit ERPC_REQ_MAX.  The biggest is
+ * wifi_rpc_lwip_send()'s fd(4) + binary length(4) + payload + flags(4); raising
+ * WIFI_RPC_STREAM_MAX therefore means raising ERPC_REQ_MAX too. */
+_Static_assert(12u + WIFI_RPC_STREAM_MAX <= ERPC_REQ_MAX,
+               "WIFI_RPC_STREAM_MAX exceeds the eRPC request staging buffer");
+
 /* rpc_wifi_drv (service 14) method IDs. */
 #define SVC_WIFI_DRV        14u
 #define M_WIFI_CONNECT       1u

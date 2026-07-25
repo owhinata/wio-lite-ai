@@ -23,10 +23,14 @@
  * therefore a prerequisite: ip/dhcp/ping require an active `wifi connect` (they never
  * power the module), and `net info` reports "not connected" otherwise.
  *
- * The RTL8720 eRPC link is a single-owner resource (one call in flight over a SPSC RX
- * ring), so every subcommand runs its whole transaction inside one rtl_link_begin() ..
- * rtl_link_end() session (shared with `wifi`, see rtl_link.h), which claims the console
- * and opens USART1 @2 Mbaud.  Long / blocking calls carry the Ctrl+C abort hook.
+ * Every subcommand runs its whole transaction inside one rtl_link_begin() ..
+ * rtl_link_end() session (shared with `wifi`, see app/rtl_link.h): that claims the
+ * console, takes the coarse link mutex -- so whole flows cannot interleave -- and
+ * references the eRPC UART (USART1 @2 Mbaud).  The eRPC frames themselves are owned by
+ * the resident service thread in app/erpc.c, which multiplexes several requests by
+ * sequence number; `net conc` below is the diagnostic that shows that working.
+ * Long / blocking calls carry the Ctrl+C abort hook (accept/recv deliberately do NOT --
+ * see the `net echo` block comment).
  *
  * `net ping` opens a raw ICMP socket (rpc_lwip_socket(SOCK_RAW, IPPROTO_ICMP)) and
  * builds/parses the ICMP echo itself.  The reported RTT is host-observed: it includes
@@ -564,7 +568,8 @@ static int cmd_net_conc(struct cli_instance *sh, int argc, char **argv)
 
 	/* Fire the blocking recvfrom (it will not reply for ~block_ms), then immediately
 	 * round-trip a system ack.  erpc_begin does NOT flush the RX while this token is in
-	 * flight, so the ack's reply and the recvfrom's reply are routed by sequence. */
+	 * flight: the link service never flushes the RX while a frame is on the wire, so the
+	 * ack's reply and the recvfrom's reply are routed to their tokens by sequence. */
 	token = wifi_rpc_lwip_recvfrom_begin(fd, 64u, 0, block_ms,
 	                                     rcvbuf, (uint16_t)sizeof(rcvbuf));
 	if (token < 0) {
@@ -608,9 +613,10 @@ static int cmd_net_conc(struct cli_instance *sh, int argc, char **argv)
  * The bring-up rehearsal for the telnet shell console (issue #21).  That console will
  * run a resident service thread holding a BLOCKING accept / recv on the module while the
  * shell instance thread runs commands; this command exercises exactly that mechanism --
- * bind/listen/accept/recv/send with the same firmware timeouts -- but single-threaded
- * inside one shell command, so no concurrency, no new thread and no change to the
- * single-owner eRPC link.  Its output is the measurement the console design needs:
+ * bind/listen/accept/recv/send with the same firmware timeouts -- but from a single
+ * shell command, so it adds no concurrency of its own (increment 8 then moved the link
+ * under a service thread that multiple clients can share).  Its output is the
+ * measurement the console design needs:
  * accept latency, the firmware's accept cap, whether MSG_DONTWAIT works, echo RTT,
  * whether getpeername is usable, and that the link is left clean.
  *
@@ -673,6 +679,7 @@ static void diag_acc(struct erpc_diag *tot, const struct erpc_diag *d)
 	tot->timeout                += d->timeout;
 	tot->skipped_reply          += d->skipped_reply;
 	tot->unsupported_invocation += d->unsupported_invocation;
+	tot->frame_stall            += d->frame_stall;
 }
 
 /*
@@ -685,10 +692,10 @@ static void echo_diag_if_dirty(struct echo_run *r)
 	const struct erpc_diag *d = &r->tot;
 
 	if (d->crc_fail || d->oversize || d->timeout || d->skipped_reply ||
-	    d->unsupported_invocation)
+	    d->unsupported_invocation || d->frame_stall)
 		cli_warn(r->sh, "  erpc diag so far: crc %u oversize %u timeout %u stale %u "
-		         "unsupported %u\r\n", d->crc_fail, d->oversize, d->timeout,
-		         d->skipped_reply, d->unsupported_invocation);
+		         "unsupported %u stall %u\r\n", d->crc_fail, d->oversize, d->timeout,
+		         d->skipped_reply, d->unsupported_invocation, d->frame_stall);
 }
 
 /* Per-call options for every echo RPC: deliberately WITHOUT the Ctrl+C abort hook. */
@@ -1101,9 +1108,9 @@ out:
 		cli_print(sh, "  echo send RTT: min %lu / avg %lu / max %lu ms over %lu sends\r\n",
 		          (unsigned long)r.emin, (unsigned long)(r.esum / r.en),
 		          (unsigned long)r.emax, (unsigned long)r.en);
-	cli_print(sh, "  erpc diag: crc %u oversize %u timeout %u stale %u unsupported %u\r\n",
-	          r.tot.crc_fail, r.tot.oversize, r.tot.timeout,
-	          r.tot.skipped_reply, r.tot.unsupported_invocation);
+	cli_print(sh, "  erpc diag: crc %u oversize %u timeout %u stale %u unsupported %u "
+	          "stall %u\r\n", r.tot.crc_fail, r.tot.oversize, r.tot.timeout,
+	          r.tot.skipped_reply, r.tot.unsupported_invocation, r.tot.frame_stall);
 	rtl_link_end(sh);
 	return r.dirty ? 1 : 0;
 }

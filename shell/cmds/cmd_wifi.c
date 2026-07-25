@@ -36,12 +36,19 @@
  * UART = USART1 carries binary eRPC, not ASCII, so it is driven via `wifi rpc` /
  * `wifi connect` etc. over the app/erpc.c + app/wifi_rpc.c client, not a bridge.)
  *
- * The eRPC subcommands (rpc / connect / disconnect / status / scan) each claim the console
- * (cli_console_claim) before touching hardware: that rejects a background worker and
- * guarantees a single owner of the SPSC RX ring and one eRPC transaction in flight.
+ * Every subcommand that touches the module goes through app/rtl_link.h first, which
+ * claims the console (rejecting a background worker: the console RX is a strict SPSC
+ * pipe owned by the foreground) and takes the coarse link mutex, so whole flows cannot
+ * interleave.  The eRPC subcommands (rpc / connect / disconnect / status / scan) use
+ * rtl_link_begin(), which also references the eRPC UART; the power / bridge / flash
+ * subcommands use rtl_link_hw_claim(), which opens no UART -- they drive it themselves.
+ * The eRPC frames are multiplexed by the resident service thread in app/erpc.c, so a
+ * command no longer owns the link exclusively for a whole RPC round-trip.
+ *
  * connect / DHCP block on the module for seconds, so those calls carry a long
  * timeout and an abort hook wired to Ctrl+C; aborting only stops the host-side wait
- * (the module keeps going -- `wifi reset` power-cycles it if it seems stuck).
+ * (the module keeps going -- `wifi reset` power-cycles it if it seems stuck; it takes
+ * the link away from whoever holds it via rtl_link_force_quiesce()).
  *
  * Clean-room design; no third-party code reused.
  */
@@ -108,10 +115,12 @@ static int parse_u32(const char *s, uint32_t *out)
 
 /*
  * Open one RTL8720DN UART and run a bidirectional bridge to the console until the
- * user presses Ctrl+C.  The console is claimed FIRST -- before any hardware action
- * -- so a background job (`wifi ... &`) is rejected without powering/opening
- * anything (cli_console_claim refuses a bg worker; the RX ring is a strict SPSC
- * pipe owned by the foreground).  Draining the module RX takes priority: when a
+ * user presses Ctrl+C.  The console + link are claimed FIRST -- before any hardware
+ * action -- so a background job (`wifi ... &`) is rejected without powering/opening
+ * anything, and the bridge is refused outright while an eRPC session references the
+ * UART (re-opening the peripheral under the service thread would desynchronise it).
+ * The bridge is then the sole reader of the RX ring.  Draining the module RX takes
+ * priority: when a
  * chunk was moved we only poll for a keypress (timeout 0) and loop again
  * immediately; when the module was idle we block up to 1 ms for a key, which yields
  * the CPU (no busy-spin) without starving anything (IWDG prio 5 / USB prio 8 /
@@ -125,12 +134,10 @@ static int wifi_bridge_run(struct cli_instance *sh, enum rtl8720_uart which,
 	uint8_t buf[256];
 	uint32_t drops;
 
-	if (cli_console_claim(sh) != 0) {              /* bg-reject / lock: no HW touched */
-		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+	if (rtl_link_hw_claim(sh, false) != 0)         /* bg/busy-reject: no HW touched */
 		return 1;
-	}
-	if (rtl8720_uart_open(which, baud) != 0) {
-		cli_console_release(sh);
+	if (rtl_link_uart_ref(which, baud) != 0) {
+		rtl_link_hw_release(sh);
 		cli_error(sh, "wifi: %s did not come ready\r\n", name);
 		return 1;
 	}
@@ -160,8 +167,8 @@ static int wifi_bridge_run(struct cli_instance *sh, enum rtl8720_uart which,
 	}
 
 	cli_rx_flush(sh);
-	rtl8720_uart_close();
-	cli_console_release(sh);
+	rtl_link_uart_unref();
+	rtl_link_hw_release(sh);
 
 	drops = rtl8720_uart_overflows();
 	cli_print(sh, "\r\nwifi: bridge ended\r\n");
@@ -182,16 +189,22 @@ static int cmd_wifi_info(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
-/* Claim the console just long enough to drive CHIP_EN: this rejects a background
- * worker (`wifi off &`) and, since an eRPC flow holds the claim for its whole
- * duration, prevents a power/reset from cutting the module mid-connect. */
+/*
+ * Claim the console + link just long enough to drive CHIP_EN: this rejects a background
+ * worker (`wifi off &`) and, since an eRPC flow holds the coarse mutex for its whole
+ * duration, prevents a power/reset from cutting the module mid-connect.
+ *
+ * These are the RECOVERY commands, so unlike the bridge/flash claims they are allowed
+ * even while the eRPC UART is referenced (allow_busy = true) -- "run `wifi reset`" is
+ * the answer to a wedged module, and refusing it exactly when the link is stuck in use
+ * would leave no way out.  They therefore take the link away first (see the callers'
+ * rtl_link_force_quiesce()): in-flight tokens are abandoned, the reference count is
+ * forced to zero and the UART is closed BEFORE CHIP_EN moves, which is also what stops
+ * the service thread from writing into a module that is being power-cycled.
+ */
 static int wifi_power_claim(struct cli_instance *sh)
 {
-	if (cli_console_claim(sh) != 0) {
-		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
-		return 1;
-	}
-	return 0;
+	return rtl_link_hw_claim(sh, true) != 0 ? 1 : 0;
 }
 
 static int cmd_wifi_on(struct cli_instance *sh, int argc, char **argv)
@@ -203,8 +216,10 @@ static int cmd_wifi_on(struct cli_instance *sh, int argc, char **argv)
 		rtl_tcpip_set_inited(false);           /* fresh power-on: lwIP not yet up */
 		rtl_set_ip_mode(RTL_IP_UNKNOWN);
 	}
+	rtl_link_force_quiesce();                      /* nobody may hold the link across
+	                                                * a CHIP_EN change */
 	rtl8720_power(true);
-	cli_console_release(sh);
+	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: CHIP_EN high (RTL8720DN powered on)\r\n");
 	return 0;
 }
@@ -214,10 +229,11 @@ static int cmd_wifi_off(struct cli_instance *sh, int argc, char **argv)
 	(void)argc; (void)argv;
 	if (wifi_power_claim(sh))
 		return 1;
+	rtl_link_force_quiesce();                  /* recovery path: take the link away */
 	rtl8720_power(false);
 	rtl_tcpip_set_inited(false);               /* module state lost on power-off */
 	rtl_set_ip_mode(RTL_IP_UNKNOWN);
-	cli_console_release(sh);
+	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: CHIP_EN low (RTL8720DN powered off)\r\n");
 	return 0;
 }
@@ -227,10 +243,11 @@ static int cmd_wifi_reset(struct cli_instance *sh, int argc, char **argv)
 	(void)argc; (void)argv;
 	if (wifi_power_claim(sh))
 		return 1;
+	rtl_link_force_quiesce();                  /* recovery path: take the link away */
 	rtl8720_reset();
 	rtl_tcpip_set_inited(false);               /* power-cycled: lwIP must be re-inited */
 	rtl_set_ip_mode(RTL_IP_UNKNOWN);
-	cli_console_release(sh);
+	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: reset (CHIP_EN low 80 ms -> high)\r\n");
 	return 0;
 }
@@ -277,22 +294,23 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "wifi: bad baud (2400..2000000)\r\n");
 		return 1;
 	}
-	if (cli_console_claim(sh) != 0) {          /* bg-reject / single owner */
-		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+	/* Its own claim rather than rtl_link_begin(): the baud is caller-chosen here, and a
+	 * non-default baud must not join an existing 2 Mbaud session (rtl_link_uart_ref
+	 * refuses that anyway).  allow_busy = false for the same reason. */
+	if (rtl_link_hw_claim(sh, false) != 0)
 		return 1;
-	}
 	if (!rtl8720_powered()) {
 		cli_print(sh, "wifi: powering on RTL8720DN, waiting ~1.5s for boot...\r\n");
 		rtl8720_power(true);
 		rtl_tcpip_set_inited(false);       /* fresh boot: lwIP not yet up */
 		rtl_set_ip_mode(RTL_IP_UNKNOWN);
 		if (cli_sleep(sh, 1500u)) {         /* cancellable boot wait */
-			cli_console_release(sh);
+			rtl_link_hw_release(sh);
 			return 1;
 		}
 	}
-	if (rtl8720_uart_open(RTL8720_UART_AT, baud) != 0) {
-		cli_console_release(sh);
+	if (rtl_link_uart_ref(RTL8720_UART_AT, baud) != 0) {
+		rtl_link_hw_release(sh);
 		cli_error(sh, "wifi: USART1 @%lu did not come ready\r\n", (unsigned long)baud);
 		return 1;
 	}
@@ -306,6 +324,7 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 		total.timeout                += diag.timeout;
 		total.skipped_reply          += diag.skipped_reply;
 		total.unsupported_invocation += diag.unsupported_invocation;
+		total.frame_stall            += diag.frame_stall;
 		if (rc == 0 && echoed == 0x5Au)
 			break;
 		if (cli_sleep(sh, 50u))            /* brief gap; Ctrl+C aborts */
@@ -318,8 +337,8 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 		if (erpc_system_version(ver, (uint16_t)sizeof(ver), &vdiag) >= 0)
 			have_ver = 1;
 	}
-	rtl8720_uart_close();
-	cli_console_release(sh);
+	rtl_link_uart_unref();
+	rtl_link_hw_release(sh);
 
 	if (rc == 0 && echoed == 0x5Au) {
 		cli_print(sh, "wifi: eRPC OK -- ack 0x5A -> 0x%02X, link up @%lu (%d tries)\r\n",
@@ -333,9 +352,10 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 	} else {
 		cli_error(sh, "wifi: eRPC FAILED -- ack 0x5A -> 0x%02X (rc %d)\r\n", echoed, rc);
 	}
-	cli_print(sh, "  diag: crc_fail %u oversize %u timeout %u skipped %u unsupported %u\r\n",
+	cli_print(sh, "  diag: crc_fail %u oversize %u timeout %u skipped %u unsupported %u "
+	          "stall %u\r\n",
 	          total.crc_fail, total.oversize, total.timeout, total.skipped_reply,
-	          total.unsupported_invocation);
+	          total.unsupported_invocation, total.frame_stall);
 	if (!(rc == 0 && echoed == 0x5Au))
 		cli_print(sh, "  hint: try `wifi rpc 614400`, or `wifi probe` to confirm boot\r\n");
 	return (rc == 0 && echoed == 0x5Au) ? 0 : 1;
@@ -875,10 +895,10 @@ static int cmd_wifi_flashprobe(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "wifi: bad hold_us (0..50000)\r\n");
 		return 1;
 	}
-	if (cli_console_claim(sh) != 0) {          /* bg-reject / single owner, HW untouched */
-		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+	/* bg-reject / busy-reject (the download path re-opens the UART itself), and the
+	 * coarse link mutex for the whole session: no HW is touched until both are held. */
+	if (rtl_link_hw_claim(sh, false) != 0)
 		return 1;
-	}
 
 	cli_print(sh, "wifi: entering RTL8720 UART download mode "
 	          "(strap PD14 low / reset PC3, hold %luus)...\r\n", (unsigned long)hold_us);
@@ -927,7 +947,7 @@ recover:
 	rtl8720_reset();
 	rtl_tcpip_set_inited(false);
 	rtl_set_ip_mode(RTL_IP_UNKNOWN);
-	cli_console_release(sh);
+	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
 	return hit ? 0 : 1;
 }
@@ -953,10 +973,10 @@ static int cmd_wifi_flashload(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "wifi: bad baud (115200 or 1500000)\r\n");
 		return 1;
 	}
-	if (cli_console_claim(sh) != 0) {
-		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+	/* bg-reject / busy-reject (the download path re-opens the UART itself), and the
+	 * coarse link mutex for the whole session: no HW is touched until both are held. */
+	if (rtl_link_hw_claim(sh, false) != 0)
 		return 1;
-	}
 
 	cli_print(sh, "wifi: download + flashloader (hold %luus, baud %lu, NON-DESTRUCTIVE)...\r\n",
 	          (unsigned long)hold_us, (unsigned long)baud);
@@ -988,7 +1008,7 @@ recover:
 	rtl8720_reset();
 	rtl_tcpip_set_inited(false);
 	rtl_set_ip_mode(RTL_IP_UNKNOWN);
-	cli_console_release(sh);
+	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
 	return ok ? 0 : 1;
 }
@@ -1009,10 +1029,10 @@ static int cmd_wifi_flashread(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "wifi: bad nsectors (1..64)\r\n");
 		return 1;
 	}
-	if (cli_console_claim(sh) != 0) {
-		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+	/* bg-reject / busy-reject (the download path re-opens the UART itself), and the
+	 * coarse link mutex for the whole session: no HW is touched until both are held. */
+	if (rtl_link_hw_claim(sh, false) != 0)
 		return 1;
-	}
 
 	cli_print(sh, "wifi: reading flash (NON-DESTRUCTIVE)...\r\n");
 	rc = rtl_dl_enter(30000u, rtl_abort_cb, sh);
@@ -1044,7 +1064,7 @@ recover:
 	rtl8720_reset();
 	rtl_tcpip_set_inited(false);
 	rtl_set_ip_mode(RTL_IP_UNKNOWN);
-	cli_console_release(sh);
+	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
 	return ok ? 0 : 1;
 }
@@ -1068,10 +1088,10 @@ static int cmd_wifi_flashtest(struct cli_instance *sh, int argc, char **argv)
 		          "Re-run `wifi flashtest 0x%lX confirm` to proceed.\r\n", (unsigned long)offset);
 		return 1;
 	}
-	if (cli_console_claim(sh) != 0) {
-		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+	/* bg-reject / busy-reject (the download path re-opens the UART itself), and the
+	 * coarse link mutex for the whole session: no HW is touched until both are held. */
+	if (rtl_link_hw_claim(sh, false) != 0)
 		return 1;
-	}
 
 	cli_print(sh, "wifi: flash erase/write/verify self-test @0x%lX "
 	          "(DESTRUCTIVE; power-cycles the module to verify)...\r\n", (unsigned long)offset);
@@ -1122,7 +1142,7 @@ recover:
 	rtl8720_reset();
 	rtl_tcpip_set_inited(false);
 	rtl_set_ip_mode(RTL_IP_UNKNOWN);
-	cli_console_release(sh);
+	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
 	return ok ? 0 : 1;
 }
@@ -1187,10 +1207,10 @@ static int cmd_wifi_flashinfo(struct cli_instance *sh, int argc, char **argv)
 
 	(void)argc; (void)argv;
 
-	if (cli_console_claim(sh) != 0) {
-		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+	/* bg-reject / busy-reject (the download path re-opens the UART itself), and the
+	 * coarse link mutex for the whole session: no HW is touched until both are held. */
+	if (rtl_link_hw_claim(sh, false) != 0)
 		return 1;
-	}
 
 	cli_print(sh, "wifi: identifying RTL8720 flash (NON-DESTRUCTIVE)...\r\n");
 	if (flash_session_open(sh) != 0)
@@ -1245,7 +1265,7 @@ recover:
 	rtl8720_reset();
 	rtl_tcpip_set_inited(false);
 	rtl_set_ip_mode(RTL_IP_UNKNOWN);
-	cli_console_release(sh);
+	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
 	return ok ? 0 : 1;
 }
@@ -1373,10 +1393,10 @@ static int cmd_wifi_flashbackup(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "wifi: range past the protocol's 16 MB (24-bit offset) limit\r\n");
 		return 1;
 	}
-	if (cli_console_claim(sh) != 0) {
-		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+	/* bg-reject / busy-reject (the download path re-opens the UART itself), and the
+	 * coarse link mutex for the whole session: no HW is touched until both are held. */
+	if (rtl_link_hw_claim(sh, false) != 0)
 		return 1;
-	}
 
 	cli_print(sh, "wifi: flash backup (NON-DESTRUCTIVE)...\r\n");
 	if (flash_session_open(sh) != 0)
@@ -1442,7 +1462,7 @@ recover:
 	rtl8720_reset();
 	rtl_tcpip_set_inited(false);
 	rtl_set_ip_mode(RTL_IP_UNKNOWN);
-	cli_console_release(sh);
+	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
 	return ok ? 0 : 1;
 }
@@ -1714,12 +1734,12 @@ static int cmd_wifi_flashwrite(struct cli_instance *sh, int argc, char **argv)
 		cli_warn(sh, "wifi: NOTE this range covers 0x105000, the factory WiFi settings "
 		         "sector -- the stored SSID/password will be replaced\r\n");
 
-	if (cli_console_claim(sh) != 0) {
-		cli_error(sh, "wifi: run in the foreground (not `wifi ... &`)\r\n");
+	/* bg-reject / busy-reject (the download path re-opens the UART itself), and the
+	 * coarse link mutex for the whole session: no HW is touched until both are held. */
+	if (rtl_link_hw_claim(sh, false) != 0)
 		return 1;
-	}
 	if (!psram_acquire()) {                 /* the image is read straight out of PSRAM */
-		cli_console_release(sh);
+		rtl_link_hw_release(sh);
 		cli_error(sh, "wifi: PSRAM is busy (another command holds it)\r\n");
 		return 1;
 	}
@@ -1804,7 +1824,7 @@ recover:
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
 out:
 	psram_release();
-	cli_console_release(sh);
+	rtl_link_hw_release(sh);
 	return ok ? 0 : 1;
 }
 

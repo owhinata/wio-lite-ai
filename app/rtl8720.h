@@ -55,6 +55,19 @@ void rtl8720_reset(void);
  * interrupt) at @p baud and start capturing received bytes into the ring.  Only one
  * UART is active at a time; opening closes any previously-open one and clears the
  * ring.  Returns 0 on success, -1 if the UART did not come ready.
+ *
+ * OWNERSHIP (issue #21 increment 8) -- open/close and the ring have several would-be
+ * users: the eRPC service thread (app/erpc.c), the `wifi log`/`probe` console bridge
+ * and the issue-#19 flash downloader.  Because open() closes the current UART and
+ * resets the shared SPSC ring, it must only be called from a path that
+ *   (a) holds the coarse link mutex (app/rtl_link.h) for the whole session, AND
+ *   (b) either goes through rtl_link_uart_ref() -- which brackets the call with
+ *       erpc_link_lock() so it cannot race the service thread -- or has established
+ *       that no eRPC session is live (rtl_link_uart_busy() == false, which is what
+ *       rtl_link_hw_claim() checks; with no live token the service thread is parked
+ *       and touches neither the UART nor the ring).
+ * The flash downloader (app/rtl8720_flash.c) opens/closes UART9 at several baud rates
+ * internally and relies on (b)'s second form.
  */
 int rtl8720_uart_open(enum rtl8720_uart which, uint32_t baud);
 

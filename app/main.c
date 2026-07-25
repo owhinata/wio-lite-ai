@@ -23,6 +23,8 @@
 #include "log.h"        /* log_init: reset-persistent RAM log (dmesg / crash record) */
 #include "iwdg.h"       /* IWDG petter (issue #4): armed from its own thread entry */
 #include "rtl8720.h"    /* onboard RTL8720DN CHIP_EN hold-off (issue #17) */
+#include "erpc.h"       /* eRPC link service thread (issue #21 increment 8) */
+#include "rtl_link.h"   /* coarse RTL8720 link mutex + UART refcount (same) */
 #include "app.h"
 #if BSP_PSRAM_INIT_IN_APP
 #include "psram.h"      /* app-first OCTOSPI1 APS6408 bring-up (issue #3) */
@@ -99,6 +101,16 @@ void tx_application_define(void *first_unused_memory)
    * `wifi` command runs, so the module never floats after reset (issue #17).
    * Register-only GPIO; safe here (pre-scheduler), like led_init_off(). */
   rtl8720_init();
+
+  /* RTL8720DN link ownership (issue #21 increment 8): the coarse mutex that serialises
+   * whole `wifi`/`net` flows, then the resident eRPC service thread that owns USART1
+   * and multiplexes requests by sequence number.  Both are pure ThreadX object
+   * creation -- no HAL_GetTick dependency, so they are safe here (issue #12) -- and the
+   * service thread only becomes READY; it parks on its event flag as soon as it runs.
+   * Fail-soft: if either fails the `wifi`/`net` commands report an error and the rest
+   * of the firmware still runs. */
+  (void) rtl_link_core_init();
+  (void) erpc_service_init();
 
 #if BSP_ENABLE_IWDG
   /* IWDG petter thread (priority 5), then arm the watchdog (issue #12: arm here, not

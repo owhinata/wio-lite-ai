@@ -71,6 +71,25 @@ Mode") with line editing, history, and Tab completion. 21 commands:
   eRPC path is a hand-written clean-room C client (`app/erpc.c`, FramedTransport +
   BasicCodec + CRC16/0xEF4A) with typed WiFi/tcpip wrappers (`app/wifi_rpc.c`) — no C++
   eRPC runtime.
+  The link is owned by a **resident eRPC service thread** (`app/erpc.c`, priority 10,
+  issue #21 increment 8): it is the only reader of the USART1 RX ring and the only
+  writer of request frames, and it routes replies to whoever is waiting by **sequence
+  number**, so several requests can be outstanding at once — which is what the N3
+  firmware's worker pool enables, and what lets a future telnet console keep a blocking
+  `accept`/`recv` parked on the module while the shell runs other commands. It sleeps
+  (touching neither the UART nor the ring) whenever nothing is in flight, so the
+  `wifi log` bridge and the `wifi flash*` downloader can own the same peripheral.
+  Ownership of the module as a whole — the coarse mutex that serialises whole flows
+  (`wifi connect` = init → off → on → connect → DHCP → get_ip), the reference count on
+  the eRPC UART, and the lwIP/IP-mode lifecycle state — lives in `app/rtl_link.c`.
+  Two consequences worth knowing: a command that needs the UART to itself (`wifi log` /
+  `probe`, every `wifi flash*`) is **refused while an eRPC session holds it**, while the
+  recovery commands (`wifi on`/`off`/`reset`) deliberately are not — they take the link
+  away first (abandoning in-flight calls, whose callers get a transport error), because
+  "run `wifi reset`" has to work exactly when the link is stuck. And since several
+  frames may be in flight, the service thread caps the request bytes it leaves
+  unanswered on the wire at the module's 127-byte input ring (see the asymmetry note
+  under `net echo` below) — a lone frame is still sent whatever its size.
   `wifi connect <ssid> [password] [security_hex]` then actually **joins an AP**
   (issue #5): it brings up the module's lwIP stack (the factory firmware leaves it
   uninitialised at boot), switches to STA mode, associates, runs the DHCP client and
@@ -170,8 +189,8 @@ Mode") with line editing, history, and Tab completion. 21 commands:
   deliberately not closed (a close racing an in-flight accept/recv is unsafe on this
   firmware) and `wifi reset` reclaims them.
   ip/dhcp/ping/conc/echo require an active association (they never power the module) and
-  share the same single-owner eRPC session as `wifi`. Pure marshalling on the STM32 side
-  — no RCC/register work.
+  share the same `app/rtl_link.c` session (console claim + coarse mutex + eRPC UART
+  reference) as `wifi`. Pure marshalling on the STM32 side — no RCC/register work.
 
   The RTL8720 device firmware itself is rebuilt (non-blocking socket handlers, then a
   worker-dispatch eRPC server so multiple requests run at once) under `fw/rtl8720/`

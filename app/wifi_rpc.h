@@ -7,10 +7,12 @@
  * WiFi/tcpip API (issue #5, increment 3: WiFi association + DHCP).
  *
  * Thin, synchronous C wrappers over app/erpc.c's erpc_call_ex().  Each function
- * performs ONE eRPC round-trip on the currently-open RTL8720 UART (open it once at
- * 2 Mbaud with rtl8720_uart_open(RTL8720_UART_AT, 2000000) before calling), so the
- * caller drives the whole connect flow inside a single UART session.  No clock/RCC
- * work here -- XIP-safe.  Layering: HAL/CMSIS <- erpc.c <- wifi_rpc.c <- cmd_wifi.c.
+ * performs ONE eRPC round-trip on the currently-open RTL8720 UART; a caller holds that
+ * UART for its whole flow by referencing it once (rtl_link_begin() for a shell command,
+ * or rtl_link_uart_ref(RTL8720_UART_AT, 2000000) directly -- see app/rtl_link.h).  The
+ * frames themselves are sent and routed by the eRPC service thread, so these are safe
+ * to call from any thread.  No clock/RCC work here -- XIP-safe.
+ * Layering: HAL/CMSIS <- erpc.c <- wifi_rpc.c <- cmd_wifi.c.
  *
  * Service / method IDs and wire layout come from the factory firmware's generated
  * shims (seeed-ambd-firmware @Wio-Lite-AI, src/erpc_shim/rpc_wifi_api_server.cpp):

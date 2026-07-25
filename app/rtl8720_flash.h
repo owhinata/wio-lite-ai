@@ -21,6 +21,15 @@
  * reconfig + the #17 rtl8720 UART/power primitives -- so it is XIP-safe.  cli-agnostic:
  * timing via ThreadX, cancellation via an optional abort hook (like app/erpc.c).
  *
+ * REQUIRED CALLER DISCIPLINE (issue #21 increment 8).  Every entry point here drives
+ * CHIP_EN and opens/closes UART9 at several baud rates internally, and reads the shared
+ * SPSC RX ring itself.  The RTL8720 link now has other users (the resident eRPC service
+ * thread, and from increment 9 a telnet console service), so a caller MUST hold the
+ * coarse link mutex with no eRPC session live for the WHOLE session --
+ * rtl_link_hw_claim(sh, false) .. rtl_link_hw_release(sh) (app/rtl_link.h), which
+ * rejects the command outright while the eRPC UART is referenced.  Nothing here takes
+ * that lock for you.
+ *
  * Entry mechanism (RTL872xD datasheet Table 3-2/3-4, schematic sheet 5/8):
  *   - The boot ROM samples PA[7] (= UART_LOG_TXD) at reset; LOW selects UART download
  *     mode (active-low).  PA[7] is wired to STM32 PD14 (UART9_RX) via WIFI_DEBUG_TXD.
@@ -233,8 +242,9 @@ struct rtl_dl_selftest {
  * Owns the whole flow: it enters download mode (strap+reset, @hold_us), loads the flashloader,
  * gates, erases, writes the test pattern, then -- because the flashloader goes unresponsive
  * after a flash program (only a power-cycle revives it) -- POWER-CYCLES and re-enters to
- * read-back verify and re-erase (restore).  So the caller only needs cli_console_claim +
- * a final rtl8720_reset; do NOT rtl_dl_enter/load before calling.
+ * read-back verify and re-erase (restore).  So the caller only needs the RTL link claim
+ * (rtl_link_hw_claim(sh, false), see the header note above) + a final rtl8720_reset;
+ * do NOT rtl_dl_enter/load before calling.
  *
  * Safe on the only board because it is hard-gated: @offset must be 4 KB-aligned and in
  * [0x00100000, 0x00200000) (past the app, within a conservative 2 MB cap), AND the sector
@@ -276,8 +286,9 @@ struct rtl_dl_program {
  * test window -- it is what actually (re)flashes the RTL8720DN's firmware, so read
  * the gates below before changing anything here.
  *
- * Owns the whole session, like rtl_dl_flash_selftest: the caller only needs
- * cli_console_claim + a final rtl8720_reset; do NOT rtl_dl_enter/load first.
+ * Owns the whole session, like rtl_dl_flash_selftest: the caller only needs the RTL link
+ * claim (rtl_link_hw_claim(sh, false)) + a final rtl8720_reset; do NOT rtl_dl_enter/load
+ * first.
  * Two phases, because a flash program leaves the flashloader unresponsive until a
  * power-cycle (established in M3):
  *   Phase 1  enter -> load flashloader -> detect capacity -> erase -> block-transfer
