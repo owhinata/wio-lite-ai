@@ -25,9 +25,9 @@
  *     the fd busy (N3 constraint 2).  So no should_abort hook is passed, and a host-side
  *     timeout (rc -2) is treated as "the module still owns these fds": they are LEAKED, not
  *     closed, and the console latches dirty until a `wifi reset` power-cycles the module.
- *  3. Requests must stay small.  A frame bigger than the module's 127-byte UART ring loses
- *     its tail (the ASYMMETRY note in wifi_rpc.h), so output is sent in
- *     WIFI_RPC_SEND_SAFE-byte chunks (a 120-byte frame, structurally safe).
+ *  3. Requests must stay small on a stock module.  A frame bigger than its 127-byte UART
+ *     ring loses its tail (the ASYMMETRY note in wifi_rpc.h), so output is sent in
+ *     wifi_rpc_send_chunk()-byte chunks -- 96 there, the full 256 on a wio-n4 module.
  *
  * Ring ownership.  The RX ring is strict SPSC: this thread is the only producer, the CLI
  * instance thread the only consumer.  The TX ring has SEVERAL producers -- the instance
@@ -71,10 +71,11 @@
 #define NSH_RX_RING         512u
 #define NSH_TX_RING         1024u
 
-/* Bytes per send RPC.  MUST stay <= WIFI_RPC_SEND_SAFE: 24 + 96 = 120 fits entirely in the
- * module's 127-byte UART ring, which is the only structural guarantee that a request cannot
- * lose its tail no matter how long the module's reader stalls. */
-#define NSH_TX_CHUNK        WIFI_RPC_SEND_SAFE
+/* Bytes per send RPC comes from wifi_rpc_send_chunk(), read fresh on every burst: 96 on a
+ * stock module (24 + 96 = 120 fits entirely in its 127-byte UART ring, the only structural
+ * guarantee that a request cannot lose its tail no matter how long its reader stalls) and
+ * the full 256 once the link is proved to be wio-n4, whose ring is 8 kB.  Reading it per
+ * burst is what lets a `wifi reset` mid-session drop us back to the safe size. */
 /* Send at most this many chunks before polling RX again, so a long output burst can still
  * see a Ctrl+C (~4 x 2 ms of send + one 2 ms poll). */
 #define NSH_TX_BURST        4u
@@ -651,6 +652,7 @@ static void nsh_tx_grace(void)
 /* Push queued output.  Returns 0 to carry on, -1 when the session or the link ended. */
 static int nsh_tx_drain(void)
 {
+	uint16_t chunk = wifi_rpc_send_chunk();
 	unsigned n;
 
 	for (n = 0u; n < NSH_TX_BURST; n++) {
@@ -662,8 +664,8 @@ static int nsh_tx_drain(void)
 
 		if (run == 0u)
 			break;
-		if (run > NSH_TX_CHUNK)
-			run = NSH_TX_CHUNK;
+		if (run > chunk)
+			run = chunk;
 
 		nsh_opts(&o, 0u);
 		rc = wifi_rpc_lwip_send(&o, g_cfd, p, (uint16_t)run, 0, &ret);

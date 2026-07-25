@@ -20,6 +20,16 @@
 _Static_assert(12u + WIFI_RPC_STREAM_MAX <= ERPC_REQ_MAX,
                "WIFI_RPC_STREAM_MAX exceeds the eRPC request staging buffer");
 
+uint16_t wifi_rpc_send_chunk(void)
+{
+	/* One latch decides both questions the old firmware forced on us: how many bytes may
+	 * be outstanding (the budget itself) and how big a single frame may be (this).  They
+	 * had the same cause -- the module's 127-byte Arduino ring -- so they are answered by
+	 * the same generation-scoped proof rather than by two flags that could disagree. */
+	return (erpc_wire_budget() > ERPC_WIRE_BUDGET_SAFE) ? WIFI_RPC_STREAM_MAX
+	                                                    : WIFI_RPC_SEND_SAFE;
+}
+
 /* rpc_wifi_drv (service 14) method IDs. */
 #define SVC_WIFI_DRV        14u
 #define M_WIFI_CONNECT       1u

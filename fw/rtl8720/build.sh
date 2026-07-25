@@ -220,8 +220,10 @@ do_build() {
 	# board's own extra_flags (-DBOARD_RTL8721D and the USB_* defines).  We reproduce
 	# that exactly -- it is how the shipped firmware was built, and the only consumer of
 	# BOARD_RTL8721D is the Wire library, which this sketch does not use.
+	# `link` is ours (patches/0004, issue #23 U0-2): the USI0 link driver and the eRPC
+	# transport built on it.  Upstream's list is otherwise reproduced verbatim.
 	local inc=""
-	for d in easylogger easylogger/inc ble wifi esp_lib erpc erpc_shim mDNS; do
+	for d in easylogger easylogger/inc ble wifi esp_lib erpc erpc_shim mDNS link; do
 		inc+=" -I$SKETCH/src/$d"
 	done
 

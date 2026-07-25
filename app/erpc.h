@@ -74,7 +74,7 @@
 /*
  * Bytes of request frames the service thread may have on the wire at once.
  *
- * The module's eRPC transport reads the UART one byte at a time behind an Arduino
+ * The stock module transport reads the UART one byte at a time behind an Arduino
  * RingBuffer of 127 usable bytes that SILENTLY DROPS a byte when full (see the
  * ASYMMETRY note in app/wifi_rpc.h): a frame whose bytes cannot all fit in that ring
  * is only delivered if the module's reader keeps up, which is load-dependent.  The
@@ -84,8 +84,23 @@
  * budget existed -- including the deliberately oversized ones `net echo <port> 256`
  * uses to reproduce the measured cliff) or the frame still fits this budget.
  * A reply proves the module consumed that request's bytes, which is what frees them.
+ *
+ * That ring is gone in the issue #23 U0-2 firmware (`2.1.3+wio-n4`), which owns USI0
+ * directly behind an 8 kB ring, so the budget can be lifted -- but ONLY once we have
+ * seen that firmware answer on THIS link.  Hence a runtime value that always starts at
+ * (and falls back to) the safe number: see erpc_set_wire_budget().
  */
-#define ERPC_WIRE_BUDGET  127u
+#define ERPC_WIRE_BUDGET_SAFE 127u
+
+/*
+ * The budget once the module is known to be wio-n4.  Deliberately far above anything the
+ * host can actually reach -- ERPC_MAX_INFLIGHT slots x (12 + ERPC_REQ_MAX) bytes = 1328 B
+ * worst case -- so on an n4 link the budget stops throttling entirely and the ledger's
+ * slot count is the only limit.  It is still a bound rather than "off" because it is what
+ * automatically reappears as the safe 127 if the link is reopened or the module is
+ * reflashed with an older image.
+ */
+#define ERPC_WIRE_BUDGET_FAST 4096u
 
 /* Per-call receive diagnostics (why a link test failed / what was skipped).
  *
@@ -152,6 +167,22 @@ void erpc_link_lock(void);
 void erpc_link_unlock(void);
 void erpc_link_opened(int carries_erpc);
 void erpc_link_closed(void);
+
+/*
+ * ---- the wire budget is a runtime value ----
+ *
+ * It starts at ERPC_WIRE_BUDGET_SAFE and only app/rtl_link.c raises it, because the thing
+ * that decides the answer -- WHICH FIRMWARE IS ON THE MODULE -- is module state, not link
+ * state.  Deliberately NOT reset by erpc_link_opened/_closed: `wifi rpc ver`, the call
+ * that proves the firmware, drops the UART reference before it returns, so a budget tied
+ * to the UART "open" would revert the moment it was earned and could never take effect.
+ * rtl_link.c clears it instead at every point the module's identity can change -- every
+ * CHIP_EN transition and every flash write -- which is the same set of points it already
+ * uses for rtl_tcpip_set_inited().  Values below the safe floor are clamped up to it, so
+ * this can only ever loosen a limit the caller has proof for.
+ */
+void     erpc_set_wire_budget(uint16_t bytes);
+uint16_t erpc_wire_budget(void);
 
 /*
  * Perform one eRPC invocation on the currently-open RTL8720 UART and wait for the

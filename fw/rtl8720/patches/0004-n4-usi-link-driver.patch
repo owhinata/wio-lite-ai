@@ -1,0 +1,466 @@
+diff --git a/src/erpc_setup.cpp b/src/erpc_setup.cpp
+index 3a5d4b8..66aa7b7 100644
+--- a/src/erpc_setup.cpp
++++ b/src/erpc_setup.cpp
+@@ -24,7 +24,10 @@
+ #include "rpc_ble_api_server.h"
+ #include "rpc_wifi_api.h"
+ #include "rpc_wifi_api_server.h"
+-#include "erpc_arduino_uart_transport.h"
++#include "wio_uart_transport.h"
++/* Was pulled in implicitly by erpc_arduino_uart_transport.h; erpc_system_init() still
++ * calls Arduino's delay(). */
++#include "Arduino.h"
+ #include "erpc_basic_codec.h"
+ #include "erpc_simple_server.h"
+ #include "erpc_arbitrated_client_manager.h"
+@@ -120,7 +123,10 @@ public:
+  *                              Constants
+  *============================================================================*/
+ 
+-UartTransport g_transport(&Serial3, 2000000);
++/* issue #23 U0-2: the link UART is owned by wio_usi_uart (USI0 direct) instead of the
++ * Arduino `Serial3`, whose 127-byte ring silently dropped the tail of a large request
++ * frame.  Same framing, same baud rate -- only the bytes underneath move differently. */
++WioUartTransport g_transport(2000000);
+ BasicCodecFactory g_basicCodecFactory;
+ ArbitratedClientManager *g_client;
+ TransportArbitrator g_arbitrator;
+@@ -171,11 +177,12 @@ char * rpc_system_version(void)
+      * literal and freeing that .rodata pointer corrupts the module heap (which is why
+      * the STM32 side never dared call rpc_system_version).  Return an erpc_malloc copy
+      * of a build id so the host can read back which firmware is loaded (`wifi rpc`).
+-     * "2.1.3" keeps the upstream base version; "+wio-n3" marks the issue-#20 N3 patch
+-     * set (bounded socket handlers + worker dispatch).  A NULL here would only happen on heap exhaustion,
++     * "2.1.3" keeps the upstream base version; "+wio-n4" marks the issue-#20 N3 patch
++     * set (bounded socket handlers + worker dispatch) plus the issue-#23 U0-2 link
++     * driver (USI0 owned directly).  A NULL here would only happen on heap exhaustion,
+      * which the stock literal never risked; the shim does not null-check, but version is
+      * called early when the heap is idle. */
+-    static const char id[] = "2.1.3+wio-n3";
++    static const char id[] = "2.1.3+wio-n4";
+     char *s = (char *)erpc_malloc(sizeof(id));
+     if (s != NULL)
+         memcpy(s, id, sizeof(id));
+@@ -254,6 +261,8 @@ __attribute__((noreturn)) static void n3_recv_task(void *arg)
+     log_i("[N3] erpc receive task up\n\r");
+ #if N3_INSTRUMENT
+     uint32_t lo_heap = 0xffffffffu;
++    /* issue #23 U0-2 link counters, last reported values (see below). */
++    struct wio_usi_stats seen = { 0u, 0u, 0u, 0u, 0u, 0u, 0u };
+ #endif
+     for (;;)
+     {
+@@ -282,6 +291,27 @@ __attribute__((noreturn)) static void n3_recv_task(void *arg)
+                 log_i("[N3] free heap low-water %u B\n\r", (unsigned)fh);
+             }
+         }
++        /* issue #23 U0-2: the link driver's own counters, the only way to see the module
++         * end of the wire (the host prints its side from `wifi rpc`).  Reported ONLY when
++         * something moves, so a healthy link stays silent -- `wifi log` and `wifi probe`
++         * must keep showing an unpolluted boot banner.  max_burst climbs a few times
++         * early and then settles; the three loss counters must stay 0.  %u only: the
++         * ROM _rtl_printf has no %lu. */
++        {
++            struct wio_usi_stats us;
++
++            wio_usi_stats(&us);
++            if (us.max_burst > seen.max_burst || us.ring_peak > seen.ring_peak ||
++                us.ring_drops != seen.ring_drops || us.hw_overflow != seen.hw_overflow ||
++                us.frame_err != seen.frame_err)
++            {
++                seen = us;
++                log_i("[U0-2] usi burst %u/64 ringpeak %u drops %u ovf %u framing %u\n\r",
++                      (unsigned)us.max_burst, (unsigned)us.ring_peak,
++                      (unsigned)us.ring_drops, (unsigned)us.hw_overflow,
++                      (unsigned)us.frame_err);
++            }
++        }
+ #endif
+     }
+ }
+diff --git a/src/link/wio_uart_transport.h b/src/link/wio_uart_transport.h
+new file mode 100644
+index 0000000..fca3ae3
+--- /dev/null
++++ b/src/link/wio_uart_transport.h
+@@ -0,0 +1,73 @@
++/*
++ * WioUartTransport -- eRPC framed transport over wio_usi_uart (issue #23 U0-2).
++ *
++ * Drop-in replacement for UartTransport(&Serial3, ...): same FramedTransport framing and
++ * CRC, so the wire format is unchanged and the host needs no protocol change.  What
++ * changes is underneath -- the Arduino HardwareSerial (127-byte ring, one byte per
++ * interrupt, one byte per read()) is gone, so a request frame larger than that ring is no
++ * longer at the mercy of how fast the receive task is scheduled.
++ */
++#ifndef WIO_UART_TRANSPORT_H
++#define WIO_UART_TRANSPORT_H
++
++#include "erpc_framed_transport.h"
++
++extern "C" {
++#include "FreeRTOS.h"
++#include "task.h"
++#include "wio_usi_uart.h"
++}
++
++namespace erpc {
++
++class WioUartTransport : public FramedTransport
++{
++public:
++	explicit WioUartTransport(uint32_t baudrate) : m_baudrate(baudrate) {}
++	virtual ~WioUartTransport(void) {}
++
++	virtual erpc_status_t init(void)
++	{
++		wio_usi_init(m_baudrate);
++		return kErpcStatus_Success;
++	}
++
++	virtual bool hasMessage(void) { return wio_usi_available() > 0u; }
++
++protected:
++	virtual erpc_status_t underlyingSend(const uint8_t *data, uint32_t size)
++	{
++		wio_usi_write(data, size);
++		return kErpcStatus_Success;
++	}
++
++	/*
++	 * Blocking, like the transport it replaces: FramedTransport::receive() asks for the
++	 * 4-byte header and then for exactly the body, and the eRPC server has nothing else
++	 * to do until a frame arrives.  The tick sleep is only reached when the ring is
++	 * genuinely empty -- a burst that is already in the ring is taken in whole memcpys
++	 * rather than one read() per byte.
++	 */
++	virtual erpc_status_t underlyingReceive(uint8_t *data, uint32_t size)
++	{
++		uint32_t got = 0u;
++
++		while (got < size) {
++			uint32_t n = wio_usi_read(data + got, size - got);
++
++			if (n == 0u) {
++				vTaskDelay(1);
++				continue;
++			}
++			got += n;
++		}
++		return kErpcStatus_Success;
++	}
++
++private:
++	uint32_t m_baudrate;
++};
++
++} /* namespace erpc */
++
++#endif /* WIO_UART_TRANSPORT_H */
+diff --git a/src/link/wio_usi_uart.c b/src/link/wio_usi_uart.c
+new file mode 100644
+index 0000000..0b3df18
+--- /dev/null
++++ b/src/link/wio_usi_uart.c
+@@ -0,0 +1,221 @@
++/*
++ * wio_usi_uart -- USI0 UART owned directly (issue #23 U0-2).  See wio_usi_uart.h.
++ *
++ * Everything called here is a ROM (_LONG_CALL_) entry point declared in
++ * component/soc/realtek/amebad/fwlib/include/rtl8721d_usi_uart.h; the behaviour relied
++ * on below was read out of the matching SDK source (Seeed-Studio/seeed-ambd-sdk,
++ * component/soc/realtek/amebad/fwlib/ram_hp/rtl8721dhp_usi_uart.c):
++ *
++ *   - USI_UARTStructInit() defaults to ODD PARITY ENABLED and RxFifoTrigLevel 1, so both
++ *     must be overridden -- the host talks 8N1.
++ *   - USI_UARTRxTimeOutCnt is in BIT PERIODS ("unit: bit period", USI_UARTRxTimeOutConfig)
++ *     and defaults to 64 = 6.4 byte times.  That is what ends a burst whose tail is
++ *     shorter than the FIFO threshold, so it is the tail latency of every reply.
++ *   - USI_UARTWritable() means "TX FIFO EMPTY", not "TX FIFO not full".  Writing with it
++ *     drains the 64-deep FIFO once per byte; USI_UARTGetTxFifoEmptyCnt() gives the free
++ *     space, which is what actually fills the FIFO.
++ *   - USI_UARTIntStatus() returns USI_INTERRUPT_STATUS, whose bits sit at the same
++ *     positions as the USI_*_INTER enable masks (confirmed against the shipped
++ *     UARTClassUsi ISR: `tst.w r0, #0x810` = ALMOST_FULL | TIMEOUT).
++ *   - Only the software-clearable sources may be written to INTERRUPT_STATUS_CLR
++ *     (IS_USI_UART_CLEAR_IT): RX FIFO overflow and stop-bit error are, and MUST be
++ *     cleared or they re-assert forever; almost-full and timeout are hardware-cleared by
++ *     draining the FIFO, which is why the drain loop below is the whole acknowledgement.
++ */
++
++#include "ameba_soc.h"
++#include "wio_usi_uart.h"
++
++#define WIO_USI_DEV        USI0_DEV
++#define WIO_USI_TX_PIN     _PB_20            /* module TX -> host USART1 RX (PA10) */
++#define WIO_USI_RX_PIN     _PB_21            /* module RX <- host USART1 TX (PB14) */
++
++/* Same priority the Arduino driver used, so the RX interrupt keeps sitting exactly where
++ * it did relative to the WiFi/lwIP interrupts.  Changing it is a separate experiment. */
++#define WIO_USI_IRQ_PRIO   10
++
++/*
++ * RX FIFO threshold: how many bytes the hardware holds before it interrupts.  This is a
++ * LATENCY budget, not a throughput one -- the FIFO is 64 deep, so the handler has
++ * (64 - threshold) byte times to start before the hardware itself overruns.  32 leaves
++ * 32 byte times (160 us at 2 Mbaud, 53 us at 6 Mbaud), which is generous next to a
++ * FreeRTOS system whose WiFi interrupts are the ones competing, and still cuts the
++ * interrupt rate by 32x against the stock trigger level of 1.
++ */
++#define WIO_USI_RX_TRIG    32u
++
++/* Bit periods of line idle that end a burst holding fewer than WIO_USI_RX_TRIG bytes.
++ * 64 = 6.4 byte times = the SDK default; it scales with the baud rate automatically. */
++#define WIO_USI_RX_TO_BITS 64u
++
++/* 8 kB, power of two.  4 ms of inflow at 2 Mbaud, 13 ms at 6 Mbaud -- room for the eRPC
++ * receive task to be preempted by WiFi work and still not lose a frame. */
++#define WIO_RING_SIZE      8192u
++#define WIO_RING_MASK      (WIO_RING_SIZE - 1u)
++
++static uint8_t           wio_ring[WIO_RING_SIZE];
++static volatile uint32_t wio_head;           /* written by the ISR only */
++static volatile uint32_t wio_tail;           /* written by the reader only */
++
++static volatile uint32_t st_irqs;
++static volatile uint32_t st_bytes;
++static volatile uint32_t st_max_burst;
++static volatile uint32_t st_ring_peak;
++static volatile uint32_t st_ring_drops;
++static volatile uint32_t st_hw_overflow;
++static volatile uint32_t st_frame_err;
++
++/* ------------------------------------------------------------------ *
++ *  interrupt
++ * ------------------------------------------------------------------ */
++static u32 wio_usi_irq(void *data)
++{
++	u32 ints = USI_UARTIntStatus(WIO_USI_DEV);
++	u32 err  = ints & (USI_RX_FIFO_OVERFLOW_INTER | USI_UART_STOP_ERROR_INTER);
++	uint32_t head = wio_head;
++	uint32_t got = 0u, used;
++
++	(void)data;
++
++	if (err != 0u) {
++		if (err & USI_RX_FIFO_OVERFLOW_INTER)
++			st_hw_overflow++;
++		if (err & USI_UART_STOP_ERROR_INTER)
++			st_frame_err++;
++		/* Latched sources: without this they re-assert immediately and the CPU never
++		 * leaves the handler. */
++		USI_UARTClearIntStatus(WIO_USI_DEV, err);
++	}
++
++	/* Drain until the FIFO is empty rather than until the threshold clears: bytes that
++	 * land while this loop runs are taken on the same interrupt, which is what keeps the
++	 * interrupt rate proportional to the data rate instead of to the threshold. */
++	while (USI_UARTReadable(WIO_USI_DEV)) {
++		uint32_t next = (head + 1u) & WIO_RING_MASK;
++		u8 b;
++
++		USI_UARTCharGet(WIO_USI_DEV, &b);
++		got++;
++		/* Re-read the tail each time: the consumer may have made room since the last
++		 * byte, and reading it late can only ever make the ring look FULLER than it is,
++		 * never emptier -- so this can drop a byte it did not have to, but can never
++		 * overwrite one the consumer has not read. */
++		if (next == wio_tail) {
++			st_ring_drops++;
++			continue;                /* keep draining: the FIFO must not overrun */
++		}
++		wio_ring[head] = b;
++		head = next;
++	}
++
++	if (got != 0u) {
++		/* Publish once, after the data stores are visible. */
++		__DMB();
++		wio_head = head;
++		st_bytes += got;
++		if (got > st_max_burst)
++			st_max_burst = got;
++		used = (head - wio_tail) & WIO_RING_MASK;
++		if (used > st_ring_peak)
++			st_ring_peak = used;
++	}
++	st_irqs++;
++	return 0;
++}
++
++/* ------------------------------------------------------------------ *
++ *  public API
++ * ------------------------------------------------------------------ */
++void wio_usi_init(uint32_t baud)
++{
++	USI_UARTInitTypeDef cfg;
++
++	wio_head = 0u;
++	wio_tail = 0u;
++
++	Pinmux_Config(WIO_USI_TX_PIN, PINMUX_FUNCTION_UART);
++	Pinmux_Config(WIO_USI_RX_PIN, PINMUX_FUNCTION_UART);
++	PAD_PullCtrl(WIO_USI_TX_PIN, GPIO_PuPd_UP);
++	PAD_PullCtrl(WIO_USI_RX_PIN, GPIO_PuPd_UP);
++
++	RCC_PeriphClockCmd(APBPeriph_USI_REG, APBPeriph_USI_CLOCK, ENABLE);
++
++	USI_UARTStructInit(&cfg);
++	cfg.USI_UARTParity          = USI_RUART_PARITY_DISABLE;   /* default is ODD */
++	cfg.USI_UARTDmaModeCtrl     = DISABLE;                    /* interrupt path only */
++	cfg.USI_UARTRxFifoTrigLevel = WIO_USI_RX_TRIG;
++	cfg.USI_UARTRxTimeOutCnt    = WIO_USI_RX_TO_BITS;
++	USI_UARTInit(WIO_USI_DEV, &cfg);
++	USI_UARTSetBaud(WIO_USI_DEV, baud);
++	USI_UARTRxCmd(WIO_USI_DEV, ENABLE);
++
++	/* Register before enabling any source, so the first interrupt cannot land on the
++	 * default handler.  USI_IRQ is the only USI interrupt (rtl8721d_vector.h). */
++	InterruptRegister((IRQ_FUN)wio_usi_irq, USI_IRQ, (u32)WIO_USI_DEV, WIO_USI_IRQ_PRIO);
++	InterruptEn(USI_IRQ, WIO_USI_IRQ_PRIO);
++	USI_UARTINTConfig(WIO_USI_DEV,
++	                  USI_RX_FIFO_ALMOST_FULL_INTER | USI_RX_FIFO_TIMEOUT_INTER |
++	                  USI_RX_FIFO_OVERFLOW_INTER | USI_UART_STOP_ERROR_INTER,
++	                  ENABLE);
++}
++
++uint32_t wio_usi_available(void)
++{
++	return (wio_head - wio_tail) & WIO_RING_MASK;
++}
++
++uint32_t wio_usi_read(uint8_t *buf, uint32_t cap)
++{
++	uint32_t tail = wio_tail;
++	uint32_t avail = (wio_head - tail) & WIO_RING_MASK;
++	uint32_t n = (avail < cap) ? avail : cap;
++	uint32_t first;
++
++	if (n == 0u)
++		return 0u;
++
++	/* The head read above must be ordered before the ring reads it makes valid. */
++	__DMB();
++
++	first = WIO_RING_SIZE - tail;
++	if (first > n)
++		first = n;
++	_memcpy(buf, &wio_ring[tail], first);
++	if (n > first)
++		_memcpy(buf + first, &wio_ring[0], n - first);
++
++	/* Release the space only after the copy has actually read it. */
++	__DMB();
++	wio_tail = (tail + n) & WIO_RING_MASK;
++	return n;
++}
++
++void wio_usi_write(const uint8_t *buf, uint32_t len)
++{
++	while (len != 0u) {
++		uint32_t space = USI_UARTGetTxFifoEmptyCnt(WIO_USI_DEV);
++		uint32_t n, i;
++
++		if (space == 0u)
++			continue;                /* spin, as the Arduino driver did -- a yield here
++			                          * would cost a whole tick per 64 bytes */
++		n = (space < len) ? space : len;
++		for (i = 0u; i < n; i++)
++			USI_UARTCharPut(WIO_USI_DEV, buf[i]);
++		buf += n;
++		len -= n;
++	}
++}
++
++void wio_usi_stats(struct wio_usi_stats *out)
++{
++	if (out == NULL)
++		return;
++	out->irqs        = st_irqs;
++	out->bytes       = st_bytes;
++	out->max_burst   = st_max_burst;
++	out->ring_peak   = st_ring_peak;
++	out->ring_drops  = st_ring_drops;
++	out->hw_overflow = st_hw_overflow;
++	out->frame_err   = st_frame_err;
++}
+diff --git a/src/link/wio_usi_uart.h b/src/link/wio_usi_uart.h
+new file mode 100644
+index 0000000..f7333d3
+--- /dev/null
++++ b/src/link/wio_usi_uart.h
+@@ -0,0 +1,73 @@
++/*
++ * wio_usi_uart -- the eRPC link UART, owned directly instead of through Arduino.
++ *
++ * Issue #23 (wio-lite-ai) U0-2.  The stock firmware reaches this UART as Arduino
++ * `Serial3` (UARTClassUsi), which caps the link at roughly 40 kB/s and, worse, makes a
++ * large REQUEST frame unreliable:
++ *
++ *   - UARTClassUsi::begin() leaves USI_UARTRxFifoTrigLevel at 1, so the RX interrupt
++ *     fires once per byte and its handler reads exactly one byte out of a 64-deep FIFO;
++ *   - it stores into an Arduino RingBuffer of SERIAL_BUFFER_SIZE = 128 (127 usable)
++ *     whose store_char() SILENTLY DROPS a byte when full;
++ *   - the eRPC transport above it reads one byte per call and sleeps a whole FreeRTOS
++ *     tick (1 ms = 200 bytes at 2 Mbaud) whenever it finds the buffer empty.
++ *
++ * Together those put a load-dependent cliff somewhere between 184 and 280 bytes of
++ * request frame (measured on board #2), which the host has to work around by chunking
++ * at 96 bytes and by tracking how many bytes it has left unanswered on the wire.
++ *
++ * This driver owns USI0 (PB_20 TX / PB_21 RX -- the module end of the host's USART1) and
++ * removes all three: the interrupt drains the whole hardware FIFO on a threshold, the
++ * ring is 8 kB, and reads are bulk memcpy.  Nothing here is Arduino, so `Serial3` is left
++ * unused (its ISR is only registered by UARTClassUsi::begin(), which nothing now calls).
++ *
++ * SPSC discipline, matching the host side (app/rtl8720.c): the interrupt is the only
++ * writer of `head`, the eRPC receive task the only writer of `tail`.  A full ring drops
++ * the NEWEST byte and counts it, so the loss is always visible rather than silent.
++ */
++#ifndef WIO_USI_UART_H
++#define WIO_USI_UART_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Bring USI0 up as an 8N1 UART at @baud and enable its RX interrupt.  Idempotent in the
++ * sense that calling it again re-initialises the peripheral and empties the ring; it is
++ * not safe to call while another thread is reading. */
++void wio_usi_init(uint32_t baud);
++
++/* Copy up to @cap bytes out of the ring.  Never blocks; returns the count copied. */
++uint32_t wio_usi_read(uint8_t *buf, uint32_t cap);
++
++/* Bytes available to wio_usi_read() right now. */
++uint32_t wio_usi_available(void);
++
++/* Write @len bytes, blocking (polled) until they are all in the TX FIFO.  Uses the free
++ * space reported by the FIFO, so a burst goes out 64 bytes at a time rather than the one
++ * byte per drain that USI_UARTWritable() (which means "TX FIFO EMPTY", not "not full")
++ * forces on UARTClassUsi::write(). */
++void wio_usi_write(const uint8_t *buf, uint32_t len);
++
++struct wio_usi_stats {
++	uint32_t irqs;          /* RX interrupts taken */
++	uint32_t bytes;         /* bytes pulled out of the RX FIFO */
++	uint32_t max_burst;     /* high-water bytes drained in ONE interrupt: this is the
++	                         * number that says whether the threshold scheme holds --
++	                         * approaching 64 means the FIFO is close to overrunning */
++	uint32_t ring_peak;     /* high-water ring occupancy (consumer keeping up?) */
++	uint32_t ring_drops;    /* bytes lost because the ring was full */
++	uint32_t hw_overflow;   /* RX FIFO overrun interrupts: hardware loss, must stay 0 */
++	uint32_t frame_err;     /* stop-bit (framing) errors: marginal baud rate */
++};
++
++/* Snapshot of the counters.  Monotonic since wio_usi_init(). */
++void wio_usi_stats(struct wio_usi_stats *out);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* WIO_USI_UART_H */

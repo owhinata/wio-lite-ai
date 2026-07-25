@@ -355,11 +355,29 @@ int wifi_rpc_lwip_errno(const struct wifi_rpc_opts *o, int32_t *err);
  * must chunk at WIFI_RPC_SEND_SAFE.  Receiving may keep using the full
  * WIFI_RPC_STREAM_MAX.
  *
- * The proper fix is on the firmware side (a bulk `readBytes()` in the transport, or a
- * larger SERIAL_BUFFER_SIZE), i.e. another patch in fw/rtl8720/patches -- deliberately
- * out of scope here, where the point is to establish the constraint.
+ * THE FIRMWARE FIX IS NOW IN (issue #23 U0-2, fw/rtl8720/patches/0004): the module owns
+ * USI0 directly behind an 8 kB ring and reads it in bulk, so none of the three causes
+ * above survives and a full WIFI_RPC_STREAM_MAX payload is safe.  But the host must keep
+ * working against an older module -- the two are flashed separately and the recovery path
+ * (`wifi imgload` / `flashwrite`) exists precisely to put an older image back -- so the
+ * chunk size is a RUNTIME question, not a compile-time one: see wifi_rpc_send_chunk().
+ * WIFI_RPC_SEND_SAFE remains the answer for a link we have no proof about.
  */
 #define WIFI_RPC_SEND_SAFE        96u
+
+/*
+ * Largest request payload that is safe to send RIGHT NOW: WIFI_RPC_STREAM_MAX on a link
+ * proved to be wio-n4 (`wifi rpc ver`), WIFI_RPC_SEND_SAFE otherwise.  Derived from
+ * erpc_wire_budget(), so it follows the same generation-scoped latch and drops back to
+ * the conservative answer the moment the link is reopened, reset or reflashed -- callers
+ * must therefore read it per burst rather than caching it.
+ *
+ * Anything streaming bytes (the issue #21 telnet console's output path) should use this.
+ * The wrappers still ACCEPT up to WIFI_RPC_STREAM_MAX regardless, so `net echo` can keep
+ * reproducing the measured cliff on a stock module.  Receiving may always use the full
+ * WIFI_RPC_STREAM_MAX.
+ */
+uint16_t wifi_rpc_send_chunk(void);
 
 /* @sa / @salen are a raw lwIP sockaddr (16-byte sockaddr_in here), as built by the
  * caller in network byte order. */

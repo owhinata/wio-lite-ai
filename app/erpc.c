@@ -64,9 +64,11 @@
 #define ERPC_FRAME_STALL_MS  200u
 
 /* Wire ledger size: how many sent-but-unanswered request frames may be tracked.  With
- * ERPC_WIRE_BUDGET 127 and the smallest frame 13 B (rpc_system_ack) at most 9 can
+ * ERPC_WIRE_BUDGET_SAFE 127 and the smallest frame 13 B (rpc_system_ack) at most 9 can
  * coexist, so 8 entries is in step with the budget and simply throttles (the caller
- * times out) rather than losing accounting. */
+ * times out) rather than losing accounting.  On a wio-n4 link the budget stops binding
+ * and this becomes the only limit, which is deliberate: ERPC_MAX_INFLIGHT is 4, so the
+ * ledger can never actually fill. */
 #define ERPC_WIRE_DEBTS      8
 
 /* Reader steps per pass through the service loop.  Bounds how long the loop can hold
@@ -133,6 +135,11 @@ struct erpc_debt {
 	uint8_t  used;
 };
 static struct erpc_debt erpc_debts[ERPC_WIRE_DEBTS];
+
+/* How many of those bytes may be outstanding.  Module-scoped, owned by app/rtl_link.c --
+ * see the erpc_set_wire_budget() contract in erpc.h for why it does NOT follow the link
+ * open/close cycle. */
+static uint16_t erpc_budget = ERPC_WIRE_BUDGET_SAFE;
 
 static uint16_t erpc_bytes_on_wire(void)
 {
@@ -480,7 +487,7 @@ static int erpc_send_one(void)
 		on_wire   = erpc_bytes_on_wire();
 		if (!erpc_debt_have_room())
 			return 0;                /* ledger full: nothing may go out at all */
-		if (on_wire != 0u && (uint32_t)on_wire + frame_len > ERPC_WIRE_BUDGET)
+		if (on_wire != 0u && (uint32_t)on_wire + frame_len > erpc_budget)
 			continue;                /* too big for the remaining budget right now;
 			                          * a smaller queued frame may still fit */
 		if (on_wire == 0u) {
@@ -664,6 +671,29 @@ void erpc_link_opened(int carries_erpc)
 	erpc_debt_reset();
 	erpc_stream_reset_locked();
 	erpc_link_up = carries_erpc ? 1u : 0u;
+	erpc_lock_put();
+}
+
+uint16_t erpc_wire_budget(void)
+{
+	uint16_t b;
+
+	if (!erpc_ready)
+		return ERPC_WIRE_BUDGET_SAFE;
+	erpc_lock_get();
+	b = erpc_budget;
+	erpc_lock_put();
+	return b;
+}
+
+void erpc_set_wire_budget(uint16_t bytes)
+{
+	if (!erpc_ready)
+		return;
+	if (bytes < ERPC_WIRE_BUDGET_SAFE)
+		bytes = ERPC_WIRE_BUDGET_SAFE;   /* never below the always-safe floor */
+	erpc_lock_get();
+	erpc_budget = bytes;
 	erpc_lock_put();
 }
 

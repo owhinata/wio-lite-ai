@@ -244,7 +244,7 @@ fw/rtl8720/
   README.md          this file
   build.sh           setup | build | gate | clean
   gate.py            the static gates
-  patches/           N2/N3 patches, applied in filename order (empty for N1)
+  patches/           N2/N3/N4 patches, applied in filename order (empty for N1)
   out/               git-ignored build output
     km0_km4_image2.bin   <- the image that gets flashed
     km0_boot_all.bin     }  core prebuilts, copied out for the gates
@@ -293,6 +293,8 @@ fw/rtl8720/
   pool, concurrency limited to an allow-list of socket calls) plus multi-in-flight on the
   STM32 (`erpc_begin`/`erpc_wait`/`erpc_cancel`). This is where concurrent TCP becomes
   possible. See *N3 result* below.
+- **N4** (built) — the link UART is driven by us, not by Arduino (`patches/0004`,
+  issue #23 U0-2). See *N4 result* below.
 
 ### N2 result
 
@@ -386,3 +388,69 @@ kept when that scope grows (both flagged in the N3 review):
    future multi-in-flight socket API must not `close`/mutate an fd while another worker is
    blocked in `recvfrom`/`accept` on it (lwIP fd-reuse / close-wakeup semantics make that
    racy).
+
+### N4 result
+
+`patches/0004-n4-usi-link-driver.patch` — new `src/link/wio_usi_uart.{c,h}` and
+`src/link/wio_uart_transport.h`, plus the transport swap and build id in
+`src/erpc_setup.cpp`. **The wire format does not change**, so every existing host feature
+is a regression test.
+
+The link was never limited by the UART. It was limited by three things stacked in the
+Arduino layer *below* the eRPC transport, all of which this removes:
+
+| | stock | N4 |
+|---|---|---|
+| RX interrupt | `USI_UARTRxFifoTrigLevel = 1`, handler reads **one** byte | threshold 32 of 64, handler drains until the FIFO is empty |
+| buffer | Arduino `RingBuffer`, **127 usable**, `store_char()` drops silently when full | 8 kB, drops the newest byte **and counts it** |
+| transport read | one `read()` per byte, `vTaskDelay(1)` when empty | bulk `memcpy` out of the ring |
+
+That 127-byte ring is why a big *request* frame was unreliable while a big *reply* was
+fine (the ASYMMETRY note in `app/wifi_rpc.h`): the module stalls mid-frame to allocate its
+4 KB message buffer, and anything that does not fit in the ring loses its tail, fails CRC
+and is never answered. The measured cliff was between 184 and 280 bytes and was
+**load-dependent**, which is why the host had to chunk sends at 96 bytes and keep a
+ledger of unanswered bytes on the wire.
+
+Facts the driver depends on, read out of the SDK source
+(`Seeed-Studio/seeed-ambd-sdk`, `component/soc/realtek/amebad/fwlib/ram_hp/rtl8721dhp_usi_uart.c`)
+rather than assumed — the fwlib entry points are ROM `_LONG_CALL_` stubs, so the headers
+alone do not answer any of them:
+
+- `USI_UARTStructInit()` defaults to **odd parity enabled**; 8N1 has to be set explicitly.
+- `USI_UARTRxTimeOutCnt` is in **bit periods** (default 64 = 6.4 byte times). This is what
+  ends a burst whose tail is shorter than the FIFO threshold, i.e. it is the tail latency
+  of every reply, and it scales with the baud rate on its own.
+- `USI_UARTWritable()` means "TX FIFO **empty**", not "not full" — polling on it sends one
+  byte per full FIFO drain. `USI_UARTGetTxFifoEmptyCnt()` is what actually fills it.
+- Almost-full and RX-timeout are hardware-cleared by draining the FIFO; RX-FIFO-overflow
+  and stop-bit error are latched and **must** be written to `INTERRUPT_STATUS_CLR`
+  (`IS_USI_UART_CLEAR_IT`) or they re-assert forever.
+
+Module-side counters go to the LOG UART (`wifi log`) and are printed **only when they
+move**, so a healthy link leaves the boot banner clean:
+`[U0-2] usi burst N/64 ringpeak N drops N ovf N framing N`. `burst` is the high-water
+bytes taken in one interrupt (approaching 64 means the FIFO is close to overrunning);
+`drops`/`ovf`/`framing` must all stay 0.
+
+#### The host side is version-gated
+
+The host and the module are flashed separately, and the recovery path exists precisely to
+put an *older* image back — so "may I send a 280-byte frame?" is a runtime question. The
+host keeps one latch, the eRPC wire budget (`app/erpc.c`), which:
+
+- starts at `ERPC_WIRE_BUDGET_SAFE` (127) and is raised to `ERPC_WIRE_BUDGET_FAST` only
+  when `wifi rpc ver` reads back `wio-n4`;
+- is dropped back by `rtl_dl_enter()` (any flash session, even an aborted one) and by
+  `rtl_link_force_quiesce()` (any CHIP_EN move, i.e. the `wifi reset` recovery path);
+- decides `wifi_rpc_send_chunk()` too, which is what the telnet console chunks its output
+  at — 96 on a stock module, the full 256 on N4.
+
+`wifi rpc` prints the current state (`wire: budget N B, send chunk N B`). Note this is
+deliberately *not* tied to the UART open/close generation: `wifi rpc ver` drops its own
+UART reference before returning, so a link-scoped latch would revert before it could ever
+be used.
+
+Acceptance (beyond the N3 regression set, with `wifi rpc ver` reading `2.1.3+wio-n4`):
+`net echo 2323 256` must complete. That is a 280-byte request frame — the exact size that
+gets no reply at all on N3 and earlier.

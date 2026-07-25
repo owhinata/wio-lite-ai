@@ -142,6 +142,11 @@ void rtl_link_force_quiesce(void)
 	g_uart_refs = 0u;                    /* whoever held it does not any more */
 	g_uart_gen++;                        /* ... and their recorded generation is now stale */
 	g_quiesce_gen++;                     /* only here: "CHIP_EN is about to move" */
+	/* This is the recovery path (`wifi reset` and friends).  If the link went dirty
+	 * BECAUSE the host was wrong about the module's firmware, the recovery must undo that
+	 * assumption too -- so drop back to the always-safe wire budget and make `wifi rpc
+	 * ver` earn it again.  Costs one command; a stale raise costs a wedged console. */
+	erpc_set_wire_budget(ERPC_WIRE_BUDGET_SAFE);
 	erpc_link_closed();                  /* tokens abandoned; their waiters get -2 */
 	rtl8720_uart_close();
 	erpc_link_unlock();

@@ -25,6 +25,7 @@
 #include "stm32h7xx_hal.h"   /* GPIO reconfig (PD14 strap: AF11 UART9_RX <-> output low) */
 #include "tx_api.h"          /* tx_time_get / tx_thread_sleep (1 tick = 1 ms here) */
 #include "rtl8720.h"         /* rtl8720_power/reset + UART9 open/close/read/write (#17) */
+#include "erpc.h"            /* erpc_set_wire_budget: a flash session voids the fw proof */
 #include "timebase.h"        /* udelay: DWT busy-wait for the bounded strap hold */
 #include "rtl8720_flash.h"
 
@@ -182,6 +183,13 @@ int rtl_dl_enter(uint32_t hold_us, int (*should_abort)(void *), void *ctx)
 	 * not contend even if the RTL8720 is currently driving PA[7] as its LOG-UART TX. */
 	rtl8720_uart_close();
 	dl_strap_release_input();
+
+	/* Whatever the host had proved about which firmware is on the module is void from
+	 * here on: this session exists to change that flash, and even an aborted one can
+	 * leave a half-written image.  Dropping to the always-safe wire budget now means the
+	 * proof has to be re-earned (`wifi rpc ver`) after the flash, rather than a stale
+	 * "it is wio-n4" surviving a downgrade to an image whose UART ring is 127 bytes. */
+	erpc_set_wire_budget(ERPC_WIRE_BUDGET_SAFE);
 
 	/* Power the module OFF before driving the strap: if it were running, its PA[7]
 	 * (LOG-UART TX) would be a live output and driving PD14 low against it would be a

@@ -378,6 +378,16 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 		struct erpc_diag vdiag = {0};
 		if (erpc_system_version(ver, (uint16_t)sizeof(ver), &vdiag) >= 0)
 			have_ver = 1;
+		/* This is the only place the host learns which firmware it is talking to, so it
+		 * is where the issue #23 U0-2 wire budget is earned: `wio-n4` means the module
+		 * owns USI0 behind an 8 kB ring, and the 127-byte limit that shaped every
+		 * request size above it no longer exists.  Anything else -- including a version
+		 * query that failed -- leaves the conservative budget in place.  It is dropped
+		 * again by any flash session or CHIP_EN move (rtl_dl_enter /
+		 * rtl_link_force_quiesce), so it can only ever describe the module in front of
+		 * us. */
+		if (have_ver && strstr(ver, "wio-n4") != NULL)
+			erpc_set_wire_budget(ERPC_WIRE_BUDGET_FAST);
 	}
 	/* Snapshot before the unref: the counters survive the close (they are only reset
 	 * by rtl8720_uart_open) but reading them here keeps them tied to this session. */
@@ -394,6 +404,14 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 			else
 				cli_print(sh, "  fw version: unavailable (pre-N2 firmware, or query failed)\r\n");
 		}
+		/* What the host currently believes it may put on the wire.  Printed on every
+		 * successful link test, not only for `ver`, because it is the one piece of state
+		 * a reader cannot infer: it outlives this command (the UART reference does not)
+		 * but not a reset or a flash session. */
+		cli_print(sh, "  wire: budget %u B, send chunk %u B%s\r\n",
+		          (unsigned)erpc_wire_budget(), (unsigned)wifi_rpc_send_chunk(),
+		          (erpc_wire_budget() > ERPC_WIRE_BUDGET_SAFE) ? " (wio-n4 link)"
+		                                                       : " (conservative)");
 	} else {
 		cli_error(sh, "wifi: eRPC FAILED -- ack 0x5A -> 0x%02X (rc %d)\r\n", echoed, rc);
 	}

@@ -36,3 +36,18 @@
 #       portMAX_DELAY back-pressure (degrades to the stock serial rate, never leaks).
 #       Needs the N3 host client (app/erpc.c erpc_begin/erpc_wait/erpc_cancel), which
 #       routes now-out-of-order replies by sequence.  Verify with `net conc`.
+#
+# N4 -- the link UART is ours (issue #23 U0-2), wire format unchanged:
+#
+#   0004-n4-usi-link-driver.patch
+#       New src/link/wio_usi_uart.{c,h} + src/link/wio_uart_transport.h, and
+#       src/erpc_setup.cpp switches the transport over (and the build id to
+#       "2.1.3+wio-n4").  Removes the three things that made a big REQUEST unreliable
+#       and capped the link near 40 kB/s, all in the Arduino layer under the eRPC
+#       transport: RxFifoTrigLevel 1 (one interrupt per byte, one byte read out of a
+#       64-deep FIFO), a 127-byte RingBuffer whose store_char() drops silently when
+#       full, and a transport that read one byte per call.  The driver owns USI0
+#       (PB_20/PB_21), drains the whole FIFO on a threshold of 32, buffers 8 kB and
+#       reads in bulk memcpys.  `Serial3` is simply never begun.
+#       Verify with `net echo 2323 256` -- a 280-byte request frame, which is the size
+#       that gets no reply on N3 and earlier.
