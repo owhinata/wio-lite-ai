@@ -16,6 +16,7 @@
  *   wifi connect <ssid> [pw] [sec]  associate (STA) + DHCP, print the IP (#5 inc 3)
  *   wifi disconnect               drop the current association
  *   wifi status                   connected? + RSSI + IP/mask/gw + MAC
+ *   wifi scan                     list visible APs: ch/band/rssi/security/bssid/ssid
  *
  * RTL8720DN firmware-download subcommands (issue #19; see app/rtl8720_flash.c):
  *   wifi flashprobe [hold_us]     M1: prove UART download-mode entry (read-only)
@@ -35,7 +36,7 @@
  * UART = USART1 carries binary eRPC, not ASCII, so it is driven via `wifi rpc` /
  * `wifi connect` etc. over the app/erpc.c + app/wifi_rpc.c client, not a bridge.)
  *
- * The eRPC subcommands (rpc / connect / disconnect / status) each claim the console
+ * The eRPC subcommands (rpc / connect / disconnect / status / scan) each claim the console
  * (cli_console_claim) before touching hardware: that rejects a background worker and
  * guarantees a single owner of the SPSC RX ring and one eRPC transaction in flight.
  * connect / DHCP block on the module for seconds, so those calls carry a long
@@ -61,10 +62,15 @@
 #include "erpc.h"
 #include "wifi_rpc.h"
 #include "rtl_link.h"
+#include "stm32h7xx_hal.h"   /* #5 inc 6: HAL_GetTick (1 ms SysTick, fed via tx_glue.c)
+                              * for the scan-wait deadline -- read-only, no HAL init. */
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdio.h>           /* snprintf: naming a scan result's security mode.
+                              * Already linked in by cmd_thread.c / cmd_membench.c /
+                              * cmd_builtin.c, so this adds no footprint. */
 
 /* Parse a 32-bit unsigned: 0x-hex or decimal.  Returns 0 on success. */
 static int parse_u32(const char *s, uint32_t *out)
@@ -537,6 +543,319 @@ static int cmd_wifi_status(struct cli_instance *sh, int argc, char **argv)
 	}
 	rtl_link_end(sh);
 	return 0;
+}
+
+/*
+ * ---- wifi scan (issue #5, increment 6) ------------------------------------------
+ *
+ * How many records to pull back in the single get_ap_records reply.  Three ceilings
+ * meet here: the module serialises the whole array into ONE eRPC frame and both sides
+ * cap a message at 4096 B (app/erpc.c ERPC_RX_SCRATCH / the firmware's 4 KB
+ * MessageBufferFactory), the module erpc_malloc()s 62*n bytes out of its FreeRTOS heap,
+ * and the reply payload has to land in host BSS because the shell thread stack is 4 KB.
+ * 32 records = 1992 B and covers any realistic environment; the firmware can only copy
+ * a PREFIX of its array (there is no offset argument), so a busier band is reported as
+ * "the first 32 of N" rather than paged.
+ */
+#define WIFI_SCAN_MAX_APS   32u
+_Static_assert(WIFI_SCAN_MAX_APS <= WIFI_RPC_SCAN_MAX_RECORDS,
+               "scan fetch cap must fit the module's record array");
+
+/* Raw reply payload for wifi_rpc_scan_record().  Static: far too big for the 4 KB
+ * shell stack (same reason as s_bak_chunk below).  Single-owner, like every other eRPC
+ * path here -- rtl_link_begin() holds the console for the whole scan. */
+static uint8_t s_scan_buf[WIFI_RPC_SCAN_BUF_SIZE(WIFI_SCAN_MAX_APS)];
+
+/* rtw_security_t bits (Realtek wifi_constants.h). */
+#define SEC_WEP        0x00000001u
+#define SEC_TKIP       0x00000002u
+#define SEC_AES        0x00000004u
+#define SEC_AES_CMAC   0x00000010u
+#define SEC_SHARED     0x00008000u
+#define SEC_WPA        0x00200000u
+#define SEC_WPA2       0x00400000u
+#define SEC_WPA3       0x00800000u
+#define SEC_WPS        0x10000000u
+
+/*
+ * Band from the CHANNEL, not from the record's `band` field.
+ *
+ * Measured on board #2: rtw_scan_result_t.band came back 0 (= RTW_802_11_BAND_5GHZ) for
+ * EVERY result, including 2.4 GHz channels 5 and 11, so on this firmware 0 evidently
+ * means "not filled in" rather than "5 GHz".  (The neighbouring fields are fine: rssi /
+ * security / channel all decoded to sensible values in the same records, which is what
+ * pins the 62-byte packed stride.)  This is an observation, not something provable from
+ * source: the field is written -- or not -- inside Realtek's prebuilt libameba scan path
+ * behind wifi_scan_networks(), and the reachable firmware source only memcpy()s the
+ * driver's record wholesale (seeed-ambd-firmware wifi_main.c, wifi_scan_result_handler).
+ * The channel number is unambiguous, so classify from that and ignore the wire `band`.
+ */
+static const char *scan_band_name(uint32_t channel)
+{
+	if (channel >= 1u && channel <= 14u)     /* 2.4 GHz: 1..13 (+14, JP 802.11b) */
+		return "2.4G";
+	if (channel >= 32u && channel <= 177u)   /* 5 GHz: UNII-1..UNII-4 */
+		return "5G";
+	return "?";
+}
+
+/* Longest name scan_security_name() can build: "WEP-SHARED" + "-MIXED" + NUL. */
+#define SEC_NAME_CAP   20u
+
+/*
+ * Name a security bitmask into @out (>= SEC_NAME_CAP bytes).  Decoded by BITS rather than matched
+ * against the RTW_SECURITY_* combinations, because a real AP's beacon yields values the
+ * enum does not enumerate (e.g. WPA|WPA2 with both ciphers).  Anything with a bit we do
+ * not know falls back to hex so the operator sees the truth instead of a wrong label.
+ */
+static void scan_security_name(uint32_t sec, char *out, size_t cap)
+{
+	static const uint32_t known = SEC_WEP | SEC_TKIP | SEC_AES | SEC_AES_CMAC |
+	                              SEC_SHARED | SEC_WPA | SEC_WPA2 | SEC_WPA3 | SEC_WPS;
+	const char *base, *ciph;
+
+	if (sec == 0u) { (void)snprintf(out, cap, "OPEN"); return; }
+	if (sec == 0xFFFFFFFFu) { (void)snprintf(out, cap, "UNKNOWN"); return; }
+	if (sec & ~known) { (void)snprintf(out, cap, "0x%08lX", (unsigned long)sec); return; }
+
+	if (sec & SEC_WPA3)                             base = "WPA3";
+	else if ((sec & (SEC_WPA | SEC_WPA2)) == (SEC_WPA | SEC_WPA2)) base = "WPA/WPA2";
+	else if (sec & SEC_WPA2)                        base = "WPA2";
+	else if (sec & SEC_WPA)                         base = "WPA";
+	else if (sec & SEC_WEP)                         base = (sec & SEC_SHARED) ? "WEP-SHARED"
+	                                                                          : "WEP";
+	else if (sec & SEC_WPS)                         base = "WPS";
+	else { (void)snprintf(out, cap, "0x%08lX", (unsigned long)sec); return; }
+
+	if ((sec & (SEC_AES | SEC_TKIP)) == (SEC_AES | SEC_TKIP)) ciph = "-MIXED";
+	else if (sec & SEC_AES)                                   ciph = "-AES";
+	else if (sec & SEC_TKIP)                                  ciph = "-TKIP";
+	else if (sec & SEC_AES_CMAC)                              ciph = "-CMAC";
+	else                                                      ciph = "";
+	(void)snprintf(out, cap, "%s%s", base, ciph);
+}
+
+/*
+ * Copy @rec's SSID into @out (>= 33 bytes) as PRINTABLE ASCII ONLY, substituting '?'
+ * for every other byte; returns non-zero if anything was substituted.
+ *
+ * An SSID is 32 bytes chosen by whoever is broadcasting -- unauthenticated, attacker-
+ * controlled input that we are about to write to a terminal.  Allow-listing 0x20..0x7E
+ * makes that structurally safe: no ESC/CSI, no C0, no DEL, and no 8-bit C1 controls
+ * (0x9B is CSI too), and no UTF-8 decoding needed -- note that even valid UTF-8 is not
+ * automatically safe, since 0xC2 0x80..0x9F decodes back to C1 controls.  A non-ASCII
+ * SSID therefore prints as '?'s; the caller compensates by dumping the raw bytes as hex
+ * so no information is lost.
+ */
+static int scan_ssid_ascii(const struct wifi_ap_record *rec, char *out)
+{
+	uint8_t i;
+	int subst = 0;
+
+	for (i = 0; i < rec->ssid_len; i++) {
+		unsigned char c = (unsigned char)rec->ssid[i];
+		if (c >= 0x20u && c <= 0x7Eu) {
+			out[i] = (char)c;
+		} else {
+			out[i] = '?';
+			subst = 1;
+		}
+	}
+	out[rec->ssid_len] = '\0';
+	if (rec->ssid_len == 0u)                /* hidden / zero-length SSID */
+		subst = 0;
+	return subst;
+}
+
+/*
+ * Wait until the module reports the scan finished.  Polls rpc_wifi_is_scaning every
+ * @POLL_MS with a cancellable sleep in between, giving up @budget_ms after entry.
+ * Returns 0 = finished, -1 = transport/decode error (message printed), -2 = budget
+ * expired, -4 = Ctrl+C.  The module keeps scanning after -2/-4; it clears the flag on
+ * its own, which is why the caller can just wait for it again on the next `wifi scan`.
+ *
+ * The budget is real elapsed time (HAL_GetTick, wrap-safe by subtraction), NOT a count
+ * of sleeps: each poll is itself an eRPC round-trip that may take up to its own timeout,
+ * so summing only the sleeps would let a slow-but-responsive module stretch a "15 s"
+ * wait several times over.  @budget_ms == 0 therefore means "query once and report".
+ */
+static int scan_wait_done(struct cli_instance *sh, struct wifi_rpc_opts *o,
+                          uint32_t budget_ms)
+{
+	const uint32_t POLL_MS = 300u;
+	uint32_t t0 = HAL_GetTick();
+	int scanning, rc;
+
+	for (;;) {
+		o->timeout_ms = 3000u;
+		rc = wifi_rpc_is_scanning(o, &scanning);
+		if (rc == -4)
+			return -4;
+		if (rc) {
+			cli_error(sh, "wifi: scan-state query failed (rc %d)\r\n", rc);
+			return -1;
+		}
+		if (!scanning)
+			return 0;
+		if ((uint32_t)(HAL_GetTick() - t0) >= budget_ms)
+			return -2;
+		if (cli_sleep(sh, POLL_MS))            /* cancellable (ticks == ms) */
+			return -4;
+	}
+}
+
+/*
+ * wifi scan (issue #5 inc 6): list the APs the module can see.
+ *
+ * The module's scan is asynchronous, so this is start -> poll -> get_ap_num ->
+ * get_ap_records, all inside one console-claimed USART1 session.  It needs an STA
+ * interface (boot leaves the radio in RTW_MODE_NONE), so when we are NOT associated it
+ * first cycles off -> on(STA) exactly as `wifi connect` step 1 does.  When we ARE
+ * associated the radio is already in STA mode, so that cycle is skipped -- it would
+ * drop a working link.  lwIP is not involved: scanning is pure L2, and `wifi connect`
+ * re-runs tcpip_init before its own off->on(STA), so the netif-before-driver ordering
+ * invariant is preserved without doing it here.
+ */
+static int cmd_wifi_scan(struct cli_instance *sh, int argc, char **argv)
+{
+	struct wifi_rpc_opts o;
+	struct erpc_diag diag;
+	struct wifi_ap_record rec;
+	char ssid[33], sec[SEC_NAME_CAP];
+	int32_t connected = -1, result = -1;
+	uint16_t ap_num = 0, want, got = 0, i;
+	int rc;
+
+	(void)argc; (void)argv;
+	if (rtl_link_begin(sh, true) != RTL_LINK_READY)
+		return 1;
+
+	o.should_abort = rtl_abort_cb;
+	o.abort_ctx    = sh;
+	o.diag         = &diag;
+
+	/* 1) Are we associated?  If so the radio is in STA mode already and we must not
+	 * touch it; if not, land in STA the same way `wifi connect` does. */
+	o.timeout_ms = 3000u;
+	rc = wifi_rpc_is_connected(&o, &connected);
+	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto fail; }
+	if (rc) {
+		cli_error(sh, "wifi: link query failed (rc %d)\r\n", rc);
+		goto fail;
+	}
+	if (connected != WIFI_RPC_OK) {
+		o.timeout_ms = 5000u;
+		(void)wifi_rpc_off(&o, &result);       /* best effort, as in connect */
+		if (cli_sleep(sh, 50u))
+			goto fail;
+		o.timeout_ms = 5000u;
+		rc = wifi_rpc_on(&o, WIFI_RPC_MODE_STA, &result);
+		if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto fail; }
+		if (rc || result < 0) {
+			cli_error(sh, "wifi: set STA mode failed (rc %d, result %ld)\r\n",
+			          rc, (long)result);
+			goto fail;
+		}
+	}
+
+	/* 2) A scan left running by an earlier Ctrl+C must finish before a new start()
+	 * would be accepted, and its results would otherwise be half-collected. */
+	rc = scan_wait_done(sh, &o, 0u);           /* budget 0: just test the flag once */
+	if (rc == -2) {
+		cli_print(sh, "wifi: a scan is already running, waiting for it...\r\n");
+		rc = scan_wait_done(sh, &o, 15000u);
+	}
+	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto fail; }
+	if (rc == -1)
+		goto fail;
+	if (rc == -2) {
+		cli_error(sh, "wifi: the previous scan did not finish within 15s\r\n");
+		goto fail;
+	}
+
+	/* 3) Start, then wait for completion. */
+	cli_print(sh, "wifi: scanning (up to ~15s, Ctrl+C aborts)...\r\n");
+	o.timeout_ms = 5000u;
+	rc = wifi_rpc_scan_start(&o, &result);
+	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto fail; }
+	if (rc || result != WIFI_RPC_OK) {
+		cli_error(sh, "wifi: scan start failed (rc %d, result %ld)\r\n",
+		          rc, (long)result);
+		goto fail;
+	}
+	rc = scan_wait_done(sh, &o, 15000u);
+	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto fail; }
+	if (rc == -1)
+		goto fail;
+	if (rc == -2) {
+		cli_error(sh, "wifi: scan did not finish within 15s\r\n");
+		goto fail;
+	}
+
+	/* 4) How many, then fetch exactly that many -- the firmware's get_ap_records()
+	 * copies `number` records regardless of how many were actually found. */
+	o.timeout_ms = 3000u;
+	rc = wifi_rpc_scan_get_ap_num(&o, &ap_num);
+	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto fail; }
+	if (rc) {
+		cli_error(sh, "wifi: AP count query failed (rc %d)\r\n", rc);
+		goto fail;
+	}
+	if (ap_num == 0u) {
+		rtl_link_end(sh);
+		cli_print(sh, "wifi: no networks found\r\n");
+		return 0;
+	}
+
+	want = (ap_num > WIFI_SCAN_MAX_APS) ? (uint16_t)WIFI_SCAN_MAX_APS : ap_num;
+	o.timeout_ms = 5000u;
+	rc = wifi_rpc_scan_get_ap_records(&o, want, s_scan_buf, (uint16_t)sizeof(s_scan_buf),
+	                                  &got, &result);
+	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto fail; }
+	if (rc || result != WIFI_RPC_OK) {
+		cli_error(sh, "wifi: fetching scan records failed (rc %d, result %ld)\r\n",
+		          rc, (long)result);
+		goto fail;
+	}
+
+	rtl_link_end(sh);
+
+	/* 5) Report.  SSID is last so a hex fallback cannot break the column alignment. */
+	cli_print(sh, "wifi: %u network%s\r\n", (unsigned)ap_num, ap_num == 1u ? "" : "s");
+	if (want < ap_num)
+		cli_print(sh, "  (showing the first %u)\r\n", (unsigned)want);
+	/* security column is 14 wide so the longest name this can build ("WPA/WPA2-MIXED")
+	 * still fits -- a wider one only shifts the two columns after it, never truncates. */
+	cli_print(sh, "  ch  band  rssi  security        bssid              ssid\r\n");
+	for (i = 0; i < got; i++) {
+		if (wifi_rpc_scan_record(s_scan_buf, got, i, &rec) != 0)
+			break;
+		scan_security_name(rec.security, sec, sizeof(sec));
+		rc = scan_ssid_ascii(&rec, ssid);
+		cli_print(sh, "  %2lu  %4s  %4d  %-14s  %02x:%02x:%02x:%02x:%02x:%02x  %s\r\n",
+		          (unsigned long)rec.channel,
+		          scan_band_name(rec.channel),
+		          (int)rec.rssi, sec,
+		          rec.bssid[0], rec.bssid[1], rec.bssid[2],
+		          rec.bssid[3], rec.bssid[4], rec.bssid[5],
+		          rec.ssid_len ? ssid : "(hidden)");
+		if (rc) {                       /* non-ASCII bytes were replaced by '?' */
+			uint8_t k;
+			cli_print(sh, "        raw ssid:");
+			for (k = 0; k < rec.ssid_len; k++)
+				cli_print(sh, " %02x", (unsigned char)rec.ssid[k]);
+			cli_print(sh, "\r\n");
+		}
+	}
+	return 0;
+
+fail:
+	rtl_link_end(sh);
+	cli_print(sh, "  diag: crc_fail %u oversize %u timeout %u skipped %u unsupported %u\r\n",
+	          diag.crc_fail, diag.oversize, diag.timeout, diag.skipped_reply,
+	          diag.unsupported_invocation);
+	cli_print(sh, "  note: if the module seems stuck, `wifi reset` power-cycles it\r\n");
+	return 1;
 }
 
 /* wifi flashprobe [hold_us] (issue #19, M1): prove RTL8720DN UART download-mode ENTRY
@@ -1500,6 +1819,7 @@ CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(connect,    NULL, "associate + DHCP: connect <ssid> [pw] [sec_hex]", cmd_wifi_connect,    2, 2),
 	CLI_CMD_ARG(disconnect, NULL, "drop the current WiFi association",     cmd_wifi_disconnect, 1, 0),
 	CLI_CMD_ARG(status,     NULL, "show connection state / RSSI / IP / MAC", cmd_wifi_status, 1, 0),
+	CLI_CMD_ARG(scan,       NULL, "list visible APs (ch/band/rssi/security/bssid/ssid)", cmd_wifi_scan, 1, 0),
 	CLI_CMD_ARG(flashprobe, NULL, "probe RTL8720 UART download-mode entry [hold_us]", cmd_wifi_flashprobe, 1, 1),
 	CLI_CMD_ARG(flashload,  NULL, "load flashloader + read flash sector0 (non-destructive) [hold] [baud]", cmd_wifi_flashload, 1, 2),
 	CLI_CMD_ARG(flashread,  NULL, "read flash <offset> [nsectors] (non-destructive survey)", cmd_wifi_flashread, 2, 1),

@@ -22,6 +22,10 @@
 #define M_WIFI_GET_RSSI     19u
 #define M_WIFI_ON           27u
 #define M_WIFI_OFF          28u
+#define M_WIFI_SCAN_START   64u
+#define M_WIFI_IS_SCANING   65u
+#define M_WIFI_SCAN_RECORDS 66u
+#define M_WIFI_SCAN_AP_NUM  67u
 
 /* rpc_wifi_tcpip (service 15) method IDs. */
 #define SVC_WIFI_TCPIP      15u
@@ -53,6 +57,10 @@ static uint32_t get_u32le(const uint8_t *p)
 {
 	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
 	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint16_t get_u16le(const uint8_t *p)
+{
+	return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
 /* Append a BasicCodec string (u32 length + raw bytes, no NUL) at @p; returns the
@@ -290,6 +298,113 @@ int wifi_rpc_set_ip_info(const struct wifi_rpc_opts *o, uint32_t itf,
 	if (rc)
 		return rc;
 	return decode_result(rep, plen, result);
+}
+
+/* ---- AP scan (rpc_wifi_drv 64..67) -- see the header for the async sequence ---- */
+
+int wifi_rpc_scan_start(const struct wifi_rpc_opts *o, int32_t *result)
+{
+	uint8_t rep[16];
+	int plen, rc;
+
+	rc = do_call(o, SVC_WIFI_DRV, M_WIFI_SCAN_START, NULL, 0u, rep, sizeof(rep), &plen);
+	if (rc)
+		return rc;
+	return decode_result(rep, plen, result);
+}
+
+int wifi_rpc_is_scanning(const struct wifi_rpc_opts *o, int *scanning)
+{
+	uint8_t rep[16];
+	int plen, rc;
+
+	rc = do_call(o, SVC_WIFI_DRV, M_WIFI_IS_SCANING, NULL, 0u, rep, sizeof(rep), &plen);
+	if (rc)
+		return rc;
+	if (plen < 1)                        /* reply = bool, written as a single byte */
+		return WIFI_RPC_EDECODE;
+	*scanning = rep[0] ? 1 : 0;
+	return 0;
+}
+
+int wifi_rpc_scan_get_ap_num(const struct wifi_rpc_opts *o, uint16_t *num)
+{
+	uint8_t rep[16];
+	int plen, rc;
+
+	rc = do_call(o, SVC_WIFI_DRV, M_WIFI_SCAN_AP_NUM, NULL, 0u, rep, sizeof(rep), &plen);
+	if (rc)
+		return rc;
+	if (plen < 2)                        /* reply = uint16 count */
+		return WIFI_RPC_EDECODE;
+	*num = get_u16le(rep);
+	return 0;
+}
+
+int wifi_rpc_scan_get_ap_records(const struct wifi_rpc_opts *o, uint16_t number,
+                                 uint8_t *buf, uint16_t buf_cap,
+                                 uint16_t *got, int32_t *result)
+{
+	uint8_t req[2];
+	uint32_t want, mlen;
+	int plen, rc;
+
+	if (number == 0u || number > WIFI_RPC_SCAN_MAX_RECORDS)
+		return -1;
+	want = (uint32_t)number * WIFI_RPC_SCAN_REC_SIZE;
+	if ((uint32_t)buf_cap < WIFI_RPC_SCAN_BUF_SIZE((uint32_t)number))
+		return -1;
+
+	req[0] = (uint8_t)number;
+	req[1] = (uint8_t)(number >> 8);
+	rc = do_call(o, SVC_WIFI_DRV, M_WIFI_SCAN_RECORDS, req, 2u, buf, buf_cap, &plen);
+	if (rc)
+		return rc;
+
+	/* reply = _scanResult(binary) + result(i32).  erpc truncates the copy to buf_cap
+	 * but returns the FULL payload length, so reject an oversized reply before trusting
+	 * any offset (same guard as wifi_rpc_lwip_recvfrom).  A failed scan_get_ap_records
+	 * on the module returns a 1-byte dummy blob, which the length check below catches. */
+	if (plen > (int)buf_cap || plen < 4)
+		return WIFI_RPC_EDECODE;
+	mlen = get_u32le(buf);
+	if (mlen != want)                    /* not exactly `number` whole records */
+		return WIFI_RPC_EDECODE;
+	if ((uint32_t)plen < 4u + mlen + 4u) /* need the trailing i32 result too */
+		return WIFI_RPC_EDECODE;
+
+	*result = (int32_t)get_u32le(buf + 4u + mlen);
+	*got    = number;
+	return 0;
+}
+
+int wifi_rpc_scan_record(const uint8_t *buf, uint16_t got, uint16_t idx,
+                         struct wifi_ap_record *rec)
+{
+	const uint8_t *r;
+	uint8_t len;
+
+	if (idx >= got)
+		return -1;
+	r = buf + 4u + (uint32_t)idx * WIFI_RPC_SCAN_REC_SIZE;
+
+	/* SSID.len then SSID.val[33].  The firmware NUL-terminates val[len], but do not
+	 * rely on that: clamp to 32 so ssid[] always gets its own terminator. */
+	len = r[0];
+	if (len > 32u)
+		len = 32u;
+	memcpy(rec->ssid, r + 1, len);
+	rec->ssid[len] = '\0';
+	rec->ssid_len  = len;
+
+	memcpy(rec->bssid, r + 34, 6);
+	rec->rssi     = (int16_t)get_u16le(r + 40);   /* signed dBm, LE on both sides */
+	rec->bss_type = get_u32le(r + 42);
+	rec->security = get_u32le(r + 46);
+	rec->wps_type = get_u32le(r + 50);
+	rec->channel  = get_u32le(r + 54);
+	rec->band     = get_u32le(r + 58);
+	return 0;
 }
 
 int wifi_rpc_lwip_socket(const struct wifi_rpc_opts *o, int32_t domain, int32_t type,

@@ -64,8 +64,8 @@ Mode") with line editing, history, and Tab completion. 21 commands:
   factory firmware is Seeed's eRPC image (UART @2 Mbaud on its `Serial3` = USART1),
   and this round-trips a byte through `rpc_system_ack` — a valid CRC-framed echo
   proves the eRPC transport end to end. `wifi rpc ver` additionally reads the module's
-  firmware build id (`rpc_system_version`) and prints `fw version: …` (`2.1.3+wio-n2`
-  for the issue-#20 N2 firmware). `ver` is opt-in because the pre-N2 shim cannot answer
+  firmware build id (`rpc_system_version`) and prints `fw version: …` (`2.1.3+wio-n3`
+  for the issue-#20 N3 firmware currently on the board). `ver` is opt-in because the pre-N2 shim cannot answer
   `version` safely — it corrupts the module heap (recoverable with `wifi reset`), so
   only send it once N2 is flashed (see `fw/rtl8720/`); plain `wifi rpc` never does. The
   eRPC path is a hand-written clean-room C client (`app/erpc.c`, FramedTransport +
@@ -75,7 +75,23 @@ Mode") with line editing, history, and Tab completion. 21 commands:
   (issue #5): it brings up the module's lwIP stack (the factory firmware leaves it
   uninitialised at boot), switches to STA mode, associates, runs the DHCP client and
   prints the leased `ip`/`mask`/`gw`. `wifi status` reports connected state, RSSI, IP
-  config and MAC; `wifi disconnect` drops the association. connect/DHCP block on the
+  config and MAC; `wifi disconnect` drops the association.
+  `wifi scan` lists the visible APs — channel, band, RSSI, security mode, BSSID and SSID
+  (the module is dual-band). The **band is derived from the channel number**, because the
+  scan record's own `band` field came back 0 (`RTW_802_11_BAND_5GHZ`) for every result on
+  hardware, 2.4 GHz APs included — on this firmware 0 evidently means "unset". That is an
+  observation, not something the sources show: the field is filled in (or not) inside
+  Realtek's prebuilt `libameba` scan path. The module's scan is asynchronous, so the shell starts
+  it, polls `rpc_wifi_is_scaning` until it clears, then reads the count **before** the
+  records: the firmware's `wifi_scan_get_ap_records()` copies as many records as you ask
+  for regardless of how many were actually found, so asking for more than the reported
+  count returns the previous scan's leftovers. Scanning needs an STA interface and boot
+  leaves the radio in `RTW_MODE_NONE`, so `scan` cycles `off → on(STA)` first — but only
+  when *not* associated, since that cycle would drop a working link. SSIDs are
+  attacker-controlled bytes from the air, so they are printed as **printable ASCII only**
+  (anything else becomes `?`, with the raw bytes dumped as hex on the next line) — that
+  rules out escape/control sequences reaching the terminal without needing to trust a
+  UTF-8 decoder. connect/DHCP block on the
   module for seconds, so those calls carry a long timeout and a Ctrl+C abort hook; the
   eRPC subcommands take the console (`cli_console_claim`) for single-owner access to
   the SPSC RX ring. Register-only on the STM32 side (GPIO + UART clock gates, baud from
