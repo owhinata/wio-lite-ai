@@ -26,6 +26,11 @@ static unsigned          g_uart_refs;
 static enum rtl8720_uart g_uart_which;
 static uint32_t          g_uart_baud;
 
+/* Generation counters for resident reference holders (see rtl_link.h).  Both are only ever
+ * touched under erpc_link_lock(), the same section that mutates g_uart_refs. */
+static uint32_t g_uart_gen = 1u;     /* ++ on every 0->1 open and on force-quiesce */
+static uint32_t g_quiesce_gen;       /* ++ on force-quiesce only (= CHIP_EN moved)  */
+
 /* Whether the module's lwIP stack has been brought up since its last power-on.  See
  * rtl_link.h; reset on every power off / reset / fresh power-on, set after tcpip init. */
 static bool g_tcpip_inited;
@@ -84,6 +89,7 @@ int rtl_link_uart_ref(enum rtl8720_uart which, uint32_t baud)
 	g_uart_which = which;
 	g_uart_baud  = baud;
 	g_uart_refs  = 1u;
+	g_uart_gen++;                        /* a new "open": stale resident refs are void */
 	/* Fresh stream: reset the reader + wire ledger.  Only the AT UART carries eRPC --
 	 * the LOG UART is the console bridge, so requests stay refused for it. */
 	erpc_link_opened(which == RTL8720_UART_AT);
@@ -106,10 +112,36 @@ bool rtl_link_uart_busy(void)
 	return g_uart_refs != 0u;
 }
 
+uint32_t rtl_link_uart_gen(void)
+{
+	return g_uart_gen;
+}
+
+void rtl_link_uart_unref_gen(uint32_t gen)
+{
+	/* Same section as the count itself, so the compare and the decrement cannot be split
+	 * by another ref/unref/force-quiesce.  A mismatch means our open is long gone (someone
+	 * force-quiesced, and possibly re-opened): the count we would decrement belongs to
+	 * somebody else, so do nothing. */
+	erpc_link_lock();
+	if (gen == g_uart_gen && g_uart_refs != 0u && --g_uart_refs == 0u) {
+		erpc_link_closed();
+		rtl8720_uart_close();
+	}
+	erpc_link_unlock();
+}
+
+uint32_t rtl_link_quiesce_gen(void)
+{
+	return g_quiesce_gen;
+}
+
 void rtl_link_force_quiesce(void)
 {
 	erpc_link_lock();
 	g_uart_refs = 0u;                    /* whoever held it does not any more */
+	g_uart_gen++;                        /* ... and their recorded generation is now stale */
+	g_quiesce_gen++;                     /* only here: "CHIP_EN is about to move" */
 	erpc_link_closed();                  /* tokens abandoned; their waiters get -2 */
 	rtl8720_uart_close();
 	erpc_link_unlock();
@@ -189,7 +221,8 @@ int rtl_link_hw_claim(struct cli_instance *sh, bool allow_busy)
 		rtl_link_unclaim();
 		cli_console_release(sh);
 		cli_error(sh, "wifi: the eRPC link is in use -- stop it first "
-		          "(this command needs the UART to itself)\r\n");
+		          "(this command needs the UART to itself; `net shell stop` if the "
+		          "telnet console is armed)\r\n");
 		return 1;
 	}
 	return 0;

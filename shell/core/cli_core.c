@@ -275,10 +275,15 @@ int cli_start(struct cli_instance *sh)
 	if (cli_register_thread(&sh->thread, sh) != 0)
 		return -1;
 
+	/* Time-sliced (CLI_INSTANCE_TIME_SLICE): several interactive instances share one
+	 * priority, so without a slice a CPU-bound command on one console would starve the
+	 * others until it blocked.  0 maps to TX_NO_TIME_SLICE (the pre-#21 behaviour). */
 	if (tx_thread_create(&sh->thread, "cli", cli_thread_entry, (ULONG)sh,
 	                     sh->stack, sh->stack_size,
 	                     CLI_INSTANCE_PRIORITY, CLI_INSTANCE_PRIORITY,
-	                     TX_NO_TIME_SLICE, TX_AUTO_START) != TX_SUCCESS) {
+	                     CLI_INSTANCE_TIME_SLICE ? (ULONG)CLI_INSTANCE_TIME_SLICE
+	                                             : TX_NO_TIME_SLICE,
+	                     TX_AUTO_START) != TX_SUCCESS) {
 		cli_unregister_thread(&sh->thread);   /* roll back the registration */
 		return -1;
 	}

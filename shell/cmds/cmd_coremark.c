@@ -21,7 +21,8 @@
  * pre-flight the allocation below because CoreMark does not NULL-check it.
  *
  * Output: CoreMark prints its canonical report via ee_printf -> printf, which the
- * USB CDC backend's strong _write routes to the same console as cli_print (the
+ * strong _write routes to the console of the thread that ran it -- the USB CDC ring,
+ * or (issue #21) the telnet instance's transport -- i.e. the same console as cli_print (the
  * CDC TX ring is sized to hold the whole report; the timed region itself does no
  * I/O, so TX back-pressure cannot perturb the score).  With the I-cache enabled
  * (app/main.c) the score reflects cached XIP execution rather than raw flash
@@ -91,7 +92,7 @@ static int cmd_coremark(struct cli_instance *sh, int argc, char **argv)
 	 * ee_printf -> printf (not the shell's cli_tx_send_blocking).  Ctrl+C during
 	 * the run is ignored; it just queues for the next prompt. */
 	cli_info(sh, "Running CoreMark (auto-calibrated, ~10-100s; not interruptible)...\r\n");
-	coremark_main();   /* prints the canonical CoreMark report via printf -> CDC */
+	coremark_main();   /* canonical report via printf -> this thread's console */
 
 done:
 	coremark_busy = 0u;   /* single cleanup point: guard cleared on every exit */

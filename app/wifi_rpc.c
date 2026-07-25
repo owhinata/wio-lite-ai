@@ -426,6 +426,20 @@ int wifi_rpc_scan_record(const uint8_t *buf, uint16_t got, uint16_t idx,
 	return 0;
 }
 
+const char *wifi_rpc_errno_name(int32_t e)
+{
+	switch (e) {
+	case WIFI_LWIP_EAGAIN:        return "EAGAIN/EWOULDBLOCK";
+	case WIFI_LWIP_EPIPE:         return "EPIPE";
+	case WIFI_LWIP_ENOPROTOOPT:   return "ENOPROTOOPT";
+	case WIFI_LWIP_ECONNABORTED:  return "ECONNABORTED";
+	case WIFI_LWIP_ECONNRESET:    return "ECONNRESET";
+	case WIFI_LWIP_ENOTCONN:      return "ENOTCONN";
+	case WIFI_LWIP_ETIMEDOUT:     return "ETIMEDOUT";
+	default:                      return "?";
+	}
+}
+
 int wifi_rpc_lwip_socket(const struct wifi_rpc_opts *o, int32_t domain, int32_t type,
                          int32_t protocol, int32_t *fd)
 {

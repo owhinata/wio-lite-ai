@@ -17,7 +17,9 @@ and the app **inherits its clock tree** — see *Key design points*.
 ## What it does
 
 Presents a `wio> ` prompt on **`/dev/ttyACM0`** (USB CDC, `0483:5740`, "CDC in FS
-Mode") with line editing, history, and Tab completion. 21 commands:
+Mode") with line editing, history, and Tab completion — and, once the board is on WiFi,
+the same shell over **telnet** (`wio-net> `, see `net shell` below), usable at the same
+time as the USB console. 21 commands:
 
 | Group | Commands |
 |---|---|
@@ -25,7 +27,7 @@ Mode") with line editing, history, and Tab completion. 21 commands:
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
-| wireless | `wifi` (L2: info/on/off/reset/log/probe/rpc · connect/status/disconnect) · `net` (L3: info/ip/dhcp/ping) |
+| wireless | `wifi` (L2: info/on/off/reset/log/probe/rpc · connect/status/disconnect/scan · flash*/img*) · `net` (L3: info/ip/dhcp/ping/conc/echo · **shell** = telnet console) |
 | benchmarks | `coremark` · `membench` |
 
 - **`thread`** — lists the ThreadX threads with state / stack use and a **`top`-style
@@ -75,8 +77,8 @@ Mode") with line editing, history, and Tab completion. 21 commands:
   issue #21 increment 8): it is the only reader of the USART1 RX ring and the only
   writer of request frames, and it routes replies to whoever is waiting by **sequence
   number**, so several requests can be outstanding at once — which is what the N3
-  firmware's worker pool enables, and what lets a future telnet console keep a blocking
-  `accept`/`recv` parked on the module while the shell runs other commands. It sleeps
+  firmware's worker pool enables, and what lets the telnet console (`net shell`, below)
+  keep a blocking `accept`/`recv` parked on the module while the shell runs other commands. It sleeps
   (touching neither the UART nor the ring) whenever nothing is in flight, so the
   `wifi log` bridge and the `wifi flash*` downloader can own the same peripheral.
   Ownership of the module as a whole — the coarse mutex that serialises whole flows
@@ -197,6 +199,58 @@ Mode") with line editing, history, and Tab completion. 21 commands:
   (issue #20); the STM32 client keeps several requests in flight over the one link with
   `app/erpc.c`'s `erpc_begin`/`erpc_wait`/`erpc_cancel`.
 
+- **`net shell` — the telnet console** (issue #21, `app/net_shell.c`). `telnet <board-ip>`
+  gets **the same shell as USB CDC, at the same time**: a second `cli_instance`
+  (prompt `wio-net> `) bound to a transport whose bytes ride the eRPC socket offload.
+  It **arms itself when an address comes up** (`wifi connect` / `net dhcp` / `net ip`);
+  `net shell start [port]` / `stop` / `status` are the manual controls. Ported from
+  `../stm32f746g-disco`'s `port/netxduo/nx_shell.c` — same transport vtable, `connected`
+  write gate, telnet IAC handling and single-session instance reuse — but with an eRPC
+  link instead of a local TCP stack underneath, which changes three things:
+
+  - **One service thread, one blocking call.** The N3 firmware has a receive task plus
+    **two** workers, and only the blocking socket receives run in parallel. Our
+    `accept`/`recv` permanently occupies one; a second blocking call would leave the shell's
+    own RPCs no worker at all. So a single thread (priority 12) owns the sockets, and
+    **no `accept` is issued while a session is live** — a second telnet client simply waits
+    in the listen backlog and is served the moment the first leaves. For the same reason
+    `net ping`, `net conc` and `net echo` are refused **from either console** while it is
+    armed — each of them parks a blocking receive of its own, and with both workers busy the
+    console's output would queue past `CLI_TX_TIMEOUT` and lose characters. `net shell stop`
+    frees the worker; building the device firmware with a larger `N3_WORKERS`
+    (`fw/rtl8720/`) would lift the restriction altogether.
+  - **Latency vs. link occupancy.** With output pending it sends up to 4 × 96 B and then
+    polls RX (`MSG_DONTWAIT`) so a Ctrl+C interrupts a long report within ~26 ms; idle, it
+    parks in a 250 ms receive (≈4 RPC/s, under 1 % of the link). After handing keystrokes
+    to the shell it waits up to 20 ms for the answer before re-arming that receive —
+    without it the echo would wait out the whole idle window, because the service thread
+    runs *above* the shell instance and would otherwise re-block before the shell ran.
+  - **Host timeouts are deliberately huge** (module time + 45 s). Everything except the
+    blocking receives takes the module's single serial mutex, so while the other console
+    runs `wifi connect`/`net dhcp` our output can be stuck behind it for 20–30 s. A shorter
+    timeout would be a *false* "link dirty" verdict, costing the session and leaking fds.
+    Recovery stays instant regardless: `wifi reset` force-quiesces the link and wakes every
+    waiting call immediately.
+
+  Self-destruct avoidance only — there is no command policy. What the telnet console
+  refuses is what would destroy the transport it is running on: `wifi on/off/reset`
+  (CHIP_EN), any YMODEM transfer (`xfer`, `wifi imgload`/`imgsend`), and `net shell stop`.
+  `wifi connect`/`disconnect` are **allowed**, and will drop your session — the module stays
+  up, so the console re-arms on the new address. Conversely, while the console is armed it
+  holds the eRPC UART referenced, so `wifi log`/`probe`/`rpc` and every `wifi flash*` are
+  refused **from either console** until `net shell stop`.
+
+  Known limits: telnet freezes for the duration of a `wifi connect`/`net dhcp` on the other
+  console (module serial mutex + the 127-byte wire budget), and output may be dropped after
+  `CLI_TX_TIMEOUT`; a host-side timeout leaks the module's sockets and latches the console
+  until a `wifi reset` (`net shell status` says so). `printf()` follows the console of the
+  thread that ran the command — `_write` hands a non-CDC instance's output to that
+  instance's transport — which is what puts the CoreMark report (`ee_printf` → `printf`) on
+  the telnet session that started it. Because two interactive
+  instances now share priority 16, `cli_start()` gives them a **time slice**
+  (`CLI_INSTANCE_TIME_SLICE`) — otherwise `coremark` on one console would freeze the other
+  for its whole run; the flip side is that benchmark scores drop while both are busy.
+
 ## Key design points
 
 - **Never reprograms the clock tree.** The DFU bootloader sets HSE 25 MHz → PLL1
@@ -267,7 +321,9 @@ Mode") with line editing, history, and Tab completion. 21 commands:
 
 ```
 app/        main + USB CDC wiring, fault handlers, USB descriptors, retarget,
-            OCTOSPI1 PSRAM bring-up (psram.c), MPU regions (mpu.c)
+            OCTOSPI1 PSRAM bring-up (psram.c), MPU regions (mpu.c),
+            RTL8720DN link: erpc.c (service thread) / wifi_rpc.c (typed wrappers) /
+            rtl_link.c (ownership) / net_shell.c (telnet console transport + server)
 shell/      core/    HW-independent CLI engine (parse/edit/history/complete/...)
             include/ public CLI API + cli_config.h
             backend/ USB CDC transport (+ dummy loopback), byte rings

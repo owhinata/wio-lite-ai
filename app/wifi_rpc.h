@@ -206,6 +206,37 @@ int wifi_rpc_scan_record(const uint8_t *buf, uint16_t got, uint16_t idx,
  * transport code: 0 (round-trip ok, @fd/@ret valid), a negative erpc_call_ex code
  * (-1/-2/-4) or WIFI_RPC_EDECODE (malformed reply).
  */
+/*
+ * lwIP ABI constants.  These are NOT a caller's choice: the module's rpc_lwip_* handlers
+ * hand them straight to its own lwIP, so they are part of the wire contract (Ameba-D uses
+ * the standard lwIP values).  They live here so every socket user -- `net`, the issue-#21
+ * telnet console, anything later -- agrees on one copy.
+ */
+#define WIFI_LWIP_AF_INET        2
+#define WIFI_LWIP_SOCK_STREAM    1
+#define WIFI_LWIP_SOCK_RAW       3
+#define WIFI_LWIP_IPPROTO_ICMP   1
+#define WIFI_LWIP_IPPROTO_TCP    6
+#define WIFI_LWIP_SOL_SOCKET     0xFFF   /* lwIP SOL_SOCKET */
+#define WIFI_LWIP_SO_REUSEADDR   0x0004
+#define WIFI_LWIP_SO_KEEPALIVE   0x0008
+#define WIFI_LWIP_SO_RCVTIMEO    0x1006  /* an int of milliseconds here */
+#define WIFI_LWIP_TCP_NODELAY    0x01    /* at level IPPROTO_TCP */
+#define WIFI_LWIP_MSG_PEEK       0x01
+#define WIFI_LWIP_MSG_DONTWAIT   0x08
+
+/* lwIP errno values worth naming in a message (lwip/errno.h). */
+#define WIFI_LWIP_EAGAIN         11      /* == EWOULDBLOCK */
+#define WIFI_LWIP_EPIPE          32
+#define WIFI_LWIP_ENOPROTOOPT    92
+#define WIFI_LWIP_ECONNABORTED  103
+#define WIFI_LWIP_ECONNRESET    104
+#define WIFI_LWIP_ENOTCONN      107
+#define WIFI_LWIP_ETIMEDOUT     110
+
+/* Name of an lwIP errno for diagnostics; "?" for anything not listed above. */
+const char *wifi_rpc_errno_name(int32_t e);
+
 int wifi_rpc_lwip_socket(const struct wifi_rpc_opts *o, int32_t domain, int32_t type,
                          int32_t protocol, int32_t *fd);
 /* Set a socket option (rpc_lwip_setsockopt).  @level / @optname are passed straight to

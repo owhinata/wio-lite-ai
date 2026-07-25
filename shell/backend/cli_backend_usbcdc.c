@@ -163,6 +163,37 @@ static struct cli_usbcdc *usbcdc_ctx_from_instance(struct cli_instance *sh)
 }
 
 /*
+ * printf from a thread whose console is NOT this backend (issue #21: the telnet
+ * instance, or a background job launched from it -- a worker aliases inst->tr =
+ * fg->tr).  Its bytes must not land on the CDC ring: send them through the core's
+ * staged output path on that instance's own transport, so printf follows the
+ * terminal that ran the command exactly like cli_print does.  That path is
+ * flow-controlled (cli_tx_send_blocking waits for TX space), unlike the CDC fast
+ * path below which is deliberately best-effort -- which is what a multi-kilobyte
+ * CoreMark report (ee_printf -> printf) needs to arrive intact.  Same LF -> CRLF
+ * translation, and the same "return len" contract: output is never re-sent.
+ */
+static int usbcdc_write_other(struct cli_instance *sh, const char *ptr, int len)
+{
+	uint8_t prev = 0;
+	int i;
+
+	if (cli_out_begin(sh) != 0)
+		return len;             /* lock unavailable: drop, as the CDC path does */
+	for (i = 0; i < len; i++) {
+		uint8_t b = (uint8_t)ptr[i];
+
+		if (b == (uint8_t)'\n' && prev != (uint8_t)'\r')
+			cli_out_putc(sh, '\r');
+		cli_out_putc(sh, (char)b);
+		prev = b;
+	}
+	cli_out_flush(sh);
+	cli_out_end(sh);
+	return len;
+}
+
+/*
  * Strong _write overriding libnosys': route printf through the same TX ring as the
  * shell so the CDC has exactly one TX owner (the usb thread drains it).  Best-effort
  * (a full ring drops the remainder -- the shell's own output uses the transport
@@ -188,6 +219,11 @@ int _write(int file, char *ptr, int len)
 	 * not _write).  Matches the UART backend. */
 	if (cli_xfer_active)
 		return len;
+
+	/* Owned by another backend's console (issue #21): hand it over rather than
+	 * writing someone else's output to the CDC. */
+	if (sh != NULL && sh->tr != NULL && sh->tr->api != &cli_usbcdc_api)
+		return usbcdc_write_other(sh, ptr, len);
 
 	if (u == NULL)
 		u = g_usbcdc_console;   /* usb thread / ISR / pre-kernel / non-shell thread */

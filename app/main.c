@@ -25,6 +25,7 @@
 #include "rtl8720.h"    /* onboard RTL8720DN CHIP_EN hold-off (issue #17) */
 #include "erpc.h"       /* eRPC link service thread (issue #21 increment 8) */
 #include "rtl_link.h"   /* coarse RTL8720 link mutex + UART refcount (same) */
+#include "net_shell.h"  /* telnet shell console over WiFi (issue #21 increment 9) */
 #include "app.h"
 #if BSP_PSRAM_INIT_IN_APP
 #include "psram.h"      /* app-first OCTOSPI1 APS6408 bring-up (issue #3) */
@@ -33,6 +34,13 @@
 /* --- interactive shell over USB CDC ------------------------------------- */
 CLI_BACKEND_USBCDC_DEFINE(cdc_tr);
 CLI_INSTANCE_DEFINE(cdc_sh, &cdc_tr, "wio> ");
+
+/* --- second console: telnet over the RTL8720DN (issue #21) --------------- */
+/* Statically defined and started at boot like the CDC one (cli_init is one-shot, so an
+ * instance cannot be created per client): app/net_shell.c drops its output until a client
+ * is actually connected, and posts CLI_EVT_CONN on accept so each client gets a fresh
+ * session.  The listening socket itself is armed later, when an IP address comes up. */
+CLI_INSTANCE_DEFINE(net_sh, &net_shell_transport, "wio-net> ");
 
 /* --- LED (PC13, red): driven off ---------------------------------------- */
 /* The bring-up heartbeat blink was removed on request; the LED is now held off
@@ -86,6 +94,8 @@ void tx_application_define(void *first_unused_memory)
    * the rest still run. */
   if (cli_init(&cdc_sh) == 0)
     cli_start(&cdc_sh);
+  if (cli_init(&net_sh) == 0)   /* telnet console; idle until net_shell arms a socket */
+    cli_start(&net_sh);
   cli_job_pool_init();          /* background-job worker pool (`cmd &`) */
 
   /* USB device pump thread (priority 8): the sole owner of tud_task()/tud_cdc_*.
@@ -111,6 +121,12 @@ void tx_application_define(void *first_unused_memory)
    * of the firmware still runs. */
   (void) rtl_link_core_init();
   (void) erpc_service_init();
+
+  /* Telnet console service (issue #21 increment 9): owns the module's listening/session
+   * sockets and feeds the net_sh instance above.  Object creation only -- the thread parks
+   * on its event flags until an IP address comes up (`wifi connect` / `net dhcp` arm it, or
+   * `net shell start` does explicitly).  Fail-soft like the two above. */
+  (void) net_shell_init();
 
 #if BSP_ENABLE_IWDG
   /* IWDG petter thread (priority 5), then arm the watchdog (issue #12: arm here, not

@@ -128,6 +128,22 @@
 #define CLI_INSTANCE_PRIORITY 16
 #endif
 
+/* ThreadX time slice (in ticks) given to each shell instance thread, 0 = none.
+ *
+ * Needed as soon as a second interactive instance exists (issue #21: USB CDC + telnet):
+ * they run at the SAME priority, and without a slice a CPU-bound command on one console
+ * (`coremark`, `membench`) holds the CPU until it blocks -- freezing the other console for
+ * the whole run.  A slice makes equal-priority instances round-robin.  Background-job
+ * workers are deliberately left unsliced: they sit one priority BELOW the instances, so any
+ * keystroke preempts them anyway.
+ *
+ * With a single active console this changes nothing measurable (there is no other ready
+ * thread at that priority to switch to); with two, benchmark scores drop -- as they should,
+ * since the CPU is genuinely shared. */
+#ifndef CLI_INSTANCE_TIME_SLICE
+#define CLI_INSTANCE_TIME_SLICE 10u
+#endif
+
 /* Bytes drained from the transport per read() in the instance thread loop
  * (impl. #4).  Purely a batching size; does not bound input length. */
 #ifndef CLI_RX_DRAIN_CHUNK

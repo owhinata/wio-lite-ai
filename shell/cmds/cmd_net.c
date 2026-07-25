@@ -42,6 +42,7 @@
 #include "cli.h"
 #include "wifi_rpc.h"
 #include "rtl_link.h"
+#include "net_shell.h"
 
 #include "stm32h7xx_hal.h"   /* HAL_GetTick (1 ms SysTick, fed via tx_glue.c) */
 
@@ -49,27 +50,8 @@
 #include <stdint.h>
 #include <string.h>
 
-/* lwIP socket constants (Ameba-D uses the standard values). */
-#define NET_AF_INET        2
-#define NET_SOCK_STREAM    1
-#define NET_SOCK_RAW       3
-#define NET_IPPROTO_ICMP   1
-#define NET_IPPROTO_TCP    6
-#define NET_SOL_SOCKET     0xFFF   /* lwIP SOL_SOCKET */
-#define NET_SO_REUSEADDR   0x0004
-#define NET_SO_RCVTIMEO    0x1006  /* lwIP SO_RCVTIMEO (an int of milliseconds here) */
-#define NET_TCP_NODELAY    0x01    /* at level IPPROTO_TCP */
-#define NET_MSG_PEEK       0x01
-#define NET_MSG_DONTWAIT   0x08
-
-/* lwIP errno values we name in messages (lwip/errno.h; everything else prints raw). */
-#define NET_EAGAIN         11      /* == EWOULDBLOCK */
-#define NET_EPIPE          32
-#define NET_ENOPROTOOPT    92
-#define NET_ECONNABORTED  103
-#define NET_ECONNRESET    104
-#define NET_ENOTCONN      107
-#define NET_ETIMEDOUT     110
+/* The lwIP socket ABI constants live in app/wifi_rpc.h (WIFI_LWIP_*): they are part of
+ * the module wire contract, shared with the issue-#21 telnet console backend. */
 
 #define ICMP_ECHO_REQUEST  8u
 #define ICMP_ECHO_REPLY    0u
@@ -296,6 +278,7 @@ static int cmd_net_ip(struct cli_instance *sh, int argc, char **argv)
 		return 1;
 	}
 	rtl_set_ip_mode(RTL_IP_STATIC);
+	net_shell_autoarm();          /* an address is up: bring the telnet console back */
 	cli_print(sh, "net: static address set\r\n");
 	cli_print(sh, "ip:    %u.%u.%u.%u/%u\r\n",
 	          ip.ip[0], ip.ip[1], ip.ip[2], ip.ip[3], mask_bits(mask));
@@ -333,6 +316,9 @@ static int cmd_net_dhcp(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "net: get IP failed (rc %d, result %ld)\r\n", rc, (long)result);
 		return 1;
 	}
+	/* Called after rtl_link_end(): the coarse mutex is free, so the telnet service can
+	 * take it immediately instead of spinning on a claim we still hold. */
+	net_shell_autoarm();
 	net_print_ip(sh, &ip);
 	return 0;
 }
@@ -375,7 +361,7 @@ static void build_sockaddr_in(uint8_t sa[16], uint32_t ip_host, uint16_t port)
 {
 	memset(sa, 0, 16);
 	sa[0] = 16u;                         /* sin_len */
-	sa[1] = (uint8_t)NET_AF_INET;        /* sin_family */
+	sa[1] = (uint8_t)WIFI_LWIP_AF_INET;        /* sin_family */
 	sa[2] = (uint8_t)(port >> 8);        /* sin_port, network byte order */
 	sa[3] = (uint8_t)port;
 	u32_to_octets(ip_host, sa + 4);      /* sin_addr, network byte order */
@@ -393,6 +379,14 @@ static int cmd_net_ping(struct cli_instance *sh, int argc, char **argv)
 	uint16_t seq = 0;
 	int rc;
 
+	/* Each probe parks a blocking recvfrom on the module for up to PING_TIMEOUT_MS.  With
+	 * the telnet console armed that is the second of the firmware's two workers, so a
+	 * console send would have to queue behind BOTH -- long enough for the shell's own TX
+	 * deadline (CLI_TX_TIMEOUT) to expire and drop characters.  Refuse instead of
+	 * corrupting the other console's output; `net shell stop` frees the worker.
+	 * (A device firmware built with more N3_WORKERS would lift this -- see fw/rtl8720/.) */
+	if (net_shell_guard_link(sh, "net ping"))
+		return 1;
 	if (parse_ipv4(argv[1], &dst) != 0) {
 		cli_error(sh, "net: bad address '%s'\r\n", argv[1]);
 		return 1;
@@ -409,7 +403,7 @@ static int cmd_net_ping(struct cli_instance *sh, int argc, char **argv)
 		return 1;
 
 	o.timeout_ms = 5000u;
-	rc = wifi_rpc_lwip_socket(&o, NET_AF_INET, NET_SOCK_RAW, NET_IPPROTO_ICMP, &fd);
+	rc = wifi_rpc_lwip_socket(&o, WIFI_LWIP_AF_INET, WIFI_LWIP_SOCK_RAW, WIFI_LWIP_IPPROTO_ICMP, &fd);
 	if (rc || fd < 0) {
 		if (rc == 0 && fd < 0 && wifi_rpc_lwip_errno(&o, &cerr) == 0)
 			cli_error(sh, "net: raw ICMP socket unavailable (errno %ld) -- the RTL8720 "
@@ -432,7 +426,7 @@ static int cmd_net_ping(struct cli_instance *sh, int argc, char **argv)
 		ms[0] = (uint8_t)PING_TIMEOUT_MS;       ms[1] = (uint8_t)(PING_TIMEOUT_MS >> 8);
 		ms[2] = (uint8_t)(PING_TIMEOUT_MS >> 16); ms[3] = (uint8_t)(PING_TIMEOUT_MS >> 24);
 		o.timeout_ms = 5000u;
-		rc = wifi_rpc_lwip_setsockopt(&o, fd, NET_SOL_SOCKET, NET_SO_RCVTIMEO,
+		rc = wifi_rpc_lwip_setsockopt(&o, fd, WIFI_LWIP_SOL_SOCKET, WIFI_LWIP_SO_RCVTIMEO,
 		                              ms, 4u, &sret);
 		if (rc || sret < 0) {
 			cli_error(sh, "net: SO_RCVTIMEO setup failed (rc %d, ret %ld) -- aborting "
@@ -544,6 +538,12 @@ static int cmd_net_conc(struct cli_instance *sh, int argc, char **argv)
 	int token, rc, an, ack_dt;
 	uint32_t t0;
 
+	/* Holds a blocking recvfrom open for `block_ms`.  With the telnet console armed that
+	 * would be the SECOND long-blocking call on a firmware that has two workers -- both
+	 * would be parked and every other RPC (including the console's own output) would queue
+	 * behind them. */
+	if (net_shell_guard_link(sh, "net conc"))
+		return 1;
 	if (argc >= 2) {
 		if (parse_uint(argv[1], &block_ms) != 0 || block_ms < 500u || block_ms > 20000u) {
 			cli_error(sh, "net: bad ms '%s' (500..20000)\r\n", argv[1]);
@@ -554,7 +554,7 @@ static int cmd_net_conc(struct cli_instance *sh, int argc, char **argv)
 		return 1;
 
 	o.timeout_ms = 5000u;
-	rc = wifi_rpc_lwip_socket(&o, NET_AF_INET, NET_SOCK_RAW, NET_IPPROTO_ICMP, &fd);
+	rc = wifi_rpc_lwip_socket(&o, WIFI_LWIP_AF_INET, WIFI_LWIP_SOCK_RAW, WIFI_LWIP_IPPROTO_ICMP, &fd);
 	if (rc || fd < 0) {
 		cli_error(sh, "net: raw ICMP socket failed (rc %d, fd %ld)\r\n", rc, (long)fd);
 		rtl_link_end(sh);
@@ -657,20 +657,6 @@ struct echo_run {
 	unsigned              sessions;
 	int                   dirty;
 };
-
-static const char *errno_name(int32_t e)
-{
-	switch (e) {
-	case NET_EAGAIN:        return "EAGAIN/EWOULDBLOCK";
-	case NET_EPIPE:         return "EPIPE";
-	case NET_ENOPROTOOPT:   return "ENOPROTOOPT";
-	case NET_ECONNABORTED:  return "ECONNABORTED";
-	case NET_ECONNRESET:    return "ECONNRESET";
-	case NET_ENOTCONN:      return "ENOTCONN";
-	case NET_ETIMEDOUT:     return "ETIMEDOUT";
-	default:                return "?";
-	}
-}
 
 static void diag_acc(struct erpc_diag *tot, const struct erpc_diag *d)
 {
@@ -779,7 +765,7 @@ static int echo_session(struct echo_run *r, int32_t cfd)
 
 	/* Without TCP_NODELAY, Nagle holds a single-byte echo until the previous segment is
 	 * ACKed -- precisely the latency an interactive console cannot afford. */
-	rc = echo_setopt(r, cfd, NET_IPPROTO_TCP, NET_TCP_NODELAY, 1, &sret);
+	rc = echo_setopt(r, cfd, WIFI_LWIP_IPPROTO_TCP, WIFI_LWIP_TCP_NODELAY, 1, &sret);
 	diag_acc(&r->tot, &r->diag);
 	if (ECHO_DIRTY(rc))
 		return -1;
@@ -800,7 +786,7 @@ static int echo_session(struct echo_run *r, int32_t cfd)
 		if (ECHO_DIRTY(rc))
 			return -1;
 		if (rc != 0 || pret < 0 || pn != 16u ||
-		    psa[0] != 16u || psa[1] != (uint8_t)NET_AF_INET) {
+		    psa[0] != 16u || psa[1] != (uint8_t)WIFI_LWIP_AF_INET) {
 			cli_print(sh, "  peer: unknown (rc %d ret %ld len %u sin_len %u family %u)\r\n",
 			          rc, (long)pret, (unsigned)pn, (unsigned)psa[0], (unsigned)psa[1]);
 		} else if (psa[4] == 0u && psa[5] == 0u && psa[6] == 0u && psa[7] == 0u) {
@@ -826,7 +812,7 @@ static int echo_session(struct echo_run *r, int32_t cfd)
 
 		echo_opts(r, ECHO_SHORT_MS);
 		rc = wifi_rpc_lwip_recv(&r->o, cfd, pb, 1u,
-		                        NET_MSG_DONTWAIT | NET_MSG_PEEK, 1u, &pgot, &pret);
+		                        WIFI_LWIP_MSG_DONTWAIT | WIFI_LWIP_MSG_PEEK, 1u, &pgot, &pret);
 		diag_acc(&r->tot, &r->diag);
 		dt = HAL_GetTick() - t0;
 		if (ECHO_DIRTY(rc))
@@ -840,7 +826,7 @@ static int echo_session(struct echo_run *r, int32_t cfd)
 			int32_t e = (pret < 0) ? echo_errno(r) : 0;
 
 			cli_print(sh, "  MSG_DONTWAIT probe: ret %ld errno %ld %s in %lu ms\r\n",
-			          (long)pret, (long)e, errno_name(e), (unsigned long)dt);
+			          (long)pret, (long)e, wifi_rpc_errno_name(e), (unsigned long)dt);
 		}
 	}
 
@@ -872,10 +858,10 @@ static int echo_session(struct echo_run *r, int32_t cfd)
 		if (ret < 0) {
 			int32_t e = echo_errno(r);
 
-			if (e == NET_EAGAIN)
+			if (e == WIFI_LWIP_EAGAIN)
 				continue;         /* idle: the module's receive timed out */
 			cli_print(sh, "  session ended: recv errno %ld %s\r\n",
-			          (long)e, errno_name(e));
+			          (long)e, wifi_rpc_errno_name(e));
 			goto done;
 		}
 		r->rx += got;
@@ -905,7 +891,7 @@ static int echo_session(struct echo_run *r, int32_t cfd)
 				int32_t e = (rc == 0) ? echo_errno(r) : 0;
 
 				cli_print(sh, "  session ended: send rc %d ret %ld errno %ld %s\r\n",
-				          rc, (long)ret, (long)e, errno_name(e));
+				          rc, (long)ret, (long)e, wifi_rpc_errno_name(e));
 				goto done;
 			}
 			if ((uint32_t)ret > (uint32_t)want) {
@@ -955,6 +941,10 @@ static int cmd_net_echo(struct cli_instance *sh, int argc, char **argv)
 	int32_t lfd = -1, cfd = -1, ret = -1, sret = -1;
 	int rc, done = 0;
 
+	/* Same reason as `net conc`: its accept/recv would be a second blocking call on a
+	 * two-worker firmware while the telnet console already owns one. */
+	if (net_shell_guard_link(sh, "net echo"))
+		return 1;
 	if (argc >= 2) {
 		if (parse_uint(argv[1], &v) != 0 || v == 0u || v > 65535u) {
 			cli_error(sh, "net: bad port '%s' (1..65535)\r\n", argv[1]);
@@ -982,7 +972,7 @@ static int cmd_net_echo(struct cli_instance *sh, int argc, char **argv)
 		return 1;
 
 	echo_opts(&r, ECHO_SHORT_MS);
-	rc = wifi_rpc_lwip_socket(&r.o, NET_AF_INET, NET_SOCK_STREAM, 0, &lfd);
+	rc = wifi_rpc_lwip_socket(&r.o, WIFI_LWIP_AF_INET, WIFI_LWIP_SOCK_STREAM, 0, &lfd);
 	diag_acc(&r.tot, &r.diag);
 	if (ECHO_DIRTY(rc)) { r.dirty = 1; goto out; }
 	if (rc || lfd < 0) {
@@ -993,7 +983,7 @@ static int cmd_net_echo(struct cli_instance *sh, int argc, char **argv)
 	}
 
 	/* Best effort: without SO_REUSEADDR a rebind during TIME_WAIT can fail. */
-	rc = echo_setopt(&r, lfd, NET_SOL_SOCKET, NET_SO_REUSEADDR, 1, &sret);
+	rc = echo_setopt(&r, lfd, WIFI_LWIP_SOL_SOCKET, WIFI_LWIP_SO_REUSEADDR, 1, &sret);
 	diag_acc(&r.tot, &r.diag);
 	if (ECHO_DIRTY(rc)) { r.dirty = 1; goto out; }
 	if (rc || sret < 0)
@@ -1009,7 +999,7 @@ static int cmd_net_echo(struct cli_instance *sh, int argc, char **argv)
 		int32_t e = (rc == 0) ? echo_errno(&r) : 0;
 
 		cli_error(sh, "net: bind :%lu failed (rc %d, ret %ld, errno %ld %s)\r\n",
-		          (unsigned long)port, rc, (long)ret, (long)e, errno_name(e));
+		          (unsigned long)port, rc, (long)ret, (long)e, wifi_rpc_errno_name(e));
 		goto out;
 	}
 
@@ -1021,7 +1011,7 @@ static int cmd_net_echo(struct cli_instance *sh, int argc, char **argv)
 		int32_t e = (rc == 0) ? echo_errno(&r) : 0;
 
 		cli_error(sh, "net: listen failed (rc %d, ret %ld, errno %ld %s)\r\n",
-		          rc, (long)ret, (long)e, errno_name(e));
+		          rc, (long)ret, (long)e, wifi_rpc_errno_name(e));
 		goto out;
 	}
 
@@ -1064,14 +1054,14 @@ static int cmd_net_echo(struct cli_instance *sh, int argc, char **argv)
 			int32_t e = echo_errno(&r);
 
 			cfd = -1;
-			if (e == NET_ETIMEDOUT) {
+			if (e == WIFI_LWIP_ETIMEDOUT) {
 				cli_print(sh, "  no client within %lu ms (firmware accept cap) -- "
 				          "listening again\r\n", (unsigned long)dt);
 				echo_diag_if_dirty(&r);
 				continue;
 			}
 			cli_error(sh, "net: accept failed (errno %ld %s)\r\n",
-			          (long)e, errno_name(e));
+			          (long)e, wifi_rpc_errno_name(e));
 			goto out;
 		}
 
@@ -1115,7 +1105,94 @@ out:
 	return r.dirty ? 1 : 0;
 }
 
+/* ---- `net shell`: the telnet console (issue #21 increment 9) -------------- */
+/*
+ * The console itself lives in app/net_shell.c; these are just its controls.  It normally
+ * arms itself when an address comes up (`wifi connect` / `net dhcp` / `net ip` above call
+ * net_shell_autoarm()), so `start` is for a different port or after a `stop`.  `stop` exists
+ * because a resident console keeps the eRPC UART referenced, which makes `wifi log/probe/rpc`
+ * and every issue-#19 flash command refuse to run -- those need the UART to themselves.
+ *
+ * Both commands POST the request and then poll: the service thread may be sitting in a
+ * blocking accept (the firmware caps it at 10 s) and may afterwards have to wait for the
+ * coarse link mutex that a `wifi connect` on the other console is holding.
+ */
+#define NET_SHELL_WAIT_MS   60000u
+#define NET_SHELL_POLL_MS     100u
+
+static int cmd_net_shell_start(struct cli_instance *sh, int argc, char **argv)
+{
+	const char *why = NULL;
+	uint32_t waited, v;
+	uint16_t port = (uint16_t)NET_SHELL_PORT_DEFAULT;
+
+	if (argc >= 2) {
+		if (parse_uint(argv[1], &v) != 0 || v == 0u || v > 65535u) {
+			cli_error(sh, "net: bad port '%s' (1..65535)\r\n", argv[1]);
+			return 1;
+		}
+		port = (uint16_t)v;
+	}
+	if (net_shell_start(port, &why) != 0) {
+		cli_error(sh, "net shell: cannot start -- %s\r\n", why != NULL ? why : "?");
+		net_shell_print_status(sh);
+		return 1;
+	}
+	cli_print(sh, "net shell: arming on port %u (waits for the link if it is busy)...\r\n",
+	          (unsigned)port);
+	for (waited = 0u; waited < NET_SHELL_WAIT_MS; waited += NET_SHELL_POLL_MS) {
+		if (net_shell_state() != NET_SHELL_ARMING)
+			break;
+		if (cli_sleep(sh, NET_SHELL_POLL_MS))
+			break;              /* Ctrl+C: the service carries on regardless */
+	}
+	net_shell_print_status(sh);
+	return net_shell_armed() ? 0 : 1;
+}
+
+static int cmd_net_shell_stop(struct cli_instance *sh, int argc, char **argv)
+{
+	uint32_t waited;
+
+	(void)argc; (void)argv;
+	/* Stopping the console we are talking on would cut the wire under our own feet. */
+	if (net_shell_guard(sh, "net shell stop"))
+		return 1;
+	if (net_shell_state() == NET_SHELL_OFF) {
+		net_shell_stop();           /* still disables auto-arm */
+		cli_print(sh, "net shell: already stopped (auto-arm off)\r\n");
+		return 0;
+	}
+	net_shell_stop();
+	cli_print(sh, "net shell: stopping (up to ~10 s -- a blocking accept may be "
+	          "outstanding on the module)...\r\n");
+	for (waited = 0u; waited < NET_SHELL_WAIT_MS; waited += NET_SHELL_POLL_MS) {
+		if (net_shell_state() == NET_SHELL_OFF)
+			break;
+		if (cli_sleep(sh, NET_SHELL_POLL_MS))
+			break;
+	}
+	net_shell_print_status(sh);
+	return net_shell_armed() ? 1 : 0;
+}
+
+static int cmd_net_shell_status(struct cli_instance *sh, int argc, char **argv)
+{
+	(void)argc; (void)argv;
+	net_shell_print_status(sh);
+	return 0;
+}
+
 /* ---- registration -------------------------------------------------------- */
+
+CLI_SUBCMD_SET_CREATE(net_shell_subcmds,
+	CLI_CMD_ARG(start,  NULL, "arm the telnet console [port] (default 23)",
+	            cmd_net_shell_start,  1, 1),
+	CLI_CMD_ARG(stop,   NULL, "close it and release the eRPC UART",
+	            cmd_net_shell_stop,   1, 0),
+	CLI_CMD_ARG(status, NULL, "state / address / counters",
+	            cmd_net_shell_status, 1, 0),
+	CLI_SUBCMD_SET_END);
 
 CLI_SUBCMD_SET_CREATE(net_subcmds,
 	CLI_CMD_ARG(info, NULL, "connection + IP / mask / gateway",   cmd_net_info, 1, 0),
@@ -1125,8 +1202,10 @@ CLI_SUBCMD_SET_CREATE(net_subcmds,
 	CLI_CMD_ARG(conc, NULL, "eRPC server concurrency probe [ms]", cmd_net_conc, 1, 1),
 	CLI_CMD_ARG(echo, NULL, "TCP echo server [port] [txchunk] (Ctrl+C stops)",
 	            cmd_net_echo, 1, 2),
+	CLI_CMD_ARG(shell, net_shell_subcmds,
+	            "telnet shell console (start [port] / stop / status)", NULL, 1, 0),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(net, net_subcmds,
-                 "IPv4 (L3) over the onboard RTL8720 (info / ip / dhcp / ping / echo)",
+                 "IPv4 (L3) over the onboard RTL8720 (info / ip / dhcp / ping / echo / shell)",
                  NULL, 1, 0);

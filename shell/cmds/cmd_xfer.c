@@ -20,6 +20,7 @@
  */
 #include "cli.h"
 #include "cmd_xfer.h"
+#include "net_shell.h"   /* refuse a raw transfer on the telnet console */
 #include "log.h"          /* transfer post-mortem into the dmesg ring -- see below */
 
 #include <string.h>
@@ -68,6 +69,16 @@ int xfer_send_source_locked(struct cli_instance *sh, const struct ym_source *src
 {
 	struct ym_io   io = { sh, io_getc, io_put };
 	enum ym_result res;
+
+	/*
+	 * Not over telnet.  YMODEM needs a raw, byte-timed console: the telnet path escapes
+	 * 0xFF (IAC) on the way out, hands bytes over in ~250 ms polls, and rides an eRPC link
+	 * whose round-trip dwarfs the protocol's own timeouts -- the transfer would corrupt or
+	 * stall.  Checked here rather than in each caller so every YMODEM user (`xfer`,
+	 * `wifi imgload` / `imgsend` / `flashbackup`) is covered by one rule.
+	 */
+	if (net_shell_guard(sh, "ymodem"))
+		return 1;
 
 	cli_rx_flush(sh);                  /* drop type-ahead / the command newline */
 	res = ymodem_send(&io, src);
@@ -126,6 +137,16 @@ int xfer_recv_sink_locked(struct cli_instance *sh, const struct ym_sink *sink)
 	struct ym_io   io = { sh, io_getc_recv, io_put };
 	const struct ym_recv_diag *d;
 	enum ym_result res;
+
+	/*
+	 * Not over telnet.  YMODEM needs a raw, byte-timed console: the telnet path escapes
+	 * 0xFF (IAC) on the way out, hands bytes over in ~250 ms polls, and rides an eRPC link
+	 * whose round-trip dwarfs the protocol's own timeouts -- the transfer would corrupt or
+	 * stall.  Checked here rather than in each caller so every YMODEM user (`xfer`,
+	 * `wifi imgload` / `imgsend` / `flashbackup`) is covered by one rule.
+	 */
+	if (net_shell_guard(sh, "ymodem"))
+		return 1;
 
 	cli_rx_flush(sh);                  /* drop type-ahead / the command newline */
 	res = ymodem_recv(&io, sink);

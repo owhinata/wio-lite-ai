@@ -90,6 +90,31 @@ void rtl_link_uart_unref(void);
 bool rtl_link_uart_busy(void);
 
 /*
+ * ---- generation counters, for a RESIDENT reference holder (issue #21 increment 9) ------
+ *
+ * An ordinary command takes and drops its reference inside one coarse-mutex section, so its
+ * reference can never be revoked underneath it.  The telnet console service is different:
+ * it holds a reference across many commands, and rtl_link_force_quiesce() (`wifi on/off/
+ * reset`) deliberately drops the count to zero while it is holding one.  A plain
+ * rtl_link_uart_unref() afterwards would decrement SOMEBODY ELSE'S reference -- the next
+ * user's -- and close the UART under them.
+ *
+ * rtl_link_uart_gen() therefore identifies the current "open": it advances on every 0->1
+ * open AND on force-quiesce.  A resident holder records it when it takes the reference and
+ * releases with rtl_link_uart_unref_gen(), which is a NO-OP once the generation has moved
+ * (its reference no longer exists).  Comparing the current value against the recorded one
+ * is also how the holder notices its link was taken away.
+ *
+ * rtl_link_quiesce_gen() advances ONLY in rtl_link_force_quiesce(), i.e. only on the three
+ * recovery commands, all of which drive CHIP_EN.  It is the "the module was power-cycled"
+ * ticket a caller can wait for after leaking module-side state (see app/net_shell.c's dirty
+ * latch); an ordinary ref/unref does not move it.
+ */
+uint32_t rtl_link_uart_gen(void);
+void     rtl_link_uart_unref_gen(uint32_t gen);
+uint32_t rtl_link_quiesce_gen(void);
+
+/*
  * Take the link away from whoever holds it, unconditionally: abandon every in-flight
  * eRPC token (their waiters wake up with -2), drop the reference count to zero and
  * close the UART.  This is the recovery primitive behind `wifi off` / `wifi reset` --

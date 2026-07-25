@@ -3,7 +3,8 @@
  * command.
  *  - Timing : 1 ms SysTick via HAL_GetTick() (EE_TICKS_PER_SEC == 1000); the
  *             SysTick that drives ThreadX also feeds HAL_IncTick (tx_glue.c).
- *  - Output : printf over USB CDC, retargeted by the shell backend's _write.
+ *  - Output : printf, retargeted by the shell backend's _write to whichever
+ *              console the running thread belongs to (USB CDC or telnet).
  * Derived from EEMBC's barebones core_portme.c (Apache-2.0).
  */
 #include "coremark.h"

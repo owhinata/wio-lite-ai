@@ -69,6 +69,7 @@
 #include "erpc.h"
 #include "wifi_rpc.h"
 #include "rtl_link.h"
+#include "net_shell.h"
 #include "stm32h7xx_hal.h"   /* #5 inc 6: HAL_GetTick (1 ms SysTick, fed via tx_glue.c)
                               * for the scan-wait deadline -- read-only, no HAL init. */
 
@@ -202,15 +203,19 @@ static int cmd_wifi_info(struct cli_instance *sh, int argc, char **argv)
  * forced to zero and the UART is closed BEFORE CHIP_EN moves, which is also what stops
  * the service thread from writing into a module that is being power-cycled.
  */
-static int wifi_power_claim(struct cli_instance *sh)
+static int wifi_power_claim(struct cli_instance *sh, const char *what)
 {
+	/* Not on the telnet console: cutting CHIP_EN takes the WiFi link -- and therefore the
+	 * very session running this command -- away.  Run it from the USB CDC console. */
+	if (net_shell_guard(sh, what))
+		return 1;
 	return rtl_link_hw_claim(sh, true) != 0 ? 1 : 0;
 }
 
 static int cmd_wifi_on(struct cli_instance *sh, int argc, char **argv)
 {
 	(void)argc; (void)argv;
-	if (wifi_power_claim(sh))
+	if (wifi_power_claim(sh, "wifi on"))
 		return 1;
 	if (!rtl8720_powered()) {
 		rtl_tcpip_set_inited(false);           /* fresh power-on: lwIP not yet up */
@@ -227,7 +232,7 @@ static int cmd_wifi_on(struct cli_instance *sh, int argc, char **argv)
 static int cmd_wifi_off(struct cli_instance *sh, int argc, char **argv)
 {
 	(void)argc; (void)argv;
-	if (wifi_power_claim(sh))
+	if (wifi_power_claim(sh, "wifi off"))
 		return 1;
 	rtl_link_force_quiesce();                  /* recovery path: take the link away */
 	rtl8720_power(false);
@@ -241,7 +246,7 @@ static int cmd_wifi_off(struct cli_instance *sh, int argc, char **argv)
 static int cmd_wifi_reset(struct cli_instance *sh, int argc, char **argv)
 {
 	(void)argc; (void)argv;
-	if (wifi_power_claim(sh))
+	if (wifi_power_claim(sh, "wifi reset"))
 		return 1;
 	rtl_link_force_quiesce();                  /* recovery path: take the link away */
 	rtl8720_reset();
@@ -460,6 +465,9 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 	}
 
 	rtl_link_end(sh);
+	/* An address is up: arm the telnet console (issue #21).  AFTER rtl_link_end() so the
+	 * service thread finds the coarse mutex free rather than spinning on our claim. */
+	net_shell_autoarm();
 	cli_print(sh, "wifi: connected\r\n");
 	cli_print(sh, "  ip   %u.%u.%u.%u\r\n", ip.ip[0], ip.ip[1], ip.ip[2], ip.ip[3]);
 	cli_print(sh, "  mask %u.%u.%u.%u\r\n",
