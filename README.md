@@ -146,9 +146,32 @@ Mode") with line editing, history, and Tab completion. 21 commands:
   (issue #20 N3): it holds a `recvfrom` (no data) open on the module and round-trips a
   foreground ack while it is outstanding — a serial server (stock/N2) cannot answer the
   ack until the receive returns, the N3 worker-dispatch server answers it in a few ms.
-  ip/dhcp/ping/conc require an active association (they never power the module) and share
-  the same single-owner eRPC session as `wifi`. Pure marshalling on the STM32 side — no
-  RCC/register work.
+  `net echo [port] [txchunk]` (default 2323 / 64 B, Ctrl+C stops) runs a **TCP echo
+  server** on the module — socket/bind/listen/accept/recv/send over the same offload — as
+  the bring-up rehearsal for the telnet shell console (issue #21): it reports accept
+  latency, the firmware's 10 s accept cap, whether `MSG_DONTWAIT` works, the echo
+  round-trip time and the eRPC diagnostics, which is exactly what that console's design
+  needs measured. It also established a constraint nothing before it had hit: **eRPC is
+  asymmetric — a big reply is fine, a big request is not.** The module's transport reads
+  the UART one byte at a time behind a 127-byte Arduino ring that silently drops on
+  overflow, and our side writes a frame as a gap-free polled burst, so a request larger
+  than that ring loses its tail and is never answered (measured on board #2: a 264-byte
+  reply arrives intact, a 280-byte request does not). The swept cliff sits between 184 and
+  280 bytes rather than at 127 — the module drains while we write, so what must stay under
+  the ring is the backlog during its longest mid-frame stall, which makes anything above
+  127 a load-dependent race. Sends therefore chunk at `WIFI_RPC_SEND_SAFE` (96 B → a
+  120-byte frame, the largest round size that still fits **entirely** inside the ring and
+  so cannot be dropped however long the reader stalls) while receives keep using the full
+  256 B; `txchunk` exists so the sweep stays reproducible. Two more rules
+  it establishes carry over: **accept/recv must never be aborted host-side** (the module
+  keeps running the call, so an aborted accept yields a socket whose fd the host never
+  learns and cannot close — hence Ctrl+C is honoured only between calls, up to ~12 s),
+  and a host-side timeout leaves the link **dirty**, in which case the sockets are
+  deliberately not closed (a close racing an in-flight accept/recv is unsafe on this
+  firmware) and `wifi reset` reclaims them.
+  ip/dhcp/ping/conc/echo require an active association (they never power the module) and
+  share the same single-owner eRPC session as `wifi`. Pure marshalling on the STM32 side
+  — no RCC/register work.
 
   The RTL8720 device firmware itself is rebuilt (non-blocking socket handlers, then a
   worker-dispatch eRPC server so multiple requests run at once) under `fw/rtl8720/`

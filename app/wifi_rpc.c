@@ -35,14 +35,26 @@
 #define M_TCPIP_DHCPC_START 13u
 #define M_TCPIP_DHCPC_STOP  14u
 
-/* rpc_wifi_lwip (service 16) method IDs (raw BSD sockets for `net ping`). */
+/* rpc_wifi_lwip (service 16) method IDs (raw BSD sockets for `net ping`, stream
+ * sockets for `net echo`).  Values from the firmware's rpc_wifi_api.h. */
 #define SVC_WIFI_LWIP       16u
+#define M_LWIP_ACCEPT        1u
+#define M_LWIP_BIND          2u
+#define M_LWIP_SHUTDOWN      3u
+#define M_LWIP_GETPEERNAME   4u
 #define M_LWIP_SETSOCKOPT    7u
 #define M_LWIP_CLOSE         8u
+#define M_LWIP_LISTEN       10u
+#define M_LWIP_RECV         12u
 #define M_LWIP_RECVFROM     14u
+#define M_LWIP_SEND         15u
 #define M_LWIP_SENDTO       17u
 #define M_LWIP_SOCKET       18u
 #define M_LWIP_ERRNO        24u
+
+/* A lwIP sockaddr_in on the wire is 16 bytes (sin_len, sin_family, sin_port,
+ * sin_addr, sin_zero[8]) -- the only address size these wrappers deal in. */
+#define SOCKADDR_LEN        16u
 
 /* tcpip_adapter_ip_info_t on the wire: ip(4) + netmask(4) + gw(4). */
 #define IP_INFO_LEN         12u
@@ -565,5 +577,184 @@ int wifi_rpc_lwip_errno(const struct wifi_rpc_opts *o, int32_t *err)
 	if (plen < 4)
 		return WIFI_RPC_EDECODE;
 	*err = (int32_t)get_u32le(rep);
+	return 0;
+}
+
+/* ---- TCP stream sockets (issue #21) -------------------------------------- */
+
+int wifi_rpc_lwip_bind(const struct wifi_rpc_opts *o, int32_t s,
+                       const uint8_t *sa, uint16_t salen, int32_t *ret)
+{
+	/* 4(s) + 4+16(name) + 4(namelen). */
+	uint8_t req[28], rep[16];
+	uint8_t *p = req;
+	int plen, rc;
+
+	if (salen != SOCKADDR_LEN)
+		return WIFI_RPC_EDECODE;
+	put_u32le(p, (uint32_t)s); p += 4;
+	p = put_binary(p, sa, salen);
+	put_u32le(p, salen);       p += 4;
+
+	rc = do_call(o, SVC_WIFI_LWIP, M_LWIP_BIND, req,
+	             (uint16_t)(p - req), rep, sizeof(rep), &plen);
+	if (rc)
+		return rc;
+	return decode_result(rep, plen, ret);
+}
+
+int wifi_rpc_lwip_listen(const struct wifi_rpc_opts *o, int32_t s, int32_t backlog,
+                         int32_t *ret)
+{
+	uint8_t req[8], rep[16];
+	int plen, rc;
+
+	put_u32le(req + 0, (uint32_t)s);
+	put_u32le(req + 4, (uint32_t)backlog);
+	rc = do_call(o, SVC_WIFI_LWIP, M_LWIP_LISTEN, req, 8u, rep, sizeof(rep), &plen);
+	if (rc)
+		return rc;
+	return decode_result(rep, plen, ret);
+}
+
+int wifi_rpc_lwip_accept(const struct wifi_rpc_opts *o, int32_t s, int32_t *fd)
+{
+	/* 4(s) + 4+16(addr) + 4(addrlen). */
+	uint8_t req[28], rep[16];
+	uint8_t sa[SOCKADDR_LEN];
+	uint8_t *p = req;
+	int plen, rc;
+
+	/* Send a real 16-byte scratch rather than an empty binary: the firmware hands
+	 * addr->data straight to lwip_accept(), and a zero-length binary would make that
+	 * an erpc_malloc(0) whose result is not guaranteed to be a usable pointer. */
+	memset(sa, 0, sizeof(sa));
+	put_u32le(p, (uint32_t)s); p += 4;
+	p = put_binary(p, sa, (uint32_t)sizeof(sa));
+	put_u32le(p, SOCKADDR_LEN); p += 4;
+
+	rc = do_call(o, SVC_WIFI_LWIP, M_LWIP_ACCEPT, req,
+	             (uint16_t)(p - req), rep, sizeof(rep), &plen);
+	if (rc)
+		return rc;
+	/* reply = addrlen(u32) + result(i32) -- two words, unlike the other calls here.
+	 * The addrlen is just our own value echoed back (the firmware passes
+	 * &addr->dataLength to lwIP, not this argument), so it is discarded. */
+	if (plen < 8)
+		return WIFI_RPC_EDECODE;
+	*fd = (int32_t)get_u32le(rep + 4);
+	return 0;
+}
+
+int wifi_rpc_lwip_recv(const struct wifi_rpc_opts *o, int32_t s,
+                       uint8_t *buf, uint16_t buf_cap, int32_t flags,
+                       uint32_t timeout_ms, uint16_t *got, int32_t *ret)
+{
+	uint8_t req[16], rep[4u + WIFI_RPC_STREAM_MAX + 4u];
+	uint32_t mlen;
+	int plen, rc;
+
+	/* A zero timeout would leave the module's SO_RCVTIMEO untouched = a blocking
+	 * receive that can pin this fd forever (and the fd may then not be closed).
+	 * Refuse rather than let a caller wander into that. */
+	if (timeout_ms == 0u)
+		return -1;
+	if (buf_cap == 0u || buf_cap > WIFI_RPC_STREAM_MAX)
+		return -1;
+
+	put_u32le(req + 0,  (uint32_t)s);
+	put_u32le(req + 4,  (uint32_t)buf_cap);   /* len: max bytes to receive */
+	put_u32le(req + 8,  (uint32_t)flags);
+	put_u32le(req + 12, timeout_ms);
+	rc = do_call(o, SVC_WIFI_LWIP, M_LWIP_RECV, req, 16u, rep, sizeof(rep), &plen);
+	if (rc)
+		return rc;
+
+	/* reply = mem(binary) + ret(i32).  Reject an over-long reply up front so every
+	 * offset below stays inside rep[] (erpc truncates to out_cap but returns the FULL
+	 * payload length), then bound each length before adding it. */
+	if (plen > (int)sizeof(rep) || plen < 4)
+		return WIFI_RPC_EDECODE;
+	mlen = get_u32le(rep);
+	if (mlen > (uint32_t)sizeof(rep) - 4u)
+		return WIFI_RPC_EDECODE;
+	if ((uint32_t)plen < 4u + mlen + 4u)
+		return WIFI_RPC_EDECODE;
+	*ret = (int32_t)get_u32le(rep + 4u + mlen);
+
+	/* Only the return value says whether data arrived: the firmware always ships a
+	 * blob, a one-byte dummy when lwip_recv() failed or the peer closed. */
+	*got = 0u;
+	if (*ret > 0) {
+		if ((uint32_t)*ret != mlen || mlen > (uint32_t)buf_cap)
+			return WIFI_RPC_EDECODE;   /* payload contradicts the return value */
+		memcpy(buf, rep + 4, mlen);
+		*got = (uint16_t)mlen;
+	}
+	return 0;
+}
+
+int wifi_rpc_lwip_send(const struct wifi_rpc_opts *o, int32_t s,
+                       const uint8_t *data, uint16_t dlen, int32_t flags, int32_t *ret)
+{
+	/* 4(s) + 4+WIFI_RPC_STREAM_MAX(dataptr) + 4(flags). */
+	uint8_t req[12u + WIFI_RPC_STREAM_MAX], rep[16];
+	uint8_t *p = req;
+	int plen, rc;
+
+	if (dlen == 0u || dlen > WIFI_RPC_STREAM_MAX)
+		return -1;
+	put_u32le(p, (uint32_t)s); p += 4;
+	p = put_binary(p, data, dlen);
+	put_u32le(p, (uint32_t)flags); p += 4;
+
+	rc = do_call(o, SVC_WIFI_LWIP, M_LWIP_SEND, req,
+	             (uint16_t)(p - req), rep, sizeof(rep), &plen);
+	if (rc)
+		return rc;
+	return decode_result(rep, plen, ret);   /* may be SHORT: caller loops */
+}
+
+int wifi_rpc_lwip_shutdown(const struct wifi_rpc_opts *o, int32_t s, int32_t how,
+                           int32_t *ret)
+{
+	uint8_t req[8], rep[16];
+	int plen, rc;
+
+	put_u32le(req + 0, (uint32_t)s);
+	put_u32le(req + 4, (uint32_t)how);
+	rc = do_call(o, SVC_WIFI_LWIP, M_LWIP_SHUTDOWN, req, 8u, rep, sizeof(rep), &plen);
+	if (rc)
+		return rc;
+	return decode_result(rep, plen, ret);
+}
+
+int wifi_rpc_lwip_getpeername(const struct wifi_rpc_opts *o, int32_t s,
+                              uint8_t sa[SOCKADDR_LEN], uint16_t *got, int32_t *ret)
+{
+	uint8_t req[8], rep[64];
+	uint32_t nlen;
+	int plen, rc;
+
+	put_u32le(req + 0, (uint32_t)s);
+	put_u32le(req + 4, SOCKADDR_LEN);       /* namelen (the firmware ignores it) */
+	rc = do_call(o, SVC_WIFI_LWIP, M_LWIP_GETPEERNAME, req, 8u, rep, sizeof(rep), &plen);
+	if (rc)
+		return rc;
+
+	/* reply = name(binary) + namelen(u32) + ret(i32); same bound-then-add discipline. */
+	if (plen > (int)sizeof(rep) || plen < 4)
+		return WIFI_RPC_EDECODE;
+	nlen = get_u32le(rep);
+	if (nlen > SOCKADDR_LEN)                /* longer than a sockaddr: not ours */
+		return WIFI_RPC_EDECODE;
+	if ((uint32_t)plen < 4u + nlen + 8u)    /* need namelen(u32) + ret(i32) */
+		return WIFI_RPC_EDECODE;
+
+	memcpy(sa, rep + 4, nlen);
+	if (nlen < SOCKADDR_LEN)                /* short copy: the rest is not an address */
+		memset(sa + nlen, 0, SOCKADDR_LEN - nlen);
+	*got = (uint16_t)nlen;
+	*ret = (int32_t)get_u32le(rep + 4u + nlen + 4u);
 	return 0;
 }

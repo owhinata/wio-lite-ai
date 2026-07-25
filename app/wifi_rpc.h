@@ -240,4 +240,131 @@ int wifi_rpc_lwip_recvfrom_begin(int32_t s, uint32_t len, int32_t flags,
 int wifi_rpc_lwip_close(const struct wifi_rpc_opts *o, int32_t s, int32_t *ret);
 int wifi_rpc_lwip_errno(const struct wifi_rpc_opts *o, int32_t *err);
 
+/*
+ * ---- TCP stream sockets (rpc_wifi_lwip, service 16), for `net echo` -- issue #21 ----
+ *
+ * Same return convention as the raw-socket calls above: the function's int return is the
+ * transport code (0 = round-trip ok, -1 bad args, -2 timeout, -4 aborted, or
+ * WIFI_RPC_EDECODE for a malformed reply), and the lwIP syscall's own value lands in
+ * @ret / @fd (>= 0 on success, < 0 with the reason in wifi_rpc_lwip_errno()).
+ *
+ * These are what a TCP server needs on top of the existing socket/setsockopt/close:
+ * bind -> listen -> accept -> recv/send.  Three firmware quirks are baked into the
+ * wrappers (all verified against seeed-ambd-firmware's generated shim + wifi_api.c):
+ *
+ *   1. accept's reply carries TWO words (u32 addrlen + i32 result), unlike every other
+ *      call here, and the firmware never fills the peer address in: it passes
+ *      &addr->dataLength (not the addrlen argument) to lwip_accept and then drops the
+ *      buffer.  So accept yields the fd only -- use wifi_rpc_lwip_getpeername() if the
+ *      caller wants to know who connected.
+ *   2. recv reports failure ONLY through @ret: the firmware hands back a one-byte dummy
+ *      blob whenever lwip_recv() returns <= 0, so the payload length must never be used
+ *      to decide whether data arrived.
+ *   3. recv's @timeout_ms drives the module's SO_RCVTIMEO (issue #20 N2), and a zero
+ *      there means "leave the socket as it is" == a BLOCKING receive.  A blocking recv
+ *      with no data pins that fd forever, and the N3 firmware's per-fd lifecycle rule
+ *      then forbids closing it (a close racing an in-flight recv on the same fd is
+ *      unsafe) -- the socket is effectively lost until `wifi reset`.  So the wrapper
+ *      REJECTS timeout_ms == 0 outright rather than let a caller ask for that.
+ *
+ * NOTE on cancellation: do NOT pass a should_abort hook for accept / recv.  Aborting only
+ * ends the HOST's wait -- the module keeps running the call, so an aborted accept can
+ * complete into a socket whose fd the host never learns (unclosable, and it consumes one
+ * of the module's few netconns), and an aborted recv leaves the fd busy so it must not be
+ * closed either.  Poll the cancel flag between calls instead (see shell/cmds/cmd_net.c).
+ */
+
+/* Maximum payload carried by one recv/send round-trip.  Bounds the wrappers' on-stack
+ * request/reply scratch (<= 268 B, comfortable on the 4 KB shell thread stack).  Raising
+ * this means moving that scratch out of the locals into static storage. */
+#define WIFI_RPC_STREAM_MAX      256u
+
+/*
+ * ASYMMETRY -- a big REQUEST is unsafe, a big REPLY is fine.  Measured on board #2.
+ *
+ * The module's eRPC transport reads the UART ONE BYTE AT A TIME and sleeps a whole
+ * FreeRTOS tick whenever it finds the buffer empty
+ * (seeed-ambd-firmware src/erpc/erpc_arduino_uart_transport.cpp:
+ * `while (!available()) vTaskDelay(1);` then a single `read()`), and behind that sits an
+ * Arduino RingBuffer of SERIAL_BUFFER_SIZE = 128 bytes -- 127 usable, and
+ * RingBufferN::store_char SILENTLY DROPS a byte when it is full
+ * (ArduinoCore-ambd cores/arduino/RingBuffer.h).  configTICK_RATE_HZ is 1000, so at
+ * 2 Mbaud one tick is 200 bytes.  Our side writes a frame as a gap-free polled burst
+ * (app/rtl8720.c rtl8720_uart_write), and the module stalls mid-frame to allocate its
+ * 4 KB message buffer between reading the 4-byte header and the body -- so any frame
+ * bigger than that ring loses its tail, the CRC fails, no reply is ever sent and the
+ * caller times out (which then leaves the link "dirty": see cmd_net.c).
+ *
+ * Measured directly: a 264-byte REPLY (recv of 256 B) arrives intact -- our RX is an
+ * interrupt-driven ring -- while a 280-byte REQUEST (send of 256 B) never gets answered.
+ *
+ * A send request frame is 24 + payload bytes (4 framing + 8 header/seq + 4 fd + 4 binary
+ * length + 4 flags).  Swept on board #2 with `net echo 2323 <txchunk>`, echoing 1000 B:
+ *
+ *     payload  64  96 128 160        256
+ *     frame    88 120 152 184        280
+ *     result   ok  ok  ok  ok        NO REPLY
+ *
+ * So the cliff is somewhere between 184 and 280 bytes -- NOT at 127, because the module's
+ * reader is draining while we write, so what really has to stay under the ring is the
+ * backlog that piles up during its longest mid-frame stall.  That makes anything above
+ * 127 a LOAD-DEPENDENT race: the same 160 that passes on an idle module can drop bytes
+ * once its WiFi/lwIP threads delay the receive task further.  A frame that fits ENTIRELY
+ * in the ring cannot be lost no matter how long the reader stalls, and that is the only
+ * structural guarantee available here -- it bounds the payload at 127 - 24 = 103.
+ *
+ * Hence WIFI_RPC_SEND_SAFE is 96: inside the ring with a little headroom, and measured at
+ * 6 ms per 256 B echoed versus 8 ms for 64 B chunks.  (The guarantee assumes one request
+ * frame in flight at a time, which is how the shell drives the link; two back-to-back
+ * erpc_begin() frames could still exceed the ring together.)  The wrappers still ACCEPT
+ * up to WIFI_RPC_STREAM_MAX so the sweep above stays reproducible, but anything that just
+ * wants to move bytes reliably -- the issue #21 telnet console's output path included --
+ * must chunk at WIFI_RPC_SEND_SAFE.  Receiving may keep using the full
+ * WIFI_RPC_STREAM_MAX.
+ *
+ * The proper fix is on the firmware side (a bulk `readBytes()` in the transport, or a
+ * larger SERIAL_BUFFER_SIZE), i.e. another patch in fw/rtl8720/patches -- deliberately
+ * out of scope here, where the point is to establish the constraint.
+ */
+#define WIFI_RPC_SEND_SAFE        96u
+
+/* @sa / @salen are a raw lwIP sockaddr (16-byte sockaddr_in here), as built by the
+ * caller in network byte order. */
+int wifi_rpc_lwip_bind(const struct wifi_rpc_opts *o, int32_t s,
+                       const uint8_t *sa, uint16_t salen, int32_t *ret);
+int wifi_rpc_lwip_listen(const struct wifi_rpc_opts *o, int32_t s, int32_t backlog,
+                         int32_t *ret);
+/* Accept one connection; *@fd is the accepted socket (>= 0) or the lwIP error (< 0).
+ * The call BLOCKS on the module until a client arrives or its internal cap expires
+ * (10 s, issue #20 N2 -- it then returns -1/ETIMEDOUT), so give @o a timeout that
+ * outlasts that cap or the host abandons a call the module is still running. */
+int wifi_rpc_lwip_accept(const struct wifi_rpc_opts *o, int32_t s, int32_t *fd);
+/* Receive up to @buf_cap (<= WIFI_RPC_STREAM_MAX) bytes.  @timeout_ms must be non-zero
+ * (see quirk 3) and @o's timeout should exceed it.  On a completed round-trip *@ret is
+ * lwip_recv()'s return: > 0 = bytes (copied into @buf, *@got = count), 0 = peer closed,
+ * < 0 = error (EAGAIN when the receive timed out with no data). */
+int wifi_rpc_lwip_recv(const struct wifi_rpc_opts *o, int32_t s,
+                       uint8_t *buf, uint16_t buf_cap, int32_t flags,
+                       uint32_t timeout_ms, uint16_t *got, int32_t *ret);
+/* Send 1..WIFI_RPC_STREAM_MAX bytes; *@ret is lwip_send()'s return, which may be SHORT --
+ * the caller must loop until everything is out.  Pass no more than WIFI_RPC_SEND_SAFE
+ * unless you are deliberately probing the request-size limit (see the ASYMMETRY note). */
+int wifi_rpc_lwip_send(const struct wifi_rpc_opts *o, int32_t s,
+                       const uint8_t *data, uint16_t dlen, int32_t flags, int32_t *ret);
+int wifi_rpc_lwip_shutdown(const struct wifi_rpc_opts *o, int32_t s, int32_t how,
+                           int32_t *ret);
+/*
+ * Peer address of a connected socket, into the 16-byte @sa (*@got = bytes the module
+ * actually returned, zero-padded to 16).
+ *
+ * BEST EFFORT ONLY -- the firmware's shim passes an UNINITIALISED socklen to
+ * lwip_getpeername (it erpc_malloc()s the binary_t and never sets dataLength before the
+ * call), so lwIP may copy fewer than 16 bytes and leave the rest of the address unset.
+ * It cannot overrun anything (the destination is a fixed 16-byte sockaddr), but the
+ * VALUE may be partial: validate it (sin_len == 16 && sin_family == AF_INET) before
+ * believing it, and treat a failed check as "unknown peer", never as an error.
+ */
+int wifi_rpc_lwip_getpeername(const struct wifi_rpc_opts *o, int32_t s,
+                              uint8_t sa[16], uint16_t *got, int32_t *ret);
+
 #endif /* APP_WIFI_RPC_H */
