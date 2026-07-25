@@ -21,6 +21,96 @@
 /* Our vector table lives at the start of the XIP flash window. */
 #define VECT_TAB_BASE_ADDRESS  0x70000000UL
 
+/* ITCM geometry -- mirrors the ITCM entry of the MEMORY block in
+ * ldscript/STM32H725AEIx_XIP.ld (64 KB because the TCM_AXI_SHARED option byte is
+ * at its default, which is also why AXI-SRAM is 320 KB).  Both are multiples of 8,
+ * which the 64-bit zero-fill below relies on. */
+#define ITCM_BASE  0x00000000UL
+#define ITCM_SIZE  (64UL * 1024UL)
+
+/* .itcm bounds from the linker script (issue #24): run image in ITCM, load image
+ * in the XIP flash.  Declared as arrays so a bare reference yields the address. */
+extern uint32_t _sitcm[], _eitcm[], _sitcm_load[];
+
+/*
+ * Move the interrupt paths into ITCM (issue #24).
+ *
+ * Every ISR in this app is otherwise fetched from the external OCTOSPI2 flash
+ * through a 16 KB I-cache, so each burst that arrives after the lines were evicted
+ * pays a cold fetch: measured 8.7 us vs 3.3 us for the same UART ISR on board #2.
+ * ITCM is zero-wait-state and outside both caches.  The CMSIS startup only copies
+ * .data, so .itcm needs its own copy -- done here, the earliest point in the boot
+ * flow (Reset_Handler: ExitRun0Mode -> SystemInit -> .data copy -> .bss zero ->
+ * __libc_init_array -> main), because ITCM holds garbage until we fill it and
+ * running that garbage as code is fatal.  On the normal path nothing dispatches
+ * while we run: SysTick is stopped and every NVIC line is disabled out of reset.
+ * Note the window is not fully closed -- VTOR already points at a table whose fault
+ * entries are ITCM addresses, so a fault raised *inside* this function would branch
+ * into memory that is still being zeroed or copied.  That is accepted: it needs a
+ * fault in ~40 instructions of straight-line code that touches only SCB and ITCM,
+ * and the pre-#24 behaviour (spin forever in Default_Handler) was no more
+ * recoverable.  A DFU reflash (hold PF1 at reset) always gets the board back.
+ *
+ * This function reads and writes only ITCMCR.  It does NOT touch the RCC / PWR /
+ * FLASH ACR -- the app inherits the bootloader's clock tree and OCTOSPI2 XIP map
+ * (see the file header), and this code is itself running from that flash.
+ */
+static void itcm_init(void)
+{
+  uint32_t itcmcr;
+  uint64_t volatile *zp;
+  uint32_t volatile *dst;
+  const uint32_t *src;
+  uint32_t n;
+
+  /* Enable the ITCM and, unconditionally, its ECC read-modify-write + retry
+   * (PM0253 4.9.1 -- a TCM with error detection/correction wants both).  ST leaves
+   * the TCMs enabled out of reset, but the ITCM has never been used on this board,
+   * so do not assume it: setting bits that are already set is idempotent.  RMW
+   * matters most -- ITCM ECC covers a 64-bit word (RM0468), so the 32-bit copy
+   * below is a partial write and needs the hardware read-modify-write to compute
+   * the new ECC instead of corrupting it. */
+  itcmcr = SCB->ITCMCR;
+  if ((itcmcr & SCB_ITCMCR_EN_Msk) == 0u)
+    itcmcr |= SCB_ITCMCR_EN_Msk;
+  itcmcr |= SCB_ITCMCR_RMW_Msk | SCB_ITCMCR_RETEN_Msk;
+  SCB->ITCMCR = itcmcr;
+  __DSB();
+  __ISB();
+
+  /* Initialise the ECC over the WHOLE 64 KB, not just the resident range: the
+   * Code region is Normal memory, so the core may speculatively prefetch past the
+   * last resident instruction, and reading an ITCM word that was never written
+   * reads an undefined ECC.  64-bit stores match the ECC granule exactly (and STRD
+   * always faults if misaligned -- ITCM base and length are both multiples of 8,
+   * so the loop stays aligned).  ~8 k stores, tens of microseconds once at boot. */
+  for (zp = (uint64_t volatile *)ITCM_BASE;
+       zp < (uint64_t volatile *)(ITCM_BASE + ITCM_SIZE); zp++)
+    *zp = 0u;
+
+  /* Copy the resident image.  32-bit words: the load address only has to be
+   * 4-byte aligned, and the destination ECC is already initialised above. */
+  dst = (uint32_t volatile *)_sitcm;
+  src = (const uint32_t *)_sitcm_load;
+  n   = (uint32_t)(_eitcm - _sitcm);      /* pointer difference -> words */
+  while (n-- != 0u)
+    *dst++ = *src++;
+
+  /* Read the image back before executing it.  RM0468 requires a read-back for data
+   * to be reliably committed to a TCM -- the same trap that made the DTCM crash log
+   * lose bytes across a reset (issue #13, svc/log.c persist_*).  The accesses are
+   * volatile so the compiler cannot drop the loop. */
+  dst = (uint32_t volatile *)_sitcm;
+  n   = (uint32_t)(_eitcm - _sitcm);
+  while (n-- != 0u)
+    (void) *dst++;
+
+  /* TCM writes bypass the caches, but the pipeline still has to be told that the
+   * instruction memory it is about to fetch from has changed. */
+  __DSB();
+  __ISB();
+}
+
 /* Inherited from the bootloader: SYSCLK = HSE(25 MHz) * 22 = 550 MHz (CPU/FCLK). */
 uint32_t SystemCoreClock = 550000000UL;
 
@@ -40,8 +130,14 @@ void SystemInit(void)
 
   /* Aim exceptions at our vector table in the XIP flash.  The bootloader already
    * set this before jumping, but re-assert it so SysTick/IRQs are unambiguously
-   * ours.  Deliberately NO RCC writes (see file header). */
+   * ours.  Deliberately NO RCC writes (see file header).  The table stays in the
+   * XIP window even though the handlers move to ITCM below: the bootloader loads
+   * the MSP from 0x70000000's vector[0], so that address is a fixed contract. */
   SCB->VTOR = VECT_TAB_BASE_ADDRESS;
+
+  /* Load the ITCM-resident interrupt paths (issue #24).  Must happen before any
+   * exception can be dispatched, and before main() enables the caches / MPU. */
+  itcm_init();
 }
 
 /* The CMSIS startup calls this before SystemInit to configure the power supply.

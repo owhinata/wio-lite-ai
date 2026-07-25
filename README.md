@@ -341,7 +341,7 @@ port/       threadx/ ThreadX low-level init + shared SysTick glue
             coremark/ EEMBC CoreMark port (core_portme.*)
 svc/        freestanding services: fmt (printf), log (DTCM ring), timebase (DWT)
 src/        custom clock-free SystemInit  (also the minimal `blink` example's main)
-ldscript/   STM32H725AEIx_XIP.ld  (FLASH @ 0x70000000, RAM = AXI-SRAM, DTCM log)
+ldscript/   STM32H725AEIx_XIP.ld  (FLASH @ 0x70000000, RAM = AXI-SRAM, DTCM log, ITCM ISRs)
 cmake/      ARM GNU toolchain file (auto-downloads gcc into tools/)
 lib/        git submodules: cmsis_core/device_h7, stm32h7xx_hal_driver, tinyusb,
             threadx, coremark
@@ -358,7 +358,7 @@ fw/rtl8720/ reproducible build of the RTL8720DN's own firmware (the eRPC server 
 | PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). |
 | AXI-SRAM (D1) | `0x24000000` | 320 KB; `_estack = 0x24050000` (the MSP the bootloader loads). |
 | DTCM | `0x20000000` | 128 KB; holds the reset-persistent `.log_noinit` crash-log ring + `membench` scratch (bypasses the D-cache). |
-| ITCM | `0x00000000` | 64 KB. |
+| ITCM | `0x00000000` | 64 KB; holds the **interrupt paths** (`.itcm`, 2096 B): ThreadX PendSV + SysTick, the RTL8720 UART RX ISR and the fault handlers, plus the 4 KB `.itcm_bench` scratch. Zero-wait-state and outside both caches, so an ISR no longer pays a cold OCTOSPI2 fetch through the 16 KB I-cache: the same UART ISR went from **8.7 µs cold / 3.3 µs warm to a flat 0.7 µs** (issue #24). Loaded from its XIP load image by `SystemInit()`, which also zero-fills all 64 KB to initialise the TCM ECC; kept read-only by the MPU so a NULL write raises MemManage instead of corrupting ISR code. |
 | internal Flash | `0x08000000` | 512 KB — **DFU bootloader only**; the app does not own it. |
 
 ## Build

@@ -24,7 +24,10 @@
  *    *bandwidth* stays high even out-of-cache (burst line-refills), so the cache
  *    step shows mainly in the dependent-load *latency* rows.  DTCM is TCM (bypasses
  *    the D-cache, always the raw rate) and Flash is the read-only XIP window.
- *  - Regions: DTCM (4 KB, .dtcm_bench), AXI-SRAM (64 KB, malloc'd on demand),
+ *  - Regions: DTCM (4 KB, .dtcm_bench), ITCM (4 KB, .itcm_bench -- READ ONLY, and no
+ *    latency column: the ISR paths live in ITCM since issue #24 and app/mpu.c marks
+ *    the region read-only, so the write/copy legs and the chain-building
+ *    pointer-chase would fault), AXI-SRAM (64 KB, malloc'd on demand),
  *    Flash int = embedded flash via AXIM 0x08000000, Flash ext = OCTOSPI2 XIP window
  *    0x70000000 (both read-only: measure the flash read rate; a read of the boot
  *    region is harmless -- no write/erase, so no brick risk), PSRAM = OCTOSPI1
@@ -67,6 +70,7 @@
  * The SRAM buffer is malloc'd on demand and freed on exit rather than permanently
  * reserving .bss for a rarely-run command. */
 #define DTCM_BENCH_BYTES   ( 4u * 1024u)
+#define ITCM_BENCH_BYTES   ( 4u * 1024u)   /* same size as DTCM's, for a direct compare */
 #define SRAM_BENCH_BYTES   (64u * 1024u)   /* > 512 D-cache lines @64B stride -> refill */
 #define SRAM_CACHED_BYTES  ( 4u * 1024u)   /* fits in the 16 KB L1 D-cache */
 #define FLASH_BENCH_BYTES  (64u * 1024u)
@@ -79,6 +83,17 @@
 
 static uint32_t dtcm_bench_buf[DTCM_BENCH_BYTES / 4]
 	__attribute__((aligned(32), section(".dtcm_bench")));
+
+/* ITCM read buffer (issue #24).  ITCM is the other tightly-coupled RAM, and since
+ * the ISR paths now execute from it, its read rate is worth having next to DTCM's.
+ * READ ONLY: app/mpu.c marks the whole ITCM read-only so a stray NULL write cannot
+ * corrupt the resident ISR code, which means the write/copy legs and the
+ * pointer-chase latency column (build_chase writes the chain) would MemManage-fault
+ * -- hence bw_row(..., writable=0) and no latency column.  const so the compiler
+ * agrees, but it still needs the section attribute: .itcm_bench is NOLOAD, and the
+ * bytes read back as the zeros SystemInit() wrote when it initialised the ECC. */
+static const uint32_t itcm_bench_buf[ITCM_BENCH_BYTES / 4]
+	__attribute__((aligned(32), section(".itcm_bench"), used));
 
 /* Volatile sink: every measured loop ends by storing into it, so -O2/-O3 cannot
  * eliminate the loop as dead code. */
@@ -374,7 +389,7 @@ static uint32_t lat_ns10(uint32_t *buf, uint32_t wss_bytes, uint32_t clk)
 
 static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 {
-	int do_dtcm = 1, do_sram = 1, do_flash = 1, do_psram = 1;
+	int do_dtcm = 1, do_itcm = 1, do_sram = 1, do_flash = 1, do_psram = 1;
 	uint32_t clk;
 	void     *sram_raw = NULL;         /* malloc base (freed on every exit via `done`) */
 	uint32_t *sram_bench_buf = NULL;   /* 32-byte-aligned working pointer */
@@ -383,14 +398,15 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 	if (argc >= 2) {
 		const char *r = argv[1];
 
-		do_dtcm = do_sram = do_flash = do_psram = 0;
-		if (!strcmp(r, "all"))        do_dtcm = do_sram = do_flash = do_psram = 1;
+		do_dtcm = do_itcm = do_sram = do_flash = do_psram = 0;
+		if (!strcmp(r, "all"))        do_dtcm = do_itcm = do_sram = do_flash = do_psram = 1;
 		else if (!strcmp(r, "dtcm"))  do_dtcm = 1;
+		else if (!strcmp(r, "itcm"))  do_itcm = 1;
 		else if (!strcmp(r, "sram"))  do_sram = 1;
 		else if (!strcmp(r, "flash")) do_flash = 1;
 		else if (!strcmp(r, "psram")) do_psram = 1;
 		else {
-			cli_error(sh, "membench: unknown region '%s' (dtcm|sram|flash|psram|all)\r\n", r);
+			cli_error(sh, "membench: unknown region '%s' (dtcm|itcm|sram|flash|psram|all)\r\n", r);
 			return 1;
 		}
 	}
@@ -431,6 +447,12 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 	if (do_dtcm) {
 		if (cli_cancel_requested(sh)) goto done;
 		bw_row(sh, "DTCM   ( 4KB)", dtcm_bench_buf, DTCM_BENCH_BYTES / 4u, clk, 1);
+	}
+	if (do_itcm) {
+		if (cli_cancel_requested(sh)) goto done;
+		/* Read-only: the MPU protects the resident ISR code (see itcm_bench_buf). */
+		bw_row(sh, "ITCM   ( 4KB, RO)", (uint32_t *)(uintptr_t)itcm_bench_buf,
+		       ITCM_BENCH_BYTES / 4u, clk, 0);
 	}
 	if (do_sram) {
 		if (cli_cancel_requested(sh)) goto done;

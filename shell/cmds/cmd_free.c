@@ -25,6 +25,12 @@
  *          then .dtcm_bench) is bump-placed from ORIGIN, so its high-water mark
  *          _dtcm_used_end (emitted at the end of the last DTCM section) is the used
  *          count -- read from the linker, not the log/membench internals.
+ *   ITCM   used = _itcm_used_end - ORIGIN(ITCM), i.e. the .itcm interrupt-path
+ *          residents (issue #24) plus the .itcm_bench membench buffer, bump-placed
+ *          from ORIGIN exactly like the DTCM block above.  The trailing "itcm:" line
+ *          breaks out the resident code size on its own and prints SCB->ITCMCR raw,
+ *          which is how the ITCM enable / ECC read-modify-write / retention bits are
+ *          confirmed on real hardware (SystemInit sets them; PM0253 sec 4.9.1).
  *
  * Region ORIGIN/LENGTH are compile-time constants mirroring the linker MEMORY
  * block (single source of truth: the .ld).
@@ -42,6 +48,8 @@
 #include <malloc.h>   /* mallinfo / struct mallinfo */
 #include <stdint.h>
 
+#include "stm32h7xx.h"   /* CMSIS core only (SCB->ITCMCR); no HAL dependency */
+
 /* Region geometry -- mirrors the MEMORY block of ldscript/STM32H725AEIx_XIP.ld. */
 #define FLASH_ORIGIN  0x70000000u          /* external OCTOSPI2 XIP window */
 #define FLASH_LENGTH  (8u * 1024u * 1024u) /* linked window (device is 16 MB) */
@@ -49,6 +57,8 @@
 #define RAM_LENGTH    (320u * 1024u)
 #define DTCM_ORIGIN   0x20000000u
 #define DTCM_LENGTH   (128u * 1024u)
+#define ITCM_ORIGIN   0x00000000u          /* .itcm ISR residents (issue #24) */
+#define ITCM_LENGTH   (64u * 1024u)
 #define PSRAM_ORIGIN  0x90000000u          /* external OCTOSPI1 APS6408 (issue #3) */
 #define PSRAM_LENGTH  (8u * 1024u * 1024u)
 
@@ -64,6 +74,8 @@ extern uint8_t _estack[];            /* top of RAM (initial MSP)      */
 extern uint8_t _Min_Stack_Size[];    /* reserved main-stack bytes     */
 extern uint8_t _dtcm_used_end[];     /* top of the DTCM resident block */
 extern uint8_t _psram_end[];         /* top of PSRAM residents (.psram_noinit) */
+extern uint8_t _sitcm[], _eitcm[];   /* .itcm run image in ITCM (issue #24) */
+extern uint8_t _itcm_used_end[];     /* top of the ITCM resident block */
 
 static uint32_t sym(const uint8_t s[])
 {
@@ -96,6 +108,9 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 	uint32_t ram_used   = heap_break - RAM_ORIGIN;        /* static + heap */
 
 	uint32_t dtcm_used  = sym(_dtcm_used_end) - DTCM_ORIGIN;  /* .log_noinit + .dtcm_bench */
+	uint32_t itcm_used  = sym(_itcm_used_end) - ITCM_ORIGIN;   /* .itcm + .itcm_bench */
+	uint32_t itcm_isr   = sym(_eitcm) - sym(_sitcm);           /* .itcm residents alone */
+	uint32_t itcmcr     = SCB->ITCMCR;
 
 	(void)argc;
 	(void)argv;
@@ -108,6 +123,8 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 	             ".data/.bss + ThreadX stacks + heap");
 	print_region(sh, "DTCM",  DTCM_ORIGIN,  DTCM_LENGTH,  dtcm_used,
 	             ".log_noinit (dmesg) + .dtcm_bench (membench)");
+	print_region(sh, "ITCM",  ITCM_ORIGIN,  ITCM_LENGTH,  itcm_used,
+	             ".itcm ISR paths + .itcm_bench (membench)");
 	print_region(sh, "PSRAM", PSRAM_ORIGIN, PSRAM_LENGTH,
 	             sym(_psram_end) - PSRAM_ORIGIN,          /* .psram_noinit residents */
 	             "ext OCTOSPI1 APS6408 (free scratch pool)");
@@ -118,6 +135,16 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 	          (unsigned long)(unsigned)mi.uordblks, (unsigned long)(unsigned)mi.fordblks);
 	cli_print(sh, "stack: top  0x%08lX  main-reserve %lu B (MSP/ISR grow down into RAM free)\r\n",
 	          (unsigned long)sym(_estack), (unsigned long)sym(_Min_Stack_Size));
+	/* ITCMCR as the hardware reports it, decoded.  EN must be 1 for the .itcm
+	 * residents to be reachable at all, and RMW is what makes the 32-bit copy in
+	 * SystemInit safe against the 64-bit ECC granule (PM0253 sec 4.9.1).  SZ is the
+	 * TCM size code the part reports (0 would mean "no ITCM"). */
+	cli_print(sh, "itcm:  ISR paths %lu B (.itcm)  ITCMCR 0x%08lX  EN=%lu RMW=%lu RETEN=%lu SZ=%lu\r\n",
+	          (unsigned long)itcm_isr, (unsigned long)itcmcr,
+	          (unsigned long)((itcmcr & SCB_ITCMCR_EN_Msk) >> SCB_ITCMCR_EN_Pos),
+	          (unsigned long)((itcmcr & SCB_ITCMCR_RMW_Msk) >> SCB_ITCMCR_RMW_Pos),
+	          (unsigned long)((itcmcr & SCB_ITCMCR_RETEN_Msk) >> SCB_ITCMCR_RETEN_Pos),
+	          (unsigned long)((itcmcr & SCB_ITCMCR_SZ_Msk) >> SCB_ITCMCR_SZ_Pos));
 	return 0;
 }
 

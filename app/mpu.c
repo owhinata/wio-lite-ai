@@ -42,6 +42,21 @@ struct mpu_region {
  * not code) -- TEX=001, C=0, B=0, S=1, AP=full, XN=1.  8 MB is a power of two and
  * naturally aligned, so it needs no sub-region masking.  Future DMA carve-outs
  * (camera framebuffer, SD scratch) are added as further rows here.
+ *
+ * Region 1: the 64 KB ITCM at 0x00000000, read-only but executable.  Since issue
+ * #24 the interrupt paths live there (.itcm), and ITCM sits at address zero -- so
+ * a stray write through a NULL pointer would overwrite the PendSV/SysTick/UART ISR
+ * code and the failure would surface later as unexplained chaos.  Read-only turns
+ * that into an immediate MemManage fault, which app/fault.c records to the
+ * reset-persistent log so `dmesg` names the culprit PC.  Nothing writes ITCM after
+ * boot: SystemInit() loads it before mpu_config() runs, and no code self-modifies.
+ * The MPU is unified and applies the same region settings to instruction and data
+ * accesses (PM0253 sec 4.6), and accesses to 0x00000000-0x1FFFFFFF go to the ITCM
+ * interface (sec 2.3.3), so this covers ITCM fetches too: AP=read-only grants the
+ * read permission an instruction fetch needs, and XN=0 leaves execution allowed.
+ * The memory type (TEX=001/C=0/B=0, matching region 0's Normal non-cacheable
+ * encoding) is effectively moot -- a TCM is never cached -- so this row exists
+ * purely for the permission bits.
  */
 static const struct mpu_region mpu_regions[] = {
 	{
@@ -51,6 +66,14 @@ static const struct mpu_region mpu_regions[] = {
 		                     /*IsCacheable*/ 0u, /*IsBufferable*/ 0u,
 		                     /*SubRegionDisable*/ 0u,
 		                     ARM_MPU_REGION_SIZE_8MB),
+	},
+	{
+		.rbar = ARM_MPU_RBAR(1u, 0x00000000u),
+		.rasr = ARM_MPU_RASR(/*DisableExec*/ 0u, ARM_MPU_AP_RO,
+		                     /*TEX*/ 1u, /*IsShareable*/ 0u,
+		                     /*IsCacheable*/ 0u, /*IsBufferable*/ 0u,
+		                     /*SubRegionDisable*/ 0u,
+		                     ARM_MPU_REGION_SIZE_64KB),
 	},
 };
 
