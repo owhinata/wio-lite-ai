@@ -1,4 +1,4 @@
-# N2/N3 patches land here (see ../README.md).  Applied in filename order to a
+# N2..N5 patches land here (see ../README.md).  Applied in filename order to a
 # pristine export of the pinned upstream commit -- the reference checkout in
 # _ref/seeed-ambd-firmware is never modified.
 #
@@ -51,3 +51,20 @@
 #       reads in bulk memcpys.  `Serial3` is simply never begun.
 #       Verify with `net echo 2323 256` -- a 280-byte request frame, which is the size
 #       that gets no reply on N3 and earlier.
+#
+# N5 -- LINK-CTRL channel (issue #23 U0-3), eRPC wire format unchanged:
+#
+#   0005-n5-link-ctrl.patch
+#       src/link/wio_uart_transport.h gets a receive() override that multiplexes a
+#       second frame type onto the same wire (u16 0xFFFF | u16 len | u16 crc | body),
+#       handled in the link layer and never passed up to eRPC; src/link/wio_usi_uart.c
+#       gains wio_usi_set_baud()/wio_usi_baud(); the build id becomes "2.1.3+wio-n5".
+#       Commands: LINK_PING, LINK_STATS (the N4 counters, readable at last WHILE traffic
+#       flows -- the LOG UART cannot be attached while the host holds the link),
+#       LINK_SETBAUD, LINK_BENCH.  0xFFFF is safe because no sender can produce a
+#       message size that big, but a DESYNCHRONISED stream can align on it, so the
+#       length is bounded before it is believed, the CRC is checked, and LINK_SETBAUD
+#       additionally needs a magic word and a rate from an allow-list.  It ACKs on the
+#       old rate then reprograms, so a lost ACK changes nothing.  Recovery from a rate
+#       mismatch is `wifi reset` -- the fallback the host attempts is best effort only.
+#       Verify with `link info`, `link sweep`, and a `link baud` round trip.

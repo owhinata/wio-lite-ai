@@ -116,6 +116,23 @@ struct rtl8720_uart_stats {
 };
 void rtl8720_uart_stats(struct rtl8720_uart_stats *out);
 
+/*
+ * Install a callback the RX ISR runs once per interrupt that stored bytes, right after
+ * it publishes the ring head (issue #23 U0-3).  @cb == NULL disarms it.
+ *
+ * It exists so a reader that would otherwise poll can be woken as soon as bytes land:
+ * the eRPC service thread polls every 1 ms, which for a 1500-byte frame at 6 Mbaud
+ * (2.5 ms on the wire) adds up to 1 ms per frame -- enough to hide the difference
+ * between 4 and 6 Mbaud in the U0-3 link measurements.  The poll is KEPT as the
+ * backstop, so a missed notification only costs latency, never correctness.
+ *
+ * RULES.  @cb runs in interrupt context at the UART's NVIC priority (5) and must be
+ * short and non-blocking; ThreadX signalling (tx_event_flags_set) is fine here because
+ * this port uses PRIMASK critical sections.  Both open and close clear the callback, so
+ * it can never outlive the session that installed it -- re-arm after every open.
+ */
+void rtl8720_uart_set_rx_notify(void (*cb)(void));
+
 /* Disable the open UART + its NVIC interrupt. */
 void rtl8720_uart_close(void);
 

@@ -1,0 +1,522 @@
+diff --git a/src/erpc_setup.cpp b/src/erpc_setup.cpp
+index 66aa7b7..3331df2 100644
+--- a/src/erpc_setup.cpp
++++ b/src/erpc_setup.cpp
+@@ -177,12 +177,15 @@ char * rpc_system_version(void)
+      * literal and freeing that .rodata pointer corrupts the module heap (which is why
+      * the STM32 side never dared call rpc_system_version).  Return an erpc_malloc copy
+      * of a build id so the host can read back which firmware is loaded (`wifi rpc`).
+-     * "2.1.3" keeps the upstream base version; "+wio-n4" marks the issue-#20 N3 patch
+-     * set (bounded socket handlers + worker dispatch) plus the issue-#23 U0-2 link
+-     * driver (USI0 owned directly).  A NULL here would only happen on heap exhaustion,
++     * "2.1.3" keeps the upstream base version; "+wio-n5" marks the issue-#20 N3 patch
++     * set (bounded socket handlers + worker dispatch) plus the issue-#23 link work:
++     * U0-2's USI0 driver and U0-3's LINK-CTRL channel.  The host PARSES the N out of
++     * this string (shell/cmds/cmd_wifi.c fw_gen_of) and gates capabilities on it being
++     * large enough, so the number must only ever go up.  A NULL here would only happen
++     * on heap exhaustion,
+      * which the stock literal never risked; the shim does not null-check, but version is
+      * called early when the heap is idle. */
+-    static const char id[] = "2.1.3+wio-n4";
++    static const char id[] = "2.1.3+wio-n5";
+     char *s = (char *)erpc_malloc(sizeof(id));
+     if (s != NULL)
+         memcpy(s, id, sizeof(id));
+@@ -262,7 +265,7 @@ __attribute__((noreturn)) static void n3_recv_task(void *arg)
+ #if N3_INSTRUMENT
+     uint32_t lo_heap = 0xffffffffu;
+     /* issue #23 U0-2 link counters, last reported values (see below). */
+-    struct wio_usi_stats seen = { 0u, 0u, 0u, 0u, 0u, 0u, 0u };
++    struct wio_usi_stats seen = { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u };
+ #endif
+     for (;;)
+     {
+diff --git a/src/link/wio_uart_transport.h b/src/link/wio_uart_transport.h
+index fca3ae3..7e1310d 100644
+--- a/src/link/wio_uart_transport.h
++++ b/src/link/wio_uart_transport.h
+@@ -6,6 +6,30 @@
+  * changes is underneath -- the Arduino HardwareSerial (127-byte ring, one byte per
+  * interrupt, one byte per read()) is gone, so a request frame larger than that ring is no
+  * longer at the mercy of how fast the receive task is scheduled.
++ *
++ * ---- LINK-CTRL (issue #23 U0-3) ----------------------------------------------
++ *
++ * receive() is overridden to multiplex a SECOND frame type onto the same wire, handled
++ * here in the link layer and never passed up to eRPC:
++ *
++ *   CTRL frame = u16 0xFFFF | u16 body_len | u16 crc16(body) | body[body_len]
++ *   body       = u8 cmd | u8 seq | u8 status | u8 rsvd | payload[]
++ *
++ * 0xFFFF is unambiguous because it is not a message size any sender can produce (the
++ * host's largest request is a few hundred bytes, ours is bounded by the 4 kB
++ * MessageBuffer).  It carries what eRPC cannot: reading this driver's counters (the LOG
++ * UART is unreachable while the host holds the link), changing the line rate, and
++ * generating measured traffic for the U0 go/no-go.  Doing it here rather than as eRPC
++ * methods avoids hand-editing the GENERATED server shim -- the same shim whose
++ * erpc_free() of a string literal corrupted the module heap in issue #20.
++ *
++ * Two locking rules, both load-bearing:
++ *   - the whole read, including CTRL consumption, stays under m_receiveLock, exactly as
++ *     the base class does (erpc_framed_transport.cpp);
++ *   - a CTRL reply is written under m_sendLock, because the N3 worker tasks call send()
++ *     concurrently and two writers would interleave their bytes.  This is the only place
++ *     that takes both, receive then send, and nothing takes them the other way round, so
++ *     the order cannot cycle.
+  */
+ #ifndef WIO_UART_TRANSPORT_H
+ #define WIO_UART_TRANSPORT_H
+@@ -18,12 +42,24 @@ extern "C" {
+ #include "wio_usi_uart.h"
+ }
+ 
++/* Marker and bounds of the CTRL channel; mirrored by the host in app/erpc.h. */
++#define WIO_CTRL_MAGIC          0xFFFFu
++#define WIO_CTRL_MAX            1600u
++#define WIO_CTRL_HDR            4u
++
++#define WIO_CTRL_PING           1u
++#define WIO_CTRL_STATS          2u
++#define WIO_CTRL_SETBAUD        3u
++#define WIO_CTRL_BENCH          4u
++
++#define WIO_CTRL_SETBAUD_MAGIC  0x42415544u   /* 'BAUD' */
++
+ namespace erpc {
+ 
+ class WioUartTransport : public FramedTransport
+ {
+ public:
+-	explicit WioUartTransport(uint32_t baudrate) : m_baudrate(baudrate) {}
++	explicit WioUartTransport(uint32_t baudrate) : m_baudrate(baudrate), m_ctrlSeq(0u) {}
+ 	virtual ~WioUartTransport(void) {}
+ 
+ 	virtual erpc_status_t init(void)
+@@ -34,6 +70,49 @@ public:
+ 
+ 	virtual bool hasMessage(void) { return wio_usi_available() > 0u; }
+ 
++	/*
++	 * Same contract as FramedTransport::receive() -- return exactly one eRPC message --
++	 * but loop over CTRL frames instead of returning after one.  Consuming a CTRL frame
++	 * is not an event the eRPC server knows how to be told about, so it must not be
++	 * allowed to surface as a short read or a spurious return.
++	 */
++	virtual erpc_status_t receive(MessageBuffer *message)
++	{
++		Header h;
++
++		{
++			Mutex::Guard lock(m_receiveLock);
++
++			for (;;) {
++				erpc_status_t ret = underlyingReceive((uint8_t *)&h, sizeof(h));
++				if (ret != kErpcStatus_Success) {
++					return ret;
++				}
++				if (h.m_messageSize != WIO_CTRL_MAGIC) {
++					/* Ordinary eRPC frame: h.m_crc is the body CRC, and the
++					 * size must fit the buffer (the base class's check). */
++					if (h.m_messageSize > message->getLength()) {
++						return kErpcStatus_ReceiveFailed;
++					}
++					ret = underlyingReceive(message->get(), h.m_messageSize);
++					if (ret != kErpcStatus_Success) {
++						return ret;
++					}
++					break;
++				}
++				/* CTRL: h.m_crc is really the body LENGTH; the CRC follows. */
++				handleCtrl(h.m_crc);
++			}
++		}
++
++		uint16_t computedCrc = m_crcImpl->computeCRC16(message->get(), h.m_messageSize);
++		if (computedCrc != h.m_crc) {
++			return kErpcStatus_CrcCheckFailed;
++		}
++		message->setUsed(h.m_messageSize);
++		return kErpcStatus_Success;
++	}
++
+ protected:
+ 	virtual erpc_status_t underlyingSend(const uint8_t *data, uint32_t size)
+ 	{
+@@ -65,7 +144,198 @@ protected:
+ 	}
+ 
+ private:
++	/* Drop everything buffered, so a frame that made no sense cannot leave the reader
++	 * parsing the next one's header as this one's body forever. */
++	void ctrlResync(void)
++	{
++		uint8_t sink[64];
++
++		while (wio_usi_read(sink, sizeof(sink)) != 0u) {
++			;
++		}
++	}
++
++	/*
++	 * Read and act on one CTRL frame whose body length is @bodyLen.  The header
++	 * (magic + length) has already been consumed; the CRC has not.
++	 *
++	 * A desynchronised stream can align on 0xFFFF by chance, so nothing here trusts
++	 * @bodyLen before bounding it, and every command checks its own payload length.  The
++	 * one command with a real side effect additionally carries a magic word and only
++	 * accepts rates from a fixed list -- a wrong rate is not recoverable from this end.
++	 */
++	void handleCtrl(uint16_t bodyLen)
++	{
++		uint16_t crc;
++
++		/* Bound FIRST: reading a bogus length would swallow real frames. */
++		if (bodyLen > WIO_CTRL_MAX || bodyLen < WIO_CTRL_HDR) {
++			ctrlResync();
++			return;
++		}
++		if (underlyingReceive((uint8_t *)&crc, sizeof(crc)) != kErpcStatus_Success ||
++		    underlyingReceive(m_ctrlRx, bodyLen) != kErpcStatus_Success) {
++			ctrlResync();
++			return;
++		}
++		if (m_crcImpl->computeCRC16(m_ctrlRx, bodyLen) != crc) {
++			ctrlResync();
++			return;
++		}
++
++		uint8_t  cmd  = m_ctrlRx[0];
++		uint8_t  seq  = m_ctrlRx[1];
++		uint32_t plen = (uint32_t)bodyLen - WIO_CTRL_HDR;
++		const uint8_t *payload = m_ctrlRx + WIO_CTRL_HDR;
++		uint32_t rlen = 0u;
++		uint8_t  status = 0u;
++		uint32_t setBaud = 0u;
++
++		switch (cmd) {
++		case WIO_CTRL_PING:
++			/* Fixed-shape commands check their own length: a frame that reached here
++			 * by chance is unlikely to carry exactly the right one. */
++			if (plen != 0u) {
++				status = 1u;
++			}
++			break;
++
++		case WIO_CTRL_STATS: {
++			struct wio_usi_stats us;
++
++			if (plen != 0u) {
++				status = 1u;
++				break;
++			}
++			wio_usi_stats(&us);
++			putU32(m_ctrlTx + WIO_CTRL_HDR +  0, us.irqs);
++			putU32(m_ctrlTx + WIO_CTRL_HDR +  4, us.bytes);
++			putU32(m_ctrlTx + WIO_CTRL_HDR +  8, us.max_burst);
++			putU32(m_ctrlTx + WIO_CTRL_HDR + 12, us.ring_peak);
++			putU32(m_ctrlTx + WIO_CTRL_HDR + 16, us.ring_drops);
++			putU32(m_ctrlTx + WIO_CTRL_HDR + 20, us.hw_overflow);
++			putU32(m_ctrlTx + WIO_CTRL_HDR + 24, us.frame_err);
++			putU32(m_ctrlTx + WIO_CTRL_HDR + 28, (uint32_t)xPortGetFreeHeapSize());
++			putU32(m_ctrlTx + WIO_CTRL_HDR + 32, wio_usi_baud());
++			putU32(m_ctrlTx + WIO_CTRL_HDR + 36, us.ring_size);
++			putU32(m_ctrlTx + WIO_CTRL_HDR + 40, us.max_entry);
++			putU32(m_ctrlTx + WIO_CTRL_HDR + 44, us.rx_trig);
++			rlen = 48u;
++			break;
++		}
++
++		case WIO_CTRL_SETBAUD:
++			/* Four gates, because this is the only command whose misfire costs the
++			 * link: exact length, a magic word, an allow-list of rates, and the
++			 * sequence byte following the last CTRL frame we accepted.  None of them
++			 * is about a hostile peer -- they are about a desynchronised stream
++			 * aligning on 0xFFFF and happening to pass CRC.  The host makes the
++			 * sequence check free by sending LINK_PING immediately before this.
++			 */
++			if (plen != 8u || getU32(payload + 4) != WIO_CTRL_SETBAUD_MAGIC ||
++			    seq != (uint8_t)(m_ctrlSeq + 1u)) {
++				status = 1u;
++				break;
++			}
++			setBaud = getU32(payload);
++			if (setBaud != 2000000u && setBaud != 3000000u &&
++			    setBaud != 4000000u && setBaud != 6000000u) {
++				status = 1u;
++				setBaud = 0u;
++			}
++			break;
++
++		case WIO_CTRL_BENCH: {
++			uint32_t want;
++
++			if (plen < 8u) {
++				status = 1u;
++				break;
++			}
++			want = getU32(payload);
++			if (want > WIO_CTRL_MAX - WIO_CTRL_HDR - 4u) {
++				status = 1u;
++				break;
++			}
++			/* Echo how many payload bytes actually arrived: the host compares it
++			 * with what it sent, which is the direct test for the lost-tail failure
++			 * the stock Arduino ring used to cause. */
++			putU32(m_ctrlTx + WIO_CTRL_HDR, plen - 8u);
++			fillPattern(m_ctrlTx + WIO_CTRL_HDR + 4u, want, payload[4]);
++			rlen = 4u + want;
++			break;
++		}
++
++		default:
++			status = 1u;
++			break;
++		}
++
++		sendCtrl(cmd, seq, status, rlen);
++
++		/* AFTER the acknowledgement is on the wire -- it necessarily goes out at the
++		 * old rate, and the host is waiting for it before it switches its own end. */
++		if (setBaud != 0u) {
++			wio_usi_set_baud(setBaud);
++		}
++		m_ctrlSeq = seq;
++	}
++
++	/* Frame and write the reply held in m_ctrlTx (payload length @rlen). */
++	void sendCtrl(uint8_t cmd, uint8_t seq, uint8_t status, uint32_t rlen)
++	{
++		uint16_t bodyLen = (uint16_t)(WIO_CTRL_HDR + rlen);
++		uint8_t hdr[6];
++
++		m_ctrlTx[0] = cmd;
++		m_ctrlTx[1] = seq;
++		m_ctrlTx[2] = status;
++		m_ctrlTx[3] = 0u;
++
++		hdr[0] = (uint8_t)WIO_CTRL_MAGIC;
++		hdr[1] = (uint8_t)(WIO_CTRL_MAGIC >> 8);
++		hdr[2] = (uint8_t)bodyLen;
++		hdr[3] = (uint8_t)(bodyLen >> 8);
++
++		uint16_t crc = m_crcImpl->computeCRC16(m_ctrlTx, bodyLen);
++		hdr[4] = (uint8_t)crc;
++		hdr[5] = (uint8_t)(crc >> 8);
++
++		/* The worker tasks send eRPC replies concurrently; without this their bytes
++		 * and ours would interleave inside a frame. */
++		Mutex::Guard lock(m_sendLock);
++		wio_usi_write(hdr, sizeof(hdr));
++		wio_usi_write(m_ctrlTx, bodyLen);
++	}
++
++	static void putU32(uint8_t *p, uint32_t v)
++	{
++		p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
++		p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
++	}
++
++	static uint32_t getU32(const uint8_t *p)
++	{
++		return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++		       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++	}
++
++	/* Same generator as the host's, so both ends make identical bytes from a seed.  Its
++	 * job is only to put real transitions on the line; integrity is the frame CRC's. */
++	static void fillPattern(uint8_t *buf, uint32_t n, uint8_t seed)
++	{
++		uint32_t x = 0x12345678u ^ (uint32_t)seed;
++
++		for (uint32_t i = 0u; i < n; i++) {
++			x = x * 1103515245u + 12345u;
++			buf[i] = (uint8_t)(x >> 24);
++		}
++	}
++
+ 	uint32_t m_baudrate;
++	uint8_t  m_ctrlSeq;                  /* last CTRL sequence acted on (diagnostic) */
++	uint8_t  m_ctrlRx[WIO_CTRL_MAX];
++	uint8_t  m_ctrlTx[WIO_CTRL_MAX];
+ };
+ 
+ } /* namespace erpc */
+diff --git a/src/link/wio_usi_uart.c b/src/link/wio_usi_uart.c
+index 0b3df18..07e14d2 100644
+--- a/src/link/wio_usi_uart.c
++++ b/src/link/wio_usi_uart.c
+@@ -24,6 +24,8 @@
+  */
+ 
+ #include "ameba_soc.h"
++#include "FreeRTOS.h"
++#include "task.h"                        /* vTaskDelay, for the baud change settle */
+ #include "wio_usi_uart.h"
+ 
+ #define WIO_USI_DEV        USI0_DEV
+@@ -37,12 +39,16 @@
+ /*
+  * RX FIFO threshold: how many bytes the hardware holds before it interrupts.  This is a
+  * LATENCY budget, not a throughput one -- the FIFO is 64 deep, so the handler has
+- * (64 - threshold) byte times to start before the hardware itself overruns.  32 leaves
+- * 32 byte times (160 us at 2 Mbaud, 53 us at 6 Mbaud), which is generous next to a
+- * FreeRTOS system whose WiFi interrupts are the ones competing, and still cuts the
+- * interrupt rate by 32x against the stock trigger level of 1.
++ * (64 - threshold) byte times to start before the hardware itself overruns.
++ *
++ * Lowered from 32 to 16 after the issue #23 U0-3 sweep on board #2 (see wio_usi_uart.h):
++ * the margin at 32 was 32 byte times, which is 160 us at 2 Mbaud but only 53 us at
++ * 6 Mbaud -- and 6 Mbaud is where this link is going.  16 restores it to 48 byte times
++ * (80 us at 6 Mbaud) at the cost of doubling the interrupt rate, which is a trade this
++ * driver can afford: its handler is a drain loop, and even at 16 it takes 16x fewer
++ * interrupts than the stock trigger level of 1 that it replaced.
+  */
+-#define WIO_USI_RX_TRIG    32u
++#define WIO_USI_RX_TRIG    16u
+ 
+ /* Bit periods of line idle that end a burst holding fewer than WIO_USI_RX_TRIG bytes.
+  * 64 = 6.4 byte times = the SDK default; it scales with the baud rate automatically. */
+@@ -53,6 +59,8 @@
+ #define WIO_RING_SIZE      8192u
+ #define WIO_RING_MASK      (WIO_RING_SIZE - 1u)
+ 
++static uint32_t          wio_baud;           /* what USI_UARTSetBaud last programmed */
++
+ static uint8_t           wio_ring[WIO_RING_SIZE];
+ static volatile uint32_t wio_head;           /* written by the ISR only */
+ static volatile uint32_t wio_tail;           /* written by the reader only */
+@@ -64,6 +72,7 @@ static volatile uint32_t st_ring_peak;
+ static volatile uint32_t st_ring_drops;
+ static volatile uint32_t st_hw_overflow;
+ static volatile uint32_t st_frame_err;
++static volatile uint32_t st_max_entry;
+ 
+ /* ------------------------------------------------------------------ *
+  *  interrupt
+@@ -74,9 +83,20 @@ static u32 wio_usi_irq(void *data)
+ 	u32 err  = ints & (USI_RX_FIFO_OVERFLOW_INTER | USI_UART_STOP_ERROR_INTER);
+ 	uint32_t head = wio_head;
+ 	uint32_t got = 0u, used;
++	uint32_t entry;
+ 
+ 	(void)data;
+ 
++	/* FIFO occupancy BEFORE the drain -- the one number that measures how much of the
++	 * (64 - threshold) grace the interrupt latency actually ate.  st_max_burst cannot:
++	 * it also counts bytes that landed while the loop below was running, which are
++	 * harmless because the loop absorbs them.  On board #2 at 6 Mbaud burst reached
++	 * 56/64 with zero overruns, and there was no way to tell whether that was a late
++	 * entry or a busy drain.  Now there is.  (Single register read, RX_FIFO_STATUS.) */
++	entry = USI_UARTGetRxFifoValidCnt(WIO_USI_DEV);
++	if (entry > st_max_entry)
++		st_max_entry = entry;
++
+ 	if (err != 0u) {
+ 		if (err & USI_RX_FIFO_OVERFLOW_INTER)
+ 			st_hw_overflow++;
+@@ -147,6 +167,7 @@ void wio_usi_init(uint32_t baud)
+ 	cfg.USI_UARTRxTimeOutCnt    = WIO_USI_RX_TO_BITS;
+ 	USI_UARTInit(WIO_USI_DEV, &cfg);
+ 	USI_UARTSetBaud(WIO_USI_DEV, baud);
++	wio_baud = baud;
+ 	USI_UARTRxCmd(WIO_USI_DEV, ENABLE);
+ 
+ 	/* Register before enabling any source, so the first interrupt cannot land on the
+@@ -207,6 +228,34 @@ void wio_usi_write(const uint8_t *buf, uint32_t len)
+ 	}
+ }
+ 
++uint32_t wio_usi_baud(void)
++{
++	return wio_baud;
++}
++
++void wio_usi_set_baud(uint32_t baud)
++{
++	uint32_t spin;
++
++	/* USI_UARTWritable() is "TX FIFO EMPTY", not "not full" (rtl8721dhp_usi_uart.c:339),
++	 * so this waits for the FIFO to drain rather than for room in it.  Bounded: a wedged
++	 * FIFO must not leave the link stuck at the old rate with the host already moved. */
++	for (spin = 0u; spin < 1000000u && !USI_UARTWritable(WIO_USI_DEV); spin++)
++		;
++	/* The last character is still in the shift register after the FIFO reports empty, and
++	 * there is no busy bit for USI.  One tick is ~200 character times at 2 Mbaud, which
++	 * settles it with an enormous margin. */
++	vTaskDelay(1);
++
++	USI_UARTSetBaud(WIO_USI_DEV, baud);
++	wio_baud = baud;
++
++	/* Anything the receiver latched around the change was sampled with the wrong bit
++	 * period; drop the hardware FIFO and our ring so the next frame starts clean. */
++	USI_UARTClearRxFifo(WIO_USI_DEV);
++	wio_tail = wio_head;
++}
++
+ void wio_usi_stats(struct wio_usi_stats *out)
+ {
+ 	if (out == NULL)
+@@ -218,4 +267,7 @@ void wio_usi_stats(struct wio_usi_stats *out)
+ 	out->ring_drops  = st_ring_drops;
+ 	out->hw_overflow = st_hw_overflow;
+ 	out->frame_err   = st_frame_err;
++	out->ring_size   = WIO_RING_SIZE;
++	out->max_entry   = st_max_entry;
++	out->rx_trig     = WIO_USI_RX_TRIG;
+ }
+diff --git a/src/link/wio_usi_uart.h b/src/link/wio_usi_uart.h
+index f7333d3..fe58f38 100644
+--- a/src/link/wio_usi_uart.h
++++ b/src/link/wio_usi_uart.h
+@@ -24,6 +24,11 @@
+  * SPSC discipline, matching the host side (app/rtl8720.c): the interrupt is the only
+  * writer of `head`, the eRPC receive task the only writer of `tail`.  A full ring drops
+  * the NEWEST byte and counts it, so the loss is always visible rather than silent.
++ *
++ * The RX threshold is a LATENCY budget: the FIFO is 64 deep, so the handler has
++ * (64 - threshold) byte times to start before the hardware overruns and a byte is lost
++ * where no software counter can see it.  Issue #23 U0-3 measured the link up to 6 Mbaud,
++ * where a byte is 1.67 us, and lowered the threshold from 32 to 16 for that reason.
+  */
+ #ifndef WIO_USI_UART_H
+ #define WIO_USI_UART_H
+@@ -61,11 +66,38 @@ struct wio_usi_stats {
+ 	uint32_t ring_drops;    /* bytes lost because the ring was full */
+ 	uint32_t hw_overflow;   /* RX FIFO overrun interrupts: hardware loss, must stay 0 */
+ 	uint32_t frame_err;     /* stop-bit (framing) errors: marginal baud rate */
++	uint32_t ring_size;     /* ring capacity, so ring_peak can be read as a fraction */
++	uint32_t max_entry;     /* high-water FIFO occupancy AT INTERRUPT ENTRY -- the real
++	                         * measure of consumed grace.  Overrun happens at 64, so the
++	                         * budget is (64 - rx_trig) and this says how much was used;
++	                         * max_burst above cannot answer that, because it also counts
++	                         * bytes that arrived during the drain (which are free) */
++	uint32_t rx_trig;       /* the configured threshold, so a reader can compute the
++	                         * budget without knowing this driver's constants */
+ };
+ 
+ /* Snapshot of the counters.  Monotonic since wio_usi_init(). */
+ void wio_usi_stats(struct wio_usi_stats *out);
+ 
++/*
++ * Change the line rate on the fly (issue #23 U0-3, LINK_SETBAUD).
++ *
++ * ONLY call this with the link quiescent -- the host guarantees that before it asks, and
++ * the caller must already have finished sending the acknowledgement, because that
++ * acknowledgement necessarily goes out at the OLD rate.  The sequence here is: wait for
++ * the TX FIFO to empty, pause long enough for the last character to leave the shift
++ * register, reprogram, then discard whatever the RX side thinks it saw across the change.
++ *
++ * USI_UARTSetBaud() is a plain read-modify-write of the TX and RX baud registers -- no
++ * FIFO reset, no disable required (seeed-ambd-sdk
++ * component/soc/realtek/amebad/fwlib/ram_hp/rtl8721dhp_usi_uart.c, USI_UARTSetBaud),
++ * which is what makes an on-the-fly change legitimate rather than merely lucky.
++ */
++void wio_usi_set_baud(uint32_t baud);
++
++/* The rate currently programmed (what wio_usi_init/_set_baud last set). */
++uint32_t wio_usi_baud(void);
++
+ #ifdef __cplusplus
+ }
+ #endif

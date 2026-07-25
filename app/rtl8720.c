@@ -132,6 +132,19 @@ static volatile uint32_t rtl_uart_ferr;       /* framing / noise events */
 static USART_TypeDef *volatile rtl_uart;
 static IRQn_Type              rtl_irqn;
 
+/*
+ * Optional "bytes have landed" callback, run from the RX ISR right after the ring's
+ * head is published (issue #23 U0-3).  Its only user is the eRPC service thread, which
+ * otherwise notices new bytes on its 1 ms poll: for a 1500-byte frame at 6 Mbaud
+ * (2.5 ms on the wire) that adds up to 1 ms per frame, enough to hide the difference
+ * between 4 and 6 Mbaud in the U0-3 measurements.  The poll is deliberately KEPT as the
+ * backstop, so this is a wake-up latency optimisation and nothing depends on it for
+ * correctness -- a dropped notification costs at most one poll period.
+ *
+ * Cleared by open/close, so a callback can never outlive the session that installed it.
+ */
+static void (*volatile rtl_rx_notify)(void);
+
 /* ------------------------------------------------------------------ *
  *  CHIP_EN (power/enable)
  * ------------------------------------------------------------------ */
@@ -273,8 +286,15 @@ static void rtl_uart_isr(void)
 		n++;
 	}
 	if (n != 0u) {
+		void (*notify)(void) = rtl_rx_notify;
+
 		__DMB();                                  /* data stores before head publish */
 		rtl_ring_head = head;
+		/* AFTER the publish: the woken reader must see the bytes this notification
+		 * is announcing.  Inside the DWT window below on purpose -- isr_max_cycles
+		 * must report what the ISR really costs now, including this. */
+		if (notify != NULL)
+			notify();
 	}
 	/* High-water of what the FIFO had accumulated by the time we got here -- count
 	 * every byte pulled from RDR, including any the ring had to drop, because it is
@@ -309,10 +329,18 @@ void USART1_IRQHandler(void)
 /* ------------------------------------------------------------------ *
  *  UART bring-up / teardown
  * ------------------------------------------------------------------ */
+void rtl8720_uart_set_rx_notify(void (*cb)(void))
+{
+	rtl_rx_notify = cb;
+}
+
 void rtl8720_uart_close(void)
 {
 	if (rtl_uart == NULL)
 		return;
+	/* Drop the callback BEFORE the interrupt goes away, so no ISR already in flight
+	 * can call into a session that is being torn down. */
+	rtl_rx_notify = NULL;
 	NVIC_DisableIRQ(rtl_irqn);
 	__DSB();
 	__ISB();                             /* the disable takes effect before we go on */
@@ -340,6 +368,9 @@ int rtl8720_uart_open(enum rtl8720_uart which, uint32_t baud)
 	if (rtl_uart != NULL)
 		rtl8720_uart_close();
 	rtl_ring_reset();
+	/* A fresh open owes nothing to the previous session: whoever wants notifications
+	 * re-arms them afterwards (app/erpc.c does, from erpc_link_opened()). */
+	rtl_rx_notify = NULL;
 
 	io.Mode  = GPIO_MODE_AF_PP;
 	io.Pull  = GPIO_PULLUP;              /* idle-high RX when the module is not driving */

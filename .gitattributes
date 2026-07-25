@@ -3,4 +3,7 @@
 # patch files must therefore keep CRLF so `git apply` matches the target byte-for-byte.
 # Tell git that a CR at end-of-line is expected here, so `git diff --check` / commit hooks
 # do not flag every CRLF context line as trailing whitespace, and never normalise them.
-/fw/rtl8720/patches/*.patch -text whitespace=cr-at-eol,-trailing-space
+# `space-before-tab` is off for the same structural reason: a diff line is a one-character
+# marker followed by the original line, so EVERY tab-indented line of patched source reads
+# as "space before tab" -- it says nothing about the code inside (issue #23 U0-3).
+/fw/rtl8720/patches/*.patch -text whitespace=cr-at-eol,-trailing-space,-space-before-tab

@@ -147,8 +147,9 @@ static int wifi_bridge_run(struct cli_instance *sh, enum rtl8720_uart which,
 	          name, (unsigned long)baud, do_reset ? " (reset first)" : "");
 	if (do_reset) {
 		rtl8720_reset();                        /* Low->High edge AFTER we listen */
-		rtl_tcpip_set_inited(false);            /* power-cycled: lwIP must be re-inited */
-		rtl_set_ip_mode(RTL_IP_UNKNOWN);        /* and any address is gone */
+		rtl_link_forget_module();               /* power-cycled: the module we come back
+		                                         * to is at 2 Mbaud with unknown firmware
+		                                         * and no lwIP */
 	}
 	cli_rx_flush(sh);                               /* drop console type-ahead */
 
@@ -217,11 +218,7 @@ static int cmd_wifi_on(struct cli_instance *sh, int argc, char **argv)
 	(void)argc; (void)argv;
 	if (wifi_power_claim(sh, "wifi on"))
 		return 1;
-	if (!rtl8720_powered()) {
-		rtl_tcpip_set_inited(false);           /* fresh power-on: lwIP not yet up */
-		rtl_set_ip_mode(RTL_IP_UNKNOWN);
-	}
-	rtl_link_force_quiesce();                      /* nobody may hold the link across
+	rtl_link_force_quiesce();                      /* also forgets rate/firmware/lwIP */                      /* nobody may hold the link across
 	                                                * a CHIP_EN change */
 	rtl8720_power(true);
 	rtl_link_hw_release(sh);
@@ -235,9 +232,8 @@ static int cmd_wifi_off(struct cli_instance *sh, int argc, char **argv)
 	if (wifi_power_claim(sh, "wifi off"))
 		return 1;
 	rtl_link_force_quiesce();                  /* recovery path: take the link away */
-	rtl8720_power(false);
-	rtl_tcpip_set_inited(false);               /* module state lost on power-off */
-	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	rtl8720_power(false);                      /* force_quiesce above already forgot the
+	                                            * module: rate, firmware, lwIP, address */
 	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: CHIP_EN low (RTL8720DN powered off)\r\n");
 	return 0;
@@ -249,9 +245,8 @@ static int cmd_wifi_reset(struct cli_instance *sh, int argc, char **argv)
 	if (wifi_power_claim(sh, "wifi reset"))
 		return 1;
 	rtl_link_force_quiesce();                  /* recovery path: take the link away */
-	rtl8720_reset();
-	rtl_tcpip_set_inited(false);               /* power-cycled: lwIP must be re-inited */
-	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	rtl8720_reset();                           /* force_quiesce above already forgot the
+	                                            * module: rate, firmware, lwIP, address */
 	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: reset (CHIP_EN low 80 ms -> high)\r\n");
 	return 0;
@@ -311,9 +306,32 @@ static void print_rx_budget(struct cli_instance *sh,
 	          (st->ore || st->ferr || st->drops) ? "  <-- NOT CLEAN" : "  (clean)");
 }
 
+/*
+ * Extract N from a "2.1.3+wio-nN" build id; 0 if the string is not one of ours.
+ *
+ * The generation is what gates every firmware-dependent capability (see
+ * erpc_set_module_gen), so it has to be read as an ordered number: a string compare
+ * against the newest id withdraws capabilities as soon as the next one is flashed, and a
+ * compare against an old one keeps claiming them after a downgrade.
+ */
+static uint8_t fw_gen_of(const char *ver)
+{
+	const char *p = strstr(ver, "wio-n");
+	unsigned n = 0u;
+
+	if (p == NULL)
+		return 0u;
+	p += 5;                                     /* past "wio-n" */
+	if (*p < '0' || *p > '9')
+		return 0u;
+	while (*p >= '0' && *p <= '9' && n < 255u)
+		n = n * 10u + (unsigned)(*p++ - '0');
+	return (uint8_t)((n > 255u) ? 255u : n);
+}
+
 static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 {
-	uint32_t baud = 2000000u;
+	uint32_t baud = rtl_link_erpc_baud();       /* whatever the link runs at now */
 	uint8_t echoed = 0u;
 	struct erpc_diag diag = {0}, total = {0};
 	struct rtl8720_uart_stats st = {0};
@@ -331,9 +349,12 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 		want_version = 1;
 		ai = 2;
 	}
+	/* Upper bound is the module's own UART ceiling (rtl8721d_usi_uart.h: 110..6000000),
+	 * raised from 2 M when issue #23 U0-3 made the link rate changeable -- this is a
+	 * one-shot probe at a given rate, though; `link baud` is what CHANGES the link. */
 	if (argc > ai && (parse_u32(argv[ai], &baud) != 0 ||
-	    baud < 2400u || baud > 2000000u)) {
-		cli_error(sh, "wifi: bad baud (2400..2000000)\r\n");
+	    baud < 2400u || baud > 6000000u)) {
+		cli_error(sh, "wifi: bad baud (2400..6000000)\r\n");
 		return 1;
 	}
 	/* Its own claim rather than rtl_link_begin(): the baud is caller-chosen here, and a
@@ -344,8 +365,7 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 	if (!rtl8720_powered()) {
 		cli_print(sh, "wifi: powering on RTL8720DN, waiting ~1.5s for boot...\r\n");
 		rtl8720_power(true);
-		rtl_tcpip_set_inited(false);       /* fresh boot: lwIP not yet up */
-		rtl_set_ip_mode(RTL_IP_UNKNOWN);
+		rtl_link_forget_module();          /* fresh boot: 2 Mbaud, fw unknown, no lwIP */
 		if (cli_sleep(sh, 1500u)) {         /* cancellable boot wait */
 			rtl_link_hw_release(sh);
 			return 1;
@@ -367,6 +387,7 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 		total.skipped_reply          += diag.skipped_reply;
 		total.unsupported_invocation += diag.unsupported_invocation;
 		total.frame_stall            += diag.frame_stall;
+		total.ctrl_bad               += diag.ctrl_bad;
 		if (rc == 0 && echoed == 0x5Au)
 			break;
 		if (cli_sleep(sh, 50u))            /* brief gap; Ctrl+C aborts */
@@ -379,15 +400,19 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 		if (erpc_system_version(ver, (uint16_t)sizeof(ver), &vdiag) >= 0)
 			have_ver = 1;
 		/* This is the only place the host learns which firmware it is talking to, so it
-		 * is where the issue #23 U0-2 wire budget is earned: `wio-n4` means the module
-		 * owns USI0 behind an 8 kB ring, and the 127-byte limit that shaped every
-		 * request size above it no longer exists.  Anything else -- including a version
-		 * query that failed -- leaves the conservative budget in place.  It is dropped
-		 * again by any flash session or CHIP_EN move (rtl_dl_enter /
-		 * rtl_link_force_quiesce), so it can only ever describe the module in front of
-		 * us. */
-		if (have_ver && strstr(ver, "wio-n4") != NULL)
-			erpc_set_wire_budget(ERPC_WIRE_BUDGET_FAST);
+		 * is where every firmware-dependent capability is earned: the issue #23 U0-2
+		 * wire budget (n4 owns USI0 behind an 8 kB ring, so the 127-byte limit that
+		 * shaped every request size is gone) and the U0-3 LINK-CTRL channel (n5).
+		 * Anything else -- including a version query that failed -- leaves the
+		 * generation at 0, i.e. every conservative default.  It is dropped again by any
+		 * flash session or CHIP_EN move (rtl_dl_enter / rtl_link_forget_module), so it
+		 * can only ever describe the module in front of us.
+		 *
+		 * Parsed as a NUMBER rather than matched against one string: the build id moves
+		 * with every firmware increment, and "== wio-n4" silently withdrew the
+		 * capability the moment n5 was flashed. */
+		if (have_ver)
+			erpc_set_module_gen(fw_gen_of(ver));
 	}
 	/* Snapshot before the unref: the counters survive the close (they are only reset
 	 * by rtl8720_uart_open) but reading them here keeps them tied to this session. */
@@ -408,17 +433,19 @@ static int cmd_wifi_rpc(struct cli_instance *sh, int argc, char **argv)
 		 * successful link test, not only for `ver`, because it is the one piece of state
 		 * a reader cannot infer: it outlives this command (the UART reference does not)
 		 * but not a reset or a flash session. */
-		cli_print(sh, "  wire: budget %u B, send chunk %u B%s\r\n",
+		cli_print(sh, "  wire: budget %u B, send chunk %u B (fw gen n%u%s)\r\n",
 		          (unsigned)erpc_wire_budget(), (unsigned)wifi_rpc_send_chunk(),
-		          (erpc_wire_budget() > ERPC_WIRE_BUDGET_SAFE) ? " (wio-n4 link)"
-		                                                       : " (conservative)");
+		          (unsigned)erpc_module_gen(),
+		          (erpc_module_gen() >= 5u) ? ", link ctrl"
+		                                    : ((erpc_module_gen() == 0u) ? " = unknown"
+		                                                                 : ""));
 	} else {
 		cli_error(sh, "wifi: eRPC FAILED -- ack 0x5A -> 0x%02X (rc %d)\r\n", echoed, rc);
 	}
 	cli_print(sh, "  diag: crc_fail %u oversize %u timeout %u skipped %u unsupported %u "
-	          "stall %u\r\n",
+	          "stall %u ctrl_bad %u\r\n",
 	          total.crc_fail, total.oversize, total.timeout, total.skipped_reply,
-	          total.unsupported_invocation, total.frame_stall);
+	          total.unsupported_invocation, total.frame_stall, total.ctrl_bad);
 	/* RX interrupt-latency budget (issue #23 U0-1).  `bytes/grace` is how much of the
 	 * RXFIFO's post-threshold headroom the worst interrupt actually used -- it is the
 	 * number that says whether the threshold scheme holds at a higher baud.  Times are
@@ -1023,8 +1050,7 @@ recover:
 	 * invalidate the host-tracked lwIP / IP state (the module rebooted). */
 	rtl8720_uart_close();
 	rtl8720_reset();
-	rtl_tcpip_set_inited(false);
-	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	rtl_link_forget_module();       /* it rebooted: rate, firmware, lwIP all unknown */
 	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
 	return hit ? 0 : 1;
@@ -1084,8 +1110,7 @@ recover:
 	/* Always: close UART9, power-cycle back to the normal eRPC firmware, invalidate state. */
 	rtl8720_uart_close();
 	rtl8720_reset();
-	rtl_tcpip_set_inited(false);
-	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	rtl_link_forget_module();       /* it rebooted: rate, firmware, lwIP all unknown */
 	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
 	return ok ? 0 : 1;
@@ -1140,8 +1165,7 @@ static int cmd_wifi_flashread(struct cli_instance *sh, int argc, char **argv)
 recover:
 	rtl8720_uart_close();
 	rtl8720_reset();
-	rtl_tcpip_set_inited(false);
-	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	rtl_link_forget_module();       /* it rebooted: rate, firmware, lwIP all unknown */
 	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
 	return ok ? 0 : 1;
@@ -1218,8 +1242,7 @@ static int cmd_wifi_flashtest(struct cli_instance *sh, int argc, char **argv)
 recover:
 	rtl8720_uart_close();
 	rtl8720_reset();
-	rtl_tcpip_set_inited(false);
-	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	rtl_link_forget_module();       /* it rebooted: rate, firmware, lwIP all unknown */
 	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
 	return ok ? 0 : 1;
@@ -1341,8 +1364,7 @@ static int cmd_wifi_flashinfo(struct cli_instance *sh, int argc, char **argv)
 recover:
 	rtl8720_uart_close();
 	rtl8720_reset();
-	rtl_tcpip_set_inited(false);
-	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	rtl_link_forget_module();       /* it rebooted: rate, firmware, lwIP all unknown */
 	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
 	return ok ? 0 : 1;
@@ -1538,8 +1560,7 @@ static int cmd_wifi_flashbackup(struct cli_instance *sh, int argc, char **argv)
 recover:
 	rtl8720_uart_close();
 	rtl8720_reset();
-	rtl_tcpip_set_inited(false);
-	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	rtl_link_forget_module();       /* it rebooted: rate, firmware, lwIP all unknown */
 	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
 	return ok ? 0 : 1;
@@ -1897,8 +1918,7 @@ static int cmd_wifi_flashwrite(struct cli_instance *sh, int argc, char **argv)
 recover:
 	rtl8720_uart_close();
 	rtl8720_reset();
-	rtl_tcpip_set_inited(false);
-	rtl_set_ip_mode(RTL_IP_UNKNOWN);
+	rtl_link_forget_module();       /* it rebooted: rate, firmware, lwIP all unknown */
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
 out:
 	psram_release();

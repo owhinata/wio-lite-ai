@@ -21,6 +21,11 @@
  *                          carries, copying the payload into that caller's @out
  *   caller: erpc_wait()    polls its slot / abort hook / deadline on 1 ms slices
  *
+ * Issue #23 U0-3 adds a second frame type on the same wire, the LINK-CTRL channel (see
+ * erpc.h): one extra slot, sent and received by the same thread, that carries link-layer
+ * business rather than eRPC -- reading the module's UART counters, changing the baud
+ * rate, and generating measured traffic.  It is only ever used on a quiescent link.
+ *
  * Why a dedicated thread: the issue-#20 N3 firmware serves several requests at once
  * and replies out of order, and its accept/recv block for seconds on the module.  A
  * per-call lock would let one blocking accept freeze the whole link, so instead the
@@ -85,11 +90,26 @@
 #define ERPC_SVC_PRIORITY    10u
 #define ERPC_SVC_STACK       1536u
 
-/* Event flags: one "work posted" bit plus one completion bit per slot. */
+/* Event flags: one "work posted" bit, one CTRL completion bit, one completion bit per
+ * eRPC slot.  ERPC_F_CTRL sits next to ERPC_F_WORK, clear of the 0x100.. DONE group. */
 #define ERPC_F_WORK          0x00000001u
+#define ERPC_F_CTRL          0x00000002u
 #define ERPC_F_DONE(i)       (0x00000100u << (i))
 
+/* Leading u16 of a LINK-CTRL frame (issue #23 U0-3).  See the channel description in
+ * erpc.h for why this cannot collide with an eRPC frame's message size. */
+#define ERPC_CTRL_MAGIC      0xFFFFu
+
+/* CTRL body header: cmd, seq, status, reserved. */
+#define ERPC_CTRL_HDR        4u
+
 static uint8_t erpc_scratch[ERPC_RX_SCRATCH];
+
+/* CTRL frames assemble into the same scratch (the reader is single and never has more
+ * than one frame in progress), so they must fit it. */
+_Static_assert(ERPC_CTRL_MAX <= ERPC_RX_SCRATCH,
+               "CTRL frames share the eRPC receive scratch");
+
 static uint32_t erpc_seq;                /* monotonically-increasing request sequence */
 
 /* ------------------------------------------------------------------ *
@@ -119,6 +139,35 @@ struct erpc_slot {
 static struct erpc_slot erpc_slots[ERPC_MAX_INFLIGHT];
 
 /* ------------------------------------------------------------------ *
+ *  LINK-CTRL slot (issue #23 U0-3) -- exactly one exchange at a time
+ * ------------------------------------------------------------------ */
+/*
+ * Deliberately NOT part of erpc_slots[]: a CTRL frame is a different frame type with its
+ * own header, so merging them would mean teaching the eRPC send/dispatch paths about a
+ * second wire format.  It does, however, share every LIFECYCLE rule -- it is sent by the
+ * service thread, counts as pending work, and is abandoned when the link is torn down --
+ * and each of those places is updated in step (see erpc_work_pending, erpc_abandon_all).
+ *
+ * One slot is enough because CTRL is only issued on a quiescent link, under the coarse
+ * link mutex; a second caller gets -1 rather than queueing.
+ */
+struct erpc_ctrl_slot {
+	uint8_t    state;                /* the ERPC_ST_* states, same meanings */
+	uint8_t    cmd;                  /* command this exchange is waiting on */
+	uint8_t    seq;                  /* and its sequence byte */
+	uint8_t    status;               /* status byte the module answered with */
+	uint8_t   *out;                  /* caller's reply buffer (may be NULL) */
+	uint16_t   out_cap;
+	uint16_t   reply_len;            /* payload length, excluding the 4-byte body header */
+	uint16_t   body_len;             /* ERPC_CTRL_HDR + request payload */
+	uint16_t   crc;
+	TX_THREAD *waiter;
+	uint8_t    body[ERPC_CTRL_MAX];
+};
+static struct erpc_ctrl_slot erpc_ctrl;
+static uint8_t               erpc_ctrl_seq;
+
+/* ------------------------------------------------------------------ *
  *  wire ledger (what the module has not answered yet)
  * ------------------------------------------------------------------ */
 /*
@@ -136,10 +185,11 @@ struct erpc_debt {
 };
 static struct erpc_debt erpc_debts[ERPC_WIRE_DEBTS];
 
-/* How many of those bytes may be outstanding.  Module-scoped, owned by app/rtl_link.c --
- * see the erpc_set_wire_budget() contract in erpc.h for why it does NOT follow the link
- * open/close cycle. */
+/* How many of those bytes may be outstanding, and the module generation it is derived
+ * from.  Module-scoped, owned by app/rtl_link.c -- see the erpc_set_module_gen() contract
+ * in erpc.h for why they do NOT follow the link open/close cycle. */
 static uint16_t erpc_budget = ERPC_WIRE_BUDGET_SAFE;
+static uint8_t  erpc_mod_gen;            /* N of "2.1.3+wio-nN"; 0 = unknown */
 
 static uint16_t erpc_bytes_on_wire(void)
 {
@@ -200,6 +250,7 @@ struct erpc_counters {
 	uint32_t skipped_reply;
 	uint32_t unsupported_invocation;
 	uint32_t frame_stall;
+	uint32_t ctrl_bad;
 };
 static struct erpc_counters erpc_ctr;
 
@@ -221,6 +272,7 @@ static void erpc_diag_delta(struct erpc_diag *diag, const struct erpc_counters *
 	diag->unsupported_invocation = erpc_delta16(erpc_ctr.unsupported_invocation,
 	                                            snap->unsupported_invocation);
 	diag->frame_stall            = erpc_delta16(erpc_ctr.frame_stall, snap->frame_stall);
+	diag->ctrl_bad               = erpc_delta16(erpc_ctr.ctrl_bad, snap->ctrl_bad);
 }
 
 /* ------------------------------------------------------------------ *
@@ -240,6 +292,27 @@ static uint8_t              erpc_ready;   /* service thread + objects exist */
  * open (the `wifi log` bridge) does NOT count -- that carries no eRPC.
  */
 static uint8_t              erpc_link_up;
+
+/*
+ * Set while the service thread is (about to be) parked on the event flag, i.e. while it
+ * is NOT looking at the RX ring.  Written under erpc_lock before the park and cleared on
+ * wake; read by the RX interrupt to decide whether a wake-up is worth signalling.  See
+ * the ordering argument at the park site -- dropping a notification is always safe.
+ */
+static volatile uint8_t     erpc_parked;
+
+/*
+ * RX interrupt hook (issue #23 U0-3).  Without it the service thread only notices bytes
+ * on its 1 ms poll, which adds up to 1 ms to every frame -- ~20 % of a 1500-byte frame at
+ * 6 Mbaud, enough to hide the 4-versus-6 Mbaud difference the U0-3 measurements exist to
+ * find.  Runs in interrupt context at NVIC priority 5; tx_event_flags_set is legal there
+ * (this ThreadX port uses PRIMASK critical sections, so an ISR cannot preempt one).
+ */
+static void erpc_rx_ready(void)
+{
+	if (erpc_parked)
+		tx_event_flags_set(&erpc_flags, ERPC_F_WORK, TX_OR);
+}
 
 static void erpc_lock_get(void)  { tx_mutex_get(&erpc_lock, TX_WAIT_FOREVER); }
 static void erpc_lock_put(void)  { tx_mutex_put(&erpc_lock); }
@@ -298,8 +371,11 @@ uint16_t erpc_crc16(const uint8_t *d, uint16_t n)
  * scratch); the deterministic clean point is the flush the send step does whenever
  * nothing is on the wire, i.e. at every command boundary.
  */
-static uint8_t  rx_hdr[4];
+/* Header staging: 4 bytes for an eRPC frame, 6 for a CTRL one (magic, length, CRC). */
+static uint8_t  rx_hdr[6];
 static uint8_t  rx_hdr_got;
+static uint8_t  rx_hdr_need = 4u;        /* 4, or 6 once the CTRL magic is seen */
+static uint8_t  rx_is_ctrl;              /* the frame being assembled is a CTRL frame */
 static uint16_t rx_size, rx_crc, rx_body_got;
 static uint32_t rx_drain_left;           /* oversize frame: bytes still to discard */
 static uint8_t  rx_active;               /* a partial frame is in progress */
@@ -309,6 +385,8 @@ static uint32_t rx_ovf_seen;             /* last observed rtl8720_uart_overflows
 static void erpc_reader_reset(void)
 {
 	rx_hdr_got    = 0u;
+	rx_hdr_need   = 4u;
+	rx_is_ctrl    = 0u;
 	rx_size       = 0u;
 	rx_crc        = 0u;
 	rx_body_got   = 0u;
@@ -392,6 +470,39 @@ static void erpc_dispatch(const uint8_t *body, uint16_t len, uint16_t crc)
 	erpc_ctr.skipped_reply++;                /* reply for an unknown / released seq */
 }
 
+/*
+ * Route one complete CTRL frame body to the single CTRL slot.  Caller holds erpc_lock.
+ *
+ * Two different rejections, deliberately handled differently: a CRC failure says the BYTE
+ * STREAM is suspect (very likely a desynchronised reader that aligned on 0xFFFF by
+ * chance), so it resynchronises; a well-formed frame nobody is waiting for is just a late
+ * reply to a timed-out exchange, which leaves the stream perfectly healthy.
+ */
+static void erpc_ctrl_dispatch(const uint8_t *body, uint16_t len, uint16_t crc)
+{
+	struct erpc_ctrl_slot *s = &erpc_ctrl;
+	uint16_t plen, copy;
+
+	if (len < ERPC_CTRL_HDR || erpc_crc16(body, len) != crc) {
+		erpc_ctr.ctrl_bad++;
+		erpc_stream_reset_locked();
+		return;
+	}
+	if (s->state != ERPC_ST_SENT || body[0] != s->cmd || body[1] != s->seq) {
+		erpc_ctr.ctrl_bad++;             /* stale / unsolicited: drop it, stream is fine */
+		return;
+	}
+
+	plen = (uint16_t)(len - ERPC_CTRL_HDR);
+	copy = (plen < s->out_cap) ? plen : s->out_cap;
+	if (s->out != NULL && copy != 0u)
+		memcpy(s->out, body + ERPC_CTRL_HDR, copy);
+	s->status    = body[2];
+	s->reply_len = plen;
+	s->state     = ERPC_ST_DONE;
+	tx_event_flags_set(&erpc_flags, ERPC_F_CTRL, TX_OR);
+}
+
 /* Advance the reader by whatever the ring holds.  Returns 1 if any byte was consumed
  * (or a frame completed), 0 if it made no progress.  Caller holds erpc_lock. */
 static int erpc_rx_step(void)
@@ -415,30 +526,54 @@ static int erpc_rx_step(void)
 		return 1;
 	}
 
-	if (rx_hdr_got < 4u) {
-		r = rtl8720_uart_read(rx_hdr + rx_hdr_got, (size_t)(4u - rx_hdr_got));
+	if (rx_hdr_got < rx_hdr_need) {
+		r = rtl8720_uart_read(rx_hdr + rx_hdr_got,
+		                      (size_t)(rx_hdr_need - rx_hdr_got));
 		if (r != 0u) {
 			rx_hdr_got = (uint8_t)(rx_hdr_got + r);
 			rx_active  = 1u;
 			progress   = 1;
 		}
-		if (rx_hdr_got < 4u)
-			return progress;
-		rx_size     = get_u16le(rx_hdr + 0);
-		rx_crc      = get_u16le(rx_hdr + 2);
-		rx_body_got = 0u;
-		if (rx_size > ERPC_RX_SCRATCH) {         /* too big: drain to resync */
-			erpc_ctr.oversize++;
-			rx_drain_left = rx_size;
-			return 1;
+		/* The CTRL marker is decided from the first two bytes, so the header grows
+		 * from 4 to 6 as soon as they are in -- before the length is believed. */
+		if (rx_hdr_got >= 2u && rx_hdr_need == 4u &&
+		    get_u16le(rx_hdr + 0) == ERPC_CTRL_MAGIC) {
+			rx_is_ctrl  = 1u;
+			rx_hdr_need = 6u;
 		}
-		if (rx_size < 8u) {                      /* cannot be a valid message */
-			erpc_ctr.crc_fail++;
-			erpc_reader_reset();
-			return 1;
+		if (rx_hdr_got < rx_hdr_need)
+			return progress;
+
+		rx_body_got = 0u;
+		if (rx_is_ctrl) {
+			rx_size = get_u16le(rx_hdr + 2);
+			rx_crc  = get_u16le(rx_hdr + 4);
+			/* NEVER drain a CTRL length we do not believe: on a desynchronised
+			 * stream it is attacker-free but arbitrary, and draining it would
+			 * swallow real frames.  Resynchronise instead. */
+			if (rx_size > ERPC_CTRL_MAX || rx_size < ERPC_CTRL_HDR) {
+				erpc_ctr.ctrl_bad++;
+				erpc_stream_reset_locked();
+				return 1;
+			}
+		} else {
+			rx_size = get_u16le(rx_hdr + 0);
+			rx_crc  = get_u16le(rx_hdr + 2);
+			if (rx_size > ERPC_RX_SCRATCH) {  /* too big: drain to resync */
+				erpc_ctr.oversize++;
+				rx_drain_left = rx_size;
+				return 1;
+			}
+			if (rx_size < 8u) {               /* cannot be a valid message */
+				erpc_ctr.crc_fail++;
+				erpc_reader_reset();
+				return 1;
+			}
 		}
 	}
 
+	/* Both frame types assemble into the same scratch: the reader is single and never
+	 * has more than one frame in progress.  ERPC_CTRL_MAX <= ERPC_RX_SCRATCH. */
 	if (rx_body_got < rx_size) {
 		r = rtl8720_uart_read(erpc_scratch + rx_body_got,
 		                      (size_t)(rx_size - rx_body_got));
@@ -450,7 +585,10 @@ static int erpc_rx_step(void)
 			return progress;
 	}
 
-	erpc_dispatch(erpc_scratch, rx_size, rx_crc);
+	if (rx_is_ctrl)
+		erpc_ctrl_dispatch(erpc_scratch, rx_size, rx_crc);
+	else
+		erpc_dispatch(erpc_scratch, rx_size, rx_crc);
 	erpc_reader_reset();
 	return 1;
 }
@@ -508,11 +646,45 @@ static int erpc_send_one(void)
 	return 0;
 }
 
-/* Any slot still needing the service thread's attention? Caller holds erpc_lock. */
+/*
+ * Send the queued CTRL frame, if any.  Returns 1 if it went out.  Caller holds erpc_lock.
+ *
+ * CTRL bypasses the wire ledger and the budget entirely: it is only ever issued on a
+ * quiescent link (erpc_link_quiescent() is a precondition of every caller), so there is
+ * nothing to account against and nothing to interleave with.
+ */
+static int erpc_ctrl_send(void)
+{
+	struct erpc_ctrl_slot *s = &erpc_ctrl;
+	uint8_t hdr[6];
+
+	if (!erpc_link_up || s->state != ERPC_ST_QUEUED)
+		return 0;
+	if (erpc_bytes_on_wire() == 0u) {
+		/* Same rule as the eRPC send step: with nothing outstanding, start from a
+		 * clean frame boundary so a stale byte cannot be parsed as our reply. */
+		erpc_stream_reset_locked();
+	}
+	put_u16le(hdr + 0, ERPC_CTRL_MAGIC);
+	put_u16le(hdr + 2, s->body_len);
+	put_u16le(hdr + 4, s->crc);
+	rtl8720_uart_write(hdr, sizeof(hdr));
+	rtl8720_uart_write(s->body, s->body_len);
+	s->state = ERPC_ST_SENT;
+	return 1;
+}
+
+/* Any slot still needing the service thread's attention? Caller holds erpc_lock.
+ *
+ * The CTRL slot MUST be counted here: it is what makes the loop below wait one tick
+ * instead of parking on TX_WAIT_FOREVER, and a parked thread polls no RX at all -- a
+ * CTRL reply would then never be read and every CTRL call would time out. */
 static int erpc_work_pending(void)
 {
 	int i;
 
+	if (erpc_ctrl.state == ERPC_ST_QUEUED || erpc_ctrl.state == ERPC_ST_SENT)
+		return 1;
 	for (i = 0; i < ERPC_MAX_INFLIGHT; i++)
 		if (erpc_slots[i].state == ERPC_ST_QUEUED ||
 		    erpc_slots[i].state == ERPC_ST_SENT)
@@ -542,6 +714,10 @@ static void erpc_svc_entry(ULONG arg)
 			erpc_stream_reset_locked();
 		}
 
+		/* CTRL first: it only runs on a quiescent link, so there is nothing for it
+		 * to be fair to, and it is the path whose latency is being measured. */
+		(void)erpc_ctrl_send();
+
 		/* Both loops are capped so this thread cannot hold erpc_lock indefinitely if
 		 * the module streams continuously (a caller waiting on the mutex would stall,
 		 * and rtl_link could not take the UART away).  Whatever is left over is
@@ -560,6 +736,18 @@ static void erpc_svc_entry(ULONG arg)
 		}
 
 		busy = erpc_work_pending();
+		/* Publish "about to sleep" while still holding the lock, so the RX interrupt
+		 * (see erpc_rx_ready) sees it no later than the decision it is meant to
+		 * shorten.  Ordering argument in full:
+		 *   - ERPC_F_WORK is sticky, so a notification raised any time AFTER this
+		 *     store either returns the wait immediately or is consumed next pass.
+		 *   - A notification raised BEFORE it can be dropped by the guard, and that
+		 *     is harmless in both cases: if busy, the wait below is one tick anyway;
+		 *     if not busy, nothing is in flight, so those bytes are stale and the
+		 *     next send's leading flush discards them -- exactly what happened
+		 *     before this optimisation existed.
+		 * So no window pairs a dropped notification with an indefinite park. */
+		erpc_parked = 1u;
 		erpc_lock_put();
 
 		/* Poll on 1 ms slices while anything is in flight; sleep until a caller
@@ -568,6 +756,7 @@ static void erpc_svc_entry(ULONG arg)
 		 * them.  ERPC_F_WORK is sticky, so a post that races this cannot be lost. */
 		wait = busy ? 1u : TX_WAIT_FOREVER;
 		(void)tx_event_flags_get(&erpc_flags, ERPC_F_WORK, TX_OR_CLEAR, &flags, wait);
+		erpc_parked = 0u;
 	}
 }
 
@@ -634,6 +823,15 @@ static int erpc_slot_settle(struct erpc_slot *s, int fail_rc, int *len)
 	return rc;
 }
 
+/* Release a CTRL slot nobody can be waiting on any more.  Caller holds erpc_lock. */
+static void erpc_ctrl_release(void)
+{
+	erpc_ctrl.out     = NULL;                /* detach first, as for the eRPC slots */
+	erpc_ctrl.out_cap = 0u;
+	erpc_ctrl.waiter  = NULL;
+	erpc_ctrl.state   = ERPC_ST_FREE;
+}
+
 void erpc_abandon_all(void)
 {
 	int i;
@@ -643,6 +841,19 @@ void erpc_abandon_all(void)
 	erpc_lock_get();
 	erpc_link_up = 0u;                       /* nothing may be sent until reopened */
 	erpc_debt_reset();                       /* the module's view is going away too */
+	/* The CTRL exchange dies with the link like any token: hand a slot somebody is
+	 * blocked on to THEM (freeing it here would let a fresh erpc_ctrl_call() reuse it
+	 * and the old waiter would pick up the new call's completion), otherwise free it. */
+	if (erpc_ctrl.state != ERPC_ST_FREE) {
+		erpc_ctrl.out     = NULL;
+		erpc_ctrl.out_cap = 0u;
+		if (erpc_ctrl.waiter == NULL) {
+			erpc_ctrl_release();
+		} else {
+			erpc_ctrl.state = ERPC_ST_ABANDONED;
+			tx_event_flags_set(&erpc_flags, ERPC_F_CTRL, TX_OR);
+		}
+	}
 	for (i = 0; i < ERPC_MAX_INFLIGHT; i++) {
 		struct erpc_slot *s = &erpc_slots[i];
 
@@ -671,7 +882,26 @@ void erpc_link_opened(int carries_erpc)
 	erpc_debt_reset();
 	erpc_stream_reset_locked();
 	erpc_link_up = carries_erpc ? 1u : 0u;
+	/* Arm the wake-up hook only for the link we actually read.  A LOG-UART open (the
+	 * `wifi log` bridge) is consumed by the command thread, not by us, and rtl8720.c
+	 * clears the hook on every open/close so this can never outlive the session. */
+	rtl8720_uart_set_rx_notify(carries_erpc ? erpc_rx_ready : NULL);
 	erpc_lock_put();
+}
+
+int erpc_link_quiescent(void)
+{
+	int quiet, i;
+
+	if (!erpc_ready)
+		return 0;
+	erpc_lock_get();
+	quiet = (erpc_ctrl.state == ERPC_ST_FREE) && (erpc_bytes_on_wire() == 0u);
+	for (i = 0; quiet && i < ERPC_MAX_INFLIGHT; i++)
+		if (erpc_slots[i].state != ERPC_ST_FREE)
+			quiet = 0;
+	erpc_lock_put();
+	return quiet;
 }
 
 uint16_t erpc_wire_budget(void)
@@ -686,14 +916,27 @@ uint16_t erpc_wire_budget(void)
 	return b;
 }
 
-void erpc_set_wire_budget(uint16_t bytes)
+uint8_t erpc_module_gen(void)
+{
+	uint8_t g;
+
+	if (!erpc_ready)
+		return 0u;
+	erpc_lock_get();
+	g = erpc_mod_gen;
+	erpc_lock_put();
+	return g;
+}
+
+void erpc_set_module_gen(uint8_t gen)
 {
 	if (!erpc_ready)
 		return;
-	if (bytes < ERPC_WIRE_BUDGET_SAFE)
-		bytes = ERPC_WIRE_BUDGET_SAFE;   /* never below the always-safe floor */
 	erpc_lock_get();
-	erpc_budget = bytes;
+	erpc_mod_gen = gen;
+	/* DERIVED, never latched separately: one fact about the module cannot be recorded
+	 * in two places without eventually disagreeing with itself. */
+	erpc_budget  = (gen >= 4u) ? ERPC_WIRE_BUDGET_FAST : ERPC_WIRE_BUDGET_SAFE;
 	erpc_lock_put();
 }
 
@@ -868,6 +1111,109 @@ int erpc_call(uint8_t service, uint8_t request,
 	/* Backwards-compatible wrapper: no abort hook (never cancelled early). */
 	return erpc_call_ex(service, request, req, req_len, out, out_cap,
 	                    timeout_ms, diag, NULL, NULL);
+}
+
+/* ------------------------------------------------------------------ *
+ *  LINK-CTRL (issue #23 U0-3)
+ * ------------------------------------------------------------------ */
+/*
+ * Decide the CTRL waiter's fate in ONE locked step, exactly as erpc_slot_settle() does
+ * for eRPC tokens, so a reply landing between two checks is never thrown away.
+ *   1        reply captured: *@len is the payload length, *@status the module's status
+ *   -2       the link was torn down under us (ABANDONED)
+ *   @fail_rc the caller's own verdict applies; the reply buffer is detached first
+ *   0        undecided (only when @fail_rc == 0)
+ */
+static int erpc_ctrl_settle(int fail_rc, int *len, uint8_t *status)
+{
+	struct erpc_ctrl_slot *s = &erpc_ctrl;
+	int rc = 0;
+
+	erpc_lock_get();
+	if (s->state == ERPC_ST_DONE) {
+		*len    = (int)s->reply_len;
+		*status = s->status;
+		erpc_ctrl_release();
+		rc = 1;
+	} else if (s->state == ERPC_ST_ABANDONED) {
+		erpc_ctrl_release();
+		rc = -2;
+	} else if (fail_rc != 0) {
+		erpc_ctrl_release();
+		rc = fail_rc;
+	}
+	erpc_lock_put();
+	return rc;
+}
+
+int erpc_ctrl_call(uint8_t cmd, const uint8_t *req, uint16_t req_len,
+                   uint8_t *out, uint16_t out_cap, uint32_t timeout_ms,
+                   struct erpc_diag *diag)
+{
+	struct erpc_ctrl_slot *s = &erpc_ctrl;
+	struct erpc_counters snap;
+	ULONG deadline;
+
+	if (diag)
+		memset(diag, 0, sizeof(*diag));
+	if (!erpc_ready)
+		return -1;
+	if (req_len > (uint16_t)(ERPC_CTRL_MAX - ERPC_CTRL_HDR) ||
+	    (req_len != 0u && req == NULL))
+		return -1;
+
+	erpc_lock_get();
+	if (!erpc_link_up || s->state != ERPC_ST_FREE) {
+		erpc_lock_put();
+		return -1;                       /* no eRPC UART, or one is already in flight */
+	}
+	s->cmd       = cmd;
+	s->seq       = ++erpc_ctrl_seq;
+	s->status    = 0u;
+	s->body[0]   = cmd;
+	s->body[1]   = s->seq;
+	s->body[2]   = 0u;                       /* status: host->module always 0 */
+	s->body[3]   = 0u;
+	if (req_len != 0u)
+		memcpy(s->body + ERPC_CTRL_HDR, req, req_len);
+	s->body_len  = (uint16_t)(ERPC_CTRL_HDR + req_len);
+	s->crc       = erpc_crc16(s->body, s->body_len);
+	s->out       = out;
+	s->out_cap   = out_cap;
+	s->reply_len = 0u;
+	s->waiter    = tx_thread_identify();
+	s->state     = ERPC_ST_QUEUED;
+	snap = erpc_ctr;
+	/* Clear a completion bit left over from an earlier exchange. */
+	tx_event_flags_set(&erpc_flags, ~ERPC_F_CTRL, TX_AND);
+	erpc_lock_put();
+
+	tx_event_flags_set(&erpc_flags, ERPC_F_WORK, TX_OR);
+
+	deadline = tx_time_get() + (ULONG)timeout_ms;   /* 1 tick = 1 ms */
+	for (;;) {
+		uint8_t status = 0u;
+		ULONG flags;
+		int len = -1, rc;
+
+		rc = erpc_ctrl_settle(0, &len, &status);
+		if (rc != 0) {
+			erpc_diag_delta(diag, &snap);
+			if (rc < 0)
+				return rc;
+			return (status != 0u) ? -3 : len;
+		}
+		if ((int32_t)(tx_time_get() - deadline) >= 0) {
+			rc = erpc_ctrl_settle(-2, &len, &status);
+			erpc_diag_delta(diag, &snap);
+			if (rc > 0)
+				return (status != 0u) ? -3 : len;  /* landed in the same instant */
+			if (diag)
+				diag->timeout++;
+			return rc;
+		}
+		(void)tx_event_flags_get(&erpc_flags, ERPC_F_CTRL, TX_OR_CLEAR, &flags, 1u);
+	}
 }
 
 int erpc_system_ack(uint8_t c, uint8_t *echoed, struct erpc_diag *diag)

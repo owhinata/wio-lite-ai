@@ -244,7 +244,7 @@ fw/rtl8720/
   README.md          this file
   build.sh           setup | build | gate | clean
   gate.py            the static gates
-  patches/           N2/N3/N4 patches, applied in filename order (empty for N1)
+  patches/           N2..N5 patches, applied in filename order (empty for N1)
   out/               git-ignored build output
     km0_km4_image2.bin   <- the image that gets flashed
     km0_boot_all.bin     }  core prebuilts, copied out for the gates
@@ -295,6 +295,9 @@ fw/rtl8720/
   possible. See *N3 result* below.
 - **N4** (built) — the link UART is driven by us, not by Arduino (`patches/0004`,
   issue #23 U0-2). See *N4 result* below.
+- **N5** (built) — a LINK-CTRL channel on the same wire (`patches/0005`, issue #23 U0-3):
+  read the module's own UART counters, change the line rate, and generate measured
+  traffic. See *N5 result* below.
 
 ### N2 result
 
@@ -401,7 +404,7 @@ Arduino layer *below* the eRPC transport, all of which this removes:
 
 | | stock | N4 |
 |---|---|---|
-| RX interrupt | `USI_UARTRxFifoTrigLevel = 1`, handler reads **one** byte | threshold 32 of 64, handler drains until the FIFO is empty |
+| RX interrupt | `USI_UARTRxFifoTrigLevel = 1`, handler reads **one** byte | threshold 16 of 64 (32 as first built, see N5), handler drains until the FIFO is empty |
 | buffer | Arduino `RingBuffer`, **127 usable**, `store_char()` drops silently when full | 8 kB, drops the newest byte **and counts it** |
 | transport read | one `read()` per byte, `vTaskDelay(1)` when empty | bulk `memcpy` out of the ring |
 
@@ -430,8 +433,8 @@ alone do not answer any of them:
 Module-side counters go to the LOG UART (`wifi log`) and are printed **only when they
 move**, so a healthy link leaves the boot banner clean:
 `[U0-2] usi burst N/64 ringpeak N drops N ovf N framing N`. `burst` is the high-water
-bytes taken in one interrupt (approaching 64 means the FIFO is close to overrunning);
-`drops`/`ovf`/`framing` must all stay 0.
+bytes taken in one interrupt; `drops`/`ovf`/`framing` must all stay 0. **`burst` is not
+the margin** — see the N5 section, which adds the counter that is.
 
 #### The host side is version-gated
 
@@ -454,3 +457,91 @@ be used.
 Acceptance (beyond the N3 regression set, with `wifi rpc ver` reading `2.1.3+wio-n4`):
 `net echo 2323 256` must complete. That is a 280-byte request frame — the exact size that
 gets no reply at all on N3 and earlier.
+
+### N5 result
+
+`patches/0005-n5-link-ctrl.patch` — `src/link/wio_uart_transport.h` gains a `receive()`
+override, `src/link/wio_usi_uart.{c,h}` gain `wio_usi_set_baud()`/`wio_usi_baud()`, and
+the build id becomes `2.1.3+wio-n5`. **The eRPC wire format is again unchanged**, so the
+whole existing host feature set is the regression test.
+
+Issue #23 needs a number before it can commit to putting a real TCP/IP stack on the STM32:
+can this UART carry 1500-byte Ethernet frames well enough? Three things were missing.
+
+1. **The module's own counters were unreadable.** N4 prints them to the LOG UART, but the
+   LOG UART cannot be attached while the host holds the eRPC link — so they could never be
+   seen *while traffic was flowing*, which is the only time they mean anything.
+2. **There was no way to change the line rate.**
+3. **There was no traffic generator.**
+
+All three are answered by a second frame type multiplexed onto the same wire, owned by the
+link layer at both ends:
+
+```
+CTRL frame = u16 0xFFFF | u16 body_len | u16 crc16(body) | body[body_len]
+body       = u8 cmd | u8 seq | u8 status | u8 rsvd | payload[]
+```
+
+`0xFFFF` cannot collide with an eRPC frame, whose leading `u16` is the message size: no
+*sender* can produce one that large (a host request is a few hundred bytes, a module reply
+is bounded by its 4 KB `MessageBuffer`), and both receivers independently reject anything
+above 4096. Adding these as eRPC methods instead would have meant hand-editing the
+*generated* server shim — the same shim whose `erpc_free()` of a string literal corrupted
+the module heap in N2.
+
+Commands: `LINK_PING`, `LINK_STATS` (10 × u32 LE: the N4 counters plus free heap, current
+baud and ring size), `LINK_SETBAUD`, `LINK_BENCH`.
+
+Two rules in `receive()` are load-bearing:
+
+- the whole read, including CTRL consumption, stays under `m_receiveLock`, as the base
+  class does — and it **loops**, returning only when a real eRPC message is in hand,
+  because consuming a CTRL frame is not something the eRPC server can be told about;
+- a CTRL reply is written under `m_sendLock`, because the N3 workers call `send()`
+  concurrently and two writers would interleave bytes inside a frame. This is the only
+  place that takes both, receive→send, and nothing takes them the other way, so the order
+  cannot cycle.
+
+**A desynchronised stream can align on `0xFFFF` by chance**, so the length is bounded
+before it is believed (never drained on faith), the CRC is checked, every command checks
+its own payload length, and the one command with a side effect that costs the link —
+`LINK_SETBAUD` — additionally requires a magic word (`'BAUD'`) and a rate from a fixed
+allow-list. It acknowledges on the **old** rate and only then reprograms, so a lost
+acknowledgement leaves both ends exactly where they were.
+
+`USI_UARTSetBaud()` is safe to call on the fly: it is a plain read-modify-write of the TX
+and RX baud registers, with no FIFO reset and no disable requirement
+(`rtl8721dhp_usi_uart.c`). The driver waits for TX FIFO empty (`USI_UARTWritable()`, which
+means *empty*, not *not full*), sleeps a tick for the shift register, reprograms, then
+discards the RX FIFO and ring — bytes sampled across a rate change are meaningless.
+
+**Recovery from a rate mismatch is `wifi reset` and nothing else.** The host tries to put
+both ends back at 2 Mbaud, but that is best effort by construction: if the new rate failed
+because of signal quality, the `LINK_SETBAUD(2M)` telling the module to come back is sent
+at that same bad rate. A CHIP_EN power cycle always works — the module boots at 2 Mbaud,
+and `rtl_link_forget_module()` puts the host there too.
+
+#### What the first 6 Mbaud sweep changed here
+
+Board #2 ran clean at every rate — 2/3/4/6 Mbaud, all three directions, **zero** losses on
+either end — but the module counters that N5 exists to expose showed `max burst` climbing
+41 → 46 → **56 of 64** as the rate went up. Two changes followed, and they are the reason
+the driver in `patches/0005` is not quite the one `patches/0004` built:
+
+- **`burst` cannot answer the question it looks like it answers.** It counts every byte one
+  interrupt took, which is entry occupancy *plus* everything that arrived while the drain
+  loop ran — and arrivals during the drain are free, because the loop absorbs them. 56/64
+  could equally be a late interrupt (bad) or a busy drain (fine). `max_entry` is now
+  sampled from `USI_UARTGetRxFifoValidCnt()` *before* the drain, which is exactly the
+  grace the interrupt latency consumed, and `link info` prints it as `entry N/M grace`.
+- **The threshold went 32 → 16.** The margin is `64 - threshold` byte times: 32 bytes is
+  160 us at 2 Mbaud but only 53 us at 6 Mbaud, and 6 Mbaud is where this link is heading.
+  16 restores it to 80 us. The cost is double the interrupt rate, which this handler —
+  a drain loop — can afford; it is still 16x fewer interrupts than the stock trigger of 1.
+
+`LINK_STATS` therefore returns 12 words, not 10 (`max_entry` and the configured threshold
+are appended), and an older N5 build is rejected by the host with a message saying so.
+
+Acceptance (beyond the N4 regression set, with `wifi rpc ver` reading `2.1.3+wio-n5`):
+`link info` shows the module counters, `link bench`/`link sweep` run with `ctrl_bad` 0, and
+`link baud 6000000` followed by `link baud 2000000` round-trips.

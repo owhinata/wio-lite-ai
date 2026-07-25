@@ -116,6 +116,11 @@ struct erpc_diag {
 	uint16_t frame_stall;            /* partial frames dropped to resynchronise the
 	                                  * stream (RX ring overflow / a module that went
 	                                  * quiet mid-frame) */
+	uint16_t ctrl_bad;               /* CTRL frames rejected: bad length / CRC / unknown
+	                                  * command / nobody waiting.  MUST STAY 0 on a
+	                                  * healthy link -- a non-zero count is either a
+	                                  * regression or a desynchronised stream that
+	                                  * happened to align on the 0xFFFF marker */
 };
 
 /* eRPC CRC-16 (init 0xEF4A, poly 0x1021, MSB-first) over @n bytes of @d. */
@@ -169,20 +174,87 @@ void erpc_link_opened(int carries_erpc);
 void erpc_link_closed(void);
 
 /*
- * ---- the wire budget is a runtime value ----
+ * ---- which firmware is on the module is a runtime latch ----
  *
- * It starts at ERPC_WIRE_BUDGET_SAFE and only app/rtl_link.c raises it, because the thing
- * that decides the answer -- WHICH FIRMWARE IS ON THE MODULE -- is module state, not link
+ * ONE latch answers every "may we do X on this link?" question, because they all depend
+ * on the same fact: WHICH FIRMWARE IS ON THE MODULE.  That is module state, not link
  * state.  Deliberately NOT reset by erpc_link_opened/_closed: `wifi rpc ver`, the call
- * that proves the firmware, drops the UART reference before it returns, so a budget tied
- * to the UART "open" would revert the moment it was earned and could never take effect.
- * rtl_link.c clears it instead at every point the module's identity can change -- every
- * CHIP_EN transition and every flash write -- which is the same set of points it already
- * uses for rtl_tcpip_set_inited().  Values below the safe floor are clamped up to it, so
- * this can only ever loosen a limit the caller has proof for.
+ * that proves the firmware, drops the UART reference before it returns, so anything tied
+ * to the UART "open" would revert the moment it was earned and could never take effect
+ * (this is exactly the defect the issue #23 U0-2 plan had).  app/rtl_link.c clears it
+ * instead at every point the module's identity can change -- every CHIP_EN transition and
+ * every flash write -- the same set of points it already uses for rtl_tcpip_set_inited().
+ *
+ * @gen is the N of the "2.1.3+wio-nN" build id, 0 when unknown (the safe default, and
+ * what the factory / pre-N2 firmware leaves it at).  What it currently gates:
+ *   >= 4  the wire budget is lifted to ERPC_WIRE_BUDGET_FAST (n4 owns USI0 behind an
+ *         8 kB ring, so the 127-byte input ring that shaped every request size is gone)
+ *   >= 5  the LINK-CTRL channel below exists at all
+ * The wire budget is DERIVED here rather than latched separately, so the two can never
+ * disagree about the same module.
  */
-void     erpc_set_wire_budget(uint16_t bytes);
+void     erpc_set_module_gen(uint8_t gen);
+uint8_t  erpc_module_gen(void);
 uint16_t erpc_wire_budget(void);
+
+/*
+ * ---- LINK-CTRL channel (issue #23 U0-3) ---------------------------------------
+ *
+ * A second frame type multiplexed onto the same UART, owned by the link layer at BOTH
+ * ends rather than by eRPC.  It carries the things eRPC cannot: reading the module's own
+ * UART counters (its LOG UART is unreachable while the eRPC link is held), changing the
+ * baud rate of the link itself, and generating measured traffic.  Adding them as eRPC
+ * methods would mean hand-editing the generated server shim, which has bitten this
+ * project before (the rpc_system_version erpc_free() bug).
+ *
+ *   CTRL frame = u16 0xFFFF | u16 body_len | u16 crc16(body) | body[body_len]
+ *   body       = u8 cmd | u8 seq | u8 status | u8 rsvd | payload[]
+ *
+ * 0xFFFF cannot collide with an eRPC frame, whose leading u16 is the message size: no
+ * SENDER can produce one that large (a host request is at most 8 + ERPC_REQ_MAX, a module
+ * reply at most its 4096-byte MessageBuffer), and both receivers reject anything above
+ * 4096 independently.  A desynchronised stream can still align on 0xFFFF by chance, so
+ * every CTRL frame is bounded (ERPC_CTRL_MAX), CRC-checked, length-checked per command,
+ * and the one command with a real side effect carries a magic word as well.
+ *
+ * U0 SIMPLIFICATION: CTRL is only issued on a QUIESCENT link (erpc_link_quiescent()), so
+ * it consumes no wire budget and needs no interleaving rules.  U1, which multiplexes CTRL
+ * with Ethernet frames continuously, has to revisit that.
+ */
+#define ERPC_CTRL_MAX 1600u              /* bound on body_len, both directions */
+
+enum {
+	ERPC_CTRL_PING    = 1,           /* no payload; proves the link at this baud */
+	ERPC_CTRL_STATS   = 2,           /* -> u32 LE x 10, see cmd_link.c */
+	ERPC_CTRL_SETBAUD = 3,           /* u32 baud + u32 magic; ACK on the OLD baud */
+	ERPC_CTRL_BENCH   = 4            /* u32 reply_bytes, u8 seed, u8 rsvd[3], data[] */
+};
+
+/* Guards the one CTRL command with a side effect against a chance 0xFFFF alignment. */
+#define ERPC_CTRL_SETBAUD_MAGIC 0x42415544u   /* 'BAUD' */
+
+/*
+ * Send one CTRL command and wait for its reply.  Only ONE CTRL exchange may be in flight
+ * (there is a single slot), and the caller is expected to hold app/rtl_link.c's coarse
+ * mutex, which is what makes that true in practice.
+ *
+ * Returns the reply payload length (>= 0; bytes copied into @out, truncated to @out_cap),
+ * or negative:
+ *   -1 bad args / no link / a CTRL exchange is already in flight / no service thread
+ *   -2 timeout, or the link was torn down under us (erpc_abandon_all)
+ *   -3 the module answered with a non-zero status byte
+ */
+int erpc_ctrl_call(uint8_t cmd, const uint8_t *req, uint16_t req_len,
+                   uint8_t *out, uint16_t out_cap, uint32_t timeout_ms,
+                   struct erpc_diag *diag);
+
+/*
+ * True when nothing at all is outstanding on the link: no eRPC token, no CTRL exchange,
+ * and no request bytes the module has not answered.  `link baud` requires it -- changing
+ * the baud rate under an in-flight frame would corrupt it at both ends -- and `link info`
+ * uses it to decide whether it may ask the module anything.
+ */
+int erpc_link_quiescent(void);
 
 /*
  * Perform one eRPC invocation on the currently-open RTL8720 UART and wait for the

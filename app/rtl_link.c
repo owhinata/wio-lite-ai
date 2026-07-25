@@ -31,12 +31,30 @@ static uint32_t          g_uart_baud;
 static uint32_t g_uart_gen = 1u;     /* ++ on every 0->1 open and on force-quiesce */
 static uint32_t g_quiesce_gen;       /* ++ on force-quiesce only (= CHIP_EN moved)  */
 
+/* The rate the eRPC link currently runs at.  MODULE state, not link state -- see
+ * rtl_link_erpc_baud() in rtl_link.h for why, and for the four places that reset it. */
+#define RTL_ERPC_BAUD_DEFAULT 2000000u
+static uint32_t g_erpc_baud = RTL_ERPC_BAUD_DEFAULT;
+
 /* Whether the module's lwIP stack has been brought up since its last power-on.  See
  * rtl_link.h; reset on every power off / reset / fresh power-on, set after tcpip init. */
 static bool g_tcpip_inited;
 
 /* Host-side memo of DHCP-vs-static for `net info` (see rtl_link.h). */
 static enum rtl_ipmode g_ip_mode;
+
+/*
+ * Everything the host believes about the module in front of it, dropped in one place.
+ * Called from every point where that identity can change; keeping it a single function
+ * is what stops the set from drifting apart as more module-scoped state appears.
+ */
+void rtl_link_forget_module(void)
+{
+	g_erpc_baud = RTL_ERPC_BAUD_DEFAULT;   /* the module always boots at 2 Mbaud */
+	erpc_set_module_gen(0u);               /* ... and its firmware must be re-proved */
+	g_tcpip_inited = false;
+	g_ip_mode      = RTL_IP_UNKNOWN;
+}
 
 /* ------------------------------------------------------------------ *
  *  core
@@ -112,6 +130,46 @@ bool rtl_link_uart_busy(void)
 	return g_uart_refs != 0u;
 }
 
+unsigned rtl_link_uart_refs(void)
+{
+	return g_uart_refs;
+}
+
+uint32_t rtl_link_erpc_baud(void)
+{
+	return g_erpc_baud;
+}
+
+int rtl_link_uart_rebaud(uint32_t baud)
+{
+	int rc = -1;
+
+	/* Under the service thread's mutex, exactly like ref/unref: holding it proves that
+	 * thread is touching neither USART1 nor the RX ring while we close and re-open. */
+	erpc_link_lock();
+	if (g_uart_refs != 0u) {
+		rtl8720_uart_close();
+		if (rtl8720_uart_open(g_uart_which, baud) == 0) {
+			g_uart_baud = baud;
+			g_erpc_baud = baud;
+			/* Deliberately NOT advancing g_uart_gen: this is the SAME session
+			 * continuing at a new rate, and the caller has established there is
+			 * no resident holder whose reference could be invalidated.  The
+			 * stream and the wire ledger do start over, though -- bytes in
+			 * flight across a rate change are meaningless. */
+			erpc_link_opened(g_uart_which == RTL8720_UART_AT);
+			rc = 0;
+		} else {
+			/* Left closed on purpose: pretending the old rate is still up would
+			 * be a lie, and every send would silently go nowhere.  The caller
+			 * recovers (or reports) from here. */
+			erpc_link_closed();
+		}
+	}
+	erpc_link_unlock();
+	return rc;
+}
+
 uint32_t rtl_link_uart_gen(void)
 {
 	return g_uart_gen;
@@ -143,10 +201,11 @@ void rtl_link_force_quiesce(void)
 	g_uart_gen++;                        /* ... and their recorded generation is now stale */
 	g_quiesce_gen++;                     /* only here: "CHIP_EN is about to move" */
 	/* This is the recovery path (`wifi reset` and friends).  If the link went dirty
-	 * BECAUSE the host was wrong about the module's firmware, the recovery must undo that
-	 * assumption too -- so drop back to the always-safe wire budget and make `wifi rpc
-	 * ver` earn it again.  Costs one command; a stale raise costs a wedged console. */
-	erpc_set_wire_budget(ERPC_WIRE_BUDGET_SAFE);
+	 * BECAUSE the host was wrong about the module -- its firmware, or the rate it is
+	 * listening at -- the recovery must undo those assumptions too, so everything
+	 * module-scoped goes back to what a freshly powered module actually is and `wifi rpc
+	 * ver` has to earn it again.  Costs one command; a stale belief costs a dead link. */
+	rtl_link_forget_module();
 	erpc_link_closed();                  /* tokens abandoned; their waiters get -2 */
 	rtl8720_uart_close();
 	erpc_link_unlock();
@@ -194,18 +253,22 @@ int rtl_link_begin(struct cli_instance *sh, bool power_on)
 		}
 		cli_print(sh, "wifi: powering on RTL8720DN, waiting ~1.5s for boot...\r\n");
 		rtl8720_power(true);
-		g_tcpip_inited = false;                /* fresh boot: lwIP not yet up */
-		g_ip_mode      = RTL_IP_UNKNOWN;       /* and no address obtained yet */
+		/* CHIP_EN moved, but NOT through rtl_link_force_quiesce() -- so this path has
+		 * to forget the module itself.  It is the easiest of the four reset points to
+		 * overlook, and forgetting the baud here is what stops a `link baud 6000000`
+		 * session from being followed by a 2 Mbaud open against a 2 Mbaud module. */
+		rtl_link_forget_module();
 		if (cli_sleep(sh, 1500u)) {            /* cancellable boot wait */
 			rtl_link_unclaim();
 			cli_console_release(sh);
 			return RTL_LINK_ERR;
 		}
 	}
-	if (rtl_link_uart_ref(RTL8720_UART_AT, 2000000u) != 0) {
+	if (rtl_link_uart_ref(RTL8720_UART_AT, rtl_link_erpc_baud()) != 0) {
 		rtl_link_unclaim();
 		cli_console_release(sh);
-		cli_error(sh, "wifi: USART1 @2000000 did not come ready\r\n");
+		cli_error(sh, "wifi: USART1 @%lu did not come ready\r\n",
+		          (unsigned long)rtl_link_erpc_baud());
 		return RTL_LINK_ERR;
 	}
 	return RTL_LINK_READY;

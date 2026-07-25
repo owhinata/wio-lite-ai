@@ -90,6 +90,57 @@ void rtl_link_uart_unref(void);
 bool rtl_link_uart_busy(void);
 
 /*
+ * How many references are outstanding.  rtl_link_uart_busy() cannot answer "is anybody
+ * ELSE holding it?", because a command that took its own reference (rtl_link_begin) always
+ * sees true -- so `link baud`, which must exclude the RESIDENT holder (the telnet console
+ * service) and only itself, tests for exactly 1 while holding the coarse mutex.  That is
+ * race-free because every reference is taken and dropped under that same mutex.
+ */
+unsigned rtl_link_uart_refs(void);
+
+/*
+ * ---- the link's baud rate is MODULE state (issue #23 U0-3) ---------------------
+ *
+ * The eRPC link ran at a hard-coded 2 Mbaud everywhere until `link baud` made it
+ * changeable.  The rate then has to be remembered somewhere that outlives a single UART
+ * open -- otherwise the next rtl_link_begin() re-opens USART1 at 2 Mbaud while the module
+ * is still at 6, and the link is dead until a power cycle.  It belongs with the module
+ * generation latch (erpc_set_module_gen) because it describes the same thing: the module
+ * in front of us.  Both are reset together, at every point that identity can change:
+ *   - rtl_link_force_quiesce()   (`wifi on/off/reset` -- CHIP_EN moves)
+ *   - rtl_dl_enter()             (any flash session, including an aborted one)
+ *   - rtl_link_begin()'s fresh power-on path (drives CHIP_EN directly, NOT via
+ *     force_quiesce -- easy to miss)
+ * The module always boots at 2 Mbaud, so the reset value is the default.
+ */
+uint32_t rtl_link_erpc_baud(void);
+
+/*
+ * Drop EVERYTHING the host believes about the module in front of it -- link baud back to
+ * 2 Mbaud, firmware generation back to unknown (which also restores the conservative
+ * wire budget), lwIP-inited and IP-mode back to unknown.
+ *
+ * Call it from any path that moves CHIP_EN or rewrites the module's flash.  It exists as
+ * one function precisely so that set cannot drift apart: rtl_link_force_quiesce() and the
+ * fresh power-on paths all go through here, and anything module-scoped added later gets
+ * reset everywhere by being added once.
+ */
+void rtl_link_forget_module(void);
+
+/*
+ * Re-open the eRPC UART at @baud, KEEPING the reference count and both generation
+ * counters (an open that is really the same session continuing at a different rate).
+ *
+ * That is only safe with no RESIDENT reference holder: app/net_shell.c detects that its
+ * reference was revoked by comparing rtl_link_uart_gen(), and holding the generation
+ * still here would hide a close/open from it.  `link baud` enforces
+ * rtl_link_uart_refs() == 1 for exactly this reason -- it is a precondition of the
+ * design, not a convenience.  Caller must hold the coarse mutex.  Returns 0, or -1 with
+ * the link left CLOSED (the caller must then recover, e.g. by re-opening at the old rate).
+ */
+int rtl_link_uart_rebaud(uint32_t baud);
+
+/*
  * ---- generation counters, for a RESIDENT reference holder (issue #21 increment 9) ------
  *
  * An ordinary command takes and drops its reference inside one coarse-mutex section, so its

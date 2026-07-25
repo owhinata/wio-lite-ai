@@ -666,6 +666,7 @@ static void diag_acc(struct erpc_diag *tot, const struct erpc_diag *d)
 	tot->skipped_reply          += d->skipped_reply;
 	tot->unsupported_invocation += d->unsupported_invocation;
 	tot->frame_stall            += d->frame_stall;
+	tot->ctrl_bad               += d->ctrl_bad;
 }
 
 /*
@@ -678,10 +679,11 @@ static void echo_diag_if_dirty(struct echo_run *r)
 	const struct erpc_diag *d = &r->tot;
 
 	if (d->crc_fail || d->oversize || d->timeout || d->skipped_reply ||
-	    d->unsupported_invocation || d->frame_stall)
+	    d->unsupported_invocation || d->frame_stall || d->ctrl_bad)
 		cli_warn(r->sh, "  erpc diag so far: crc %u oversize %u timeout %u stale %u "
-		         "unsupported %u stall %u\r\n", d->crc_fail, d->oversize, d->timeout,
-		         d->skipped_reply, d->unsupported_invocation, d->frame_stall);
+		         "unsupported %u stall %u ctrl_bad %u\r\n", d->crc_fail, d->oversize,
+		         d->timeout, d->skipped_reply, d->unsupported_invocation,
+		         d->frame_stall, d->ctrl_bad);
 }
 
 /* Per-call options for every echo RPC: deliberately WITHOUT the Ctrl+C abort hook. */
@@ -1099,8 +1101,9 @@ out:
 		          (unsigned long)r.emin, (unsigned long)(r.esum / r.en),
 		          (unsigned long)r.emax, (unsigned long)r.en);
 	cli_print(sh, "  erpc diag: crc %u oversize %u timeout %u stale %u unsupported %u "
-	          "stall %u\r\n", r.tot.crc_fail, r.tot.oversize, r.tot.timeout,
-	          r.tot.skipped_reply, r.tot.unsupported_invocation, r.tot.frame_stall);
+	          "stall %u ctrl_bad %u\r\n", r.tot.crc_fail, r.tot.oversize, r.tot.timeout,
+	          r.tot.skipped_reply, r.tot.unsupported_invocation, r.tot.frame_stall,
+	          r.tot.ctrl_bad);
 	rtl_link_end(sh);
 	return r.dirty ? 1 : 0;
 }

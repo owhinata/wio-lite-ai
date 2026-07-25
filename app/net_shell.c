@@ -366,6 +366,7 @@ static void nsh_diag_acc(void)
 	g_diag_tot.skipped_reply          += g_diag.skipped_reply;
 	g_diag_tot.unsupported_invocation += g_diag.unsupported_invocation;
 	g_diag_tot.frame_stall            += g_diag.frame_stall;
+	g_diag_tot.ctrl_bad               += g_diag.ctrl_bad;
 }
 
 /* Ask the module why the last socket call failed (0 when even that did not get through). */
@@ -499,9 +500,12 @@ static int nsh_arm(uint16_t port)
 			return -1;
 		}
 	}
-	if (rtl_link_uart_ref(RTL8720_UART_AT, 2000000u) != 0) {
+	/* Whatever rate the link is running at (issue #23 U0-3 made it changeable): a
+	 * mismatched literal here would refuse the reference rather than re-open, because
+	 * rtl_link_uart_ref() rejects a configuration that disagrees with the open one. */
+	if (rtl_link_uart_ref(RTL8720_UART_AT, rtl_link_erpc_baud()) != 0) {
 		rtl_link_unclaim();
-		g_last = "USART1 @2000000 did not come ready";
+		g_last = "USART1 did not come ready";
 		return -1;
 	}
 	/* Record which "open" our reference belongs to: a force-quiesce (`wifi on/off/reset`)
@@ -985,9 +989,10 @@ void net_shell_print_status(struct cli_instance *sh)
 	          (unsigned long)g_sessions, (unsigned long)g_rx_bytes,
 	          (unsigned long)g_tx_bytes, (unsigned long)g_rx_drops);
 	cli_print(sh, "  erpc diag crc %u oversize %u timeout %u stale %u unsupported %u "
-	          "stall %u\r\n", g_diag_tot.crc_fail, g_diag_tot.oversize, g_diag_tot.timeout,
-	          g_diag_tot.skipped_reply, g_diag_tot.unsupported_invocation,
-	          g_diag_tot.frame_stall);
+	          "stall %u ctrl_bad %u\r\n", g_diag_tot.crc_fail, g_diag_tot.oversize,
+	          g_diag_tot.timeout, g_diag_tot.skipped_reply,
+	          g_diag_tot.unsupported_invocation, g_diag_tot.frame_stall,
+	          g_diag_tot.ctrl_bad);
 	if (g_last != NULL)
 		cli_print(sh, "  last      %s\r\n", g_last);
 	if (nsh_blocked_dirty())

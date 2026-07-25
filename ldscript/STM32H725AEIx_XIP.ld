@@ -130,6 +130,21 @@ SECTIONS
     *(.text.UART9_IRQHandler)
     *(.text.rtl_uart_isr*)
 
+    /* ...and the wake-up it performs (issue #23 U0-3).  The RX ISR signals the eRPC
+     * service thread so it starts reading a frame immediately instead of waiting out
+     * its 1 ms poll.  Measured on board #2, adding that call took the ISR from 0.7 us
+     * to 4.3 us warm and 12.9 us cold -- all of it XIP fetch, at ~24 k interrupts/s at
+     * 6 Mbaud, i.e. around a tenth of the CPU spent fetching instructions.
+     *
+     * _tx_thread_system_resume is the tail of that path (the service thread is
+     * suspended on the event flag, so every notification really does resume it).  It
+     * is shared with every other ISR-to-thread wakeup in the system, which makes
+     * placing it here a general win rather than a special case. */
+    *(.text.erpc_rx_ready)
+    *(.text._txe_event_flags_set)
+    *(.text._tx_event_flags_set)
+    *(.text._tx_thread_system_resume)
+
     /* Fault handlers (app/fault.c).  This buys the fetch cost of the handler body
      * only -- it does NOT make a wedged OCTOSPI2 survivable, because the vector
      * read itself still comes from 0x70000000 and fault_handler_c calls log_write
@@ -355,4 +370,13 @@ SECTIONS
   ASSERT(DEFINED(fault_handler_c) ?
          (fault_handler_c < ORIGIN(ITCM) + LENGTH(ITCM)) : 1,
          "fault_handler_c is not in ITCM")
+  /* The RX ISR's wake-up path (issue #23 U0-3).  erpc_rx_ready itself is static and may
+   * be inlined, like rtl_uart_isr, so it is not asserted -- these two are what actually
+   * cost the fetch time, and they are ThreadX globals. */
+  ASSERT(DEFINED(_tx_event_flags_set) ?
+         (_tx_event_flags_set < ORIGIN(ITCM) + LENGTH(ITCM)) : 1,
+         "_tx_event_flags_set (RTL8720 RX wake-up) is not in ITCM")
+  ASSERT(DEFINED(_tx_thread_system_resume) ?
+         (_tx_thread_system_resume < ORIGIN(ITCM) + LENGTH(ITCM)) : 1,
+         "_tx_thread_system_resume (RTL8720 RX wake-up) is not in ITCM")
 }

@@ -259,6 +259,36 @@ time as the USB console. 21 commands:
   (`CLI_INSTANCE_TIME_SLICE`) — otherwise `coremark` on one console would freeze the other
   for its whole run; the flip side is that benchmark scores drop while both are busy.
 
+- **`link` — the UART link itself** (issue #23 U0-3, `shell/cmds/cmd_link.c`). Where `wifi`
+  is L2 and `net` is L3, this is the wire between the STM32 and the companion chip, and it
+  exists to produce a number: can a UART link carry 1500-byte Ethernet frames well enough
+  to justify putting a real TCP/IP stack on the host?
+  `link info` prints **both ends'** counters — the host's RX interrupt budget and error
+  tally, and the module's own (interrupt count, ring peak, the three loss counters, free
+  heap, current rate, and **how much of its FIFO grace one interrupt consumed**). Reading
+  the module's side while traffic flows was impossible before: they go to the LOG UART,
+  which cannot be attached while the eRPC link is held. Note `entry` and `burst` are
+  different questions — `entry` is FIFO occupancy when the interrupt *started*, which is
+  the real margin; `burst` also counts bytes that landed during the drain, and those are
+  free.
+  `link baud <2000000|3000000|4000000|6000000>` changes the line rate of the link.
+  `link bench [bytes] [secs] [rx|tx|both]` (default 1500 B / 3 s / both) and `link sweep`
+  generate measured traffic and report throughput plus the round-trip distribution
+  (min / avg / p99 / max) — the **max** is the number that matters for carrying frames.
+  All of it rides a **LINK-CTRL channel** (`u16 0xFFFF | u16 len | u16 crc | body`)
+  multiplexed onto the same wire and owned by the link layer at both ends, so none of it
+  required touching the generated eRPC server shim. It needs module firmware
+  `2.1.3+wio-n5` (`fw/rtl8720/patches/0005`) and, because the host only learns which
+  firmware is loaded from `wifi rpc ver`, every subcommand asks you to run that first.
+  CTRL is only issued on a **quiescent** link, so `link` refuses while anything else holds
+  the eRPC UART — in practice, stop the telnet console (`net shell stop`).
+  `link baud` is the one command whose failure costs the link: the module acknowledges on
+  the *old* rate and only then switches, so a lost acknowledgement changes nothing, but if
+  the *new* rate does not work the host's attempt to put both ends back is best effort
+  (the message telling the module to return is sent at that same bad rate). **`wifi reset`
+  is the guaranteed recovery** — the module boots at 2 Mbaud and the host resets its own
+  belief to match.
+
 ## Key design points
 
 - **Never reprograms the clock tree.** The DFU bootloader sets HSE 25 MHz → PLL1
@@ -358,7 +388,7 @@ fw/rtl8720/ reproducible build of the RTL8720DN's own firmware (the eRPC server 
 | PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). |
 | AXI-SRAM (D1) | `0x24000000` | 320 KB; `_estack = 0x24050000` (the MSP the bootloader loads). |
 | DTCM | `0x20000000` | 128 KB; holds the reset-persistent `.log_noinit` crash-log ring + `membench` scratch (bypasses the D-cache). |
-| ITCM | `0x00000000` | 64 KB; holds the **interrupt paths** (`.itcm`, 2096 B): ThreadX PendSV + SysTick, the RTL8720 UART RX ISR and the fault handlers, plus the 4 KB `.itcm_bench` scratch. Zero-wait-state and outside both caches, so an ISR no longer pays a cold OCTOSPI2 fetch through the 16 KB I-cache: the same UART ISR went from **8.7 µs cold / 3.3 µs warm to a flat 0.7 µs** (issue #24). Loaded from its XIP load image by `SystemInit()`, which also zero-fills all 64 KB to initialise the TCM ECC; kept read-only by the MPU so a NULL write raises MemManage instead of corrupting ISR code. |
+| ITCM | `0x00000000` | 64 KB; holds the **interrupt paths** (`.itcm`, ~3 KB): ThreadX PendSV + SysTick, the RTL8720 UART RX ISR **and the wake-up it signals** (`tx_event_flags_set` + `_tx_thread_system_resume`, issue #23 U0-3 — that call alone had put the ISR back to 4.3 µs warm / 12.9 µs cold), and the fault handlers, plus the 4 KB `.itcm_bench` scratch. Zero-wait-state and outside both caches, so an ISR no longer pays a cold OCTOSPI2 fetch through the 16 KB I-cache: the same UART ISR went from **8.7 µs cold / 3.3 µs warm to a flat 0.7 µs** (issue #24). Loaded from its XIP load image by `SystemInit()`, which also zero-fills all 64 KB to initialise the TCM ECC; kept read-only by the MPU so a NULL write raises MemManage instead of corrupting ISR code. |
 | internal Flash | `0x08000000` | 512 KB — **DFU bootloader only**; the app does not own it. |
 
 ## Build
