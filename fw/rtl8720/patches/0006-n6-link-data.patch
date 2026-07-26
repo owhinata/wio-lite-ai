@@ -1,0 +1,892 @@
+--- a/src/erpc_setup.cpp
++++ b/src/erpc_setup.cpp
+@@ -127,6 +127,13 @@
+  * Arduino `Serial3`, whose 127-byte ring silently dropped the tail of a large request
+  * frame.  Same framing, same baud rate -- only the bytes underneath move differently. */
+ WioUartTransport g_transport(2000000);
++
++/* C-callable trampoline for the DATA task (issue #23 U1); see setup_erpc(). */
++extern "C" void wio_data_write_frame(const uint8_t *hdr, uint32_t hlen,
++                                     const uint8_t *body, uint32_t blen)
++{
++    g_transport.writeFramed(hdr, hlen, body, blen);
++}
+ BasicCodecFactory g_basicCodecFactory;
+ ArbitratedClientManager *g_client;
+ TransportArbitrator g_arbitrator;
+@@ -177,15 +184,15 @@
+      * literal and freeing that .rodata pointer corrupts the module heap (which is why
+      * the STM32 side never dared call rpc_system_version).  Return an erpc_malloc copy
+      * of a build id so the host can read back which firmware is loaded (`wifi rpc`).
+-     * "2.1.3" keeps the upstream base version; "+wio-n5" marks the issue-#20 N3 patch
++     * "2.1.3" keeps the upstream base version; "+wio-n6" marks the issue-#20 N3 patch
+      * set (bounded socket handlers + worker dispatch) plus the issue-#23 link work:
+-     * U0-2's USI0 driver and U0-3's LINK-CTRL channel.  The host PARSES the N out of
++     * U0-2's USI0 driver, U0-3's LINK-CTRL channel and U1's DATA channel.  The host PARSES the N out of
+      * this string (shell/cmds/cmd_wifi.c fw_gen_of) and gates capabilities on it being
+      * large enough, so the number must only ever go up.  A NULL here would only happen
+      * on heap exhaustion,
+      * which the stock literal never risked; the shim does not null-check, but version is
+      * called early when the heap is idle. */
+-    static const char id[] = "2.1.3+wio-n5";
++    static const char id[] = "2.1.3+wio-n6";
+     char *s = (char *)erpc_malloc(sizeof(id));
+     if (s != NULL)
+         memcpy(s, id, sizeof(id));
+@@ -357,6 +364,13 @@
+ 
+     g_transport.init();
+ 
++    /* issue #23 U1: bring up the DATA channel and tell it how to write a frame.  It has
++     * to go through the transport so the write takes m_sendLock -- the same lock the N3
++     * worker tasks take for their replies, and the only thing keeping two writers from
++     * interleaving their bytes inside one frame. */
++    wio_link_data_set_writer(&wio_data_write_frame);
++    wio_link_data_init();
++
+     g_arbitrator.setSharedTransport(&g_transport);
+     g_arbitrator.setCodec(g_basicCodecFactory.create());
+ 
+--- a/src/link/wio_uart_transport.h
++++ b/src/link/wio_uart_transport.h
+@@ -40,6 +40,7 @@
+ #include "FreeRTOS.h"
+ #include "task.h"
+ #include "wio_usi_uart.h"
++#include "wio_link_data.h"
+ }
+ 
+ /* Marker and bounds of the CTRL channel; mirrored by the host in app/erpc.h. */
+@@ -51,6 +52,10 @@
+ #define WIO_CTRL_STATS          2u
+ #define WIO_CTRL_SETBAUD        3u
+ #define WIO_CTRL_BENCH          4u
++#define WIO_CTRL_DATA_CFG       5u            /* issue #23 U1: the DATA channel */
++#define WIO_CTRL_DATA_STATS     6u
++
++#define WIO_CTRL_DATA_MAGIC     0x44415441u   /* 'DATA' */
+ 
+ #define WIO_CTRL_SETBAUD_MAGIC  0x42415544u   /* 'BAUD' */
+ 
+@@ -71,6 +76,20 @@
+ 	virtual bool hasMessage(void) { return wio_usi_available() > 0u; }
+ 
+ 	/*
++	 * Write one already-framed DATA frame (issue #23 U1).  Public because the DATA
++	 * task, which is plain C, is the only writer that is not an eRPC path -- and it
++	 * must take THE SAME m_sendLock the N3 worker tasks take for their replies, or two
++	 * writers would interleave their bytes inside a frame.  erpc_setup.cpp installs a
++	 * trampoline to this as wio_link_data_set_writer().
++	 */
++	void writeFramed(const uint8_t *hdr, uint32_t hlen, const uint8_t *body, uint32_t blen)
++	{
++		Mutex::Guard lock(m_sendLock);
++		wio_usi_write(hdr, hlen);
++		wio_usi_write(body, blen);
++	}
++
++	/*
+ 	 * Same contract as FramedTransport::receive() -- return exactly one eRPC message --
+ 	 * but loop over CTRL frames instead of returning after one.  Consuming a CTRL frame
+ 	 * is not an event the eRPC server knows how to be told about, so it must not be
+@@ -88,20 +107,29 @@
+ 				if (ret != kErpcStatus_Success) {
+ 					return ret;
+ 				}
+-				if (h.m_messageSize != WIO_CTRL_MAGIC) {
+-					/* Ordinary eRPC frame: h.m_crc is the body CRC, and the
+-					 * size must fit the buffer (the base class's check). */
+-					if (h.m_messageSize > message->getLength()) {
+-						return kErpcStatus_ReceiveFailed;
+-					}
+-					ret = underlyingReceive(message->get(), h.m_messageSize);
+-					if (ret != kErpcStatus_Success) {
+-						return ret;
+-					}
+-					break;
++				if (h.m_messageSize == WIO_CTRL_MAGIC) {
++					/* CTRL: h.m_crc is really the body LENGTH; the CRC
++					 * follows. */
++					handleCtrl(h.m_crc);
++					continue;
+ 				}
+-				/* CTRL: h.m_crc is really the body LENGTH; the CRC follows. */
+-				handleCtrl(h.m_crc);
++				if (h.m_messageSize == WIO_DATA_MAGIC) {
++					/* DATA: same header shape as CTRL.  Consumed here and
++					 * handed to the DATA task; like CTRL it must not
++					 * surface to the eRPC server as a short read. */
++					handleData(h.m_crc);
++					continue;
++				}
++				/* Ordinary eRPC frame: h.m_crc is the body CRC, and the size
++				 * must fit the buffer (the base class's check). */
++				if (h.m_messageSize > message->getLength()) {
++					return kErpcStatus_ReceiveFailed;
++				}
++				ret = underlyingReceive(message->get(), h.m_messageSize);
++				if (ret != kErpcStatus_Success) {
++					return ret;
++				}
++				break;
+ 			}
+ 		}
+ 
+@@ -156,6 +184,57 @@
+ 	}
+ 
+ 	/*
++	 * Read one DATA frame whose body length is @bodyLen (issue #23 U1).  The header
++	 * (magic + length) has been consumed; the CRC has not.
++	 *
++	 * THREE outcomes, and they are deliberately different:
++	 *   - a length outside the channel's bounds is not a frame at all (a
++	 *     desynchronised stream that landed on 0xFFFE), so resynchronise -- draining
++	 *     a length we do not believe would swallow real frames;
++	 *   - a believable length with no pool buffer free IS a frame, just one we cannot
++	 *     hold: DRAIN exactly it.  Losing a frame is an ordinary Ethernet event;
++	 *     losing stream synchronisation is not;
++	 *   - otherwise read the body straight into the pool buffer -- no copy through a
++	 *     scratch -- and let wio_link_data_commit() check the CRC and queue it.
++	 */
++	void handleData(uint16_t bodyLen)
++	{
++		uint16_t crc;
++		uint8_t *body;
++
++		if (bodyLen < WIO_DATA_HDR || bodyLen > WIO_DATA_BODY_MAX) {
++			ctrlResync();
++			return;
++		}
++		if (underlyingReceive((uint8_t *)&crc, sizeof(crc)) != kErpcStatus_Success) {
++			ctrlResync();
++			return;
++		}
++		body = wio_link_data_claim(bodyLen);
++		if (body == NULL) {
++			uint8_t sink[64];
++			uint32_t left = bodyLen;
++
++			while (left != 0u) {
++				uint32_t want = (left < sizeof(sink)) ? left : sizeof(sink);
++
++				if (underlyingReceive(sink, want) != kErpcStatus_Success) {
++					ctrlResync();
++					return;
++				}
++				left -= want;
++			}
++			return;
++		}
++		if (underlyingReceive(body, bodyLen) != kErpcStatus_Success) {
++			wio_link_data_abort(body);
++			ctrlResync();
++			return;
++		}
++		wio_link_data_commit(body, bodyLen, crc);
++	}
++
++	/*
+ 	 * Read and act on one CTRL frame whose body length is @bodyLen.  The header
+ 	 * (magic + length) has already been consumed; the CRC has not.
+ 	 *
+@@ -266,6 +345,38 @@
+ 			break;
+ 		}
+ 
++		case WIO_CTRL_DATA_CFG: {
++			/* Same shape of guard as SETBAUD: an exact length plus a magic word,
++			 * because this one starts a transmitter.  It runs on the receive task,
++			 * and switching OFF deliberately BLOCKS here until the DATA writer is
++			 * idle -- that wait is the promise the host's teardown depends on
++			 * (wio_link_data.h). */
++			if (plen != 12u || getU32(payload + 8) != WIO_CTRL_DATA_MAGIC) {
++				status = 1u;
++				break;
++			}
++			status = wio_link_data_cfg(payload[0], payload[1],
++			                           (uint16_t)((uint16_t)payload[2] |
++			                                      ((uint16_t)payload[3] << 8)),
++			                           getU32(payload + 4));
++			break;
++		}
++
++		case WIO_CTRL_DATA_STATS: {
++			uint32_t st[WIO_DATA_STAT_WORDS];
++			uint32_t i;
++
++			if (plen != 0u) {
++				status = 1u;
++				break;
++			}
++			wio_link_data_stats(st);
++			for (i = 0u; i < WIO_DATA_STAT_WORDS; i++)
++				putU32(m_ctrlTx + WIO_CTRL_HDR + i * 4u, st[i]);
++			rlen = WIO_DATA_STAT_WORDS * 4u;
++			break;
++		}
++
+ 		default:
+ 			status = 1u;
+ 			break;
+--- a/src/link/wio_usi_uart.c
++++ b/src/link/wio_usi_uart.c
+@@ -54,9 +54,13 @@
+  * 64 = 6.4 byte times = the SDK default; it scales with the baud rate automatically. */
+ #define WIO_USI_RX_TO_BITS 64u
+ 
+-/* 8 kB, power of two.  4 ms of inflow at 2 Mbaud, 13 ms at 6 Mbaud -- room for the eRPC
+- * receive task to be preempted by WiFi work and still not lose a frame. */
+-#define WIO_RING_SIZE      8192u
++/* 16 kB, power of two.  8 ms of inflow at 2 Mbaud, 27 ms at 6 Mbaud -- room for the eRPC
++ * receive task to be preempted by WiFi work and still not lose a frame.
++ *
++ * Doubled from 8 kB for issue #23 U1: the host may now stream Ethernet-sized DATA frames
++ * continuously rather than one request at a time, so the window that has to be survived
++ * is no longer bounded by the host waiting for a reply. */
++#define WIO_RING_SIZE      16384u
+ #define WIO_RING_MASK      (WIO_RING_SIZE - 1u)
+ 
+ static uint32_t          wio_baud;           /* what USI_UARTSetBaud last programmed */
+--- a/src/link/wio_link_data.h
++++ b/src/link/wio_link_data.h
+@@ -0,0 +1,96 @@
++/*
++ * wio_link_data -- the link's DATA channel (issue #23 U1, wio-lite-ai).
++ *
++ * Third frame type on the USI0 link, alongside eRPC and LINK-CTRL:
++ *
++ *   DATA frame = u16 0xFFFE | u16 body_len | u16 crc16(body) | body[body_len]
++ *   body       = u8 chan | u8 flags | payload[body_len - 2]
++ *
++ * Unlike the other two it is unsolicited, bidirectional and unacknowledged -- it exists
++ * to carry raw Ethernet frames once this firmware is turned into an L2 bridge (U2), so
++ * the STM32 can run its own TCP/IP stack.  In U1 the endpoint here is a sink/source
++ * bench instead: the plumbing (pools, queue, receive task, transmit task) is exactly
++ * what U2 needs, and only what it feeds changes.
++ *
++ * WHY A TRANSMIT TASK.  wio_usi_write() spins on the TX FIFO, which is 2.5 ms for a
++ * 1500-byte frame at 6 Mbaud.  In U2 the producer is the WiFi driver's receive path, and
++ * spinning there would stall the driver; queueing hands that cost to a task whose
++ * priority we choose.  The same task drains the queue and generates bench traffic, so
++ * there is only ever one DATA writer.
++ *
++ * The frame is written through a callback the transport installs
++ * (wio_link_data_set_writer), because the serialisation point is the transport's
++ * m_sendLock -- the N3 worker tasks send eRPC replies concurrently, and two writers
++ * without it would interleave their bytes inside a frame.
++ */
++#ifndef WIO_LINK_DATA_H
++#define WIO_LINK_DATA_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define WIO_DATA_MAGIC        0xFFFEu
++#define WIO_DATA_HDR          2u          /* chan + flags */
++#define WIO_DATA_PAYLOAD_MAX  1536u
++#define WIO_DATA_BODY_MAX     (WIO_DATA_HDR + WIO_DATA_PAYLOAD_MAX)
++
++#define WIO_DATA_CHAN_ETH     0u
++#define WIO_DATA_CHAN_BENCH   1u
++
++/* LINK_DATA_CFG modes (mirrored by the host in app/erpc.h). */
++#define WIO_DATA_MODE_OFF     0x00u
++#define WIO_DATA_MODE_SINK    0x01u
++#define WIO_DATA_MODE_SOURCE  0x02u
++
++/* Counters, in the order wio_link_data_stats() writes them. */
++#define WIO_DATA_STAT_WORDS   12u
++
++typedef void (*wio_link_write_fn)(const uint8_t *hdr, uint32_t hlen,
++                                  const uint8_t *body, uint32_t blen);
++
++/* Install the framed-write callback and create the pools, queue and tasks.  Call once
++ * from setup_erpc(), after the transport exists. */
++void wio_link_data_set_writer(wio_link_write_fn fn);
++void wio_link_data_init(void);
++
++/* ---- receive side, called from the transport's receive loop -------------------
++ * Claim a buffer for a frame of @body_len bytes (NULL when the pool is empty -- the
++ * caller must then DRAIN those bytes, never skip them), hand it back unused, or commit
++ * it once full.  commit() checks the CRC and queues the frame for the receive task. */
++uint8_t *wio_link_data_claim(uint16_t body_len);
++void     wio_link_data_abort(uint8_t *body);
++void     wio_link_data_commit(uint8_t *body, uint16_t body_len, uint16_t crc);
++
++/* ---- transmit side ------------------------------------------------------------
++ * Queue one frame.  Copies @p, returns 0 or -1 when no buffer is free (a drop, which is
++ * what an Ethernet-carrying link is allowed to do).  U2's bridge calls this; U1 does not.
++ */
++int wio_link_data_send(uint8_t chan, const uint8_t *p, uint16_t n);
++
++/*
++ * LINK_DATA_CFG.  @mode is a bitmask of WIO_DATA_MODE_*; SOURCE runs for @ms
++ * milliseconds or until it is switched off, whichever comes first.  Returns a CTRL
++ * status byte (0 = accepted).
++ *
++ * CONTRACT for mode == OFF, which the host depends on when it tears the channel down:
++ * this does not return until the source has stopped, wio_link_data_send() has been
++ * refused for good, the transmit queue is drained AND the transmit task is not inside a
++ * write.  So the acknowledgement the host sees means "no further DATA frame can be on the
++ * way" -- a promise no amount of waiting on the host side could otherwise establish.
++ * (The send() half matters for U2, whose bridge queues frames on its own schedule; the
++ * U1 bench only drives the source.)  Bounded at 1 s: past that it answers with a non-zero
++ * status, so a broken promise is reported rather than assumed.
++ */
++uint8_t wio_link_data_cfg(uint8_t mode, uint8_t seed, uint16_t bytes, uint32_t ms);
++
++/* LINK_DATA_STATS: WIO_DATA_STAT_WORDS counters, host order (see cmd_link.c). */
++void wio_link_data_stats(uint32_t *out);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* WIO_LINK_DATA_H */
+--- a/src/link/wio_link_data.c
++++ b/src/link/wio_link_data.c
+@@ -0,0 +1,540 @@
++/*
++ * wio_link_data -- the link's DATA channel (issue #23 U1).  See wio_link_data.h.
++ *
++ * Locking: the pools and both queues are guarded by a FreeRTOS mutex, not by disabling
++ * interrupts -- everything here runs in task context (the eRPC receive task, the worker
++ * tasks and the DATA task), and the regions are short index operations.  The payload
++ * copy and the CRC are deliberately done OUTSIDE it.
++ *
++ * Buffer lifetime is tracked with a state byte per slot rather than by the queues alone,
++ * for the same reason the host side does it (app/link_data.c): a buffer can be held
++ * outside the lock -- by the receive loop mid-frame, or by a sender copying into it --
++ * while a reset takes the pool back, and without the state byte that holder's later
++ * commit would put the slot into the free list twice.
++ */
++
++#include "FreeRTOS.h"
++#include "task.h"
++#include "queue.h"
++#include "semphr.h"
++
++#include "wio_usi_uart.h"
++#include "wio_link_data.h"
++
++#include <string.h>
++
++/* Pools.  6 receive + 4 transmit x 1544 B is ~15 kB of static BSS; the receive side is
++ * deeper because a burst arrives whether or not anything is ready for it. */
++#define WIO_DATA_RX_BUFS   6u
++#define WIO_DATA_TX_BUFS   4u
++
++/* The DATA task: below the eRPC receive task and the workers (tskIDLE_PRIORITY + 8) so
++ * link control and RPC replies always win over bulk traffic, and above idle so it still
++ * gets the CPU when they are blocked. */
++#define WIO_DATA_TASK_PRIO (tskIDLE_PRIORITY + 6)
++#define WIO_DATA_TASK_STACK (1024 * 3)
++
++enum { LD_FREE = 0, LD_BUSY = 1, LD_QUEUED = 2 };
++
++struct wio_data_buf {
++	uint8_t  body[WIO_DATA_BODY_MAX];
++	uint16_t len;
++} __attribute__((aligned(8)));
++
++static struct wio_data_buf d_rx[WIO_DATA_RX_BUFS];
++static struct wio_data_buf d_tx[WIO_DATA_TX_BUFS];
++static uint8_t d_rx_state[WIO_DATA_RX_BUFS];
++static uint8_t d_tx_state[WIO_DATA_TX_BUFS];
++
++static SemaphoreHandle_t d_lock;
++static QueueHandle_t     d_rx_q;                 /* indices into d_rx */
++static SemaphoreHandle_t d_tx_wake;              /* "something to send" hint, not state */
++static wio_link_write_fn d_write;
++
++/*
++ * The transmit queue is an index ring under d_lock rather than a FreeRTOS queue, and
++ * that is a correctness requirement, not a preference.  wio_link_data_cfg(OFF) has to be
++ * able to state that NO further frame can go out; it can only do that if "take the next
++ * frame" and "mark the writer busy" happen in ONE locked step.  With a FreeRTOS queue
++ * they cannot: the task would return from xQueueReceive() holding an index and then take
++ * the lock, and a CFG(OFF) landing in that window would see an empty queue, an idle
++ * writer -- and a frame that goes out immediately afterwards.
++ */
++static uint8_t  d_tx_ring[WIO_DATA_TX_BUFS + 1u];
++static uint8_t  d_tx_head, d_tx_tail;
++#define D_TX_RING_CAP (WIO_DATA_TX_BUFS + 1u)
++
++/* Bench / bridge configuration, written under d_lock by the CTRL command. */
++static volatile uint8_t  d_mode;
++/*
++ * Whether wio_link_data_send() may put anything into the ring at all.  Cleared by
++ * CFG(OFF) and set by any other CFG, and it is what extends the OFF contract to the
++ * QUEUE side: without it, "no frame can still go out" would only cover the bench source,
++ * and U2's bridge -- which calls send() on its own schedule -- could slip a frame in
++ * after the acknowledgement.  Checked again at enqueue time, so a sender that was already
++ * copying when OFF arrived is caught too.
++ */
++static volatile uint8_t  d_tx_enabled = 1u;
++static volatile uint8_t  d_seed;
++static volatile uint16_t d_gen_bytes;
++static volatile uint32_t d_gen_until;            /* tick count when SOURCE stops */
++static volatile uint8_t  d_tx_busy;              /* the task is inside a frame write */
++
++static uint32_t st_rx_frames, st_rx_bytes, st_rx_drops, st_rx_crc, st_rx_oversize;
++static uint32_t st_rx_gaps, st_tx_frames, st_tx_bytes, st_tx_drops;
++static uint32_t st_rx_seq_next;
++static uint8_t  st_rx_seq_valid;
++
++static struct wio_data_buf d_gen;                /* the source's staging frame */
++
++/* ------------------------------------------------------------------ *
++ *  CRC-16, identical to erpc::Crc16 (init 0xEF4A, poly 0x1021, MSB first)
++ * ------------------------------------------------------------------ */
++/* Reimplemented here rather than reached through the C++ Crc16 object because this file
++ * is C and runs off the transport's thread; the values are the same by construction and
++ * the frame would simply be rejected at the far end if they were not. */
++static uint16_t d_crc16(const uint8_t *d, uint32_t n)
++{
++	uint32_t crc = 0xEF4Au;
++	uint32_t j;
++
++	for (j = 0u; j < n; j++) {
++		int i;
++
++		crc ^= (uint32_t)d[j] << 8;
++		for (i = 0; i < 8; i++) {
++			uint32_t t = crc << 1;
++
++			if (crc & 0x8000u)
++				t ^= 0x1021u;
++			crc = t;
++		}
++	}
++	return (uint16_t)crc;
++}
++
++static void d_take(void)
++{
++	if (d_lock != NULL)
++		xSemaphoreTake(d_lock, portMAX_DELAY);
++}
++
++static void d_give(void)
++{
++	if (d_lock != NULL)
++		xSemaphoreGive(d_lock);
++}
++
++static int d_rx_index(const uint8_t *body)
++{
++	const uint8_t *base = (const uint8_t *)&d_rx[0];
++	uint32_t off;
++	int idx;
++
++	if (body == NULL || body < base)
++		return -1;
++	off = (uint32_t)(body - base);
++	if (off % sizeof(d_rx[0]) != 0u)
++		return -1;
++	idx = (int)(off / sizeof(d_rx[0]));
++	return (idx < (int)WIO_DATA_RX_BUFS) ? idx : -1;
++}
++
++/* ------------------------------------------------------------------ *
++ *  receive
++ * ------------------------------------------------------------------ */
++uint8_t *wio_link_data_claim(uint16_t body_len)
++{
++	uint8_t *body = NULL;
++	unsigned i;
++
++	if (body_len < WIO_DATA_HDR || body_len > WIO_DATA_BODY_MAX) {
++		d_take();
++		st_rx_oversize++;
++		d_give();
++		return NULL;
++	}
++	d_take();
++	for (i = 0u; i < WIO_DATA_RX_BUFS; i++) {
++		if (d_rx_state[i] == LD_FREE) {
++			d_rx_state[i] = LD_BUSY;
++			body = d_rx[i].body;
++			break;
++		}
++	}
++	if (body == NULL)
++		st_rx_drops++;                   /* caller drains the body to stay in sync */
++	d_give();
++	return body;
++}
++
++void wio_link_data_abort(uint8_t *body)
++{
++	int idx = d_rx_index(body);
++
++	if (idx < 0)
++		return;
++	d_take();
++	d_rx_state[idx] = LD_FREE;
++	d_give();
++}
++
++void wio_link_data_commit(uint8_t *body, uint16_t body_len, uint16_t crc)
++{
++	int idx = d_rx_index(body);
++	uint8_t i8;
++
++	if (idx < 0)
++		return;
++	if (d_crc16(body, body_len) != crc) {
++		d_take();
++		st_rx_crc++;
++		d_rx_state[idx] = LD_FREE;
++		d_give();
++		return;
++	}
++	d_take();
++	if (d_rx_state[idx] != LD_BUSY) {
++		d_give();                        /* reclaimed under us: stale */
++		return;
++	}
++	d_rx[idx].len   = body_len;
++	d_rx_state[idx] = LD_QUEUED;
++	d_give();
++
++	i8 = (uint8_t)idx;
++	if (d_rx_q == NULL || xQueueSend(d_rx_q, &i8, 0) != pdTRUE) {
++		d_take();
++		st_rx_drops++;
++		d_rx_state[idx] = LD_FREE;
++		d_give();
++	}
++}
++
++/*
++ * The receive endpoint.  In U1 this is the bench sink: it checks the sequence number the
++ * host puts at the head of a bench payload, which is how frame loss becomes visible (the
++ * link has no retransmission, and one lost byte costs a resynchronisation and therefore
++ * several frames).  U2 replaces the body of this loop with netif->linkoutput().
++ */
++static void wio_data_rx_task(void *arg)
++{
++	uint8_t idx;
++
++	(void)arg;
++	for (;;) {
++		if (xQueueReceive(d_rx_q, &idx, portMAX_DELAY) != pdTRUE)
++			continue;
++		if (idx >= WIO_DATA_RX_BUFS)
++			continue;
++
++		{
++			struct wio_data_buf *b = &d_rx[idx];
++			uint16_t plen = (uint16_t)(b->len - WIO_DATA_HDR);
++			const uint8_t *pl = b->body + WIO_DATA_HDR;
++
++			d_take();
++			st_rx_frames++;
++			st_rx_bytes += plen;
++			if (plen >= 4u) {
++				uint32_t seq = (uint32_t)pl[0] | ((uint32_t)pl[1] << 8) |
++				               ((uint32_t)pl[2] << 16) | ((uint32_t)pl[3] << 24);
++
++				if (!st_rx_seq_valid)
++					st_rx_seq_valid = 1u;
++				else if (seq != st_rx_seq_next)
++					st_rx_gaps += (uint32_t)(seq - st_rx_seq_next);
++				st_rx_seq_next = seq + 1u;
++			}
++			d_rx_state[idx] = LD_FREE;
++			d_give();
++		}
++	}
++}
++
++/* ------------------------------------------------------------------ *
++ *  transmit
++ * ------------------------------------------------------------------ */
++/* Frame and write one body.  The caller has already claimed the writer (d_tx_busy set
++ * under d_lock) -- that claim is what wio_link_data_cfg(OFF) waits on. */
++static void d_write_frame(const uint8_t *body, uint16_t body_len)
++{
++	uint8_t hdr[6];
++	uint16_t crc = d_crc16(body, body_len);
++
++	hdr[0] = (uint8_t)WIO_DATA_MAGIC;
++	hdr[1] = (uint8_t)(WIO_DATA_MAGIC >> 8);
++	hdr[2] = (uint8_t)body_len;
++	hdr[3] = (uint8_t)(body_len >> 8);
++	hdr[4] = (uint8_t)crc;
++	hdr[5] = (uint8_t)(crc >> 8);
++
++	if (d_write != NULL)
++		d_write(hdr, sizeof(hdr), body, body_len);
++	d_take();
++	st_tx_frames++;
++	st_tx_bytes += (uint32_t)(body_len - WIO_DATA_HDR);
++	d_give();
++}
++
++/* Give the writer back.  Always paired with the locked step that set d_tx_busy. */
++static void d_tx_release(int idx)
++{
++	d_take();
++	if (idx >= 0)
++		d_tx_state[idx] = LD_FREE;
++	d_tx_busy = 0u;
++	d_give();
++}
++
++int wio_link_data_send(uint8_t chan, const uint8_t *p, uint16_t n)
++{
++	struct wio_data_buf *b;
++	unsigned i;
++	int idx = -1;
++
++	if (n > WIO_DATA_PAYLOAD_MAX || (n != 0u && p == NULL))
++		return -1;
++	d_take();
++	if (!d_tx_enabled) {
++		st_tx_drops++;
++		d_give();
++		return -1;
++	}
++	for (i = 0u; i < WIO_DATA_TX_BUFS; i++) {
++		if (d_tx_state[i] == LD_FREE) {
++			d_tx_state[i] = LD_BUSY;
++			idx = (int)i;
++			break;
++		}
++	}
++	if (idx < 0)
++		st_tx_drops++;
++	d_give();
++	if (idx < 0)
++		return -1;
++
++	b = &d_tx[idx];
++	b->body[0] = chan;
++	b->body[1] = 0u;
++	if (n != 0u)
++		memcpy(b->body + WIO_DATA_HDR, p, n);
++	b->len = (uint16_t)(WIO_DATA_HDR + n);
++
++	d_take();
++	if (d_tx_state[idx] != LD_BUSY || !d_tx_enabled) {
++		/* CFG(OFF) landed while we were copying: this frame must NOT go out, or the
++		 * acknowledgement the host already has would have been a lie. */
++		st_tx_drops++;
++		d_tx_state[idx] = LD_FREE;
++		d_give();
++		return -1;
++	}
++	d_tx_state[idx] = LD_QUEUED;
++	d_tx_ring[d_tx_head] = (uint8_t)idx;
++	d_tx_head = (uint8_t)((d_tx_head + 1u) % D_TX_RING_CAP);
++	d_give();
++
++	if (d_tx_wake != NULL)
++		xSemaphoreGive(d_tx_wake);       /* a hint; the ring is the real state */
++	return 0;
++}
++
++/* Deterministic filler, so the wire carries real transitions.  Integrity is the frame
++ * CRC's job, not the pattern's. */
++static void d_fill(uint8_t *buf, uint32_t n, uint8_t seed)
++{
++	uint32_t x = 0x12345678u ^ (uint32_t)seed;
++	uint32_t i;
++
++	for (i = 0u; i < n; i++) {
++		x = x * 1103515245u + 12345u;
++		buf[i] = (uint8_t)(x >> 24);
++	}
++}
++
++/*
++ * The single DATA writer.  Two sources of work, checked in this order:
++ *   1. the bench source, while it is enabled and its window has not expired
++ *   2. the transmit queue (what U2's bridge will use)
++ * When neither has anything it blocks on the queue, so an idle link costs nothing.
++ */
++static void wio_data_tx_task(void *arg)
++{
++	uint32_t seq = 0u;
++
++	(void)arg;
++	for (;;) {
++		int generating, idx = -1;
++
++		/*
++		 * ONE locked step decides everything: whether the source may run, or which
++		 * queued frame is next, and it claims the writer at the same time.  That
++		 * atomicity is what lets wio_link_data_cfg(OFF) promise the host that
++		 * nothing more can go out -- see the ring comment at the top of the file.
++		 */
++		d_take();
++		generating = ((d_mode & WIO_DATA_MODE_SOURCE) != 0u) &&
++		             ((int32_t)(xTaskGetTickCount() - d_gen_until) < 0);
++		if (!generating && d_tx_head != d_tx_tail) {
++			idx = (int)d_tx_ring[d_tx_tail];
++			d_tx_tail = (uint8_t)((d_tx_tail + 1u) % D_TX_RING_CAP);
++			if (idx >= (int)WIO_DATA_TX_BUFS)
++				idx = -1;
++		}
++		if (generating || idx >= 0)
++			d_tx_busy = 1u;
++		d_give();
++
++		if (generating) {
++			uint16_t plen = d_gen_bytes;
++
++			if (plen < 4u)
++				plen = 4u;
++			if (plen > WIO_DATA_PAYLOAD_MAX)
++				plen = WIO_DATA_PAYLOAD_MAX;
++			d_gen.body[0] = WIO_DATA_CHAN_BENCH;
++			d_gen.body[1] = 0u;
++			d_gen.body[WIO_DATA_HDR + 0] = (uint8_t)seq;
++			d_gen.body[WIO_DATA_HDR + 1] = (uint8_t)(seq >> 8);
++			d_gen.body[WIO_DATA_HDR + 2] = (uint8_t)(seq >> 16);
++			d_gen.body[WIO_DATA_HDR + 3] = (uint8_t)(seq >> 24);
++			if (plen > 4u)
++				d_fill(d_gen.body + WIO_DATA_HDR + 4u, (uint32_t)plen - 4u, d_seed);
++			seq++;
++			d_write_frame(d_gen.body, (uint16_t)(WIO_DATA_HDR + plen));
++			d_tx_release(-1);
++			/* Yield once per frame: this task must not be able to lock out the
++			 * receive task, which is what keeps the incoming direction alive. */
++			taskYIELD();
++			continue;
++		}
++		seq = 0u;                        /* a new run starts its sequence at zero */
++
++		if (idx >= 0) {
++			d_write_frame(d_tx[idx].body, d_tx[idx].len);
++			d_tx_release(idx);
++			continue;
++		}
++		/* Nothing to do: block on the hint, with a timeout so a lost give (or a
++		 * source whose window opened while we waited) costs at most 20 ms. */
++		if (d_tx_wake != NULL)
++			(void)xSemaphoreTake(d_tx_wake, pdMS_TO_TICKS(20));
++		else
++			vTaskDelay(pdMS_TO_TICKS(20));
++	}
++}
++
++/* ------------------------------------------------------------------ *
++ *  CTRL commands
++ * ------------------------------------------------------------------ */
++uint8_t wio_link_data_cfg(uint8_t mode, uint8_t seed, uint16_t bytes, uint32_t ms)
++{
++	int spins;
++
++	if ((mode & ~(WIO_DATA_MODE_SINK | WIO_DATA_MODE_SOURCE)) != 0u)
++		return 1u;
++	if (bytes > WIO_DATA_PAYLOAD_MAX)
++		return 1u;
++
++	d_take();
++	d_mode       = mode;
++	d_tx_enabled = (mode != WIO_DATA_MODE_OFF) ? 1u : 0u;
++	d_seed       = seed;
++	d_gen_bytes  = bytes;
++	d_gen_until  = xTaskGetTickCount() + pdMS_TO_TICKS(ms);
++	if (mode != WIO_DATA_MODE_OFF) {
++		st_rx_frames = st_rx_bytes = st_rx_drops = st_rx_crc = 0u;
++		st_rx_oversize = st_rx_gaps = 0u;
++		st_tx_frames = st_tx_bytes = st_tx_drops = 0u;
++		st_rx_seq_valid = 0u;
++	}
++	d_give();
++
++	if (mode != WIO_DATA_MODE_OFF)
++		return 0u;
++
++	/*
++	 * The OFF contract (see wio_link_data.h): do not answer until nothing more can go
++	 * out.  The source is already stopped by d_mode above; what remains is a queued
++	 * frame and a write in progress.  Bounded, because an unbounded wait here would
++	 * hold the receive lock and wedge the whole link -- and if it ever expires the host
++	 * sees a non-zero status and knows the promise was not kept.
++	 */
++	for (spins = 0; spins < 100; spins++) {          /* 100 x 10 ms = 1 s */
++		int quiet;
++
++		/* Drain the ring AND test the writer in the SAME locked step as the task
++		 * uses to take work from it.  Seeing "ring empty and writer idle" here
++		 * therefore means the task cannot be about to start a frame: to start one it
++		 * would have to take this lock and find the ring empty and the source off. */
++		d_take();
++		while (d_tx_head != d_tx_tail) {
++			uint8_t idx = d_tx_ring[d_tx_tail];
++
++			d_tx_tail = (uint8_t)((d_tx_tail + 1u) % D_TX_RING_CAP);
++			if (idx < WIO_DATA_TX_BUFS) {
++				d_tx_state[idx] = LD_FREE;
++				st_tx_drops++;
++			}
++		}
++		quiet = (d_tx_busy == 0u);
++		d_give();
++		if (quiet)
++			return 0u;
++		vTaskDelay(pdMS_TO_TICKS(10));
++	}
++	return 1u;
++}
++
++void wio_link_data_stats(uint32_t *out)
++{
++	unsigned i;
++	uint32_t inuse = 0u, queued = 0u;
++
++	if (out == NULL)
++		return;
++	d_take();
++	for (i = 0u; i < WIO_DATA_RX_BUFS; i++)
++		if (d_rx_state[i] != LD_FREE)
++			inuse++;
++	for (i = 0u; i < WIO_DATA_TX_BUFS; i++)
++		if (d_tx_state[i] != LD_FREE)
++			queued++;
++	out[0]  = st_rx_frames;
++	out[1]  = st_rx_bytes;
++	out[2]  = st_rx_drops;
++	out[3]  = st_rx_crc;
++	out[4]  = st_rx_oversize;
++	out[5]  = st_rx_gaps;
++	out[6]  = st_tx_frames;
++	out[7]  = st_tx_bytes;
++	out[8]  = st_tx_drops;
++	out[9]  = queued;
++	out[10] = inuse;
++	out[11] = d_mode;
++	d_give();
++}
++
++/* ------------------------------------------------------------------ *
++ *  init
++ * ------------------------------------------------------------------ */
++void wio_link_data_set_writer(wio_link_write_fn fn)
++{
++	d_write = fn;
++}
++
++void wio_link_data_init(void)
++{
++	if (d_lock != NULL)
++		return;
++	d_lock    = xSemaphoreCreateMutex();
++	d_rx_q    = xQueueCreate(WIO_DATA_RX_BUFS, sizeof(uint8_t));
++	d_tx_wake = xSemaphoreCreateBinary();
++	if (d_lock == NULL || d_rx_q == NULL || d_tx_wake == NULL)
++		return;                          /* fail-soft: the channel stays inert */
++	xTaskCreate(wio_data_rx_task, "wio-drx", WIO_DATA_TASK_STACK / sizeof(portSTACK_TYPE),
++	            NULL, WIO_DATA_TASK_PRIO, NULL);
++	xTaskCreate(wio_data_tx_task, "wio-dtx", WIO_DATA_TASK_STACK / sizeof(portSTACK_TYPE),
++	            NULL, WIO_DATA_TASK_PRIO, NULL);
++}

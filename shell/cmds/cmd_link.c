@@ -39,6 +39,7 @@
  */
 #include "cli.h"
 #include "erpc.h"
+#include "link_data.h"
 #include "rtl_link.h"
 #include "rtl8720.h"
 
@@ -74,6 +75,16 @@ static const uint32_t link_bauds[] = { 2000000u, 3000000u, 4000000u, 6000000u };
  * above anything healthy, and a bench that needs it has already failed. */
 #define LINK_BENCH_TMO_MS 2000u
 #define LINK_CTRL_TMO_MS  500u
+
+/*
+ * LINK_DATA_CFG needs its own, much longer timeout.  Every other CTRL command answers as
+ * fast as the module can turn a frame around, but CFG(off) DELIBERATELY delays its
+ * acknowledgement until the module's DATA writer is idle -- that delay is the promise the
+ * teardown depends on -- and the module bounds its own wait at 1 s.  A 500 ms timeout here
+ * would abandon the exchange exactly when the module is keeping its side of the bargain,
+ * and leave a stale acknowledgement in the stream behind it.
+ */
+#define LINK_DCFG_TMO_MS  2500u
 
 /*
  * Latency distribution: a fixed histogram rather than stored samples.  A 3-second run at
@@ -199,7 +210,7 @@ static void link_put_ms(struct cli_instance *sh, const char *label, uint32_t us)
  * it does; otherwise prints why and returns non-zero.  Caller already holds the session
  * (rtl_link_begin), so its own UART reference is the 1 that is expected.
  */
-static int link_ctrl_ready(struct cli_instance *sh)
+static int link_ctrl_ready_ex(struct cli_instance *sh, int allow_busy)
 {
 	if (erpc_module_gen() < 5u) {
 		cli_error(sh, "link: this needs firmware 2.1.3+wio-n5 or later, and the host "
@@ -208,6 +219,17 @@ static int link_ctrl_ready(struct cli_instance *sh)
 		          "answer is dropped again by any `wifi reset` or flash session)\r\n");
 		return 1;
 	}
+	/*
+	 * `link dbench` deliberately runs with the link BUSY (issue #23 U1).  Every other
+	 * subcommand here inherits the U0 rule that CTRL is only issued on a quiescent link,
+	 * but U1 exists to answer "can the three channels interleave continuously?" -- and
+	 * refusing to start while a telnet console is up would rule out the only test that
+	 * asks the question.  It is safe for the same reason U1 is possible at all: on a
+	 * wio-n4+ link the wire budget no longer throttles, the frame reader demultiplexes
+	 * by frame type, and the CTRL slot is independent of the eRPC slots.
+	 */
+	if (allow_busy)
+		return 0;
 	if (rtl_link_uart_refs() != 1u) {
 		cli_error(sh, "link: something else is holding the eRPC link\r\n");
 		cli_print(sh, "  LINK-CTRL is only sent on a quiescent link -- stop the telnet "
@@ -219,6 +241,11 @@ static int link_ctrl_ready(struct cli_instance *sh)
 		return 1;
 	}
 	return 0;
+}
+
+static int link_ctrl_ready(struct cli_instance *sh)
+{
+	return link_ctrl_ready_ex(sh, 0);
 }
 
 /* ---- CTRL wrappers ------------------------------------------------------- */
@@ -651,6 +678,317 @@ static int cmd_link_bench(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
+/* ---- link dbench (issue #23 U1: the DATA channel) ------------------------- */
+
+/*
+ * `link bench` measures the CTRL channel, which is a REQUEST/REPLY exchange: the host
+ * sends one frame and waits.  That is not how Ethernet will use this link, so it cannot
+ * answer the question U1 exists to answer -- can DATA, eRPC and CTRL interleave
+ * continuously without losing anything?  `link dbench` runs the DATA channel free: both
+ * ends push frames as fast as their queues accept, nobody waits for anybody, and loss is
+ * detected by a sequence number inside the payload rather than by a missing reply.
+ *
+ * A gap in that sequence is the ground truth for "the multiplexer dropped something".
+ * The link has no retransmission, and one lost BYTE costs a resynchronisation -- i.e.
+ * several frames -- so gaps are also how a byte-level failure becomes visible.
+ */
+#define LINK_DBENCH_MIN   64u            /* below this the framing dominates */
+
+/* Payload: u32 sequence, then filler.  The frame CRC already proves integrity, so the
+ * filler is only there to put real transitions on the wire. */
+#define LINK_DBENCH_HDR   4u
+
+/* DATA_STATS reply: u32 LE, in the order link_print_dstats() prints them. */
+#define LINK_DSTAT_WORDS  12u
+
+struct link_dbench {
+	volatile uint32_t rx_frames;
+	volatile uint32_t rx_bytes;
+	volatile uint32_t rx_gaps;       /* sequence discontinuities = frames lost */
+	volatile uint32_t rx_badlen;
+	volatile uint32_t next_seq;
+	volatile uint8_t  started;
+	uint32_t tx_frames;
+	uint32_t tx_bytes;
+	uint32_t tx_drops;
+	uint32_t elapsed_ms;
+};
+static struct link_dbench link_db;
+
+/* Transmit staging, static for the same reason as link_req: 1.5 kB will not fit on a CLI
+ * instance stack (CLI_INSTANCE_STACK_SIZE = 2048). */
+static uint8_t link_dtx[LINK_DATA_PAYLOAD_MAX];
+
+/*
+ * Runs ON THE LINK SERVICE THREAD (app/erpc.c), once per received DATA frame, with no
+ * link lock held.  It must be short -- while it runs nothing is draining the UART ring --
+ * so it only counts.  Returns 0: the buffer is handed straight back to the pool.
+ */
+static int link_dbench_rx(void *ctx, uint8_t chan, uint8_t *p, uint16_t n)
+{
+	struct link_dbench *d = (struct link_dbench *)ctx;
+	uint32_t seq;
+
+	(void)chan;
+	if (n < LINK_DBENCH_HDR) {
+		d->rx_badlen++;
+		return 0;
+	}
+	seq = get_u32le(p);
+	if (!d->started) {
+		d->started = 1u;                 /* first frame defines the origin */
+	} else if (seq != d->next_seq) {
+		/* Wrap-safe forward difference; a repeat or a reorder cannot happen on a
+		 * single ordered wire, so anything but "the next one" is loss. */
+		d->rx_gaps += (uint32_t)(seq - d->next_seq);
+	}
+	d->next_seq = seq + 1u;
+	d->rx_frames++;
+	d->rx_bytes += n;
+	return 0;
+}
+
+/* Tell the module what to do with the DATA channel.  @mode 0 stops it, and its
+ * acknowledgement means the module's own transmit queue is drained (see erpc.h). */
+static int link_dbench_cfg(struct cli_instance *sh, uint8_t mode, uint16_t bytes,
+                           uint32_t ms, uint8_t seed)
+{
+	struct erpc_diag diag = {0};
+	uint8_t req[12];
+	int n;
+
+	req[0] = mode;
+	req[1] = seed;
+	req[2] = (uint8_t)bytes;
+	req[3] = (uint8_t)(bytes >> 8);
+	put_u32le(req + 4, ms);
+	put_u32le(req + 8, ERPC_CTRL_DATA_MAGIC);
+	n = erpc_ctrl_call(ERPC_CTRL_DATA_CFG, req, (uint16_t)sizeof(req), link_reply,
+	                   (uint16_t)sizeof(link_reply), LINK_DCFG_TMO_MS, &diag);
+	if (n < 0) {
+		cli_error(sh, "link: LINK_DATA_CFG(%u) failed (rc %d)\r\n", mode, n);
+		return -1;
+	}
+	return 0;
+}
+
+static int link_get_dstats(struct cli_instance *sh, uint32_t st[LINK_DSTAT_WORDS])
+{
+	struct erpc_diag diag = {0};
+	int n = erpc_ctrl_call(ERPC_CTRL_DATA_STATS, NULL, 0u, link_reply,
+	                       (uint16_t)sizeof(link_reply), LINK_CTRL_TMO_MS, &diag);
+	unsigned i;
+
+	if (n < (int)(LINK_DSTAT_WORDS * 4u)) {
+		cli_error(sh, "link: LINK_DATA_STATS failed (rc %d)\r\n", n);
+		return -1;
+	}
+	for (i = 0u; i < LINK_DSTAT_WORDS; i++)
+		st[i] = get_u32le(link_reply + i * 4u);
+	return 0;
+}
+
+static void link_print_dstats(struct cli_instance *sh, const uint32_t st[LINK_DSTAT_WORDS])
+{
+	cli_print(sh, "  mod data rx: %lu frames, %lu B, drops %lu, crc %lu, oversize %lu, "
+	          "gaps %lu%s\r\n",
+	          (unsigned long)st[0], (unsigned long)st[1], (unsigned long)st[2],
+	          (unsigned long)st[3], (unsigned long)st[4], (unsigned long)st[5],
+	          (st[2] || st[3] || st[4] || st[5]) ? "  <-- LOSS" : "  (clean)");
+	cli_print(sh, "  mod data tx: %lu frames, %lu B, drops %lu (queued %lu, in-use %lu)\r\n",
+	          (unsigned long)st[6], (unsigned long)st[7], (unsigned long)st[8],
+	          (unsigned long)st[9], (unsigned long)st[10]);
+}
+
+static void link_print_dhost(struct cli_instance *sh)
+{
+	struct link_data_stats ds;
+
+	link_data_stats(&ds);
+	cli_print(sh, "  host data rx: %lu frames, %lu B, drops %lu, crc %lu, oversize %lu, "
+	          "gaps %lu%s\r\n",
+	          (unsigned long)ds.rx_frames, (unsigned long)ds.rx_bytes,
+	          (unsigned long)ds.rx_drops, (unsigned long)ds.rx_crc_err,
+	          (unsigned long)ds.rx_oversize, (unsigned long)link_db.rx_gaps,
+	          (ds.rx_drops || ds.rx_crc_err || ds.rx_oversize || link_db.rx_gaps)
+	                  ? "  <-- LOSS" : "  (clean)");
+	/* no-buf is NOT loss here: the bench offers frames as fast as it can and a full pool
+	 * is the link telling it to wait, which it does.  A frame counted here was never
+	 * queued, so it never entered the sequence the far end checks. */
+	cli_print(sh, "  host data tx: %lu frames, %lu B, no-buf %lu (queued %lu, rx-in-use %lu)\r\n",
+	          (unsigned long)ds.tx_frames, (unsigned long)ds.tx_bytes,
+	          (unsigned long)ds.tx_drops, (unsigned long)ds.tx_queued,
+	          (unsigned long)ds.rx_inuse);
+}
+
+static void link_dbench_report(struct cli_instance *sh, const char *dir, uint32_t bytes)
+{
+	uint64_t total = (uint64_t)link_db.tx_bytes + (uint64_t)link_db.rx_bytes;
+	uint32_t kbs_x10 = 0u;
+
+	if (link_db.elapsed_ms != 0u)
+		kbs_x10 = (uint32_t)(total * 10000u / link_db.elapsed_ms / 1024u);
+	cli_print(sh, "  %-4s %4lu B: tx %lu / rx %lu frames, %lu KB in %lu ms = %lu.%lu KB/s"
+	          " (waited %lu)\r\n",
+	          dir, (unsigned long)bytes, (unsigned long)link_db.tx_frames,
+	          (unsigned long)link_db.rx_frames, (unsigned long)(total / 1024u),
+	          (unsigned long)link_db.elapsed_ms,
+	          (unsigned long)(kbs_x10 / 10u), (unsigned long)(kbs_x10 % 10u),
+	          (unsigned long)link_db.tx_drops);
+}
+
+/*
+/*
+ * Wait for BOTH ends to be quiet before the channel is detached.  This is the ordering
+ * rule from app/link_data.h, and the reason it is a state test rather than a delay: the
+ * flush suppression that keeps DATA frames intact is lifted the instant the consumer
+ * detaches, so a frame still on the wire at that moment would be thrown away mid-body
+ * and desynchronise the reader.  The module's side is proved by the CFG(off)
+ * acknowledgement plus its own queue/pool counters; the host's by erpc_data_quiescent().
+ *
+ * It asks about the DATA CHANNEL, not about the link.  The first version of this used
+ * erpc_link_quiescent(), which additionally requires that no eRPC request be outstanding
+ * -- and the telnet console keeps a blocking accept outstanding for as long as it is
+ * armed (issue #21), so with a console up this could never succeed no matter how quiet
+ * the DATA channel was.  Measured on board #2: the module reported queue 0 / in-use 0
+ * (its promise kept) while this still timed out for a full second.
+ */
+static int link_dbench_settle(struct cli_instance *sh)
+{
+	uint32_t st[LINK_DSTAT_WORDS];
+	int tries;
+
+	for (tries = 0; tries < 50; tries++) {          /* 50 x 20 ms = 1 s */
+		if (erpc_data_quiescent() && link_get_dstats(sh, st) == 0 &&
+		    st[9] == 0u && st[10] == 0u)
+			return 0;
+		cli_sleep(sh, 20u);
+	}
+	cli_error(sh, "link: the DATA channel did not go quiet -- `wifi reset` before using "
+	          "the link again\r\n");
+	return -1;
+}
+
+static int cmd_link_dbench(struct cli_instance *sh, int argc, char **argv)
+{
+	uint32_t bytes = LINK_BENCH_DEF, secs = LINK_BENCH_SECS, tx, rx;
+	uint32_t st[LINK_DSTAT_WORDS], t_start;
+	const char *dir = "both";
+	uint8_t mode;
+	int rc = 0;
+
+	if (argc > 1 && (parse_u32(argv[1], &bytes) != 0 || bytes < LINK_DBENCH_MIN ||
+	                 bytes > LINK_DATA_PAYLOAD_MAX)) {
+		cli_error(sh, "link: bad size (%u..%u)\r\n", (unsigned)LINK_DBENCH_MIN,
+		          (unsigned)LINK_DATA_PAYLOAD_MAX);
+		return 1;
+	}
+	if (argc > 2 && (parse_u32(argv[2], &secs) != 0 || secs == 0u ||
+	                 secs > LINK_BENCH_MAX_S)) {
+		cli_error(sh, "link: bad duration (1..%u s)\r\n", (unsigned)LINK_BENCH_MAX_S);
+		return 1;
+	}
+	if (argc > 3)
+		dir = argv[3];
+	if (link_dir_sizes(dir, bytes, &tx, &rx) != 0) {
+		cli_error(sh, "link: direction must be rx, tx or both\r\n");
+		return 1;
+	}
+
+	if (rtl_link_begin(sh, false) != RTL_LINK_READY)
+		return 1;
+	if (link_ctrl_ready_ex(sh, 1) != 0) {    /* runs with the link busy -- on purpose */
+		rtl_link_end(sh);
+		return 1;
+	}
+	if (erpc_module_gen() < 6u) {
+		cli_error(sh, "link: the DATA channel needs firmware 2.1.3+wio-n6 or later\r\n");
+		rtl_link_end(sh);
+		return 1;
+	}
+
+	memset(&link_db, 0, sizeof(link_db));
+	memset(link_dtx, 0x5A, sizeof(link_dtx));
+	if (link_data_attach(link_dbench_rx, &link_db) != 0) {
+		cli_error(sh, "link: the DATA channel already has a consumer\r\n");
+		rtl_link_end(sh);
+		return 1;
+	}
+
+	/* The module sinks what we send and sources what we want back.  Its source stops
+	 * on its own after the requested time as well as on CFG(off), so a host that dies
+	 * mid-run cannot leave it transmitting forever. */
+	mode = (uint8_t)((tx != 0u ? ERPC_DATA_MODE_SINK : 0u) |
+	                 (rx != 0u ? ERPC_DATA_MODE_SOURCE : 0u));
+	cli_print(sh, "link: dbench %s %lu B for %lu s at %lu baud...\r\n", dir,
+	          (unsigned long)bytes, (unsigned long)secs,
+	          (unsigned long)rtl_link_erpc_baud());
+	if (link_dbench_cfg(sh, mode, (uint16_t)rx, secs * 1000u + 500u, 0x5Au) != 0) {
+		rtl_link_end(sh);                /* closes the UART: nothing can arrive now */
+		link_data_detach();
+		return 1;
+	}
+
+	t_start = HAL_GetTick();
+	for (;;) {
+		uint32_t elapsed = (uint32_t)(HAL_GetTick() - t_start);
+
+		if (elapsed >= secs * 1000u || cli_cancel_requested(sh))
+			break;
+		if (tx == 0u) {
+			cli_sleep(sh, 10u);      /* receive-only: just let the run elapse */
+			continue;
+		}
+		put_u32le(link_dtx, link_db.tx_frames);
+		if (link_data_send(LINK_DATA_CHAN_BENCH, link_dtx, (uint16_t)tx) == 0) {
+			link_db.tx_frames++;
+			link_db.tx_bytes += tx;
+		} else {
+			/* Pool full: the service thread is still writing.  This is
+			 * BACKPRESSURE, not loss -- the frame was never given a sequence
+			 * number, so the far end cannot miss it.  Yielding here is what keeps
+			 * this loop (priority 16) from starving the thread that drains it. */
+			link_db.tx_drops++;
+			cli_sleep(sh, 1u);
+		}
+	}
+	link_db.elapsed_ms = (uint32_t)(HAL_GetTick() - t_start);
+
+	/* Report before anything else can fail: after a Ctrl+C the core discards handler
+	 * output, so a summary held back to the end would simply vanish (issue #16). */
+	link_dbench_report(sh, dir, bytes);
+
+	/* Stop the far end and prove both ends are quiet BEFORE reading the counters, so
+	 * what is printed is a finished run rather than a moving one. */
+	if (link_dbench_cfg(sh, ERPC_DATA_MODE_OFF, 0u, 0u, 0u) != 0)
+		rc = 1;
+	else if (link_dbench_settle(sh) != 0)
+		rc = 1;
+
+	if (link_get_dstats(sh, st) == 0)
+		link_print_dstats(sh, st);
+	link_print_dhost(sh);
+	link_print_host(sh);
+
+	/*
+	 * Order matters.  Detaching restores the pre-send RX flush, so it must not happen
+	 * while a DATA frame could still arrive.  TWO things make that true, and which one
+	 * applies depends on whether anything else is holding the link:
+	 *   - the settle above, which proves the module has stopped (its CFG(off)
+	 *     acknowledgement is a promise it has drained its own writer); and
+	 *   - rtl_link_end(), which drops OUR reference -- and if it was the last one the
+	 *     UART closes outright, so nothing can arrive at all.
+	 * With a telnet console resident the reference count does not reach zero and only
+	 * the first applies, which is exactly why settle is a state test and not a delay.
+	 * If it timed out we detach anyway and say so: a broken promise costs a
+	 * resynchronisation (the reader's CRC and overflow detectors handle it), and
+	 * refusing to detach would strand the channel with no owner.
+	 */
+	rtl_link_end(sh);
+	link_data_detach();
+	return rc;
+}
+
 /* ---- link sweep ---------------------------------------------------------- */
 
 /*
@@ -713,10 +1051,12 @@ CLI_SUBCMD_SET_CREATE(link_subcmds,
 	            cmd_link_baud,  2, 0),
 	CLI_CMD_ARG(bench, NULL, "measured traffic [bytes] [secs] [rx|tx|both]",
 	            cmd_link_bench, 1, 3),
+	CLI_CMD_ARG(dbench, NULL, "free-running DATA channel [bytes] [secs] [rx|tx|both]",
+	            cmd_link_dbench, 1, 3),
 	CLI_CMD_ARG(sweep, NULL, "bench all three directions at the current rate",
 	            cmd_link_sweep, 1, 0),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(link, link_subcmds,
-                 "the RTL8720 UART link itself (info / baud / bench / sweep)",
+                 "the RTL8720 UART link itself (info / baud / bench / dbench / sweep)",
                  NULL, 1, 0);

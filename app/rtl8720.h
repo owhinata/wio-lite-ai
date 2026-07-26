@@ -75,8 +75,52 @@ int rtl8720_uart_open(enum rtl8720_uart which, uint32_t baud);
  * (0 if empty).  Non-blocking; foreground/thread context. */
 size_t rtl8720_uart_read(uint8_t *buf, size_t n);
 
-/* Send @p n bytes out of the open UART (bounded poll on TXFNF; never hangs). */
+/*
+ * Queue @p n bytes for transmission on the open UART (issue #23 U1).
+ *
+ * INTERRUPT-DRIVEN since U1: the bytes are copied into a TX ring and the TXFIFO
+ * threshold interrupt drains it, so this RETURNS BEFORE THE BYTES ARE ON THE WIRE.
+ * Before U1 it was a polling spin, which at 6 Mbaud held the caller for 2.5 ms per
+ * 1500-byte frame -- with the link service thread at priority 10 that starves the
+ * shell and the telnet service, and burns ~60 % of the CPU spinning once Ethernet
+ * frames flow continuously.
+ *
+ * Two consequences for callers:
+ *   - Anything that must observe the bytes having LEFT (closing the UART, changing
+ *     the baud rate, handing the pins to another user) must call
+ *     rtl8720_uart_flush() first.  rtl8720_uart_close() does this itself, and every
+ *     baud change in the tree goes through a close, so this is normally automatic.
+ *   - Bytes are NEVER dropped: with a full ring the call waits (yielding, bounded) for
+ *     the interrupt to make room.  Dropping mid-frame would desynchronise the link
+ *     framing at the far end, which is far worse than the wait.
+ *
+ * SINGLE WRITER.  Callers must be serialised by the link ownership rules (app/erpc.c's
+ * mutex for the eRPC path, app/rtl_link.c's coarse mutex + console claim for the
+ * bridge / flash paths) -- the ring is strictly single-producer.  That was already
+ * true when this was a spin loop; it is now load-bearing.
+ */
 void rtl8720_uart_write(const uint8_t *buf, size_t n);
+
+/*
+ * Wait until everything handed to rtl8720_uart_write() has physically left the UART:
+ * TX ring empty, then USART_ISR TXFE (TXFIFO empty) AND TC (the last frame has left
+ * the shift register).  RM0468 sec 53.8.9: TC is set when transmission of the last
+ * data is complete AND TXFE is set -- TXFE alone would cut the final character.
+ *
+ * Returns 0 when the line is idle, -1 on timeout (or with no UART open, which is
+ * vacuously flushed).  Bounded on purpose: a wedged peripheral must not hang the shell.
+ */
+int rtl8720_uart_flush(uint32_t timeout_ms);
+
+/*
+ * Bytes rtl8720_uart_write() can take right now without waiting.
+ *
+ * For a caller that must not block: the link service thread holds its own mutex across
+ * the send step, so a wait there would stall every other thread that needs the link --
+ * including the `wifi reset` recovery path.  It checks this first and simply leaves a
+ * bulk frame queued for the next pass instead (app/erpc.c erpc_data_send_one).
+ */
+uint32_t rtl8720_uart_tx_space(void);
 
 /* RX bytes dropped by ring overflow since open (diagnostic). */
 uint32_t rtl8720_uart_overflows(void);
@@ -105,7 +149,7 @@ uint32_t rtl8720_uart_overflows(void);
  * (see condition (b) in app/rtl8720.c).
  */
 struct rtl8720_uart_stats {
-	uint32_t isr_count;       /* RX interrupts taken since open */
+	uint32_t isr_count;       /* UART interrupts taken since open (RX and/or TX) */
 	uint32_t isr_max_bytes;   /* most bytes pulled from RDR in one interrupt */
 	uint32_t isr_grace;       /* bytes the FIFO can still take after the threshold */
 	uint32_t isr_max_cycles;  /* longest time spent inside the ISR (DWT cycles) */
@@ -113,6 +157,16 @@ struct rtl8720_uart_stats {
 	uint32_t ore;             /* USART overrun: the hardware FIFO overflowed */
 	uint32_t ferr;            /* framing / noise errors (baud mismatch indicator) */
 	uint32_t ring_size;       /* RX ring capacity in bytes */
+
+	/* TX side (issue #23 U1).  Kept SEPARATE from the RX numbers on purpose: the two
+	 * share one interrupt, and time spent refilling the TXFIFO is time subtracted from
+	 * @isr_grace.  If @isr_max_bytes ever climbs towards the grace, @tx_max_bytes says
+	 * whether the transmitter is the reason. */
+	uint32_t tx_isr_count;    /* interrupts that pushed at least one byte into TDR */
+	uint32_t tx_max_bytes;    /* most bytes pushed into TDR in one interrupt */
+	uint32_t tx_bytes;        /* bytes handed to the hardware since open */
+	uint32_t tx_waits;        /* rtl8720_uart_write() calls that had to wait for room */
+	uint32_t tx_ring_size;    /* TX ring capacity in bytes */
 };
 void rtl8720_uart_stats(struct rtl8720_uart_stats *out);
 

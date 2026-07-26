@@ -45,6 +45,7 @@
 #include "tx_api.h"       /* tx_time_get / mutex / event flags (1 tick = 1 ms here) */
 #include "rtl8720.h"      /* rtl8720_uart_read / _write (USART1 @2 Mbaud, #17) */
 #include "erpc.h"
+#include "link_data.h"    /* the DATA channel this thread also multiplexes (U1) */
 
 #include <string.h>
 
@@ -97,8 +98,15 @@
 #define ERPC_F_DONE(i)       (0x00000100u << (i))
 
 /* Leading u16 of a LINK-CTRL frame (issue #23 U0-3).  See the channel description in
- * erpc.h for why this cannot collide with an eRPC frame's message size. */
+ * erpc.h for why this cannot collide with an eRPC frame's message size.  0xFFFE is the
+ * DATA channel's marker (app/link_data.h), by the same argument. */
 #define ERPC_CTRL_MAGIC      0xFFFFu
+
+/* DATA frames the service thread may write in one pass through the loop.  Bounded so a
+ * saturated transmit queue cannot keep it from draining the RX ring: at 6 Mbaud two
+ * 1500-byte frames is 5 ms of wire time, which is already far more than the ring holds
+ * in reserve, and the loop comes straight back for the rest. */
+#define ERPC_DATA_TX_PER_PASS 2
 
 /* CTRL body header: cmd, seq, status, reserved. */
 #define ERPC_CTRL_HDR        4u
@@ -336,21 +344,53 @@ static uint32_t get_u32le(const uint8_t *p)
 	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+/*
+ * CRC-16 (poly 0x1021, MSB-first, no reflection, init 0xEF4A -- erpc_crc16.cpp).
+ *
+ * TABLE-DRIVEN since issue #23 U1, for the DATA channel: the bit-at-a-time loop this
+ * replaces costs ~40 cycles/byte, which is ~110 us for a 1500-byte Ethernet frame, and
+ * the receive side of that runs on the link service thread for every frame in both
+ * directions.  One byte per step brings it to ~11 us.  The table is built once on first
+ * use FROM THE SAME BIT LOOP, so the values cannot drift from the definition -- the
+ * standard identity CRC(byte) = table[(crc >> 8) ^ byte] ^ (crc << 8) holds exactly for
+ * a non-reflected MSB-first CRC.  Verified byte-for-byte against the old implementation
+ * over every length 0..64 and 1500 with pseudo-random data (off-target check, U1).
+ *
+ * 512 B of BSS.  The lazy init costs 256 * 8 iterations once and is idempotent, so it
+ * does not need erpc_service_init() to have run (cmd_link.c computes CRCs too).
+ */
+static uint16_t erpc_crc_tab[256];
+static uint8_t  erpc_crc_tab_ready;
+
+static void erpc_crc16_build(void)
+{
+	uint32_t b;
+
+	for (b = 0u; b < 256u; b++) {
+		uint32_t crc = b << 8;
+		int i;
+
+		for (i = 0; i < 8; i++) {
+			uint32_t t = crc << 1;
+
+			if (crc & 0x8000u)
+				t ^= 0x1021u;
+			crc = t;
+		}
+		erpc_crc_tab[b] = (uint16_t)crc;
+	}
+	erpc_crc_tab_ready = 1u;                 /* publish last: the table is idempotent */
+}
+
 uint16_t erpc_crc16(const uint8_t *d, uint16_t n)
 {
 	uint32_t crc = 0xEF4Au;
 	uint16_t j;
 
-	for (j = 0u; j < n; j++) {
-		int i;
-		crc ^= (uint32_t)d[j] << 8;
-		for (i = 0; i < 8; i++) {
-			uint32_t t = crc << 1;
-			if (crc & 0x8000u)
-				t ^= 0x1021u;
-			crc = t;
-		}
-	}
+	if (!erpc_crc_tab_ready)
+		erpc_crc16_build();
+	for (j = 0u; j < n; j++)
+		crc = (uint32_t)erpc_crc_tab[((crc >> 8) ^ d[j]) & 0xFFu] ^ (crc << 8);
 	return (uint16_t)crc;
 }
 
@@ -371,22 +411,40 @@ uint16_t erpc_crc16(const uint8_t *d, uint16_t n)
  * scratch); the deterministic clean point is the flush the send step does whenever
  * nothing is on the wire, i.e. at every command boundary.
  */
-/* Header staging: 4 bytes for an eRPC frame, 6 for a CTRL one (magic, length, CRC). */
+/* Header staging: 4 bytes for an eRPC frame, 6 for a CTRL or DATA one (magic, length,
+ * CRC). */
 static uint8_t  rx_hdr[6];
 static uint8_t  rx_hdr_got;
-static uint8_t  rx_hdr_need = 4u;        /* 4, or 6 once the CTRL magic is seen */
+static uint8_t  rx_hdr_need = 4u;        /* 4, or 6 once a channel magic is seen */
 static uint8_t  rx_is_ctrl;              /* the frame being assembled is a CTRL frame */
+static uint8_t  rx_is_data;              /* ... or a DATA frame (issue #23 U1) */
 static uint16_t rx_size, rx_crc, rx_body_got;
 static uint32_t rx_drain_left;           /* oversize frame: bytes still to discard */
 static uint8_t  rx_active;               /* a partial frame is in progress */
 static ULONG    rx_progress;             /* tick of the last byte consumed */
 static uint32_t rx_ovf_seen;             /* last observed rtl8720_uart_overflows() */
 
+/*
+ * Where the body being assembled is going: erpc_scratch for eRPC and CTRL frames, or a
+ * DATA pool buffer, which the reader fills DIRECTLY so a 1500-byte Ethernet frame is not
+ * copied through a scratch buffer first.
+ *
+ * That makes the reader a buffer OWNER, which every abandon path has to respect --
+ * hence the single reset below rather than a bare state clear: a partial DATA frame is
+ * dropped by resync (ring overflow), by the stall backstop, by a stream reset before a
+ * send, by link_data_reset() and by the UART closing, and all of them come through here.
+ */
+static uint8_t *rx_dst;
+
 static void erpc_reader_reset(void)
 {
+	if (rx_is_data && rx_dst != NULL)
+		link_data_rx_abort(rx_dst);      /* no-op if the pool already took it back */
+	rx_dst        = NULL;
 	rx_hdr_got    = 0u;
 	rx_hdr_need   = 4u;
 	rx_is_ctrl    = 0u;
+	rx_is_data    = 0u;
 	rx_size       = 0u;
 	rx_crc        = 0u;
 	rx_body_got   = 0u;
@@ -408,8 +466,9 @@ static void erpc_rx_flush(void)
 		budget -= (r > budget) ? budget : (uint32_t)r;
 }
 
-/* Reset the byte stream: drop what is buffered, forget any partial frame and resync
- * the overflow watch.  Caller holds erpc_lock (so the reader is not running). */
+/* Reset the byte stream: drop what is buffered, forget any partial frame (returning its
+ * DATA pool buffer, if it had claimed one) and resync the overflow watch.  Caller holds
+ * erpc_lock (so the reader is not running). */
 static void erpc_stream_reset_locked(void)
 {
 	erpc_rx_flush();
@@ -534,18 +593,47 @@ static int erpc_rx_step(void)
 			rx_active  = 1u;
 			progress   = 1;
 		}
-		/* The CTRL marker is decided from the first two bytes, so the header grows
-		 * from 4 to 6 as soon as they are in -- before the length is believed. */
-		if (rx_hdr_got >= 2u && rx_hdr_need == 4u &&
-		    get_u16le(rx_hdr + 0) == ERPC_CTRL_MAGIC) {
-			rx_is_ctrl  = 1u;
-			rx_hdr_need = 6u;
+		/* The channel marker is decided from the first two bytes, so the header
+		 * grows from 4 to 6 as soon as they are in -- before the length is
+		 * believed. */
+		if (rx_hdr_got >= 2u && rx_hdr_need == 4u) {
+			uint16_t lead = get_u16le(rx_hdr + 0);
+
+			if (lead == ERPC_CTRL_MAGIC) {
+				rx_is_ctrl  = 1u;
+				rx_hdr_need = 6u;
+			} else if (lead == LINK_DATA_MAGIC) {
+				rx_is_data  = 1u;
+				rx_hdr_need = 6u;
+			}
 		}
 		if (rx_hdr_got < rx_hdr_need)
 			return progress;
 
 		rx_body_got = 0u;
-		if (rx_is_ctrl) {
+		if (rx_is_data) {
+			rx_size = get_u16le(rx_hdr + 2);
+			rx_crc  = get_u16le(rx_hdr + 4);
+			/* TWO different failures, and they must not be handled the same way:
+			 *  - a length outside the channel's bounds is not a frame at all (a
+			 *    desynchronised stream that landed on 0xFFFE), so resynchronise --
+			 *    draining a number we do not believe would swallow real frames;
+			 *  - a valid length with the pool empty IS a frame, just one we cannot
+			 *    hold, so drain exactly it.  Losing a frame is an ordinary
+			 *    Ethernet event; losing stream synchronisation is not. */
+			if (rx_size < LINK_DATA_HDR || rx_size > LINK_DATA_BODY_MAX) {
+				rx_is_data = 0u;
+				(void)link_data_rx_claim(rx_size);   /* counts rx_oversize */
+				erpc_stream_reset_locked();
+				return 1;
+			}
+			rx_dst = link_data_rx_claim(rx_size);
+			if (rx_dst == NULL) {
+				rx_is_data    = 0u;   /* nothing to give back */
+				rx_drain_left = rx_size;
+				return 1;
+			}
+		} else if (rx_is_ctrl) {
 			rx_size = get_u16le(rx_hdr + 2);
 			rx_crc  = get_u16le(rx_hdr + 4);
 			/* NEVER drain a CTRL length we do not believe: on a desynchronised
@@ -572,23 +660,35 @@ static int erpc_rx_step(void)
 		}
 	}
 
-	/* Both frame types assemble into the same scratch: the reader is single and never
-	 * has more than one frame in progress.  ERPC_CTRL_MAX <= ERPC_RX_SCRATCH. */
-	if (rx_body_got < rx_size) {
-		r = rtl8720_uart_read(erpc_scratch + rx_body_got,
-		                      (size_t)(rx_size - rx_body_got));
-		if (r != 0u) {
-			rx_body_got = (uint16_t)(rx_body_got + r);
-			progress    = 1;
-		}
-		if (rx_body_got < rx_size)
-			return progress;
-	}
+	/* eRPC and CTRL frames assemble into the shared scratch (the reader is single and
+	 * never has more than one frame in progress; ERPC_CTRL_MAX <= ERPC_RX_SCRATCH);
+	 * a DATA frame goes straight into the pool buffer claimed above. */
+	{
+		uint8_t *dst = rx_is_data ? rx_dst : erpc_scratch;
 
-	if (rx_is_ctrl)
-		erpc_ctrl_dispatch(erpc_scratch, rx_size, rx_crc);
-	else
-		erpc_dispatch(erpc_scratch, rx_size, rx_crc);
+		if (rx_body_got < rx_size) {
+			r = rtl8720_uart_read(dst + rx_body_got,
+			                      (size_t)(rx_size - rx_body_got));
+			if (r != 0u) {
+				rx_body_got = (uint16_t)(rx_body_got + r);
+				progress    = 1;
+			}
+			if (rx_body_got < rx_size)
+				return progress;
+		}
+
+		if (rx_is_data) {
+			/* Hands the buffer to link_data, which checks the CRC and queues it
+			 * for dispatch OUTSIDE this lock (see the service loop). */
+			link_data_rx_commit(dst, rx_size, rx_crc);
+			rx_is_data = 0u;         /* no longer ours: do not abort it in reset */
+			rx_dst     = NULL;
+		} else if (rx_is_ctrl) {
+			erpc_ctrl_dispatch(dst, rx_size, rx_crc);
+		} else {
+			erpc_dispatch(dst, rx_size, rx_crc);
+		}
+	}
 	erpc_reader_reset();
 	return 1;
 }
@@ -628,10 +728,20 @@ static int erpc_send_one(void)
 		if (on_wire != 0u && (uint32_t)on_wire + frame_len > erpc_budget)
 			continue;                /* too big for the remaining budget right now;
 			                          * a smaller queued frame may still fit */
-		if (on_wire == 0u) {
+		if (on_wire == 0u && !link_data_attached()) {
 			/* Nothing outstanding: drop stale RX so this call starts at a frame
 			 * boundary (what erpc_begin() did before increment 8).  Never done
-			 * with a frame on the wire -- its reply may already be buffered. */
+			 * with a frame on the wire -- its reply may already be buffered.
+			 *
+			 * ...and never while the DATA channel is live (issue #23 U1): those
+			 * "stale" bytes are then most likely the middle of an Ethernet frame
+			 * arriving right now, and throwing them away would desynchronise the
+			 * reader instead of cleaning it.  Nothing is lost by skipping it: a
+			 * late reply is still dropped by the strict sequence match, and the
+			 * reader's own frame-boundary state is what resynchronisation uses.
+			 * The rule that makes this safe in the other direction is the detach
+			 * ordering contract in app/link_data.h -- the channel is only
+			 * un-attached once both ends are known to be quiet. */
 			erpc_stream_reset_locked();
 		}
 		(void)erpc_debt_add(s->seq, frame_len);
@@ -660,9 +770,10 @@ static int erpc_ctrl_send(void)
 
 	if (!erpc_link_up || s->state != ERPC_ST_QUEUED)
 		return 0;
-	if (erpc_bytes_on_wire() == 0u) {
+	if (erpc_bytes_on_wire() == 0u && !link_data_attached()) {
 		/* Same rule as the eRPC send step: with nothing outstanding, start from a
-		 * clean frame boundary so a stale byte cannot be parsed as our reply. */
+		 * clean frame boundary so a stale byte cannot be parsed as our reply -- and
+		 * the same exception while DATA is live. */
 		erpc_stream_reset_locked();
 	}
 	put_u16le(hdr + 0, ERPC_CTRL_MAGIC);
@@ -674,16 +785,63 @@ static int erpc_ctrl_send(void)
 	return 1;
 }
 
+/*
+ * Send one queued DATA frame.  Returns 1 if a frame went out.  Caller holds erpc_lock.
+ *
+ * DATA is the lowest priority of the three channels: CTRL first (it only runs on a
+ * quiescent link and is what measures the link), then eRPC (low rate, and its latency is
+ * a telnet keystroke), then bulk DATA.  Frames are written WHOLE and never interleaved
+ * with another channel's bytes -- the far end has no way to reassemble a fragment -- so
+ * a 1500-byte frame at 6 Mbaud does delay whatever is queued behind it by 2.5 ms.  That
+ * is the head-of-line cost of not fragmenting, and it is deliberate.
+ *
+ * No wire ledger and no budget: a DATA frame has no reply, so there is nothing to free
+ * it, and the module's 16 kB input ring is what absorbs a burst (issue #23 U1).
+ */
+static int erpc_data_send_one(void)
+{
+	const uint8_t *body;
+	uint16_t body_len = 0u, crc = 0u;
+	uint8_t hdr[6];
+
+	if (!erpc_link_up)
+		return 0;
+	body = link_data_tx_peek(&body_len, &crc);
+	if (body == NULL)
+		return 0;
+	/*
+	 * Only start a frame the UART can swallow WITHOUT waiting.  rtl8720_uart_write()
+	 * blocks when its ring is full, and this runs holding erpc_lock -- a wait here would
+	 * stall every other user of the link, `wifi reset`'s force-quiesce included.  Bulk
+	 * traffic has no deadline of its own, so leaving it queued for the next pass costs
+	 * nothing; eRPC and CTRL frames are small and keep their unconditional write.
+	 */
+	if (rtl8720_uart_tx_space() < (uint32_t)body_len + sizeof(hdr))
+		return 0;
+	put_u16le(hdr + 0, LINK_DATA_MAGIC);
+	put_u16le(hdr + 2, body_len);
+	put_u16le(hdr + 4, crc);
+	rtl8720_uart_write(hdr, sizeof(hdr));
+	rtl8720_uart_write(body, body_len);
+	link_data_tx_pop();
+	return 1;
+}
+
 /* Any slot still needing the service thread's attention? Caller holds erpc_lock.
  *
  * The CTRL slot MUST be counted here: it is what makes the loop below wait one tick
  * instead of parking on TX_WAIT_FOREVER, and a parked thread polls no RX at all -- a
- * CTRL reply would then never be read and every CTRL call would time out. */
+ * CTRL reply would then never be read and every CTRL call would time out.  The DATA
+ * queues are counted for the same reason (issue #23 U1): a frame handed to
+ * link_data_send() from another thread must not sit until something else happens to
+ * wake this one. */
 static int erpc_work_pending(void)
 {
 	int i;
 
 	if (erpc_ctrl.state == ERPC_ST_QUEUED || erpc_ctrl.state == ERPC_ST_SENT)
+		return 1;
+	if (link_data_tx_pending() || link_data_rx_ready())
 		return 1;
 	for (i = 0; i < ERPC_MAX_INFLIGHT; i++)
 		if (erpc_slots[i].state == ERPC_ST_QUEUED ||
@@ -725,6 +883,10 @@ static void erpc_svc_entry(ULONG arg)
 		 * single tick. */
 		for (guard = 0; guard < ERPC_MAX_INFLIGHT && erpc_send_one(); guard++)
 			;
+		/* DATA after eRPC: bulk traffic must not delay a reply the shell is
+		 * waiting on, and the cap keeps a saturated queue from starving RX. */
+		for (guard = 0; guard < ERPC_DATA_TX_PER_PASS && erpc_data_send_one(); guard++)
+			;
 		for (guard = 0; guard < ERPC_RX_STEPS_PER_PASS && erpc_rx_step(); guard++)
 			rx_progress = tx_time_get();
 
@@ -749,6 +911,18 @@ static void erpc_svc_entry(ULONG arg)
 		 * So no window pairs a dropped notification with an indefinite park. */
 		erpc_parked = 1u;
 		erpc_lock_put();
+
+		/*
+		 * Deliver received DATA frames with NO LOCK HELD (issue #23 U1).  The
+		 * consumer is a network stack once U3 lands, and calling it from inside the
+		 * lock would (a) hold the link shut for as long as the stack takes to
+		 * process a packet and (b) put erpc_lock underneath whatever locks the stack
+		 * takes, on a path where the reverse order (stack -> link_data_send) also
+		 * exists.  Doing it here, after erpc_parked is published and the lock is
+		 * dropped, costs nothing: ERPC_F_WORK is sticky, so anything that arrives
+		 * while the callback runs returns the wait below immediately.
+		 */
+		link_data_rx_dispatch();
 
 		/* Poll on 1 ms slices while anything is in flight; sleep until a caller
 		 * posts work otherwise -- idle costs nothing and, crucially, leaves the
@@ -841,6 +1015,13 @@ void erpc_abandon_all(void)
 	erpc_lock_get();
 	erpc_link_up = 0u;                       /* nothing may be sent until reopened */
 	erpc_debt_reset();                       /* the module's view is going away too */
+	/* Order matters: the reader gives its half-filled buffer back FIRST, then the
+	 * pools are emptied.  The other way round would hand a buffer to a pool that has
+	 * already reclaimed it (link_data.c's state byte catches that, but relying on the
+	 * catch rather than the order would be sloppy). */
+	erpc_reader_reset();
+	link_data_reset();                       /* queued/partial DATA belongs to a link
+	                                          * that no longer exists */
 	/* The CTRL exchange dies with the link like any token: hand a slot somebody is
 	 * blocked on to THEM (freeing it here would let a fresh erpc_ctrl_call() reuse it
 	 * and the old waiter would pick up the new call's completion), otherwise free it. */
@@ -880,13 +1061,36 @@ void erpc_link_opened(int carries_erpc)
 		return;
 	erpc_lock_get();
 	erpc_debt_reset();
-	erpc_stream_reset_locked();
+	erpc_stream_reset_locked();              /* returns any claimed DATA buffer first */
+	link_data_reset();
 	erpc_link_up = carries_erpc ? 1u : 0u;
 	/* Arm the wake-up hook only for the link we actually read.  A LOG-UART open (the
 	 * `wifi log` bridge) is consumed by the command thread, not by us, and rtl8720.c
 	 * clears the hook on every open/close so this can never outlive the session. */
 	rtl8720_uart_set_rx_notify(carries_erpc ? erpc_rx_ready : NULL);
 	erpc_lock_put();
+}
+
+void erpc_data_posted(void)
+{
+	if (erpc_ready)
+		tx_event_flags_set(&erpc_flags, ERPC_F_WORK, TX_OR);
+}
+
+int erpc_data_quiescent(void)
+{
+	int quiet;
+
+	if (!erpc_ready)
+		return 0;
+	erpc_lock_get();
+	/* Only a DATA frame half-received matters here.  rx_active would also be true for
+	 * an eRPC frame arriving, and on a link with a telnet console that is a normal,
+	 * frequent state -- asking about it would make this answer "no" for reasons that
+	 * have nothing to do with the DATA channel. */
+	quiet = !rx_is_data;
+	erpc_lock_put();
+	return quiet && !link_data_tx_pending() && !link_data_rx_ready();
 }
 
 int erpc_link_quiescent(void)
@@ -897,6 +1101,11 @@ int erpc_link_quiescent(void)
 		return 0;
 	erpc_lock_get();
 	quiet = (erpc_ctrl.state == ERPC_ST_FREE) && (erpc_bytes_on_wire() == 0u);
+	/* The DATA channel counts too (issue #23 U1): a queued frame is about to be
+	 * written, and a reader mid-frame means bytes are still coming.  `link baud`
+	 * relies on this -- changing the line rate under either would corrupt it. */
+	if (quiet && (link_data_tx_pending() || link_data_rx_ready() || rx_active))
+		quiet = 0;
 	for (i = 0; quiet && i < ERPC_MAX_INFLIGHT; i++)
 		if (erpc_slots[i].state != ERPC_ST_FREE)
 			quiet = 0;

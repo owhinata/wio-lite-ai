@@ -259,10 +259,10 @@ time as the USB console. 21 commands:
   (`CLI_INSTANCE_TIME_SLICE`) — otherwise `coremark` on one console would freeze the other
   for its whole run; the flip side is that benchmark scores drop while both are busy.
 
-- **`link` — the UART link itself** (issue #23 U0-3, `shell/cmds/cmd_link.c`). Where `wifi`
-  is L2 and `net` is L3, this is the wire between the STM32 and the companion chip, and it
-  exists to produce a number: can a UART link carry 1500-byte Ethernet frames well enough
-  to justify putting a real TCP/IP stack on the host?
+- **`link` — the UART link itself** (issue #23 U0-3 / U1, `shell/cmds/cmd_link.c`). Where
+  `wifi` is L2 and `net` is L3, this is the wire between the STM32 and the companion chip,
+  and it exists to produce a number: can a UART link carry 1500-byte Ethernet frames well
+  enough to justify putting a real TCP/IP stack on the host?
   `link info` prints **both ends'** counters — the host's RX interrupt budget and error
   tally, and the module's own (interrupt count, ring peak, the three loss counters, free
   heap, current rate, and **how much of its FIFO grace one interrupt consumed**). Reading
@@ -288,6 +288,35 @@ time as the USB console. 21 commands:
   (the message telling the module to return is sent at that same bad rate). **`wifi reset`
   is the guaranteed recovery** — the module boots at 2 Mbaud and the host resets its own
   belief to match.
+
+- **The DATA channel** (issue #23 U1, `app/link_data.{c,h}` + `fw/rtl8720/patches/0006`).
+  A third frame type on the same wire — `u16 0xFFFE | u16 len | u16 crc | body`, body =
+  `u8 chan | u8 flags | payload` — and unlike eRPC and CTRL it is **unsolicited,
+  bidirectional and unacknowledged**, which is what a raw Ethernet frame needs. U2 will
+  hang the module's WiFi netif off it; U1 builds the plumbing and measures it against a
+  sink/source bench on the module (`link dbench [bytes] [secs] [rx|tx|both]`). Both magic
+  numbers are safe for the same reason, and it is about the SENDER, not the receiver: an
+  eRPC frame's leading u16 is its message size, and neither end can produce one that large
+  (host ≤ 8 + 320 B, module ≤ its 4096-byte buffer).
+  **Measured on board #2: 875 KB/s full duplex at 6 Mbaud, with the transmit direction at
+  100 % of the wire rate** (602.7 kB/s against a theoretical 597.8) and zero loss at every
+  rate. The 366 KB/s the U0-3 CTRL bench reported was never a property of the wire — it was
+  the half-duplex turnaround of a request/reply exchange, and removing the reply removes it.
+  Three things had to change around it:
+  **(1)** the host's UART transmit became **interrupt-driven** (`app/rtl8720.c`, TX ring +
+  `CR3.TXFTIE`) — the polling spin it replaces held the link service thread for 2.5 ms per
+  1500-byte frame at 6 Mbaud, which starves the shell and the telnet console once frames
+  flow continuously. Anything that tears the peripheral down now flushes first
+  (`rtl8720_uart_flush()`, called from `rtl8720_uart_close()`, which every baud change and
+  every recovery path already goes through).
+  **(2)** the pre-request **RX flush is suppressed while the channel is live** — those
+  "stale" bytes are then most likely the middle of a frame arriving right now. The
+  matching rule is that the channel is only detached once **both** ends are known quiet:
+  `LINK_DATA_CFG(off)` does not answer until the module has stopped its source and drained
+  its transmit queue, which is a promise no amount of waiting on the host side could
+  otherwise establish.
+  **(3)** `erpc_crc16()` is now table-driven (same polynomial, same values) — the
+  bit-at-a-time loop was ~110 µs per 1500-byte frame on the link service thread.
 
 ## Key design points
 

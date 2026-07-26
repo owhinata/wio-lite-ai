@@ -224,14 +224,31 @@ uint16_t erpc_wire_budget(void);
 #define ERPC_CTRL_MAX 1600u              /* bound on body_len, both directions */
 
 enum {
-	ERPC_CTRL_PING    = 1,           /* no payload; proves the link at this baud */
-	ERPC_CTRL_STATS   = 2,           /* -> u32 LE x 10, see cmd_link.c */
-	ERPC_CTRL_SETBAUD = 3,           /* u32 baud + u32 magic; ACK on the OLD baud */
-	ERPC_CTRL_BENCH   = 4            /* u32 reply_bytes, u8 seed, u8 rsvd[3], data[] */
+	ERPC_CTRL_PING       = 1,        /* no payload; proves the link at this baud */
+	ERPC_CTRL_STATS      = 2,        /* -> u32 LE x 12, see cmd_link.c */
+	ERPC_CTRL_SETBAUD    = 3,        /* u32 baud + u32 magic; ACK on the OLD baud */
+	ERPC_CTRL_BENCH      = 4,        /* u32 reply_bytes, u8 seed, u8 rsvd[3], data[] */
+	/* DATA channel control (issue #23 U1), firmware wio-n6 and later. */
+	ERPC_CTRL_DATA_CFG   = 5,        /* u8 mode, u8 seed, u16 bytes, u32 ms, u32 magic */
+	ERPC_CTRL_DATA_STATS = 6         /* -> u32 LE x 12, see cmd_link.c */
 };
 
 /* Guards the one CTRL command with a side effect against a chance 0xFFFF alignment. */
 #define ERPC_CTRL_SETBAUD_MAGIC 0x42415544u   /* 'BAUD' */
+
+/*
+ * DATA_CFG modes.  SINK makes the module accept and count DATA frames; SOURCE makes it
+ * generate them for the requested number of milliseconds.  Mode 0 is "off", and its
+ * acknowledgement carries a CONTRACT the host relies on when it tears the channel down:
+ * the module has stopped its source AND drained its own transmit queue before it answers,
+ * so no further DATA frame can be on the way.  See the detach ordering rule in
+ * app/link_data.h -- a time-based "it has been quiet for a while" test would not do,
+ * because there is no defensible number to wait for.
+ */
+#define ERPC_CTRL_DATA_MAGIC    0x44415441u   /* 'DATA' */
+#define ERPC_DATA_MODE_OFF      0x00u
+#define ERPC_DATA_MODE_SINK     0x01u
+#define ERPC_DATA_MODE_SOURCE   0x02u
 
 /*
  * Send one CTRL command and wait for its reply.  Only ONE CTRL exchange may be in flight
@@ -249,10 +266,38 @@ int erpc_ctrl_call(uint8_t cmd, const uint8_t *req, uint16_t req_len,
                    struct erpc_diag *diag);
 
 /*
+ * ---- DATA channel (issue #23 U1) ------------------------------------------------
+ *
+ * The third frame type on this wire lives in app/link_data.{c,h}; the service thread
+ * here is what actually reads and writes it, exactly as it does for eRPC and CTRL.  The
+ * only thing link_data needs from this side is a way to wake the thread: it parks on
+ * TX_WAIT_FOREVER whenever it believes nothing is outstanding, so a frame queued from
+ * another thread would otherwise sit there.
+ *
+ * Deliberately NOT the mutex-taking kind of call: link_data_send() may run with a
+ * network stack's own lock held (U3), so it must not be able to block on this module.
+ */
+void erpc_data_posted(void);
+
+/*
+ * True when NO DATA frame is anywhere in the host's pipeline: none queued to send, none
+ * waiting to be delivered, none half-received.
+ *
+ * Deliberately NOT erpc_link_quiescent() -- that answers "is the whole link idle?", which
+ * additionally requires no eRPC request to be outstanding, and the telnet console keeps a
+ * blocking accept outstanding by design (issue #21).  Asking the stronger question when
+ * tearing the DATA channel down therefore never succeeds while a console is armed, for
+ * reasons that have nothing to do with DATA.  This is the half of it that matters: the
+ * detach ordering rule in app/link_data.h needs the DATA channel quiet, not the link idle.
+ */
+int erpc_data_quiescent(void);
+
+/*
  * True when nothing at all is outstanding on the link: no eRPC token, no CTRL exchange,
- * and no request bytes the module has not answered.  `link baud` requires it -- changing
- * the baud rate under an in-flight frame would corrupt it at both ends -- and `link info`
- * uses it to decide whether it may ask the module anything.
+ * no queued or half-received DATA frame, and no request bytes the module has not
+ * answered.  `link baud` requires it -- changing the baud rate under an in-flight frame
+ * would corrupt it at both ends -- and `link info` uses it to decide whether it may ask
+ * the module anything.
  */
 int erpc_link_quiescent(void);
 

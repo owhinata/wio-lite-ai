@@ -329,6 +329,7 @@ add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/rtl8720_img.c"
     "${GEN_DIR}/rtl8720_flashloader_data.c"
     "${CMAKE_SOURCE_DIR}/app/erpc.c"
+    "${CMAKE_SOURCE_DIR}/app/link_data.c"
     "${CMAKE_SOURCE_DIR}/app/wifi_rpc.c"
     "${CMAKE_SOURCE_DIR}/app/rtl_link.c"
     "${CMAKE_SOURCE_DIR}/app/net_shell.c"

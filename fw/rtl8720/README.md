@@ -244,7 +244,7 @@ fw/rtl8720/
   README.md          this file
   build.sh           setup | build | gate | clean
   gate.py            the static gates
-  patches/           N2..N5 patches, applied in filename order (empty for N1)
+  patches/           N2..N6 patches, applied in filename order (empty for N1)
   out/               git-ignored build output
     km0_km4_image2.bin   <- the image that gets flashed
     km0_boot_all.bin     }  core prebuilts, copied out for the gates
@@ -298,6 +298,9 @@ fw/rtl8720/
 - **N5** (built) — a LINK-CTRL channel on the same wire (`patches/0005`, issue #23 U0-3):
   read the module's own UART counters, change the line rate, and generate measured
   traffic. See *N5 result* below.
+- **N6** (built) — a DATA channel on the same wire (`patches/0006`, issue #23 U1): the
+  unsolicited, unacknowledged frame type that raw Ethernet needs, plus the pools, queue
+  and tasks that U2's L2 bridge will plug into. See *N6 result* below.
 
 ### N2 result
 
@@ -545,3 +548,92 @@ are appended), and an older N5 build is rejected by the host with a message sayi
 Acceptance (beyond the N4 regression set, with `wifi rpc ver` reading `2.1.3+wio-n5`):
 `link info` shows the module counters, `link bench`/`link sweep` run with `ctrl_bad` 0, and
 `link baud 6000000` followed by `link baud 2000000` round-trips.
+
+### N6 result
+
+`patches/0006-n6-link-data.patch` — new `src/link/wio_link_data.{c,h}`, a `handleData()`
+branch and a public `writeFramed()` in `src/link/wio_uart_transport.h`, the receive ring
+doubled to 16 kB in `src/link/wio_usi_uart.c`, and the build id becomes `2.1.3+wio-n6`.
+**The eRPC wire format is unchanged for the third time**, so the whole existing host
+feature set is again the regression test.
+
+CTRL answered "how fast is this wire". N6 answers the question after it: **can the three
+channels interleave continuously without losing anything?** That needs a frame type that
+is nothing like the other two — unsolicited, bidirectional, unacknowledged:
+
+```
+DATA frame = u16 0xFFFE | u16 body_len | u16 crc16(body) | body[body_len]
+body       = u8 chan | u8 flags | payload[body_len - 2]
+```
+
+`0xFFFE` is safe for exactly the reason `0xFFFF` is, and it is a property of the SENDER,
+not of the receiver: an eRPC frame's leading `u16` is its message size and neither end can
+produce one that large. The two-byte body header earns its keep — with the buffer 8-byte
+aligned, an Ethernet frame at +2 puts its IP header on a 4-byte boundary, which is what
+the host's stack will want in U3.
+
+In U1 the endpoint is a bench: `WIO_DATA_MODE_SINK` counts what arrives (checking the
+sequence number in the payload, which is how loss becomes visible — the link has no
+retransmission, and one lost *byte* costs a resynchronisation and therefore several
+frames) and `WIO_DATA_MODE_SOURCE` generates. U2 replaces the body of the receive task
+with `netif->linkoutput()` and feeds `wio_link_data_send()` from the driver's receive
+path; nothing else about the file changes.
+
+Three design points that are not obvious:
+
+- **The transmit task exists because `wio_usi_write()` spins.** 1500 bytes at 6 Mbaud is
+  2.5 ms of polling the TX FIFO. In U2 the producer is the WiFi driver's receive path, and
+  spinning there would stall the driver, so frames are queued and a task at
+  `tskIDLE_PRIORITY + 6` — below the eRPC receive task and the workers, so link control and
+  RPC replies always win — does the writing. It writes through the transport's
+  `writeFramed()`, which takes **`m_sendLock`**: the N3 workers send replies concurrently,
+  and that lock is the only thing keeping two writers from interleaving bytes inside a
+  frame.
+- **The transmit queue is an index ring under the module's own mutex, not a FreeRTOS
+  queue**, and that is a correctness requirement. `LINK_DATA_CFG(off)` promises the host
+  that no further DATA frame can be on the way — the host's teardown depends on it, because
+  detaching restores a flush that would eat a frame still in flight. That promise is only
+  provable if "take the next frame" and "mark the writer busy" happen in ONE locked step.
+  With a FreeRTOS queue they cannot: the task returns from `xQueueReceive()` holding an
+  index and *then* takes the lock, and a `CFG(off)` landing in that window sees an empty
+  queue, an idle writer — and a frame that goes out immediately afterwards.
+- **Three outcomes in `handleData()`, deliberately different.** A length outside the
+  channel's bounds is not a frame at all (a desynchronised stream that landed on `0xFFFE`)
+  → resynchronise, because draining a length we do not believe would swallow real frames.
+  A believable length with no pool buffer free IS a frame, just one we cannot hold → drain
+  exactly it; losing a frame is an ordinary Ethernet event, losing stream synchronisation
+  is not. Otherwise the body is read straight into the pool buffer, with no copy through a
+  scratch.
+
+Cost: `.ram_image2.bss` 83,252 → 108,532 B (+25,280 — six receive and four transmit
+buffers of 1544 B, the generator's staging frame, and the 8 kB of extra ring). The
+FreeRTOS heap array is unchanged at 208,896 B, so `link info`'s free heap only moves by
+the two new task stacks (3 kB each). The image grows by one sector, 880,640 → 884,736 B.
+
+#### Measured on board #2
+
+| baud | rx | tx | both | loss |
+|---|---|---|---|---|
+| 2 M | 187.9 KB/s | 198.2 | 375.4 | 0 |
+| 3 M | 270.5 | 295.4 | 531.7 | 0 |
+| 4 M | 349.6 | 397.4 | 674.8 | 0 |
+| **6 M** | **489.2** | **585.4** | **875.4** | one module-side pool drop (below) |
+
+**The transmit direction runs at the wire rate.** 1199 frames × (1500 + 8) B in 3.000 s is
+602.7 kB/s against a theoretical 597.8 kB/s at BRR 23 — 100 %, with the excess inside the
+tick granularity of the measurement. That settles what U0-3 could not: the 366 KB/s the
+CTRL bench reached was **not** a property of the wire, it was the half-duplex turnaround of
+a request/reply exchange. Remove the reply and the gap disappears.
+
+The single loss, at 6 Mbaud with both directions saturated, is a **module-side pool drop**
+(`drops 1`, one sequence gap) with `crc 0`, `ring-drops 0` and `fifo-overrun 0` — so no
+byte was lost on the wire. The receive pipeline was momentarily behind, once in 1198
+frames, and dropped a frame the way an Ethernet device is entitled to. The pool stays at
+six buffers: real traffic does not sit at 100 % saturation, and enlarging it would cost a
+reflash for something already counted and correct. It is the first knob to reach for in U2
+if the netif turns out to be a slower consumer than this bench.
+
+Acceptance (beyond the N5 regression set, with `wifi rpc ver` reading `2.1.3+wio-n6`):
+`link dbench 1500 3 rx | tx | both` completes with **zero** loss on either end — no
+sequence gaps, no CRC failures, no pool drops, no ring drops, no FIFO overruns — and a
+10 s `both` run does the same with a telnet console attached and running a command.
