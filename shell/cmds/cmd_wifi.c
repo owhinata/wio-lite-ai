@@ -562,9 +562,9 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 	}
 
 	rtl_link_end(sh);
-	/* An address is up: arm the telnet console (issue #21).  AFTER rtl_link_end() so the
-	 * service thread finds the coarse mutex free rather than spinning on our claim. */
-	net_shell_autoarm();
+	/* No net_shell_autoarm() here any more: this address belongs to the MODULE's lwIP,
+	 * and since issue #23 U4-2 the telnet console is a NetX socket on the host stack.
+	 * `net up` + `net dhcp` is what arms it now. */
 	cli_print(sh, "wifi: connected\r\n");
 	cli_print(sh, "  ip   %u.%u.%u.%u\r\n", ip.ip[0], ip.ip[1], ip.ip[2], ip.ip[3]);
 	cli_print(sh, "  mask %u.%u.%u.%u\r\n",

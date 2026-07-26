@@ -68,6 +68,14 @@
 #define NXN_CLAIM_MS       RTL_LINK_CLAIM_WAIT_MS
 #define NXN_ARM_CLAIM_MS   20000u     /* how long ARM waits for the coarse mutex      */
 
+/*
+ * How long the interface waits for the telnet console to prove it has released its socket
+ * (issue #23 U4-2).  Typically ~250 ms -- one poll of the console server's connect wait --
+ * so this is the "something is wrong" bound, not the expected cost.  It is spent holding
+ * the coarse link mutex in nxn_stop(), which is the only reason it is not larger.
+ */
+#define NXN_SHELL_STOP_MS  3000u
+
 #define NXN_OFF_RETRIES    3
 #define NXN_SETTLE_TRIES   50         /* x 20 ms = 1 s, as link_data_settle()         */
 #define NXN_REFRESH_FAILS  2          /* consecutive CFG failures before STOP         */
@@ -379,7 +387,32 @@ static void nxn_stop(const char *why)
 	nxn_state = NX_NET_STOPPING;
 	nxn_refresh_fails = 0;
 
-	/* Stop producing on our side first. */
+	/*
+	 * Stop producing on our side first, in this order.
+	 *
+	 * The telnet console goes FIRST because it is the only producer that is not ours to
+	 * silence by flipping a flag: it owns a TCP socket, and TCP transmits on its own
+	 * schedule (a FIN, a retransmit) after the last byte the application wrote.
+	 * net_shell_stop_sync() returns 0 only when nx_tcp_socket_delete() succeeded, i.e.
+	 * when the socket is gone rather than merely idle.
+	 *
+	 * If that cannot be proved we must NOT continue: link_data_detach() below would
+	 * restore the link service thread's stale-byte flush while something can still hand
+	 * this driver a frame, and app/link_data.h names that as the way to desynchronise
+	 * the eRPC stream.  So it becomes FAILED, exactly like a module that will not
+	 * acknowledge DATA_CFG(off) -- same rule, different producer.
+	 *
+	 * None of this is the PROOF of silence.  nxn_settle() still is.  These two steps
+	 * only make it terminate: without them the settle would be racing a live console.
+	 */
+	if (net_shell_stop_sync(NXN_SHELL_STOP_MS) != 0) {
+		/* Close the driver's gate before unwinding, so that whatever the console
+		 * still has queued is released as tx_link_down instead of reaching the DATA
+		 * channel while nxn_enter_failed() detaches it. */
+		nx_link_driver_set_link(0);
+		nxn_enter_failed("the telnet console could not be shut down");
+		return;
+	}
 	nx_link_driver_set_link(0);
 	nxn_dhcp_halt();
 
@@ -437,10 +470,15 @@ static void nxn_arm(void)
 
 	nxn_refresh_fails = 0;
 
-	/* While the tap is in, the module's lwIP receives nothing -- and an armed telnet
-	 * console is sitting on an accept that would then never complete. */
-	if (net_shell_state() != NET_SHELL_OFF) {
-		nxn_why = "the telnet console is armed (run `net shell stop` first)";
+	/*
+	 * The console cannot be up here -- it refuses to start unless the host stack is,
+	 * and this runs from OFF -- but assert it by DOING it rather than by believing it.
+	 * A stale socket from a previous session would otherwise be carried into this one,
+	 * and the whole teardown contract is built on the console being provably absent.
+	 * It is a no-op returning 0 when already stopped.
+	 */
+	if (net_shell_stop_sync(NXN_SHELL_STOP_MS) != 0) {
+		nxn_why = "the telnet console would not release its socket";
 		goto refuse;
 	}
 	if (!rtl8720_powered()) {

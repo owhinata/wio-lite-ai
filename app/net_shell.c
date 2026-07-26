@@ -4,37 +4,23 @@
  */
 /**
  * @file    net_shell.c
- * @brief   telnet shell console over the RTL8720DN socket offload.  See net_shell.h.
+ * @brief   telnet shell console on the host's NetX Duo stack.  See net_shell.h.
  *
- * Structure (ported from ../stm32f746g-disco port/netxduo/nx_shell.c): a transport vtable
- * that only moves bytes between two rings and a `connected` write gate, plus a server
- * thread that owns the sockets.  What differs is that there is no local TCP stack -- every
- * socket operation is an eRPC round-trip to the companion chip -- so the "callbacks push,
- * the server blocks in accept" model of the NetX version becomes a single thread that polls
- * the link with blocking calls.  Three properties of that link shape everything below:
+ * Three threads touch what is here, and the split between them is the whole design:
  *
- *  1. ONE blocking module call at a time.  The issue-#20 N3 firmware runs a receive task
- *     plus TWO workers, and only the blocking socket receives are allowed to run in
- *     parallel (fw/rtl8720/README.md).  Our accept/recv permanently occupies one worker; if
- *     we started a second blocking call the shell's own RPCs -- from either console -- would
- *     have no worker left.  Hence one service thread, and no accept while a session runs
- *     (a second client waits in the listen backlog until the first leaves).
- *  2. Never abort accept/recv, and never close an fd with a call outstanding on it.
- *     Aborting only ends the HOST's wait; the module keeps running the call, so an aborted
- *     accept can complete into a socket whose fd we never learn and an aborted recv leaves
- *     the fd busy (N3 constraint 2).  So no should_abort hook is passed, and a host-side
- *     timeout (rc -2) is treated as "the module still owns these fds": they are LEAKED, not
- *     closed, and the console latches dirty until a `wifi reset` power-cycles the module.
- *  3. Requests must stay small on a stock module.  A frame bigger than its 127-byte UART
- *     ring loses its tail (the ASYMMETRY note in wifi_rpc.h), so output is sent in
- *     wifi_rpc_send_chunk()-byte chunks -- 96 there, the full 256 on a wio-n4 module.
+ *   server thread (14)   owns the socket.  It is the ONLY caller of create / listen /
+ *                        accept / relisten / disconnect / unaccept / unlisten / delete,
+ *                        which is why the teardown can prove what it proves.
+ *   NetX IP thread (11)  runs the receive / disconnect / window callbacks.  They only
+ *                        move bytes into the RX ring and set flags -- never a socket call.
+ *   CLI threads (16)     the shell instance and any background job, inside write().
  *
- * Ring ownership.  The RX ring is strict SPSC: this thread is the only producer, the CLI
- * instance thread the only consumer.  The TX ring has SEVERAL producers -- the instance
- * thread, a background-job worker writing through sh->fg, and session_begin() (which the
- * core calls WITHOUT the output lock) -- so producers serialise with a short PRIMASK
- * critical section, exactly like the USB CDC backend.  This thread is the sole consumer and
- * touches only `tail`, never `head`, so it never contends with them.
+ * The RX ring is strict SPSC: the IP thread is the only producer, the CLI instance thread
+ * the only consumer.  There is no TX ring at all -- output goes straight into an NX_PACKET
+ * and out through nx_tcp_socket_send(), and back-pressure is TCP's own: a refused send
+ * makes write() return short, the core waits on CLI_EVT_TX, and NetX's window-update /
+ * queue-depth callbacks wake it.  That is the mechanism the packet pool and the link's
+ * DATA transmit pool were sized around (see the transmit budget note in app/nx_net.h).
  *
  * No clock/RCC/register work of its own (XIP-safe).  Clean-room design.
  */
@@ -43,97 +29,70 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "stm32h7xx_hal.h"    /* HAL_GetTick + CMSIS __get_PRIMASK/__disable_irq */
 #include "tx_api.h"
+#include "stm32h7xx_hal.h"   /* __get_PRIMASK / __disable_irq / __set_PRIMASK */
+#include "nx_api.h"
 
 #include "cli.h"
 #include "cli_instance.h"
 #include "cli_uart_ring.h"
 
-#include "erpc.h"
-#include "rtl8720.h"
-#include "rtl_link.h"
-#include "wifi_rpc.h"
+#include "nx_net.h"
 
 #define LOG_TAG "nshell"
 #include "log.h"
 
 /* ---- tunables ------------------------------------------------------------ */
 
-/* Above the CLI instances (16) so a reply is routed while a command computes, below the
- * eRPC service (10) that it depends on, and below usb (8) / iwdg (5). */
-#define NSH_PRIORITY        12u
-/* wifi_rpc_lwip_send() stages a 268 B request and _recv() a 264 B reply on the caller's
- * stack, on top of this thread's own frame and the lazy-VFP context.  Sized generously for
- * the first hardware validation; shrink only against a measured `thread` high-water mark. */
+/* Below the nx-net owner (13) and the NetX IP thread (11) it depends on, above the CLI
+ * instances (16) so a connection is accepted while a command computes.  Same slot the
+ * f746 port uses. */
+#define NSH_PRIORITY        14u
+/* Sized for first hardware validation, not measured: the accept/dispatch work is shallow
+ * (command execution happens in the bound CLI instance, not here), but issue #23 U4-3
+ * shrinks it against a `thread` high-water mark rather than a guess. */
 #define NSH_STACK           3072u
 
 #define NSH_RX_RING         512u
-#define NSH_TX_RING         1024u
-
-/* Bytes per send RPC comes from wifi_rpc_send_chunk(), read fresh on every burst: 96 on a
- * stock module (24 + 96 = 120 fits entirely in its 127-byte UART ring, the only structural
- * guarantee that a request cannot lose its tail no matter how long its reader stalls) and
- * the full 256 once the link is proved to be wio-n4, whose ring is 8 kB.  Reading it per
- * burst is what lets a `wifi reset` mid-session drop us back to the safe size. */
-/* Send at most this many chunks before polling RX again, so a long output burst can still
- * see a Ctrl+C (~4 x 2 ms of send + one 2 ms poll). */
-#define NSH_TX_BURST        4u
-
-/* Module-side receive window when there is nothing to send.  This is also the worst-case
- * latency for output that is NOT a reply to input (a `watch` refresh, a background job), so
- * it trades link occupancy (4 RPC/s ~ 0.8% of the link) against that lag. */
-#define NSH_RECV_IDLE_MS    250u
-/* Module-side receive window for the "is there a keystroke?" poll between output chunks. */
-#define NSH_RECV_POLL_MS    1u
-/* After handing received bytes to the shell, wait this long for its answer before going
- * back to a blocking receive.  Without it the echo would wait out NSH_RECV_IDLE_MS: this
- * thread runs ABOVE the CLI instance, so it would re-arm the receive before the shell ever
- * ran.  Only costs anything when input produced no output at all. */
-#define NSH_TX_GRACE_MS     20u
-
-/* The firmware's own accept cap (issue #20 N2 patch: a hard 10 s lwip_select, SO_RCVTIMEO
- * is NOT honoured there). */
-#define NSH_ACCEPT_MS       10000u
+#define NSH_WINDOW          2048u    /* advertised TCP receive window                */
+#define NSH_MSS             1400u    /* bytes per transmitted packet                 */
+#define NSH_EXTRACT         1500u    /* per-packet receive extraction buffer         */
 
 /*
- * Host-side headroom added to every call's module-side duration.
+ * How long the server sleeps between housekeeping passes when nothing is happening.  It is
+ * NOT how quickly a request is noticed -- every request raises a flag this wait is armed
+ * on -- it only bounds how long an unannounced change (the host stack going away, a
+ * handshake NetX abandoned) can go unseen.
  *
- * It has to be BIG.  Everything except the blocking receives takes the module's single
- * serial mutex, so while another console runs `wifi connect` / `net dhcp` our send can be
- * queued behind it for its whole 20-30 s -- and the eRPC wire budget (127 B) additionally
- * holds our frame back while their 128 B request is outstanding.  A host timeout firing
- * there would be a FALSE "link dirty" verdict, costing the session and leaking two fds.
- * The cost of being generous is only that a genuinely dead module takes this long to
- * notice; `wifi reset` remains instant either way, because force-quiesce wakes every
- * waiting token with -2 immediately.
+ * There is no polling here on purpose.  nx_tcp_socket_state_wait() would have been the
+ * obvious way to wait for a connection and it is what issue #23 U4-1's `net echo` uses,
+ * but it is a tx_thread_sleep(1) loop -- 1000 wake-ups a second, for ever, on a console
+ * that is idle almost all of its life.  A command can afford that; a resident service
+ * cannot.  nx_tcp_socket_establish_notify() gives the same information as an event.
  */
-#define NSH_RPC_SLACK_MS    45000u
+#define NSH_IDLE_MS         1000u
+#define NSH_DISC_MS         1000u    /* bounded FIN handshake                        */
 
-/* How long ARM waits for the coarse link mutex before giving up (a `wifi connect` holds it
- * for its whole flow). */
-#define NSH_ARM_CLAIM_MS    60000u
+/*
+ * Packets of the shared pool this console will not take.  Its output bursts (a `dmesg`, a
+ * `membench` table) must not be able to starve the receive path, which allocates with
+ * NX_NO_WAIT and drops the frame when it fails.  Advisory -- read without a lock -- which
+ * is all it needs to be.
+ */
+#define NSH_POOL_RESERVE    8u
 
 /* Service thread event flags. */
-#define NSH_EVT_TX          0x1u    /* the TX ring gained bytes         */
-#define NSH_EVT_CMD         0x2u    /* a start/stop request was posted  */
-
-/* A host-side timeout or abort: the module is still running the call (see the header). */
-#define NSH_DIRTY(rc)       ((rc) == -2 || (rc) == -4)
+#define NSH_EVT_CMD         0x1u    /* a start/stop request was posted   */
+#define NSH_EVT_DISC        0x2u    /* the peer disconnected             */
+#define NSH_EVT_DONE        0x4u    /* teardown finished AND was proved  */
+#define NSH_EVT_CONN        0x8u    /* the socket reached ESTABLISHED    */
 
 /* ---- state --------------------------------------------------------------- */
 
-/* PRIMASK critical section, as in shell/backend/cli_backend_usbcdc.c.  Nests safely inside
- * ThreadX's own PRIMASK sections. */
-#define NSH_CRIT_ENTER()  do { uint32_t _pm = __get_PRIMASK(); __disable_irq()
-#define NSH_CRIT_EXIT()   __set_PRIMASK(_pm); } while (0)
-
 struct nsh_ctx {
 	struct cli_instance *sh;             /* set by nsh_init() from tr->sh          */
-	struct cli_uart_ring rx;             /* service thread -> CLI thread (SPSC)    */
-	struct cli_uart_ring tx;             /* CLI/bg threads -> service thread (MPSC)*/
+	struct cli_uart_ring rx;             /* IP thread -> CLI thread (SPSC)         */
 	uint8_t              rx_buf[NSH_RX_RING];
-	uint8_t              tx_buf[NSH_TX_RING];
 	volatile uint8_t     connected;      /* write gate; owned by the CLI thread    */
 };
 
@@ -143,93 +102,62 @@ static TX_EVENT_FLAGS_GROUP g_evt;
 static UCHAR                g_stack[NSH_STACK] __attribute__((aligned(8)));
 static uint8_t              g_ready;
 
-/* Owned by the service thread (others only read). */
-static volatile enum net_shell_state g_state;
-static int32_t   g_lfd = -1, g_cfd = -1;
-static uint16_t  g_port = NET_SHELL_PORT_DEFAULT;
-static uint32_t  g_uart_gen;             /* the UART "open" our reference belongs to */
-static int       g_iac;                  /* telnet IAC receive state                 */
-static uint8_t   g_rxbuf[WIFI_RPC_STREAM_MAX];   /* static: keeps the stack shallow  */
-static uint8_t   g_ip[4];                /* address we are listening on (for status) */
-
-/* A connection is currently accepted.  Set here before CLI_EVT_CONN is posted and cleared
- * on disconnect, so a session_begin() the CLI thread only reaches AFTER the client vanished
- * does not resurrect the write gate on a dead socket. */
-static volatile uint8_t g_link_live;
+static NX_TCP_SOCKET        g_sock;
+static uint8_t              g_sock_created;   /* server thread only */
 
 /*
- * Requests from command threads.  Arming is posted by moving the state to NET_SHELL_ARMING
- * (only ever done from NET_SHELL_OFF, which no client can be using) and THEN raising
- * NSH_EVT_CMD -- that order is what makes the service thread's "test the state, else park on
- * the flag" loop free of lost wakeups without a lock.
+ * Serialises "the socket is usable" between the CLI threads inside write() and the server
+ * thread's teardown.  Held across short socket calls, with ONE exception: the bounded FIN
+ * handshake in nsh_unwind(), which must not race a delete.  nsh_write() pays for that
+ * exception by re-checking `connected` when its TX_NO_WAIT acquisition fails.
  */
+static TX_MUTEX             g_sock_lock;
+
+/* Owned by the server thread (others only read). */
+static volatile enum net_shell_state g_state;
+static uint16_t  g_port = NET_SHELL_PORT_DEFAULT;
+static int       g_iac;                          /* telnet IAC receive state          */
+static uint8_t   g_extract[NSH_EXTRACT];         /* IP thread only                    */
+static uint8_t   g_stage[2u * NSH_MSS];          /* write() escaping; under g_sock_lock */
+static uint8_t   g_ip[4];                        /* address we listen on, for status  */
+
+/* Set by the disconnect callback (IP thread). */
+static volatile uint8_t g_peer_gone;
+
+/*
+ * A connection is currently accepted.  Set before CLI_EVT_CONN is posted and cleared on
+ * disconnect, so a session_begin() the CLI thread only reaches AFTER the client vanished
+ * does not resurrect the write gate on a dead socket.
+ */
+static volatile uint8_t g_link_live;
+
+/* Requests from command threads. */
 static volatile uint8_t  g_req_stop;
 static volatile uint8_t  g_autoarm = 1u;
 static volatile uint16_t g_req_port = NET_SHELL_PORT_DEFAULT;
 
-/* Dirty latch: module-side sockets were leaked and only a power cycle reclaims them.  Held
- * against the quiesce generation at the time, so any later `wifi on/off/reset` clears it. */
-static uint8_t  g_dirty;
-static uint32_t g_dirty_at;
-
-static const char *g_last;               /* last state-changing reason, for `status` */
+static const char *g_last = "never started";     /* last state-changing reason        */
 static uint32_t g_sessions, g_rx_bytes, g_tx_bytes, g_rx_drops;
-static struct erpc_diag g_diag, g_diag_tot;
-
-/* ---- TX ring producer side (PRIMASK; may run on any shell thread) --------- */
-
-/* Store one byte verbatim.  Returns 1 if stored, 0 if the ring was full. */
-static int nsh_tx_put_raw(uint8_t b)
-{
-	int ok;
-
-	NSH_CRIT_ENTER();
-	ok = cli_uart_ring_put(&g_ctx.tx, b);
-	NSH_CRIT_EXIT();
-	return ok;
-}
-
 /*
- * Store one shell byte, telnet-encoded: a literal 0xFF must go out as IAC IAC or the client
- * reads it as the start of a command (f746's nx_shell strips IAC on receive but never
- * escaped its output -- which corrupts any binary the shell prints).  The pair is stored
- * inside ONE critical section so another producer can never be interleaved between them.
+ * Why a write() was not accepted, kept apart because the three answers mean opposite
+ * things and a single "refused" counter says nothing:
+ *
+ *   g_tx_wait   the TCP window or the socket's transmit queue is full.  This is the
+ *               DESIGNED back-pressure -- the core waits on CLI_EVT_TX and NetX's
+ *               window/queue notify resumes it -- so a large number here is health, not
+ *               trouble.  A 64 kB `dmesg` over telnet produces thousands.
+ *   g_tx_nobuf  the packet pool was empty or below this console's reserve.  THIS is the
+ *               sizing signal: it means output was competing with the receive path for
+ *               packets, which is what NXN_TCP_TX_DEPTH and the pool were sized to avoid.
+ *   g_tx_busy   the socket mutex was held -- only the teardown does that.
  */
-static int nsh_tx_put(uint8_t b)
-{
-	int ok;
-
-	NSH_CRIT_ENTER();
-	if (b == 0xFFu)
-		ok = (cli_uart_ring_free(&g_ctx.tx) >= 2u) &&
-		     cli_uart_ring_put(&g_ctx.tx, 0xFFu) &&
-		     cli_uart_ring_put(&g_ctx.tx, 0xFFu);
-	else
-		ok = cli_uart_ring_put(&g_ctx.tx, b);
-	NSH_CRIT_EXIT();
-	return ok;
-}
-
-/* Drop everything queued.  CONSUMER side (service thread): it only advances `tail`, so it
- * never races a producer's `head`.  Always followed by the TX notify below, so a writer
- * blocked on CLI_EVT_TX wakes up, re-enters write() and returns at once on the closed gate
- * instead of waiting out CLI_TX_TIMEOUT. */
-static void nsh_tx_discard(void)
-{
-	size_t n = cli_uart_ring_count(&g_ctx.tx);
-
-	if (n)
-		cli_uart_ring_advance_tail(&g_ctx.tx, n);
-	if (g_ctx.sh != NULL)
-		cli_transport_notify_tx(g_ctx.sh);
-}
+static uint32_t g_tx_wait, g_tx_nobuf, g_tx_busy;
 
 /* ---- transport vtable ---------------------------------------------------- */
 
 static int nsh_init(struct cli_transport *tr)
 {
 	cli_uart_ring_init(&g_ctx.rx, g_ctx.rx_buf, sizeof g_ctx.rx_buf);
-	cli_uart_ring_init(&g_ctx.tx, g_ctx.tx_buf, sizeof g_ctx.tx_buf);
 	g_ctx.connected = 0;
 	g_ctx.sh        = tr->sh;      /* cli_init() sets tr->sh before calling init */
 	return 0;
@@ -237,34 +165,120 @@ static int nsh_init(struct cli_transport *tr)
 
 static int nsh_enable(struct cli_transport *tr)
 {
-	(void)tr;                      /* the sockets are opened by the service thread */
+	(void)tr;                      /* the socket is opened by the server thread */
 	return 0;
 }
 
+/*
+ * Put @n bytes on the wire verbatim.  MUST be called with g_sock_lock held.  Returns the
+ * number of bytes accepted (0 when the pool or the socket refused).
+ */
+static int nsh_emit_locked(const uint8_t *p, ULONG n)
+{
+	NX_PACKET_POOL *pool = (NX_PACKET_POOL *)nx_net_pool();
+	NX_PACKET *pkt = NX_NULL;
+	UINT s;
+
+	if (pool == NX_NULL || !g_sock_created)
+		return 0;
+	/* Leave the receive path some pool.  Advisory: an unlocked read of a counter NetX
+	 * maintains, which is the right weight for a policy whose only job is to keep an
+	 * output burst from being the reason a frame was dropped. */
+	if (pool->nx_packet_pool_available <= NSH_POOL_RESERVE) {
+		g_tx_nobuf++;
+		return 0;
+	}
+	if (nx_packet_allocate(pool, &pkt, NX_TCP_PACKET, NX_NO_WAIT) != NX_SUCCESS) {
+		g_tx_nobuf++;
+		return 0;
+	}
+	if (nx_packet_data_append(pkt, (VOID *)p, n, pool, NX_NO_WAIT) != NX_SUCCESS) {
+		nx_packet_release(pkt);
+		g_tx_nobuf++;
+		return 0;
+	}
+	s = nx_tcp_socket_send(&g_sock, pkt, NX_NO_WAIT);
+	if (s != NX_SUCCESS) {
+		/* Release it -- NetX did not take it -- and let the core wait for the notify.
+		 * The window/queue answers are the healthy path and are counted apart from
+		 * anything else (NX_NOT_CONNECTED on a disconnect race lands in g_tx_nobuf,
+		 * which is harmless: the session is ending anyway). */
+		nx_packet_release(pkt);
+		if (s == NX_WINDOW_OVERFLOW || s == NX_TX_QUEUE_DEPTH)
+			g_tx_wait++;
+		else
+			g_tx_nobuf++;
+		return 0;
+	}
+	return (int)n;
+}
+
+/*
+ * ---- the write path, and the one rule it must not break ------------------------
+ *
+ * cli_transport_api.write() is a NON-BLOCKING contract (cli_instance.h): it returns how
+ * much it took and the core waits on CLI_EVT_TX for the rest.  So g_sock_lock is acquired
+ * with TX_NO_WAIT and a failure returns 0 rather than waiting -- during a teardown the
+ * server holds it only across short socket calls, and the teardown clears `connected` and
+ * fires the TX notify, so the core re-enters write() and gets `len` back on the closed
+ * gate instead of waiting out CLI_TX_TIMEOUT.
+ *
+ * A literal 0xFF must go out as IAC IAC or a telnet client reads it as the start of a
+ * command (f746's nx_shell strips IAC on receive but never escaped its output, which
+ * corrupts any binary the shell prints).  The escape happens into a static staging buffer,
+ * which is safe precisely because g_sock_lock is held: write() has three possible callers
+ * (the instance thread, a background job through sh->fg, and session_begin(), which the
+ * core calls WITHOUT its output lock).
+ */
 static int nsh_write(struct cli_transport *tr, const uint8_t *data, size_t len)
 {
-	size_t i;
+	size_t i, out = 0, taken = 0;
+	int sent;
 
 	(void)tr;
-	/* Not connected: swallow it (req §11).  Returning `len` is what keeps the shell from
-	 * ever wedging on a console nobody is attached to. */
+	/* Not connected: swallow it.  Returning `len` is what keeps the shell from ever
+	 * wedging on a console nobody is attached to. */
 	if (!g_ctx.connected)
 		return (int)len;
+	if (len == 0u)
+		return 0;
+
+	if (tx_mutex_get(&g_sock_lock, TX_NO_WAIT) != TX_SUCCESS) {
+		/*
+		 * The holder is the teardown, which DOES wait under this lock (the bounded
+		 * FIN handshake in nsh_unwind()).  It clears `connected` first, but we may
+		 * have read it just before that -- so re-read it here.  Without this the core
+		 * would wait out CLI_TX_TIMEOUT for space that is never coming, on a session
+		 * that has already ended.
+		 */
+		g_tx_busy++;
+		return g_ctx.connected ? 0 : (int)len;
+	}
 
 	for (i = 0; i < len; i++) {
-		if (!nsh_tx_put(data[i]))
-			break;                 /* full: the core waits for CLI_EVT_TX */
+		size_t need = (data[i] == 0xFFu) ? 2u : 1u;
+
+		if (out + need > NSH_MSS)
+			break;                       /* one packet's worth per call */
+		g_stage[out++] = data[i];
+		if (need == 2u)
+			g_stage[out++] = 0xFFu;
+		taken++;
 	}
-	if (i != 0u)
-		(void)tx_event_flags_set(&g_evt, NSH_EVT_TX, TX_OR);
-	return (int)i;
+	sent = nsh_emit_locked(g_stage, (ULONG)out);
+	(void)tx_mutex_put(&g_sock_lock);
+
+	if (sent <= 0)
+		return 0;                            /* core waits for CLI_EVT_TX */
+	g_tx_bytes += (uint32_t)out;
+	return (int)taken;                           /* INPUT bytes consumed */
 }
 
 static int nsh_read(struct cli_transport *tr, uint8_t *data, size_t cap)
 {
 	(void)tr;
-	/* SPSC: the service thread is the only producer, this (the CLI thread) the only
-	 * consumer -- lock-free, like the UART/CDC backends. */
+	/* SPSC: the IP-thread callback is the only producer, this (the CLI thread) the
+	 * only consumer -- lock-free, like the UART/CDC backends. */
 	return (int)cli_uart_ring_get_buf(&g_ctx.rx, data, cap);
 }
 
@@ -279,7 +293,6 @@ static const uint8_t nsh_charmode[] = {
 static void nsh_session_begin(struct cli_transport *tr)
 {
 	uint8_t junk;
-	unsigned i;
 
 	(void)tr;
 	/* The CLI thread calls this on CLI_EVT_CONN, after the editor state was reset and
@@ -287,15 +300,17 @@ static void nsh_session_begin(struct cli_transport *tr)
 	 * consumer side, so the RX ring stays strict SPSC. */
 	while (cli_uart_ring_get(&g_ctx.rx, &junk))
 		;
-	/* Enable output only if the connection is still up: a client that vanished before the
-	 * CLI thread got here leaves g_link_live == 0, so the prompt is dropped rather than
-	 * written to a socket that is gone. */
+	/* Enable output only if the connection is still up: a client that vanished before
+	 * the CLI thread got here leaves g_link_live == 0, so the prompt is dropped rather
+	 * than written to a socket that is gone. */
 	g_ctx.connected = g_link_live;
 	if (!g_ctx.connected)
 		return;
-	for (i = 0u; i < sizeof nsh_charmode; i++)
-		(void)nsh_tx_put_raw(nsh_charmode[i]);   /* IAC bytes: NOT escaped */
-	(void)tx_event_flags_set(&g_evt, NSH_EVT_TX, TX_OR);
+	/* Raw: these ARE IAC sequences and must not be escaped. */
+	if (tx_mutex_get(&g_sock_lock, TX_NO_WAIT) == TX_SUCCESS) {
+		(void)nsh_emit_locked(nsh_charmode, (ULONG)sizeof nsh_charmode);
+		(void)tx_mutex_put(&g_sock_lock);
+	}
 }
 
 static const struct cli_transport_api nsh_api = {
@@ -308,10 +323,31 @@ struct cli_transport net_shell_transport = {
 	.ctx = &g_ctx,
 };
 
-/* ---- telnet receive ------------------------------------------------------ */
+/* ---- NetX callbacks (IP-thread context: ring + flags only) --------------- */
 
-/* Drop 0xFF + command [+ option]; 0xFF 0xFF becomes one literal 0xFF.  Returns 1 when @b is
- * consumed (negotiation), 0 when it is shell data. */
+/*
+ * Put one byte into the RX ring.
+ *
+ * The ring is lock-free and leaves concurrency to the backend (cli_uart_ring.h), and this
+ * backend has TWO producers: the receive callback on the NetX IP thread, and the server
+ * thread injecting a Ctrl+C when a client vanishes.  Only the consumer side is naturally
+ * exclusive (one CLI instance thread, touching only `tail`), so the producers serialise
+ * with the same short interrupt-masked region the USB CDC backend uses.  Returns 1 if
+ * stored.
+ */
+static int nsh_rx_put(uint8_t b)
+{
+	uint32_t pm = __get_PRIMASK();
+	int ok;
+
+	__disable_irq();
+	ok = cli_uart_ring_put(&g_ctx.rx, b);
+	__set_PRIMASK(pm);
+	return ok;
+}
+
+/* Drop 0xFF + command [+ option]; 0xFF 0xFF becomes one literal 0xFF.  Returns 1 when @b
+ * is consumed (negotiation), 0 when it is shell data. */
 static int nsh_iac_consume(uint8_t b)
 {
 	switch (g_iac) {
@@ -327,481 +363,288 @@ static int nsh_iac_consume(uint8_t b)
 	}
 }
 
-/* Hand received bytes to the shell instance. */
-static void nsh_feed(const uint8_t *d, uint16_t n)
+static void nsh_rx_notify(NX_TCP_SOCKET *s)
 {
-	uint16_t i;
+	NX_PACKET *pkt;
 	int woke = 0;
 
-	g_rx_bytes += n;
-	for (i = 0u; i < n; i++) {
-		if (nsh_iac_consume(d[i]))
-			continue;
-		if (!cli_uart_ring_put(&g_ctx.rx, d[i])) {
-			g_rx_drops++;          /* ring full: byte lost, keep the stream in sync */
-			continue;
+	while (nx_tcp_socket_receive(s, &pkt, NX_NO_WAIT) == NX_SUCCESS) {
+		ULONG copied = 0, off = 0;
+
+		while (off < pkt->nx_packet_length) {
+			ULONG got = 0, i;
+
+			if (nx_packet_data_extract_offset(pkt, off, g_extract,
+			                                  sizeof g_extract, &got) != NX_SUCCESS ||
+			    got == 0)
+				break;
+			off += got;
+			copied += got;
+			for (i = 0; i < got; i++) {
+				if (nsh_iac_consume(g_extract[i]))
+					continue;
+				if (!nsh_rx_put(g_extract[i])) {
+					g_rx_drops++;   /* ring full: byte lost, stream in sync */
+					continue;
+				}
+				woke = 1;
+			}
 		}
-		woke = 1;
+		g_rx_bytes += (uint32_t)copied;
+		nx_packet_release(pkt);
 	}
 	if (woke && g_ctx.sh != NULL)
 		cli_transport_notify_rx(g_ctx.sh);
 }
 
-/* ---- eRPC helpers -------------------------------------------------------- */
-
-/* Per-call options.  Deliberately WITHOUT an abort hook -- see the header. */
-static void nsh_opts(struct wifi_rpc_opts *o, uint32_t module_ms)
+static void nsh_disconnect_cb(NX_TCP_SOCKET *s)
 {
-	o->timeout_ms   = module_ms + NSH_RPC_SLACK_MS;
-	o->should_abort = NULL;
-	o->abort_ctx    = NULL;
-	o->diag         = &g_diag;
-}
-
-static void nsh_diag_acc(void)
-{
-	g_diag_tot.crc_fail               += g_diag.crc_fail;
-	g_diag_tot.oversize               += g_diag.oversize;
-	g_diag_tot.timeout                += g_diag.timeout;
-	g_diag_tot.skipped_reply          += g_diag.skipped_reply;
-	g_diag_tot.unsupported_invocation += g_diag.unsupported_invocation;
-	g_diag_tot.frame_stall            += g_diag.frame_stall;
-	g_diag_tot.ctrl_bad               += g_diag.ctrl_bad;
-}
-
-/* Ask the module why the last socket call failed (0 when even that did not get through). */
-static int32_t nsh_errno(void)
-{
-	struct wifi_rpc_opts o;
-	int32_t e = 0;
-
-	nsh_opts(&o, 0u);
-	if (wifi_rpc_lwip_errno(&o, &e) != 0)
-		e = 0;
-	nsh_diag_acc();
-	return e;
-}
-
-/*
- * Give up the link without closing anything.  Called when a call did not come back: the
- * module may still be running it, and closing an fd underneath an in-flight receive is
- * exactly what N3 constraint 2 forbids -- so the fds are LEAKED and only a power cycle
- * reclaims them.  If our UART reference was revoked instead (force-quiesce from `wifi
- * on/off/reset`), the module is being power-cycled anyway: the sockets die with it, so that
- * case does NOT latch dirty and a re-arm after the reset is free.
- */
-static void nsh_fail(const char *why)
-{
-	int revoked = (rtl_link_uart_gen() != g_uart_gen);
-
+	(void)s;
+	/* Peer FIN/RST.  Stop output, reset the telnet IAC state (same IP-thread domain as
+	 * nsh_iac_consume) and wake the server thread, which completes the close and
+	 * relistens. */
+	g_peer_gone     = 1u;
+	g_link_live     = 0u;
 	g_ctx.connected = 0;
-	g_link_live     = 0;
-	nsh_tx_discard();
-	g_cfd = -1;
-	g_lfd = -1;
-	if (!revoked) {
-		g_dirty    = 1u;
-		g_dirty_at = rtl_link_quiesce_gen();
-		LOG_ERR("%s -- module sockets leaked, run `wifi reset`", why);
-	} else {
-		LOG_WRN("%s", why);
-	}
-	rtl_link_uart_unref_gen(g_uart_gen);   /* no-op once the generation moved */
-	g_last  = why;
-	g_state = NET_SHELL_OFF;
+	g_iac           = 0;
+	(void)tx_event_flags_set(&g_evt, NSH_EVT_DISC, TX_OR);
 }
 
-/* Close @*fd.  Safe by construction: this thread issues every blocking call on these fds
- * and is here, so none is outstanding (N3 constraint 2).  Returns 0, or -1 when the link
- * went dirty (nsh_fail() has already run). */
-static int nsh_close(int32_t *fd, const char *what)
+/* The handshake completed.  IP-thread context (_nx_tcp_socket_state_syn_received calls it
+ * the instant the state becomes ESTABLISHED): flag only. */
+static void nsh_establish_cb(NX_TCP_SOCKET *s)
 {
-	struct wifi_rpc_opts o;
-	int32_t ret = -1;
-	int rc;
-
-	if (*fd < 0)
-		return 0;
-	nsh_opts(&o, 0u);
-	rc = wifi_rpc_lwip_close(&o, *fd, &ret);
-	nsh_diag_acc();
-	if (NSH_DIRTY(rc)) {
-		nsh_fail("close got no reply from the module");
-		return -1;
-	}
-	if (rc || ret < 0)
-		LOG_WRN("close(%s fd %ld) failed (rc %d ret %ld)", what, (long)*fd, rc, (long)ret);
-	*fd = -1;
-	return 0;
+	(void)s;
+	(void)tx_event_flags_set(&g_evt, NSH_EVT_CONN, TX_OR);
 }
+
+static void nsh_tx_notify(NX_TCP_SOCKET *s)
+{
+	(void)s;                            /* window / queue space freed */
+	if (g_ctx.sh != NULL)
+		cli_transport_notify_tx(g_ctx.sh);
+}
+
+/* ---- socket lifecycle (server thread only) ------------------------------- */
 
 /*
- * One int-valued setsockopt.  The OPTION is best effort -- a module that refuses it only
- * costs us Nagle or a keepalive -- but the CALL is not: no reply means the module is still
- * running it, so the link is dirty and nothing further may be issued.  Returns 0 to carry
- * on, -1 when the link went dirty (nsh_fail() has already run).
+ * Arm the passive open.  CALL EXACTLY ONCE PER CONNECTION.
+ *
+ * Re-entering nx_tcp_server_socket_accept() is NOT a legal way to stay cancellable: every
+ * entry from LISTEN regenerates the ISN and moves the socket to SYN_RECEIVED
+ * (nx_tcp_server_socket_accept.c:102-124), and the timeout path restores LISTEN WITHOUT
+ * unbinding, leaving a bound-but-LISTEN socket whose completing ACK
+ * _nx_tcp_socket_packet_process() drops -- it has no LISTEN case
+ * (nx_tcp_socket_packet_process.c:334-449).  Issue #23 U4-1 found that on hardware: the
+ * client connects and receives nothing, for ever.  So arm once with NX_NO_WAIT and wait
+ * with nx_tcp_socket_state_wait(), which touches nothing and may be re-entered freely.
  */
-static int nsh_setopt(int32_t fd, int32_t level, int32_t opt, int32_t val, const char *what)
+static int nsh_arm_accept(void)
 {
-	struct wifi_rpc_opts o;
-	uint8_t v[4];
-	int32_t ret = -1;
-	int rc;
+	UINT s = nx_tcp_server_socket_accept(&g_sock, NX_NO_WAIT);
 
-	v[0] = (uint8_t)val;                     v[1] = (uint8_t)((uint32_t)val >> 8);
-	v[2] = (uint8_t)((uint32_t)val >> 16);   v[3] = (uint8_t)((uint32_t)val >> 24);
-	nsh_opts(&o, 0u);
-	rc = wifi_rpc_lwip_setsockopt(&o, fd, level, opt, v, 4u, &ret);
-	nsh_diag_acc();
-	if (NSH_DIRTY(rc)) {
-		nsh_fail("setsockopt got no reply from the module");
-		return -1;
-	}
-	if (rc || ret < 0)
-		LOG_WRN("%s failed (rc %d ret %ld)", what, rc, (long)ret);
-	return 0;
+	if (s == NX_SUCCESS || s == NX_IN_PROGRESS)
+		return 0;
+	LOG_ERR("accept arm failed (0x%02x)", (unsigned)s);
+	return -1;
 }
 
-/* ---- arm / teardown ------------------------------------------------------ */
-
-/* Build a 16-byte lwIP sockaddr_in for 0.0.0.0:@port. */
-static void nsh_sockaddr(uint8_t sa[16], uint16_t port)
-{
-	unsigned i;
-
-	for (i = 0u; i < 16u; i++)
-		sa[i] = 0u;
-	sa[0] = 16u;                             /* sin_len                       */
-	sa[1] = (uint8_t)WIFI_LWIP_AF_INET;      /* sin_family                    */
-	sa[2] = (uint8_t)(port >> 8);            /* sin_port, network byte order  */
-	sa[3] = (uint8_t)port;
-}
-
-/* Take the link and open the listening socket.  Returns 0 with the state left in
- * NET_SHELL_LISTENING, or -1 with g_last set (state OFF). */
+/* Create the socket and start listening.  Returns 0 with the state left LISTENING. */
 static int nsh_arm(uint16_t port)
 {
-	struct wifi_rpc_opts o;
-	struct wifi_ip_info ip;
-	uint8_t sa[16];
-	uint32_t t0 = HAL_GetTick();
-	int32_t fd = -1, ret = -1, res = -1, conn = -1;
-	int rc;
+	NX_IP *ip = (NX_IP *)nx_net_ip();
+	struct nx_net_info ni;
+	UINT s;
 
-	if (!rtl8720_powered()) {
-		g_last = "the RTL8720 is powered off";
-		return -1;
-	}
-	/* The coarse mutex serialises us against whole command flows; a `wifi connect` can
-	 * hold it for its full 30 s, so wait properly rather than give up on the first miss. */
-	while (rtl_link_claim(RTL_LINK_CLAIM_WAIT_MS) != 0) {
-		if (g_req_stop || (uint32_t)(HAL_GetTick() - t0) > NSH_ARM_CLAIM_MS) {
-			g_last = "the RTL8720 link stayed busy";
-			return -1;
-		}
-	}
-	/* Whatever rate the link is running at (issue #23 U0-3 made it changeable): a
-	 * mismatched literal here would refuse the reference rather than re-open, because
-	 * rtl_link_uart_ref() rejects a configuration that disagrees with the open one. */
-	if (rtl_link_uart_ref(RTL8720_UART_AT, rtl_link_erpc_baud()) != 0) {
-		rtl_link_unclaim();
-		g_last = "USART1 did not come ready";
-		return -1;
-	}
-	/* Record which "open" our reference belongs to: a force-quiesce (`wifi on/off/reset`)
-	 * revokes it, and releasing it afterwards must NOT decrement the next user's. */
-	g_uart_gen = rtl_link_uart_gen();
-
-	nsh_opts(&o, 3000u);
-	rc = wifi_rpc_is_connected(&o, &conn);
-	nsh_diag_acc();
-	if (rc || conn != WIFI_RPC_OK) {
-		g_last = "the RTL8720 is not associated";
+	if (ip == NX_NULL || !nx_net_is_up()) {
+		g_last = "the host stack is not up (`net up` first)";
 		goto fail;
 	}
-
-	nsh_opts(&o, 0u);
-	rc = wifi_rpc_lwip_socket(&o, WIFI_LWIP_AF_INET, WIFI_LWIP_SOCK_STREAM, 0, &fd);
-	nsh_diag_acc();
-	if (NSH_DIRTY(rc))
-		goto dirty;
-	if (rc || fd < 0) {
-		g_last = "socket(SOCK_STREAM) failed";
-		goto fail;
-	}
-	/* Own it from here on, so every path below either closes it (fail) or deliberately
-	 * leaks it (dirty) rather than losing the number. */
-	g_lfd = fd;
-	/* Best effort: without SO_REUSEADDR a re-arm while a previous connection is in
-	 * TIME_WAIT cannot rebind the port (lwIP scans the TIME_WAIT list unless it is set). */
-	if (nsh_setopt(fd, WIFI_LWIP_SOL_SOCKET, WIFI_LWIP_SO_REUSEADDR, 1, "SO_REUSEADDR") != 0) {
-		rtl_link_unclaim();        /* nsh_fail() already ran */
+	/*
+	 * A socket NetX still has on its created list must never be created over: the
+	 * control block IS the list node, so a second create would corrupt it.  That only
+	 * happens if a previous delete was refused, which is already reported as an error --
+	 * this is the latch that stops it becoming silent memory corruption later.
+	 */
+	if (g_sock_created) {
+		g_last = "the previous socket was never released (reset to clear)";
+		LOG_ERR("refusing to re-create: the socket is still on the IP instance");
+		g_state = NET_SHELL_OFF;
 		return -1;
 	}
 
-	nsh_sockaddr(sa, port);
-	nsh_opts(&o, 0u);
-	rc = wifi_rpc_lwip_bind(&o, fd, sa, (uint16_t)sizeof sa, &ret);
-	nsh_diag_acc();
-	if (NSH_DIRTY(rc))
-		goto dirty;
-	if (rc || ret < 0) {
-		int32_t e = (rc == 0) ? nsh_errno() : 0;
+	s = nx_tcp_socket_create(ip, &g_sock, "net-shell", NX_IP_NORMAL, NX_FRAGMENT_OKAY,
+	                         NX_IP_TIME_TO_LIVE, NSH_WINDOW, NX_NULL, nsh_disconnect_cb);
+	if (s != NX_SUCCESS) {
+		LOG_ERR("socket create failed (0x%02x)", (unsigned)s);
+		g_last = "socket create failed";
+		goto fail;
+	}
+	g_sock_created = 1u;
 
-		LOG_ERR("bind :%u failed (rc %d ret %ld errno %ld %s)", (unsigned)port, rc,
-		        (long)ret, (long)e, wifi_rpc_errno_name(e));
-		g_last = "bind failed (port in use? retry in ~1 min)";
+	(void)nx_tcp_socket_receive_notify(&g_sock, nsh_rx_notify);
+	/* Available because NX_DISABLE_EXTENDED_NOTIFY_SUPPORT is not defined; it is what
+	 * lets this thread wait on an event instead of polling for ESTABLISHED. */
+	(void)nx_tcp_socket_establish_notify(&g_sock, nsh_establish_cb);
+	(void)nx_tcp_socket_window_update_notify_set(&g_sock, nsh_tx_notify);
+	(void)nx_tcp_socket_queue_depth_notify_set(&g_sock, nsh_tx_notify);
+	/* Bound what this socket can have outstanding towards the link's DATA transmit
+	 * pool -- the transmit budget note in app/nx_net.h is what makes that number safe. */
+	(void)nx_tcp_socket_transmit_configure(&g_sock, NXN_TCP_TX_DEPTH, NXN_TCP_RTO_MS,
+	                                       NXN_TCP_RTO_RETRIES, NXN_TCP_RTO_SHIFT);
+
+	s = nx_tcp_server_socket_listen(ip, port, &g_sock, 1, NX_NULL);
+	if (s != NX_SUCCESS) {
+		LOG_ERR("listen :%u failed (0x%02x)", (unsigned)port, (unsigned)s);
+		g_last = "listen failed (port in use?)";
+		goto fail;
+	}
+	g_peer_gone = 0u;
+	if (nsh_arm_accept() != 0) {
+		(void)nx_tcp_server_socket_unlisten(ip, port);
+		g_last = "could not arm accept";
 		goto fail;
 	}
 
-	nsh_opts(&o, 0u);
-	rc = wifi_rpc_lwip_listen(&o, fd, 1, &ret);
-	nsh_diag_acc();
-	if (NSH_DIRTY(rc))
-		goto dirty;
-	if (rc || ret < 0) {
-		g_last = "listen failed";
-		goto fail;
+	if (nx_net_info_get(&ni) == NXN_OK && ni.ip_valid) {
+		g_ip[0] = (uint8_t)(ni.ip >> 24); g_ip[1] = (uint8_t)(ni.ip >> 16);
+		g_ip[2] = (uint8_t)(ni.ip >> 8);  g_ip[3] = (uint8_t)ni.ip;
 	}
-
-	/* Address, for the banner and `net shell status` (best effort). */
-	nsh_opts(&o, 3000u);
-	if (wifi_rpc_get_ip(&o, 0u, &ip, &res) == 0 && res == WIFI_RPC_OK) {
-		g_ip[0] = ip.ip[0]; g_ip[1] = ip.ip[1];
-		g_ip[2] = ip.ip[2]; g_ip[3] = ip.ip[3];
-	}
-	nsh_diag_acc();
-
-	rtl_link_unclaim();
 	g_port  = port;
 	g_iac   = 0;
 	g_last  = "listening";
 	g_state = NET_SHELL_LISTENING;
-	LOG_INF("listening on %u.%u.%u.%u:%u (telnet)", g_ip[0], g_ip[1], g_ip[2], g_ip[3],
-	        (unsigned)port);
+	LOG_INF("listening on %u.%u.%u.%u:%u (telnet, host stack)",
+	        g_ip[0], g_ip[1], g_ip[2], g_ip[3], (unsigned)port);
 	return 0;
 
-dirty:
-	rtl_link_unclaim();
-	nsh_fail("the module stopped answering while arming");
-	return -1;
 fail:
-	if (g_lfd >= 0)
-		(void)nsh_close(&g_lfd, "listening");
-	rtl_link_uart_unref_gen(g_uart_gen);
-	rtl_link_unclaim();
+	if (g_sock_created) {
+		(void)tx_mutex_get(&g_sock_lock, TX_WAIT_FOREVER);
+		if (nx_tcp_socket_delete(&g_sock) == NX_SUCCESS)
+			g_sock_created = 0u;
+		(void)tx_mutex_put(&g_sock_lock);
+	}
+	LOG_WRN("arm failed: %s", g_last);
 	g_state = NET_SHELL_OFF;
 	return -1;
 }
 
-/* Close the sockets and give the UART reference back. */
-static void nsh_teardown(const char *why)
+/*
+ * Unwind the socket and PROVE it.  Returns 0 only when nx_tcp_socket_delete() succeeded,
+ * which is what net_shell_stop_sync()'s contract rests on.
+ *
+ * The order is forced by nx_tcp_socket_delete(), which refuses anything still bound or not
+ * in NX_TCP_CLOSED (nx_tcp_socket_delete.c:93).  disconnect + unaccept are issued
+ * UNCONDITIONALLY, not only when a session was accepted, because an armed passive open can
+ * be bound too: nx_tcp_server_socket_relisten() binds the socket when a SYN was already
+ * queued.  Between them the pair covers every state -- ESTABLISHED (disconnect leaves
+ * >= CLOSE_WAIT or LISTEN, unaccept forces LISTEN then unbinds), bound LISTEN (unaccept
+ * unbinds via bound_next), unbound LISTEN (unaccept clears the listen request).  unaccept
+ * MUST precede unlisten: it clears the request's socket pointer, unlisten removes the
+ * request.
+ */
+static int nsh_unwind(void)
 {
+	NX_IP *ip = (NX_IP *)nx_net_ip();
+	UINT s;
+
+	/* Stop producers first, and wake anyone parked in the core's TX wait so it
+	 * re-enters write() and returns on the closed gate. */
 	g_ctx.connected = 0;
-	g_link_live     = 0;
-	nsh_tx_discard();
-	if (nsh_close(&g_cfd, "client") != 0)
-		return;                        /* dirty: nsh_fail() already finished up */
-	if (nsh_close(&g_lfd, "listening") != 0)
-		return;
-	/* The coarse mutex is the right thing to hold while dropping the reference (a
-	 * bridge/flash session drives the same UART without referencing it).  If another
-	 * console is sitting on it we release anyway: keeping the reference would leave those
-	 * commands refused forever, and the count itself is protected by the eRPC link lock. */
-	if (rtl_link_claim(RTL_LINK_CLAIM_WAIT_MS) == 0) {
-		rtl_link_uart_unref_gen(g_uart_gen);
-		rtl_link_unclaim();
-	} else {
-		rtl_link_uart_unref_gen(g_uart_gen);
-		LOG_WRN("dropped the UART reference without the coarse mutex (it stayed busy)");
+	g_link_live     = 0u;
+	if (g_ctx.sh != NULL)
+		cli_transport_notify_tx(g_ctx.sh);
+
+	if (!g_sock_created)
+		return 0;
+
+	/*
+	 * The lock keeps a CLI thread from being inside nx_tcp_socket_send() while the
+	 * socket is deleted.  It IS held across the bounded FIN handshake below -- the one
+	 * place this file waits under it -- which is why nsh_write() re-checks `connected`
+	 * when its TX_NO_WAIT acquisition fails: a writer must not be told "no space" for a
+	 * second while the session it belongs to is being dismantled.
+	 */
+	(void)tx_mutex_get(&g_sock_lock, TX_WAIT_FOREVER);
+	(void)nx_tcp_socket_disconnect(&g_sock, NSH_DISC_MS);
+	(void)nx_tcp_server_socket_unaccept(&g_sock);
+	if (ip != NX_NULL)
+		(void)nx_tcp_server_socket_unlisten(ip, g_port);
+	s = nx_tcp_socket_delete(&g_sock);
+	if (s == NX_SUCCESS)
+		g_sock_created = 0u;
+	(void)tx_mutex_put(&g_sock_lock);
+
+	if (s != NX_SUCCESS) {
+		LOG_ERR("socket delete refused (0x%02x) -- the console may still transmit",
+		        (unsigned)s);
+		return -1;
 	}
-	g_last  = why;
-	g_state = NET_SHELL_OFF;
-	LOG_INF("stopped (%s)", why);
+	return 0;
 }
 
-/* End the current session and go back to listening. */
-static void nsh_end_session(const char *why)
+/* End the current session and go back to listening.  Returns 0, or -1 if the socket could
+ * not be re-armed (the caller then stops). */
+static int nsh_end_session(const char *why)
 {
+	NX_IP *ip = (NX_IP *)nx_net_ip();
+	UINT s;
+
 	g_ctx.connected = 0;
-	g_link_live     = 0;
-	nsh_tx_discard();
-	/* A command may still be running for the client that just left.  0x03 is exactly what
-	 * Ctrl+C delivers, so pushing one cancels it and leaves the instance idle for the next
-	 * client instead of holding the link until it finishes on its own. */
-	if (cli_uart_ring_put(&g_ctx.rx, 0x03u) && g_ctx.sh != NULL)
+	g_link_live     = 0u;
+	if (g_ctx.sh != NULL)
+		cli_transport_notify_tx(g_ctx.sh);
+	/* A command may still be running for the client that just left.  0x03 is exactly
+	 * what Ctrl+C delivers, so pushing one cancels it and leaves the instance idle for
+	 * the next client instead of holding the console until it finishes on its own. */
+	if (nsh_rx_put(0x03u) && g_ctx.sh != NULL)
 		cli_transport_notify_rx(g_ctx.sh);
-	if (nsh_close(&g_cfd, "client") != 0)
-		return;                        /* dirty */
+
+	(void)tx_mutex_get(&g_sock_lock, TX_WAIT_FOREVER);
+	(void)nx_tcp_socket_disconnect(&g_sock, NSH_DISC_MS);
+	(void)nx_tcp_server_socket_unaccept(&g_sock);
+	(void)tx_mutex_put(&g_sock_lock);
+
+	if (ip == NX_NULL)
+		return -1;
+	s = nx_tcp_server_socket_relisten(ip, g_port, &g_sock);
+	if (s != NX_SUCCESS && s != NX_CONNECTION_PENDING) {
+		LOG_ERR("relisten failed (0x%02x)", (unsigned)s);
+		return -1;
+	}
+	g_peer_gone = 0u;
+	if (nsh_arm_accept() != 0)
+		return -1;
+
 	g_iac   = 0;
 	g_last  = why;
 	g_state = NET_SHELL_LISTENING;
 	LOG_INF("client disconnected (%s)", why);
-}
-
-/* ---- service rounds ------------------------------------------------------ */
-
-/* Wait briefly for the shell to produce output (see NSH_TX_GRACE_MS).  The ring, never this
- * flag, is the source of truth: the caller re-checks it, so a stale or cleared flag can
- * only cost one extra loop. */
-static void nsh_tx_grace(void)
-{
-	ULONG f;
-
-	if (cli_uart_ring_count(&g_ctx.tx) != 0u)
-		return;
-	(void)tx_event_flags_get(&g_evt, NSH_EVT_TX, TX_OR_CLEAR, &f, NSH_TX_GRACE_MS);
-}
-
-/* Push queued output.  Returns 0 to carry on, -1 when the session or the link ended. */
-static int nsh_tx_drain(void)
-{
-	uint16_t chunk = wifi_rpc_send_chunk();
-	unsigned n;
-
-	for (n = 0u; n < NSH_TX_BURST; n++) {
-		struct wifi_rpc_opts o;
-		const uint8_t *p;
-		size_t run = cli_uart_ring_contig(&g_ctx.tx, &p);
-		int32_t ret = -1;
-		int rc;
-
-		if (run == 0u)
-			break;
-		if (run > chunk)
-			run = chunk;
-
-		nsh_opts(&o, 0u);
-		rc = wifi_rpc_lwip_send(&o, g_cfd, p, (uint16_t)run, 0, &ret);
-		nsh_diag_acc();
-		if (NSH_DIRTY(rc)) {
-			nsh_fail("send got no reply from the module");
-			return -1;
-		}
-		if (rc) {
-			nsh_end_session("send transport error");
-			return -1;
-		}
-		if (ret <= 0 || (uint32_t)ret > (uint32_t)run) {
-			nsh_end_session("send refused by the peer");
-			return -1;
-		}
-		cli_uart_ring_advance_tail(&g_ctx.tx, (size_t)ret);
-		g_tx_bytes += (uint32_t)ret;
-		/* Space freed: the core may be blocked on CLI_EVT_TX waiting for exactly this
-		 * (the vtable contract in cli_instance.h). */
-		if (g_ctx.sh != NULL)
-			cli_transport_notify_tx(g_ctx.sh);
-	}
 	return 0;
 }
 
-static void nsh_listen_round(void)
+/* ---- server thread ------------------------------------------------------- */
+
+/* Complete a stop: unwind, publish the outcome, and raise NSH_EVT_DONE only if the unwind
+ * was PROVED.  A caller waiting in net_shell_stop_sync() must not be told "stopped" on the
+ * strength of an attempt. */
+static void nsh_do_stop(const char *why)
 {
-	struct wifi_rpc_opts o;
-	int32_t cfd = -1;
-	int rc;
-
-	nsh_opts(&o, NSH_ACCEPT_MS);
-	rc = wifi_rpc_lwip_accept(&o, g_lfd, &cfd);
-	nsh_diag_acc();
-	if (NSH_DIRTY(rc)) {
-		nsh_fail("accept got no reply from the module");
-		return;
+	g_state = NET_SHELL_STOPPING;
+	if (nsh_unwind() != 0) {
+		g_last  = "the socket could not be released -- the console may still transmit";
+		g_state = NET_SHELL_OFF;      /* nothing left to do here; the latch in
+		                               * nsh_arm()/net_shell_start() refuses a re-arm
+		                               * while the old socket is still on the list */
+		LOG_ERR("stop could not be proved (%s)", why);
+		return;                       /* deliberately NO NSH_EVT_DONE */
 	}
-	if (rc) {
-		g_state = NET_SHELL_STOPPING;
-		nsh_teardown("accept transport error");
-		return;
-	}
-	if (cfd < 0) {
-		int32_t e = nsh_errno();
-
-		if (e == WIFI_LWIP_ETIMEDOUT)
-			return;                /* nobody within the firmware's cap: listen again */
-		LOG_ERR("accept failed (errno %ld %s)", (long)e, wifi_rpc_errno_name(e));
-		g_state = NET_SHELL_STOPPING;
-		nsh_teardown("accept failed");
-		return;
-	}
-
-	g_cfd = cfd;
-	/* Without TCP_NODELAY, Nagle holds a one-byte echo until the previous segment is
-	 * ACKed -- exactly the latency an interactive console cannot afford. */
-	if (nsh_setopt(cfd, WIFI_LWIP_IPPROTO_TCP, WIFI_LWIP_TCP_NODELAY, 1, "TCP_NODELAY") != 0)
-		return;
-	if (nsh_setopt(cfd, WIFI_LWIP_SOL_SOCKET, WIFI_LWIP_SO_KEEPALIVE, 1, "SO_KEEPALIVE") != 0)
-		return;
-
-	/* Drop whatever the previous session left queued BEFORE opening the gate (consumer
-	 * side, so no producer is involved), then let the CLI thread start a clean session. */
-	nsh_tx_discard();
-	g_iac       = 0;
-	g_link_live = 1u;
-	g_sessions++;
-	g_state = NET_SHELL_SESSION;
-	g_last  = "client connected";
-	if (g_ctx.sh != NULL)
-		cli_transport_notify_conn(g_ctx.sh);
-	LOG_INF("client connected (fd %ld, session %lu)", (long)cfd, (unsigned long)g_sessions);
-
-	/* Let the instance draw its prompt before we go back to a blocking receive. */
-	nsh_tx_grace();
-	(void)nsh_tx_drain();
+	g_last  = why;
+	g_state = NET_SHELL_OFF;
+	LOG_INF("stopped (%s)", why);
+	(void)tx_event_flags_set(&g_evt, NSH_EVT_DONE, TX_OR);
 }
-
-static void nsh_session_round(void)
-{
-	struct wifi_rpc_opts o;
-	uint16_t got = 0u;
-	int32_t ret = -1;
-	uint32_t win;
-	int32_t flags;
-	int rc;
-
-	if (cli_uart_ring_count(&g_ctx.tx) != 0u) {
-		if (nsh_tx_drain() != 0)
-			return;
-		/* Output is flowing: poll RX instead of parking on it, so a Ctrl+C interrupts a
-		 * long report within about one burst. */
-		win   = NSH_RECV_POLL_MS;
-		flags = WIFI_LWIP_MSG_DONTWAIT;
-	} else {
-		win   = NSH_RECV_IDLE_MS;
-		flags = 0;
-	}
-
-	nsh_opts(&o, win);
-	rc = wifi_rpc_lwip_recv(&o, g_cfd, g_rxbuf, (uint16_t)sizeof g_rxbuf, flags, win,
-	                        &got, &ret);
-	nsh_diag_acc();
-	if (NSH_DIRTY(rc)) {
-		nsh_fail("recv got no reply from the module");
-		return;
-	}
-	if (rc) {
-		nsh_end_session("recv transport error");
-		return;
-	}
-	if (ret == 0) {
-		nsh_end_session("peer closed");
-		return;
-	}
-	if (ret < 0) {
-		int32_t e = nsh_errno();
-
-		if (e == WIFI_LWIP_EAGAIN)
-			return;                /* idle: the module's receive window expired */
-		LOG_INF("recv ended (errno %ld %s)", (long)e, wifi_rpc_errno_name(e));
-		nsh_end_session("peer gone");
-		return;
-	}
-
-	nsh_feed(g_rxbuf, got);
-	nsh_tx_grace();                    /* give the shell a chance to answer before recv */
-}
-
-/* ---- service thread ------------------------------------------------------ */
 
 static void nsh_entry(ULONG arg)
 {
@@ -809,55 +652,87 @@ static void nsh_entry(ULONG arg)
 
 	for (;;) {
 		ULONG f;
+		UINT  st;
 
-		if (g_req_stop) {
+		if (g_req_stop && g_state != NET_SHELL_ARMING) {
 			g_req_stop = 0u;
 			g_autoarm  = 0u;           /* an explicit stop stays stopped */
-			if (g_state != NET_SHELL_OFF) {
-				g_state = NET_SHELL_STOPPING;
-				nsh_teardown("requested");
-			}
+			if (g_state != NET_SHELL_OFF)
+				nsh_do_stop("requested");
+			else
+				(void)tx_event_flags_set(&g_evt, NSH_EVT_DONE, TX_OR);
 			continue;
 		}
 
 		switch (g_state) {
 		case NET_SHELL_OFF:
-			/* Nothing to do.  Sticky flags: a request that lands between the switch
-			 * above and this wait still wakes us, because the requester moves the
-			 * state FIRST and raises NSH_EVT_CMD second. */
+			/* Sticky flags: a request landing between the switch and this wait
+			 * still wakes us, because the requester moves the state FIRST and
+			 * raises NSH_EVT_CMD second. */
 			(void)tx_event_flags_get(&g_evt, NSH_EVT_CMD, TX_OR_CLEAR, &f,
 			                         TX_WAIT_FOREVER);
 			break;
 
 		case NET_SHELL_ARMING:
-			if (nsh_arm(g_req_port) != 0) {
-				LOG_ERR("arm failed: %s", g_last ? g_last : "?");
-				/* Belt and braces: every failure path must leave ARMING, or this
-				 * loop would spin retrying forever. */
-				if (g_state == NET_SHELL_ARMING)
-					g_state = NET_SHELL_OFF;
-			}
+			if (nsh_arm(g_req_port) != 0 && g_state == NET_SHELL_ARMING)
+				g_state = NET_SHELL_OFF;   /* belt and braces: never spin here */
 			break;
 
 		case NET_SHELL_LISTENING:
-			nsh_listen_round();
+			(void)tx_event_flags_get(&g_evt, NSH_EVT_CONN | NSH_EVT_CMD,
+			                         TX_OR_CLEAR, &f, NSH_IDLE_MS);
+			if (g_req_stop)
+				break;                 /* handled at the top of the loop */
+			/*
+			 * The state is the truth, not the flag: the connection may have
+			 * completed just before the wait was armed, or the wait may have timed
+			 * out with it complete.  Reading it here covers both.
+			 */
+			st = g_sock.nx_tcp_socket_state;
+			if (st != NX_TCP_ESTABLISHED) {
+				if (st != NX_TCP_LISTEN_STATE && st != NX_TCP_SYN_RECEIVED) {
+					LOG_WRN("left the passive open (state %u) -- re-arming",
+					        (unsigned)st);
+					if (nsh_end_session("re-armed") != 0)
+						nsh_do_stop("could not re-arm the socket");
+				}
+				/* The host stack going away takes the socket with it. */
+				if (!nx_net_is_up())
+					nsh_do_stop("the host stack went down");
+				break;
+			}
+			g_peer_gone = 0u;
+			g_link_live = 1u;
+			g_sessions++;
+			g_state = NET_SHELL_SESSION;
+			g_last  = "client connected";
+			if (g_ctx.sh != NULL)
+				cli_transport_notify_conn(g_ctx.sh);
+			LOG_INF("client connected (session %lu)", (unsigned long)g_sessions);
 			break;
 
 		case NET_SHELL_SESSION:
-			nsh_session_round();
+			/* Nothing to do while a client is attached: the callbacks move the
+			 * bytes.  Wait for the disconnect, waking periodically so a stop
+			 * request and a vanished interface are both noticed. */
+			(void)tx_event_flags_get(&g_evt, NSH_EVT_DISC | NSH_EVT_CMD,
+			                         TX_OR_CLEAR, &f, NSH_IDLE_MS);
+			if (g_req_stop)
+				break;                 /* handled at the top of the loop */
+			if (!nx_net_is_up()) {
+				nsh_do_stop("the host stack went down");
+				break;
+			}
+			if (g_peer_gone || g_sock.nx_tcp_socket_state != NX_TCP_ESTABLISHED) {
+				if (nsh_end_session("peer closed") != 0)
+					nsh_do_stop("could not re-arm after the client left");
+			}
 			break;
 
 		default:
 			g_state = NET_SHELL_OFF;
 			break;
 		}
-
-		/* Did somebody take the link away underneath us (`wifi on/off/reset`)?  The RPCs
-		 * above usually notice first (-2 from an abandoned token), but a revocation
-		 * between two calls would otherwise go unseen until the next one. */
-		if ((g_state == NET_SHELL_LISTENING || g_state == NET_SHELL_SESSION) &&
-		    rtl_link_uart_gen() != g_uart_gen)
-			nsh_fail("the RTL8720 link was taken away (wifi on/off/reset)");
 	}
 }
 
@@ -867,6 +742,8 @@ int net_shell_init(void)
 {
 	if (tx_event_flags_create(&g_evt, "nshell") != TX_SUCCESS)
 		return -1;
+	if (tx_mutex_create(&g_sock_lock, "nshsock", TX_INHERIT) != TX_SUCCESS)
+		return -1;
 	if (tx_thread_create(&g_thread, "net-shell", nsh_entry, 0,
 	                     g_stack, sizeof g_stack, NSH_PRIORITY, NSH_PRIORITY,
 	                     TX_NO_TIME_SLICE, TX_AUTO_START) != TX_SUCCESS)
@@ -875,33 +752,27 @@ int net_shell_init(void)
 	return 0;
 }
 
-/* True while the module still holds sockets we leaked. */
-static int nsh_blocked_dirty(void)
-{
-	return g_dirty && rtl_link_quiesce_gen() == g_dirty_at;
-}
-
 int net_shell_start(uint16_t port, const char **why)
 {
 	const char *reason = NULL;   /* string literals: valid after we return */
 
-	if (!g_ready) {
+	if (!g_ready)
 		reason = "the telnet console service is not available";
-	} else if (g_state != NET_SHELL_OFF) {
+	else if (g_state != NET_SHELL_OFF)
 		reason = "it is already running";
-	} else if (nsh_blocked_dirty()) {
-		reason = "the module still holds sockets this console leaked -- "
-		         "run `wifi reset` first";
-	}
+	else if (g_sock_created)
+		reason = "its previous socket could not be released; reset the board";
+	else if (!nx_net_is_up())
+		reason = "the telnet console runs on the host stack -- `net up` first "
+		         "(issue #23 U4 moved it off the module's lwIP)";
 	if (reason != NULL) {
 		if (why != NULL)
 			*why = reason;
 		return -1;
 	}
-	g_dirty    = 0u;
 	g_autoarm  = 1u;
 	g_req_port = port;
-	g_state    = NET_SHELL_ARMING;   /* state first, then the wake-up (see the note above) */
+	g_state    = NET_SHELL_ARMING;   /* state first, then the wake-up */
 	(void)tx_event_flags_set(&g_evt, NSH_EVT_CMD, TX_OR);
 	return 0;
 }
@@ -915,11 +786,50 @@ void net_shell_stop(void)
 	(void)tx_event_flags_set(&g_evt, NSH_EVT_CMD, TX_OR);
 }
 
+int net_shell_stop_sync(uint32_t timeout_ms)
+{
+	ULONG f;
+	uint32_t waited = 0u;
+
+	if (!g_ready)
+		return 0;
+	/*
+	 * OFF is NOT the same as "proved stopped".  A refused nx_tcp_socket_delete() leaves
+	 * the state OFF -- there is nothing left for the server thread to do -- while the
+	 * socket is still on the IP instance and NetX can still hand this driver a frame.
+	 * Returning 0 there would let nxn_stop() detach the DATA channel underneath a live
+	 * socket, which is the exact failure this whole contract exists to prevent.  There
+	 * is nothing further to try, so say so at once rather than after the timeout.
+	 */
+	if (g_sock_created && g_state == NET_SHELL_OFF) {
+		LOG_ERR("cannot prove the stop: the socket was never released");
+		return -1;
+	}
+	if (g_state == NET_SHELL_OFF)
+		return 0;
+
+	/* Clear any stale completion before asking, so what we wait for is OURS. */
+	(void)tx_event_flags_get(&g_evt, NSH_EVT_DONE, TX_OR_CLEAR, &f, TX_NO_WAIT);
+	net_shell_stop();
+
+	while (waited < timeout_ms) {
+		ULONG slice = (timeout_ms - waited > NSH_IDLE_MS) ? NSH_IDLE_MS
+		                                                  : (timeout_ms - waited);
+
+		if (tx_event_flags_get(&g_evt, NSH_EVT_DONE, TX_OR_CLEAR, &f, slice) ==
+		    TX_SUCCESS)
+			return 0;
+		waited += (uint32_t)slice;
+	}
+	LOG_ERR("stop could not be proved within %lu ms (state %u)",
+	        (unsigned long)timeout_ms, (unsigned)g_state);
+	return -1;
+}
+
 void net_shell_autoarm(void)
 {
-	if (!g_ready || !g_autoarm || g_state != NET_SHELL_OFF || nsh_blocked_dirty())
+	if (!g_ready || !g_autoarm || g_state != NET_SHELL_OFF || !nx_net_is_up())
 		return;
-	g_dirty    = 0u;
 	g_req_port = (g_port != 0u) ? g_port : (uint16_t)NET_SHELL_PORT_DEFAULT;
 	g_state    = NET_SHELL_ARMING;
 	(void)tx_event_flags_set(&g_evt, NSH_EVT_CMD, TX_OR);
@@ -932,7 +842,10 @@ enum net_shell_state net_shell_state(void)
 
 bool net_shell_armed(void)
 {
-	return g_state != NET_SHELL_OFF;
+	/* A socket that outlived a refused delete still counts: it is still on the IP
+	 * instance, and every caller of this asks in order to decide whether something
+	 * else may proceed. */
+	return g_state != NET_SHELL_OFF || g_sock_created != 0u;
 }
 
 bool net_shell_is_console(const struct cli_instance *sh)
@@ -954,19 +867,6 @@ int net_shell_guard(struct cli_instance *sh, const char *what)
 	return 1;
 }
 
-int net_shell_guard_link(struct cli_instance *sh, const char *what)
-{
-	/* On the telnet console itself the advice below ("stop it first") is useless -- and
-	 * `net shell stop` is refused there anyway -- so give that console its own message. */
-	if (net_shell_guard(sh, what))
-		return 1;
-	if (!net_shell_armed())
-		return 0;
-	cli_error(sh, "%s: the telnet console already owns the module's one blocking socket "
-	          "call (its firmware has two workers) -- run `net shell stop` first\r\n", what);
-	return 1;
-}
-
 void net_shell_print_status(struct cli_instance *sh)
 {
 	const char *st;
@@ -978,7 +878,7 @@ void net_shell_print_status(struct cli_instance *sh)
 	case NET_SHELL_STOPPING:  st = "stopping";  break;
 	default:                  st = "stopped";   break;
 	}
-	cli_print(sh, "net shell: %s", st);
+	cli_print(sh, "net shell: %s (host stack)", st);
 	if (g_state == NET_SHELL_LISTENING || g_state == NET_SHELL_SESSION)
 		cli_print(sh, " on %u.%u.%u.%u:%u",
 		          g_ip[0], g_ip[1], g_ip[2], g_ip[3], (unsigned)g_port);
@@ -988,14 +888,23 @@ void net_shell_print_status(struct cli_instance *sh)
 	cli_print(sh, "  sessions  %lu   rx %lu B   tx %lu B   rx-drops %lu\r\n",
 	          (unsigned long)g_sessions, (unsigned long)g_rx_bytes,
 	          (unsigned long)g_tx_bytes, (unsigned long)g_rx_drops);
-	cli_print(sh, "  erpc diag crc %u oversize %u timeout %u stale %u unsupported %u "
-	          "stall %u ctrl_bad %u\r\n", g_diag_tot.crc_fail, g_diag_tot.oversize,
-	          g_diag_tot.timeout, g_diag_tot.skipped_reply,
-	          g_diag_tot.unsupported_invocation, g_diag_tot.frame_stall,
-	          g_diag_tot.ctrl_bad);
+	cli_print(sh, "  tx waits  %lu (back-pressure, normal)   no-buf %lu%s   busy %lu\r\n",
+	          (unsigned long)g_tx_wait, (unsigned long)g_tx_nobuf,
+	          g_tx_nobuf ? "  <-- pool too small" : "", (unsigned long)g_tx_busy);
 	if (g_last != NULL)
 		cli_print(sh, "  last      %s\r\n", g_last);
-	if (nsh_blocked_dirty())
-		cli_warn(sh, "  the module still holds leaked sockets -- `wifi reset` before "
-		         "starting again\r\n");
+	/*
+	 * The same report to the log.  The console's own status is most wanted exactly when
+	 * that console is in trouble, and cli_tx_send_blocking() discards a handler's output
+	 * once Ctrl+C is latched (cli_core.c:456-459) -- issue #23 U4-1 lost a whole
+	 * hardware measurement to that.  `dmesg` consults neither the output path nor
+	 * cancel_req, and survives a reset.
+	 */
+	LOG_INF("status: %s, port %u, auto-arm %s, sessions %lu, rx %lu B, tx %lu B, "
+	        "rx-drops %lu, tx waits %lu, no-buf %lu, busy %lu, last: %s",
+	        st, (unsigned)g_port, g_autoarm ? "on" : "off", (unsigned long)g_sessions,
+	        (unsigned long)g_rx_bytes, (unsigned long)g_tx_bytes,
+	        (unsigned long)g_rx_drops, (unsigned long)g_tx_wait,
+	        (unsigned long)g_tx_nobuf, (unsigned long)g_tx_busy,
+	        g_last ? g_last : "?");
 }

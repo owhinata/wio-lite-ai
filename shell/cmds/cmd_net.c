@@ -313,6 +313,12 @@ static int cmd_net_down(struct cli_instance *sh, int argc, char **argv)
 
 	(void)argc; (void)argv;
 
+	/* Since U4-2 the telnet console IS a socket on this interface, so taking the
+	 * interface down from that console cuts the branch it is sitting on -- and the
+	 * teardown deliberately refuses to proceed until the console is gone, so it would
+	 * deadlock on itself rather than merely disconnect. */
+	if (net_shell_guard(sh, "net down"))
+		return 1;
 	if (nx_net_state() == NX_NET_OFF) {
 		cli_print(sh, "net: the host stack is already down\r\n");
 		return 0;
@@ -422,6 +428,7 @@ static int cmd_net_ip(struct cli_instance *sh, int argc, char **argv)
 			return 1;
 		}
 		cli_print(sh, "net: static address set (host stack)\r\n");
+		net_shell_autoarm();
 		if (nx_net_info_get(&ni) == NXN_OK)
 			net_print_nx_ip(sh, &ni);
 		return 0;
@@ -445,7 +452,6 @@ static int cmd_net_ip(struct cli_instance *sh, int argc, char **argv)
 		return 1;
 	}
 	rtl_set_ip_mode(RTL_IP_STATIC);
-	net_shell_autoarm();          /* an address is up: bring the telnet console back */
 	cli_print(sh, "net: static address set\r\n");
 	cli_print(sh, "ip:    %u.%u.%u.%u/%u\r\n",
 	          ip.ip[0], ip.ip[1], ip.ip[2], ip.ip[3], mask_bits(mask));
@@ -484,8 +490,9 @@ static int cmd_net_dhcp(struct cli_instance *sh, int argc, char **argv)
 			cli_sleep(sh, NET_NX_POLL_MS);
 			waited += NET_NX_POLL_MS;
 		}
-		/* No net_shell_autoarm(): the telnet console runs on the module's lwIP,
-		 * which is deaf while the bridge is in.  U4 moves it onto a NetX socket. */
+		/* The host stack has an address: this is where the telnet console belongs
+		 * since U4-2, and where it is armed from. */
+		net_shell_autoarm();
 		net_print_nx_ip(sh, &ni);
 		return 0;
 	}
@@ -510,9 +517,9 @@ static int cmd_net_dhcp(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "net: get IP failed (rc %d, result %ld)\r\n", rc, (long)result);
 		return 1;
 	}
-	/* Called after rtl_link_end(): the coarse mutex is free, so the telnet service can
-	 * take it immediately instead of spinning on a claim we still hold. */
-	net_shell_autoarm();
+	/* No net_shell_autoarm() on this path: since issue #23 U4-2 the telnet console is a
+	 * NetX socket on the HOST stack, so an address the MODULE's lwIP just took is not
+	 * one it can listen on. */
 	net_print_ip(sh, &ip);
 	return 0;
 }
@@ -632,8 +639,6 @@ static int cmd_net_ping(struct cli_instance *sh, int argc, char **argv)
 	/* Each probe parks a blocking recvfrom on the module for up to PING_TIMEOUT_MS.  With
 	 * the telnet console armed that is the second of the firmware's two workers (see the
 	 * comment above). */
-	if (net_shell_guard_link(sh, "net ping"))
-		return 1;
 
 	if (net_session_connected(sh, &o, &diag) != RTL_LINK_READY)
 		return 1;
@@ -780,8 +785,6 @@ static int cmd_net_conc(struct cli_instance *sh, int argc, char **argv)
 	 * behind them. */
 	if (nx_net_guard(sh, "net conc"))
 		return 1;
-	if (net_shell_guard_link(sh, "net conc"))
-		return 1;
 	if (argc >= 2) {
 		if (parse_uint(argv[1], &block_ms) != 0 || block_ms < 500u || block_ms > 20000u) {
 			cli_error(sh, "net: bad ms '%s' (500..20000)\r\n", argv[1]);
@@ -883,19 +886,18 @@ static int cmd_net_echo(struct cli_instance *sh, int argc, char **argv)
 	return nx_echo_run(sh, (uint16_t)port);
 }
 
-/* ---- `net shell`: the telnet console (issue #21 increment 9) -------------- */
+/* ---- `net shell`: the telnet console (issue #23 U4-2) --------------------- */
 /*
- * The console itself lives in app/net_shell.c; these are just its controls.  It normally
- * arms itself when an address comes up (`wifi connect` / `net dhcp` / `net ip` above call
- * net_shell_autoarm()), so `start` is for a different port or after a `stop`.  `stop` exists
- * because a resident console keeps the eRPC UART referenced, which makes `wifi log/probe/rpc`
- * and every issue-#19 flash command refuse to run -- those need the UART to themselves.
+ * The console itself lives in app/net_shell.c; these are just its controls.  Since U4-2 it
+ * is a NetX socket on the HOST stack, so it REQUIRES `net up`, and it arms itself when the
+ * host stack takes an address (`net dhcp` / `net ip` above call net_shell_autoarm()).
+ * `start` is therefore for a different port or after a `stop`.
  *
- * Both commands POST the request and then poll: the service thread may be sitting in a
- * blocking accept (the firmware caps it at 10 s) and may afterwards have to wait for the
- * coarse link mutex that a `wifi connect` on the other console is holding.
+ * `stop` is no longer about freeing the eRPC UART -- the console does not touch it any
+ * more.  It exists because `net down` refuses to unwind the interface while a socket on it
+ * is alive, and because a resident console is not always wanted.
  */
-#define NET_SHELL_WAIT_MS   60000u
+#define NET_SHELL_WAIT_MS   10000u
 #define NET_SHELL_POLL_MS     100u
 
 static int cmd_net_shell_start(struct cli_instance *sh, int argc, char **argv)
@@ -911,17 +913,12 @@ static int cmd_net_shell_start(struct cli_instance *sh, int argc, char **argv)
 		}
 		port = (uint16_t)v;
 	}
-	/* The telnet console lives on the module's lwIP, which receives nothing while the
-	 * bridge is in.  Arming it there would sit on an accept that can never complete. */
-	if (nx_net_guard(sh, "net shell start"))
-		return 1;
 	if (net_shell_start(port, &why) != 0) {
 		cli_error(sh, "net shell: cannot start -- %s\r\n", why != NULL ? why : "?");
 		net_shell_print_status(sh);
 		return 1;
 	}
-	cli_print(sh, "net shell: arming on port %u (waits for the link if it is busy)...\r\n",
-	          (unsigned)port);
+	cli_print(sh, "net shell: arming on port %u...\r\n", (unsigned)port);
 	for (waited = 0u; waited < NET_SHELL_WAIT_MS; waited += NET_SHELL_POLL_MS) {
 		if (net_shell_state() != NET_SHELL_ARMING)
 			break;
@@ -946,8 +943,7 @@ static int cmd_net_shell_stop(struct cli_instance *sh, int argc, char **argv)
 		return 0;
 	}
 	net_shell_stop();
-	cli_print(sh, "net shell: stopping (up to ~10 s -- a blocking accept may be "
-	          "outstanding on the module)...\r\n");
+	cli_print(sh, "net shell: stopping...\r\n");
 	for (waited = 0u; waited < NET_SHELL_WAIT_MS; waited += NET_SHELL_POLL_MS) {
 		if (net_shell_state() == NET_SHELL_OFF)
 			break;
