@@ -168,10 +168,10 @@ static int cmd_thread(struct cli_instance *sh, int argc, char **argv)
 
 #ifdef TX_EXECUTION_PROFILE_ENABLE
 	window = (tt - cpu_prev_thread) + (it - cpu_prev_isr) + (id - cpu_prev_idle);
-	cli_print(sh, "%-20s %-6s %3s %6s %6s %5s %5s %6s\r\n",
+	cli_print(sh, "%-20s %-6s %3s %8s %6s %5s %5s %6s\r\n",
 	          "name", "state", "pri", "runs", "size", "peak", "use%", "cpu%");
 #else
-	cli_print(sh, "%-20s %-6s %3s %6s %6s %5s %5s %4s\r\n",
+	cli_print(sh, "%-20s %-6s %3s %8s %6s %5s %5s %4s\r\n",
 	          "name", "state", "pri", "runs", "size", "peak", "free", "use%");
 #endif
 
@@ -211,7 +211,7 @@ static int cmd_thread(struct cli_instance *sh, int argc, char **argv)
 			next_count++;
 		}
 
-		cli_print(sh, "%-20s %-6s %3u %6lu %6lu %5lu %4lu%% %6s\r\n",
+		cli_print(sh, "%-20s %-6s %3u %8lu %6lu %5lu %4lu%% %6s\r\n",
 		          name, state_name(t->tx_thread_state),
 		          t->tx_thread_priority,
 		          (unsigned long)t->tx_thread_run_count,
@@ -220,7 +220,7 @@ static int cmd_thread(struct cli_instance *sh, int argc, char **argv)
 #else
 		ULONG freeb = size - peak;
 
-		cli_print(sh, "%-20s %-6s %3u %6lu %6lu %5lu %5lu %3lu%%\r\n",
+		cli_print(sh, "%-20s %-6s %3u %8lu %6lu %5lu %5lu %3lu%%\r\n",
 		          name, state_name(t->tx_thread_state),
 		          t->tx_thread_priority,
 		          (unsigned long)t->tx_thread_run_count,
@@ -232,10 +232,10 @@ static int cmd_thread(struct cli_instance *sh, int argc, char **argv)
 #ifdef TX_EXECUTION_PROFILE_ENABLE
 	/* Pseudo-rows so the cpu% column sums to ~100%: idle headroom and ISR load. */
 	cpu_fmt(cpubuf, sizeof cpubuf, have, id - cpu_prev_idle, window);
-	cli_print(sh, "%-20s %-6s %3s %6s %6s %5s %5s %6s\r\n",
+	cli_print(sh, "%-20s %-6s %3s %8s %6s %5s %5s %6s\r\n",
 	          "(idle)", "", "", "", "", "", "", cpubuf);
 	cpu_fmt(cpubuf, sizeof cpubuf, have, it - cpu_prev_isr, window);
-	cli_print(sh, "%-20s %-6s %3s %6s %6s %5s %5s %6s\r\n",
+	cli_print(sh, "%-20s %-6s %3s %8s %6s %5s %5s %6s\r\n",
 	          "(isr)", "", "", "", "", "", "", cpubuf);
 
 	/* Commit this snapshot as the baseline for the next `thread`. */

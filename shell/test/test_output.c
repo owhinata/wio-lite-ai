@@ -81,6 +81,15 @@ static void test_formatter(void)
 	EXPECT("0000001f", "%08x", 0x1fu);
 	EXPECT("  abc", "%5s", "abc");
 	EXPECT("abc  |", "%-5s|", "abc");
+
+	/* Width on %lu, which is what `thread`'s columns are built from (issue #26 widened
+	 * the runs column from 6 to 8 after a 7-digit value pushed every column right).
+	 * The interesting cases are the two ends: a value narrower than the field must be
+	 * padded, and one wider must OVERFLOW rather than truncate -- a truncated run count
+	 * would be a wrong number reported as if it were right. */
+	EXPECT(" 5143002", "%8lu", 5143002UL);
+	EXPECT("99999999", "%8lu", 99999999UL);
+	EXPECT("4294967295", "%8lu", 4294967295UL);   /* ULONG max: wider than the field */
 }
 
 static void test_formatter_boundaries(void)
