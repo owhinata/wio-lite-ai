@@ -70,6 +70,7 @@
 #include "wifi_rpc.h"
 #include "rtl_link.h"
 #include "net_shell.h"
+#include "nx_net.h"    /* the host stack owns the module while it is up (issue #23 U3) */
 #include "stm32h7xx_hal.h"   /* #5 inc 6: HAL_GetTick (1 ms SysTick, fed via tx_glue.c)
                               * for the scan-wait deadline -- read-only, no HAL init. */
 
@@ -482,6 +483,11 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 		security = pass ? WIFI_RPC_SEC_WPA2_AES_PSK : WIFI_RPC_SEC_OPEN;
 	}
 
+	/* Re-associating underneath a live host stack would take the module's lwIP,
+	 * DHCP client and netif address out from under the bridge, and this flow holds
+	 * the coarse mutex for longer than the bridge's watchdog (issue #23 U3). */
+	if (nx_net_guard(sh, "wifi connect"))
+		return 1;
 	if (rtl_link_begin(sh, true) != RTL_LINK_READY)
 		return 1;
 
@@ -584,6 +590,8 @@ static int cmd_wifi_disconnect(struct cli_instance *sh, int argc, char **argv)
 	int rc, link;
 
 	(void)argc; (void)argv;
+	if (nx_net_guard(sh, "wifi disconnect"))
+		return 1;
 	link = rtl_link_begin(sh, false);
 	if (link == RTL_LINK_OFF) {
 		cli_print(sh, "wifi: powered off (nothing to disconnect)\r\n");
@@ -847,6 +855,9 @@ static int cmd_wifi_scan(struct cli_instance *sh, int argc, char **argv)
 	int rc;
 
 	(void)argc; (void)argv;
+	/* A scan retunes the radio, which is the one the bridge is relaying through. */
+	if (nx_net_guard(sh, "wifi scan"))
+		return 1;
 	if (rtl_link_begin(sh, true) != RTL_LINK_READY)
 		return 1;
 

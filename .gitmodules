@@ -17,3 +17,6 @@
 [submodule "lib/coremark"]
 	path = lib/coremark
 	url = https://github.com/eembc/coremark
+[submodule "lib/netxduo"]
+	path = lib/netxduo
+	url = https://github.com/eclipse-threadx/netxduo

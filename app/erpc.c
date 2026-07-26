@@ -86,10 +86,15 @@
  * marshalling only (no printf) and frames are assembled in static BSS, so the stack
  * stays shallow: measured on board #2 after 69k scheduling activations covering every
  * path (including a 1992-byte scan reply and the `net echo` data loop) the high-water
- * mark was 268 B of 1536.  The headroom is deliberate but could be reduced to 1 KB if
- * AXI-SRAM ever gets tight. */
+ * mark was 268 B of 1536.
+ *
+ * Issue #23 U3 raised it to 3072.  That 268 B was measured when the DATA receive callback
+ * did nothing but count bytes; the callback is now a NetX driver that allocates a packet,
+ * copies up to 1514 bytes into it and queues it for the IP thread.  The right time to
+ * find that out is not from a stack overflow on the only surviving board, so the headroom
+ * goes in first and comes back out later against a measured `thread` high-water. */
 #define ERPC_SVC_PRIORITY    10u
-#define ERPC_SVC_STACK       1536u
+#define ERPC_SVC_STACK       3072u
 
 /* Event flags: one "work posted" bit, one CTRL completion bit, one completion bit per
  * eRPC slot.  ERPC_F_CTRL sits next to ERPC_F_WORK, clear of the 0x100.. DONE group. */

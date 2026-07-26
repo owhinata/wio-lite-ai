@@ -23,7 +23,8 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/stm32h7xx_hal_driver/Src/stm32h7x
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/cmsis_core/Include/core_cm7.h"
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/cmsis_device_h7/Include/stm32h725xx.h"
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/tinyusb/src/tusb.h"
-   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/coremark/core_main.c")
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/coremark/core_main.c"
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/netxduo/common/src/nx_ip_create.c")
     message(STATUS "Initializing git submodules ...")
     execute_process(
         COMMAND git submodule update --init
@@ -191,6 +192,20 @@ list(FILTER TX_ASM  EXCLUDE REGEX "tx_misra\\.S$")
 # common/src, so the TX_CORE glob above does not pick it up -- add it explicitly.
 set(TX_EPK "${TX_DIR}/utility/execution_profile_kit/tx_execution_profile.c")
 
+# ---- NetX Duo (issue #23 U3) ------------------------------------------------
+# The host's own TCP/IP stack.  Its "Ethernet MAC" is app/nx_link_driver.c, which puts
+# raw frames on the RTL8720 link's DATA channel -- there is no MAC and no DMA here.
+# Compiled into the same single executable as everything else, so every translation
+# unit that sees NX_PACKET agrees on its layout (NX_INCLUDE_USER_DEFINE_FILE +
+# port/netxduo on the include path), the same ABI argument as ThreadX above.
+# The whole common/src glob is taken: the IPv6 sources compile to empty objects
+# because nx_user.h defines NX_DISABLE_IPV6, and --gc-sections drops the rest.
+set(NX_DIR "${CMAKE_SOURCE_DIR}/lib/netxduo")
+file(GLOB NX_CORE "${NX_DIR}/common/src/*.c")
+list(FILTER NX_CORE EXCLUDE REGEX "nx_ram_network_driver")
+# DHCP is the only addon: `net dhcp` needs a client once the module's is out of the way.
+set(NX_ADDONS "${NX_DIR}/addons/dhcp/nxd_dhcp_client.c")
+
 # CDC-only TinyUSB device subset (the boot set minus the DFU class).
 set(APP_TINYUSB_SOURCES
     "${TUSB_DIR}/tusb.c"
@@ -333,12 +348,15 @@ add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/wifi_rpc.c"
     "${CMAKE_SOURCE_DIR}/app/rtl_link.c"
     "${CMAKE_SOURCE_DIR}/app/net_shell.c"
+    "${CMAKE_SOURCE_DIR}/app/nx_link_driver.c"
+    "${CMAKE_SOURCE_DIR}/app/nx_net.c"
     "${CMAKE_SOURCE_DIR}/port/threadx/tx_glue.c"
     "${CMAKE_SOURCE_DIR}/src/system_stm32h7xx.c"
     "${CMSIS_DEV}/Source/Templates/gcc/startup_stm32h725xx.s"
     ${SHELL_SOURCES}
     ${APP_TINYUSB_SOURCES}
     ${TX_CORE} ${TX_ASM} ${TX_EPK}
+    ${NX_CORE} ${NX_ADDONS}
     ${HAL_SOURCES})
 target_link_libraries(shell PRIVATE bsp_iface coremark_obj)
 # CoreMark's canonical report prints its score with %f; pull in newlib's float
@@ -354,10 +372,19 @@ target_include_directories(shell PRIVATE
     "${TUSB_DIR}"
     "${TX_DIR}/common/inc"
     "${TX_DIR}/utility/execution_profile_kit"   # issue #2: tx_execution_profile.h
-    "${TX_PORT}/inc")
+    "${TX_PORT}/inc"
+    "${NX_DIR}/common/inc"                      # issue #23 U3: NetX Duo
+    "${NX_DIR}/ports/cortex_m7/gnu/inc"
+    "${NX_DIR}/addons/dhcp"
+    "${CMAKE_SOURCE_DIR}/port/netxduo")         # nx_user.h
 target_compile_definitions(shell PRIVATE
     CFG_TUSB_MCU=OPT_MCU_STM32H7
     TX_INCLUDE_USER_DEFINE_FILE
+    NX_INCLUDE_USER_DEFINE_FILE        # issue #23 U3: port/netxduo/nx_user.h
+    # The DHCP client shares the one packet pool instead of creating its own, and its
+    # thread sits just below the NetX IP thread (11) so IP processing always wins.
+    NX_DHCP_CLIENT_USER_CREATE_PACKET_POOL
+    NX_DHCP_THREAD_PRIORITY=13
     CLI_ENABLE_DANGEROUS_CMDS=1        # reboot / devmem / crash
     CLI_INSTANCE_STACK_SIZE=4096       # headroom for cli_print + coremark
     CLI_BG_JOB_STACK_SIZE=4096

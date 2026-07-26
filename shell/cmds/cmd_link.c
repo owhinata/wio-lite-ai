@@ -46,6 +46,7 @@
 #include "rtl_link.h"
 #include "rtl8720.h"
 #include "wifi_rpc.h"        /* `link eth` reads the address and stops DHCP first */
+#include "nx_net.h"          /* the host stack owns the DATA channel while it is up */
 
 #include "stm32h7xx_hal.h"   /* HAL_GetTick, TIM2 */
 
@@ -216,6 +217,17 @@ static void link_put_ms(struct cli_instance *sh, const char *label, uint32_t us)
  */
 static int link_ctrl_ready_ex(struct cli_instance *sh, int allow_busy)
 {
+	/*
+	 * Every subcommand here is refused while the host stack owns the link, including
+	 * the read-only ones, and the reason is the same for all of them: they hold the
+	 * coarse mutex for as long as they run (`link sweep` is twelve benches back to
+	 * back), and the interface's watchdog refresh needs that mutex every eight seconds
+	 * or the module takes its own tap out.  `link dbench` and `link eth` additionally
+	 * want the DATA channel, which has exactly one consumer.  `net info` reports the
+	 * link and DATA counters while the stack is up.
+	 */
+	if (nx_net_guard(sh, "link"))
+		return 1;
 	if (erpc_module_gen() < 5u) {
 		cli_error(sh, "link: this needs firmware 2.1.3+wio-n5 or later, and the host "
 		          "does not know which is loaded\r\n");

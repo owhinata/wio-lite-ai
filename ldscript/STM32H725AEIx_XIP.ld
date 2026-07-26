@@ -282,9 +282,25 @@ SECTIONS
     . = ALIGN(4);
   } >DTCM
 
+  /* NetX Duo packet pool (issue #23 U3), in DTCM after the log ring.  Frames are
+   * memcpy'd in and out by the CPU alone -- the module relays them over a UART, there
+   * is no DMA anywhere in this firmware -- so DTCM is not merely allowed here, it is
+   * the better home: zero wait states, no D-cache line to evict, and 32 KB of 1.5 KB
+   * frames kept out of the AXI-SRAM budget.  NOLOAD because nx_packet_pool_create()
+   * builds every block header itself; zero-filling it at boot would be wasted work.
+   * The reset-persistent read-back rule (issue #13) applies to surviving a reset, not
+   * to ordinary runtime access, and nothing here outlives one. */
+  .nx_pool (NOLOAD) :
+  {
+    . = ALIGN(32);
+    *(.nx_pool)
+    *(.nx_pool*)
+    . = ALIGN(4);
+  } >DTCM
+
   /* Scratch working buffer for the `membench` command (cmd_membench.c), in DTCM
-   * after the log ring.  NOLOAD: uninitialized diagnostic scratch, never loaded or
-   * zeroed at boot.  Sits above .log_noinit; the two together use ~24 KB of DTCM. */
+   * after the log ring and the packet pool.  NOLOAD: uninitialized diagnostic
+   * scratch, never loaded or zeroed at boot. */
   .dtcm_bench (NOLOAD) :
   {
     . = ALIGN(32);
@@ -340,6 +356,13 @@ SECTIONS
   /* Anything placed in PSRAM must fit inside the 8 MB OCTOSPI1 window. */
   ASSERT(_psram_end <= ORIGIN(PSRAM) + LENGTH(PSRAM),
          ".psram_noinit overflows the 8 MB OCTOSPI1 PSRAM window")
+
+  /* The DTCM residents (.log_noinit + .nx_pool + .dtcm_bench) must fit in 128 KB.
+   * ld does not diagnose an overflowing NOLOAD region on its own, and the first two
+   * are a crash log and a network packet pool -- both would fail silently and
+   * confusingly. */
+  ASSERT(_dtcm_used_end <= ORIGIN(DTCM) + LENGTH(DTCM),
+         "DTCM residents overflow the 128 KB DTCM")
 
   /* ---- .itcm residency guards (issue #24) ---------------------------------
    * An input-section pattern that stops matching does NOT fail the link -- the

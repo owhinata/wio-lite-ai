@@ -43,6 +43,7 @@
 #include "wifi_rpc.h"
 #include "rtl_link.h"
 #include "net_shell.h"
+#include "nx_net.h"   /* the host stack: `net up` switches the backend (issue #23 U3) */
 
 #include "stm32h7xx_hal.h"   /* HAL_GetTick (1 ms SysTick, fed via tx_glue.c) */
 
@@ -201,6 +202,135 @@ static void net_print_ip(struct cli_instance *sh, const struct wifi_ip_info *ip)
 	          ip->gw[0], ip->gw[1], ip->gw[2], ip->gw[3], mode);
 }
 
+/* ---- host stack (issue #23 U3) ------------------------------------------- */
+
+/*
+ * `net` now has two possible backends and picks between them with ONE predicate,
+ * nx_net_is_up(), so no subcommand can disagree with its neighbour about which stack
+ * answered:
+ *
+ *   down (the default)  the module's lwIP, reached over eRPC -- everything below the
+ *                       U3 section, unchanged
+ *   up   (`net up`)     NetX Duo on this MCU, over the L2 bridge (app/nx_net.c)
+ *
+ * They are mutually exclusive by construction, not by policy: while the bridge is in,
+ * the module's WiFi netif is tapped and its own lwIP receives nothing at all, so
+ * `net ping`/`conc`/`echo` and the telnet console -- all of which run on that lwIP --
+ * are refused rather than left to time out mysteriously.
+ *
+ * Note what does NOT change: association, MAC and RSSI come from the module's WiFi
+ * DRIVER (eRPC service 14), which the tap does not touch, so `net info` reports them the
+ * same way either way.  Only the address changes hands.
+ */
+
+#define NET_NX_POLL_MS      100u
+#define NET_NX_ARM_WAIT_MS  20000u
+#define NET_NX_DHCP_WAIT_MS 30000u
+
+static void net_print_nx_ip(struct cli_instance *sh, const struct nx_net_info *ni)
+{
+	cli_print(sh, "ip:    %u.%u.%u.%u/%u\r\n",
+	          (unsigned)((ni->ip >> 24) & 0xFFu), (unsigned)((ni->ip >> 16) & 0xFFu),
+	          (unsigned)((ni->ip >> 8) & 0xFFu),  (unsigned)(ni->ip & 0xFFu),
+	          mask_bits(ni->mask));
+	cli_print(sh, "gw:    %u.%u.%u.%u (%s)\r\n",
+	          (unsigned)((ni->gw >> 24) & 0xFFu), (unsigned)((ni->gw >> 16) & 0xFFu),
+	          (unsigned)((ni->gw >> 8) & 0xFFu),  (unsigned)(ni->gw & 0xFFu),
+	          ni->dhcp_mode ? "dhcp" : "static");
+}
+
+/*
+ * ARMING and STOPPING are transient.  Wait for them to resolve rather than guessing a
+ * backend -- picking one mid-transition is how a command ends up talking to the stack
+ * that is on its way out.
+ */
+static int net_nx_settled(struct cli_instance *sh)
+{
+	unsigned waited = 0u;
+
+	while (nx_net_state() == NX_NET_ARMING || nx_net_state() == NX_NET_STOPPING) {
+		if (cli_cancel_requested(sh) || waited >= NET_NX_ARM_WAIT_MS) {
+			cli_error(sh, "net: the host stack is still %s\r\n",
+			          nx_net_state() == NX_NET_ARMING ? "coming up" : "going down");
+			return -1;
+		}
+		cli_sleep(sh, NET_NX_POLL_MS);
+		waited += NET_NX_POLL_MS;
+	}
+	if (nx_net_state() == NX_NET_FAILED) {
+		cli_error(sh, "net: the host stack could not be shut down cleanly -- "
+		          "run `wifi reset`\r\n");
+		return -1;
+	}
+	return 0;
+}
+
+static int cmd_net_up(struct cli_instance *sh, int argc, char **argv)
+{
+	const char *why = "";
+	unsigned waited = 0u;
+
+	(void)argc; (void)argv;
+
+	if (nx_net_is_up()) {
+		cli_print(sh, "net: the host stack is already up\r\n");
+		nx_net_print_status(sh);
+		return 0;
+	}
+	if (net_nx_settled(sh) != 0)
+		return 1;
+	if (nx_net_up(&why) != 0) {
+		cli_error(sh, "net: %s\r\n", why);
+		return 1;
+	}
+
+	cli_print(sh, "net: bringing the host stack up (bridging the module)...\r\n");
+	while (nx_net_state() == NX_NET_ARMING) {
+		if (waited >= NET_NX_ARM_WAIT_MS)
+			break;
+		/* Ctrl+C stops WAITING, not the owner: aborting a half-installed bridge from
+		 * a second thread is exactly the unwind app/nx_net.h refuses to improvise. */
+		if (cli_cancel_requested(sh)) {
+			cli_print(sh, "net: still arming in the background; `net info` to "
+			          "check\r\n");
+			return 1;
+		}
+		cli_sleep(sh, NET_NX_POLL_MS);
+		waited += NET_NX_POLL_MS;
+	}
+
+	nx_net_print_status(sh);
+	if (!nx_net_is_up())
+		return 1;
+	cli_print(sh, "net: run `net dhcp` to take a lease with the host stack\r\n");
+	return 0;
+}
+
+static int cmd_net_down(struct cli_instance *sh, int argc, char **argv)
+{
+	unsigned waited = 0u;
+
+	(void)argc; (void)argv;
+
+	if (nx_net_state() == NX_NET_OFF) {
+		cli_print(sh, "net: the host stack is already down\r\n");
+		return 0;
+	}
+	nx_net_down();
+	cli_print(sh, "net: taking the host stack down...\r\n");
+	while (nx_net_state() != NX_NET_OFF && nx_net_state() != NX_NET_FAILED) {
+		if (waited >= NET_NX_ARM_WAIT_MS)
+			break;
+		cli_sleep(sh, NET_NX_POLL_MS);
+		waited += NET_NX_POLL_MS;
+	}
+	nx_net_print_status(sh);
+	if (nx_net_state() != NX_NET_OFF)
+		return 1;
+	cli_print(sh, "net: the module owns the network again -- `net dhcp` for a lease\r\n");
+	return 0;
+}
+
 /* ---- subcommands --------------------------------------------------------- */
 
 static int cmd_net_info(struct cli_instance *sh, int argc, char **argv)
@@ -232,13 +362,29 @@ static int cmd_net_info(struct cli_instance *sh, int argc, char **argv)
 	          connected == WIFI_RPC_OK ? "up (associated)" : "down (not connected)");
 	if (wifi_rpc_get_mac(&o, mac, &result) == 0 && result == WIFI_RPC_OK)
 		cli_print(sh, "mac:   %s\r\n", mac);
-	if (connected == WIFI_RPC_OK) {
+
+	/* Which stack owns the address decides who is asked for it.  Say so on its own
+	 * line: an A/B between the two backends is worthless if the output is ambiguous. */
+	cli_print(sh, "stack: %s\r\n",
+	          nx_net_is_up() ? "host (NetX Duo, module bridged)"
+	                         : "module (lwIP offload)");
+	if (nx_net_is_up()) {
+		struct nx_net_info ni;
+
+		if (nx_net_info_get(&ni) == NXN_OK && ni.ip_valid)
+			net_print_nx_ip(sh, &ni);
+		else
+			cli_print(sh, "ip:    none (run `net dhcp`)\r\n");
+	} else if (connected == WIFI_RPC_OK) {
 		if (wifi_rpc_get_ip(&o, 0u, &ip, &result) == 0 && result == WIFI_RPC_OK)
 			net_print_ip(sh, &ip);
 		else
 			cli_print(sh, "ip:    none\r\n");
 	}
 	rtl_link_end(sh);
+
+	if (nx_net_state() != NX_NET_OFF)
+		nx_net_print_status(sh);
 	return 0;
 }
 
@@ -258,6 +404,20 @@ static int cmd_net_ip(struct cli_instance *sh, int argc, char **argv)
 	if (argc >= 3 && parse_ipv4(argv[2], &gw) != 0) {
 		cli_error(sh, "net: bad gateway '%s'\r\n", argv[2]);
 		return 1;
+	}
+	if (net_nx_settled(sh) != 0)
+		return 1;
+	if (nx_net_is_up()) {
+		struct nx_net_info ni;
+
+		if (nx_net_set_static(a, mask, gw) != NXN_OK) {
+			cli_error(sh, "net: NetX refused the static address\r\n");
+			return 1;
+		}
+		cli_print(sh, "net: static address set (host stack)\r\n");
+		if (nx_net_info_get(&ni) == NXN_OK)
+			net_print_nx_ip(sh, &ni);
+		return 0;
 	}
 	if (net_session_connected(sh, &o, &diag) != RTL_LINK_READY)
 		return 1;
@@ -295,6 +455,33 @@ static int cmd_net_dhcp(struct cli_instance *sh, int argc, char **argv)
 	int rc;
 
 	(void)argc; (void)argv;
+	if (net_nx_settled(sh) != 0)
+		return 1;
+	if (nx_net_is_up()) {
+		struct nx_net_info ni;
+		unsigned waited = 0u;
+
+		if (nx_net_dhcp_renew() != NXN_OK) {
+			cli_error(sh, "net: NetX DHCP client would not start\r\n");
+			return 1;
+		}
+		cli_print(sh, "net: requesting DHCP lease with the host stack "
+		          "(up to ~30s, Ctrl+C to stop)...\r\n");
+		for (;;) {
+			if (nx_net_info_get(&ni) == NXN_OK && ni.ip_valid)
+				break;
+			if (cli_cancel_requested(sh) || waited >= NET_NX_DHCP_WAIT_MS) {
+				cli_error(sh, "net: no lease yet\r\n");
+				return 1;
+			}
+			cli_sleep(sh, NET_NX_POLL_MS);
+			waited += NET_NX_POLL_MS;
+		}
+		/* No net_shell_autoarm(): the telnet console runs on the module's lwIP,
+		 * which is deaf while the bridge is in.  U4 moves it onto a NetX socket. */
+		net_print_nx_ip(sh, &ni);
+		return 0;
+	}
 	if (net_session_connected(sh, &o, &diag) != RTL_LINK_READY)
 		return 1;
 
@@ -385,8 +572,6 @@ static int cmd_net_ping(struct cli_instance *sh, int argc, char **argv)
 	 * deadline (CLI_TX_TIMEOUT) to expire and drop characters.  Refuse instead of
 	 * corrupting the other console's output; `net shell stop` frees the worker.
 	 * (A device firmware built with more N3_WORKERS would lift this -- see fw/rtl8720/.) */
-	if (net_shell_guard_link(sh, "net ping"))
-		return 1;
 	if (parse_ipv4(argv[1], &dst) != 0) {
 		cli_error(sh, "net: bad address '%s'\r\n", argv[1]);
 		return 1;
@@ -398,6 +583,50 @@ static int cmd_net_ping(struct cli_instance *sh, int argc, char **argv)
 		}
 		count = (int)c;
 	}
+
+	if (net_nx_settled(sh) != 0)
+		return 1;
+	if (nx_net_is_up()) {
+		/*
+		 * A real ICMP echo: built by NetX, its destination resolved by our own ARP
+		 * cache, put on the wire by app/nx_link_driver.c and relayed by the module.
+		 * The RTT is measured across nx_icmp_ping() alone, so unlike the offload path
+		 * below it does not include any eRPC round trip.
+		 */
+		for (i = 0; i < count; i++) {
+			unsigned rtt = 0;
+			int nrc = nx_net_ping(dst, PING_TIMEOUT_MS, &rtt);
+
+			if (nrc == NXN_OK) {
+				ok++;
+				if (rtt < rmin) rmin = rtt;
+				if (rtt > rmax) rmax = rtt;
+				rsum += rtt;
+				cli_print(sh, "  reply %d: %u ms\r\n", i + 1, rtt);
+			} else if (nrc == NXN_TIMEOUT) {
+				cli_print(sh, "  probe %d: timeout\r\n", i + 1);
+			} else {
+				cli_error(sh, "  probe %d: NetX error\r\n", i + 1);
+			}
+			if (i + 1 < count) {
+				if (cli_cancel_requested(sh))
+					break;
+				cli_sleep(sh, 1000u);
+			}
+		}
+		cli_print(sh, "net: %d/%d received", ok, count);
+		if (ok)
+			cli_print(sh, ", rtt min/avg/max = %u/%u/%u ms", rmin,
+			          (unsigned)(rsum / (unsigned)ok), rmax);
+		cli_print(sh, "\r\n");
+		return ok ? 0 : 1;
+	}
+
+	/* Each probe parks a blocking recvfrom on the module for up to PING_TIMEOUT_MS.  With
+	 * the telnet console armed that is the second of the firmware's two workers (see the
+	 * comment above). */
+	if (net_shell_guard_link(sh, "net ping"))
+		return 1;
 
 	if (net_session_connected(sh, &o, &diag) != RTL_LINK_READY)
 		return 1;
@@ -542,6 +771,8 @@ static int cmd_net_conc(struct cli_instance *sh, int argc, char **argv)
 	 * would be the SECOND long-blocking call on a firmware that has two workers -- both
 	 * would be parked and every other RPC (including the console's own output) would queue
 	 * behind them. */
+	if (nx_net_guard(sh, "net conc"))
+		return 1;
 	if (net_shell_guard_link(sh, "net conc"))
 		return 1;
 	if (argc >= 2) {
@@ -945,6 +1176,8 @@ static int cmd_net_echo(struct cli_instance *sh, int argc, char **argv)
 
 	/* Same reason as `net conc`: its accept/recv would be a second blocking call on a
 	 * two-worker firmware while the telnet console already owns one. */
+	if (nx_net_guard(sh, "net echo"))
+		return 1;
 	if (net_shell_guard_link(sh, "net echo"))
 		return 1;
 	if (argc >= 2) {
@@ -1136,6 +1369,10 @@ static int cmd_net_shell_start(struct cli_instance *sh, int argc, char **argv)
 		}
 		port = (uint16_t)v;
 	}
+	/* The telnet console lives on the module's lwIP, which receives nothing while the
+	 * bridge is in.  Arming it there would sit on an accept that can never complete. */
+	if (nx_net_guard(sh, "net shell start"))
+		return 1;
 	if (net_shell_start(port, &why) != 0) {
 		cli_error(sh, "net shell: cannot start -- %s\r\n", why != NULL ? why : "?");
 		net_shell_print_status(sh);
@@ -1198,6 +1435,9 @@ CLI_SUBCMD_SET_CREATE(net_shell_subcmds,
 	CLI_SUBCMD_SET_END);
 
 CLI_SUBCMD_SET_CREATE(net_subcmds,
+	CLI_CMD_ARG(up,   NULL, "bring the host TCP/IP stack up (bridge the module)",
+	            cmd_net_up,   1, 0),
+	CLI_CMD_ARG(down, NULL, "give the network back to the module",  cmd_net_down, 1, 0),
 	CLI_CMD_ARG(info, NULL, "connection + IP / mask / gateway",   cmd_net_info, 1, 0),
 	CLI_CMD_ARG(ip,   NULL, "set static <a.b.c.d/mask> [gw]",     cmd_net_ip,   2, 1),
 	CLI_CMD_ARG(dhcp, NULL, "(re)acquire an address via DHCP",    cmd_net_dhcp, 1, 0),

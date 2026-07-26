@@ -26,6 +26,7 @@
 #include "erpc.h"       /* eRPC link service thread (issue #21 increment 8) */
 #include "rtl_link.h"   /* coarse RTL8720 link mutex + UART refcount (same) */
 #include "net_shell.h"  /* telnet shell console over WiFi (issue #21 increment 9) */
+#include "nx_net.h"     /* NetX Duo over the RTL8720 L2 bridge (issue #23 U3) */
 #include "app.h"
 #if BSP_PSRAM_INIT_IN_APP
 #include "psram.h"      /* app-first OCTOSPI1 APS6408 bring-up (issue #3) */
@@ -127,6 +128,12 @@ void tx_application_define(void *first_unused_memory)
    * on its event flags until an IP address comes up (`wifi connect` / `net dhcp` arm it, or
    * `net shell start` does explicitly).  Fail-soft like the two above. */
   (void) net_shell_init();
+
+  /* The host's own IP stack (issue #23 U3): NetX Duo plus the thread that owns a bridge
+   * session.  Object creation only -- the IP instance comes up with address 0.0.0.0 and
+   * the link DOWN, and nothing touches the RTL8720 until `net up`.  Fail-soft: without
+   * it `net` keeps working through the module's lwIP exactly as before. */
+  (void) nx_net_init();
 
 #if BSP_ENABLE_IWDG
   /* IWDG petter thread (priority 5), then arm the watchdog (issue #12: arm here, not

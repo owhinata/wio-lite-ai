@@ -19,7 +19,7 @@ and the app **inherits its clock tree** — see *Key design points*.
 Presents a `wio> ` prompt on **`/dev/ttyACM0`** (USB CDC, `0483:5740`, "CDC in FS
 Mode") with line editing, history, and Tab completion — and, once the board is on WiFi,
 the same shell over **telnet** (`wio-net> `, see `net shell` below), usable at the same
-time as the USB console. 21 commands:
+time as the USB console. 22 commands:
 
 | Group | Commands |
 |---|---|
@@ -27,7 +27,7 @@ time as the USB console. 21 commands:
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
-| wireless | `wifi` (L2: info/on/off/reset/log/probe/rpc · connect/status/disconnect/scan · flash*/img*) · `net` (L3: info/ip/dhcp/ping/conc/echo · **shell** = telnet console) |
+| wireless | `wifi` (L2: info/on/off/reset/log/probe/rpc · connect/status/disconnect/scan · flash*/img*) · `net` (L3: **up/down** · info/ip/dhcp/ping/conc/echo · **shell** = telnet console) · `link` (info/baud/bench/dbench/sweep/eth/arp) |
 | benchmarks | `coremark` · `membench` |
 
 - **`thread`** — lists the ThreadX threads with state / stack use and a **`top`-style
@@ -207,6 +207,34 @@ time as the USB console. 21 commands:
   (issue #20); the STM32 client keeps several requests in flight over the one link with
   `app/erpc.c`'s `erpc_begin`/`erpc_wait`/`erpc_cancel`.
 
+- **`net up` / `net down` — the host's own TCP/IP stack** (issue #23 U3,
+  `app/nx_net.c` + `app/nx_link_driver.c`). `net up` turns the module into the L2 relay
+  U2 built and brings **Eclipse NetX Duo up on the STM32**: our own ARP cache, our own
+  DHCP client, our own ICMP. `net` keeps its command names and picks the backend from
+  **one predicate**, so `net info` prints `stack: host (NetX Duo, module bridged)` or
+  `stack: module (lwIP offload)` and `net dhcp` / `net ip` / `net ping` follow it. With
+  the host stack up, `net ping` is a real echo request built by NetX and put on the wire
+  by our driver — no eRPC round trip in the RTT at all.
+
+  NetX Duo's "Ethernet MAC" here is the link's DATA channel: a transmit is a 14-byte
+  header prepended in place and one `link_data_send()`, a receive is a copy into an
+  `NX_PACKET` and `_nx_ip_packet_deferred_receive()`. The 32 kB packet pool lives in
+  **DTCM** — the only bus master that ever touches a frame is the CPU, so it costs
+  nothing from AXI-SRAM and evicts nothing from the D-cache.
+
+  A resident owner thread holds the link, keeps the module's bridge watchdog fed every
+  8 s, and accumulates the module's DATA counters **before** each re-arm (a re-arm zeroes
+  them). The teardown obeys one rule: **once the bridge has been asked for, only the full
+  stop may end the session** — `CFG(OFF)` → both ends proved quiet → detach. If that
+  cannot be proved the interface goes to `FAILED` and says `wifi reset`, because
+  detaching early would re-arm a stale-byte flush in the middle of a frame.
+
+  While the host stack is up the module's own lwIP receives nothing, so `net conc`,
+  `net echo`, `net shell start`, `wifi connect/disconnect/scan` and every `link`
+  subcommand are refused with a message saying to run `net down`. `wifi on/off/reset`
+  stay allowed — they are the recovery path, and the owner notices the link being taken
+  away and stands down cleanly. **The device firmware is unchanged** (`2.1.3+wio-n7`).
+
 - **`net shell` — the telnet console** (issue #21, `app/net_shell.c`). `telnet <board-ip>`
   gets **the same shell as USB CDC, at the same time**: a second `cli_instance`
   (prompt `wio-net> `) bound to a transport whose bytes ride the eRPC socket offload.
@@ -321,8 +349,9 @@ time as the USB console. 21 commands:
 - **The L2 bridge** (issue #23 U2, `fw/rtl8720/patches/0007` + `link eth` / `link arp`).
   The DATA channel stops carrying a bench pattern and starts carrying **real Ethernet
   frames**: the module hands what it receives from the air to the host instead of to its own
-  lwIP, and frames sent on `LINK_DATA_CHAN_ETH` go out over the air. The host has no IP stack
-  yet — that is U3 — so `link eth [secs] [max]` just decodes what arrives (ARP in full, IPv4
+  lwIP, and frames sent on `LINK_DATA_CHAN_ETH` go out over the air. These two are the
+  **diagnostic** view of that channel — the stack that consumes it for real is `net up`
+  above — so `link eth [secs] [max]` just decodes what arrives (ARP in full, IPv4
   addresses and protocol, everything else by ethertype) and `link arp <ip> [secs] [sender-ip]`
   puts one well-formed request on the wire once a second. **An `is-at` reply is the test**: it
   proves the host built a frame, the module transmitted it with its own MAC, a real machine
@@ -409,8 +438,10 @@ time as the USB console. 21 commands:
 ```
 app/        main + USB CDC wiring, fault handlers, USB descriptors, retarget,
             OCTOSPI1 PSRAM bring-up (psram.c), MPU regions (mpu.c),
-            RTL8720DN link: erpc.c (service thread) / wifi_rpc.c (typed wrappers) /
-            rtl_link.c (ownership) / net_shell.c (telnet console transport + server)
+            RTL8720DN link: erpc.c (service thread) / link_data.c (DATA channel) /
+            wifi_rpc.c (typed wrappers) / rtl_link.c (ownership) /
+            net_shell.c (telnet console transport + server) /
+            nx_net.c + nx_link_driver.c (NetX Duo over the L2 bridge, issue #23 U3)
 shell/      core/    HW-independent CLI engine (parse/edit/history/complete/...)
             include/ public CLI API + cli_config.h
             backend/ USB CDC transport (+ dummy loopback), byte rings
@@ -418,12 +449,14 @@ shell/      core/    HW-independent CLI engine (parse/edit/history/complete/...)
             test/    host unit tests (run with host gcc; see below)
 port/       threadx/ ThreadX low-level init + shared SysTick glue
             coremark/ EEMBC CoreMark port (core_portme.*)
+            netxduo/ nx_user.h (NetX Duo build configuration; the driver is in app/,
+                     because what it sits on is the RTL8720 link, not a MAC)
 svc/        freestanding services: fmt (printf), log (DTCM ring), timebase (DWT)
 src/        custom clock-free SystemInit  (also the minimal `blink` example's main)
 ldscript/   STM32H725AEIx_XIP.ld  (FLASH @ 0x70000000, RAM = AXI-SRAM, DTCM log, ITCM ISRs)
 cmake/      ARM GNU toolchain file (auto-downloads gcc into tools/)
 lib/        git submodules: cmsis_core/device_h7, stm32h7xx_hal_driver, tinyusb,
-            threadx, coremark
+            threadx, netxduo, coremark
 boot/       standalone USB DFU bootloader (internal 0x08000000) — see boot/README.md
 fw/rtl8720/ reproducible build of the RTL8720DN's own firmware (the eRPC server that
             wifi/net drive) — host-side only, flashed by `wifi flashwrite`; see its README
@@ -436,7 +469,7 @@ fw/rtl8720/ reproducible build of the RTL8720DN's own firmware (the eRPC server 
 | FLASH (XIP) | `0x70000000` | external OCTOSPI2. Chip is 16 MB; the **app owns the first 8 MB** (boot validates writes there), the upper 8 MB is reserved for a future filesystem. |
 | PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). |
 | AXI-SRAM (D1) | `0x24000000` | 320 KB; `_estack = 0x24050000` (the MSP the bootloader loads). |
-| DTCM | `0x20000000` | 128 KB; holds the reset-persistent `.log_noinit` crash-log ring + `membench` scratch (bypasses the D-cache). |
+| DTCM | `0x20000000` | 128 KB; holds the reset-persistent `.log_noinit` crash-log ring, the **32 KB NetX Duo packet pool** (`.nx_pool`, issue #23 U3 — no DMA touches a frame, so DTCM costs nothing from AXI-SRAM and evicts nothing from the D-cache) and `membench` scratch. All of it bypasses the D-cache. |
 | ITCM | `0x00000000` | 64 KB; holds the **interrupt paths** (`.itcm`, ~3 KB): ThreadX PendSV + SysTick, the RTL8720 UART RX ISR **and the wake-up it signals** (`tx_event_flags_set` + `_tx_thread_system_resume`, issue #23 U0-3 — that call alone had put the ISR back to 4.3 µs warm / 12.9 µs cold), and the fault handlers, plus the 4 KB `.itcm_bench` scratch. Zero-wait-state and outside both caches, so an ISR no longer pays a cold OCTOSPI2 fetch through the 16 KB I-cache: the same UART ISR went from **8.7 µs cold / 3.3 µs warm to a flat 0.7 µs** (issue #24). Loaded from its XIP load image by `SystemInit()`, which also zero-fills all 64 KB to initialise the TCM ECC; kept read-only by the MPU so a NULL write raises MemManage instead of corrupting ISR code. |
 | internal Flash | `0x08000000` | 512 KB — **DFU bootloader only**; the app does not own it. |
 
