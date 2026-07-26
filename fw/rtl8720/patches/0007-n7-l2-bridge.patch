@@ -1,0 +1,922 @@
+diff --git a/src/erpc_setup.cpp b/src/erpc_setup.cpp
+index 8325681..c7e5856 100644
+--- a/src/erpc_setup.cpp
++++ b/src/erpc_setup.cpp
+@@ -184,15 +184,16 @@ char * rpc_system_version(void)
+      * literal and freeing that .rodata pointer corrupts the module heap (which is why
+      * the STM32 side never dared call rpc_system_version).  Return an erpc_malloc copy
+      * of a build id so the host can read back which firmware is loaded (`wifi rpc`).
+-     * "2.1.3" keeps the upstream base version; "+wio-n6" marks the issue-#20 N3 patch
++     * "2.1.3" keeps the upstream base version; "+wio-n7" marks the issue-#20 N3 patch
+      * set (bounded socket handlers + worker dispatch) plus the issue-#23 link work:
+-     * U0-2's USI0 driver, U0-3's LINK-CTRL channel and U1's DATA channel.  The host PARSES the N out of
++     * U0-2's USI0 driver, U0-3's LINK-CTRL channel, U1's DATA channel and U2's L2
++     * bridge.  The host PARSES the N out of
+      * this string (shell/cmds/cmd_wifi.c fw_gen_of) and gates capabilities on it being
+      * large enough, so the number must only ever go up.  A NULL here would only happen
+      * on heap exhaustion,
+      * which the stock literal never risked; the shim does not null-check, but version is
+      * called early when the heap is idle. */
+-    static const char id[] = "2.1.3+wio-n6";
++    static const char id[] = "2.1.3+wio-n7";
+     char *s = (char *)erpc_malloc(sizeof(id));
+     if (s != NULL)
+         memcpy(s, id, sizeof(id));
+@@ -370,6 +371,10 @@ void erpc_system_init()
+      * interleaving their bytes inside one frame. */
+     wio_link_data_set_writer(&wio_data_write_frame);
+     wio_link_data_init();
++    /* issue #23 U2: the L2 bridge's lock and completion semaphore.  Every entry point in
++     * wio_link_eth.c is inert until this has run, so it goes up with the channel it
++     * feeds -- not lazily, which would race the two tasks that call into it. */
++    wio_eth_init();
+ 
+     g_arbitrator.setSharedTransport(&g_transport);
+     g_arbitrator.setCodec(g_basicCodecFactory.create());
+diff --git a/src/link/wio_link_data.c b/src/link/wio_link_data.c
+index 644d5b1..2014b9a 100644
+--- a/src/link/wio_link_data.c
++++ b/src/link/wio_link_data.c
+@@ -20,6 +20,7 @@
+ 
+ #include "wio_usi_uart.h"
+ #include "wio_link_data.h"
++#include "wio_link_eth.h"
+ 
+ #include <string.h>
+ 
+@@ -212,10 +213,19 @@ void wio_link_data_commit(uint8_t *body, uint16_t body_len, uint16_t crc)
+ }
+ 
+ /*
+- * The receive endpoint.  In U1 this is the bench sink: it checks the sequence number the
+- * host puts at the head of a bench payload, which is how frame loss becomes visible (the
+- * link has no retransmission, and one lost byte costs a resynchronisation and therefore
+- * several frames).  U2 replaces the body of this loop with netif->linkoutput().
++ * The receive endpoint, dispatched by the channel byte (issue #23 U2).
++ *
++ *   WIO_DATA_CHAN_ETH    a raw Ethernet frame from the host: put it on the air.
++ *   WIO_DATA_CHAN_BENCH  U1's sink: check the sequence number the host puts at the head
++ *                        of the payload, which is how frame loss becomes visible (the
++ *                        link has no retransmission, and one lost byte costs a
++ *                        resynchronisation and therefore several frames).
++ *
++ * Keeping the bench alongside the bridge is deliberate: `link dbench` stays a live
++ * regression test of the multiplexer after the bridge lands on top of it.
++ *
++ * wio_eth_to_air() is called with the lock RELEASED -- it goes down into the WiFi driver,
++ * which is not something to do while holding a lock the eRPC receive task also takes.
+  */
+ static void wio_data_rx_task(void *arg)
+ {
+@@ -232,11 +242,12 @@ static void wio_data_rx_task(void *arg)
+ 			struct wio_data_buf *b = &d_rx[idx];
+ 			uint16_t plen = (uint16_t)(b->len - WIO_DATA_HDR);
+ 			const uint8_t *pl = b->body + WIO_DATA_HDR;
++			uint8_t chan = b->body[0];
+ 
+ 			d_take();
+ 			st_rx_frames++;
+ 			st_rx_bytes += plen;
+-			if (plen >= 4u) {
++			if (chan != WIO_DATA_CHAN_ETH && plen >= 4u) {
+ 				uint32_t seq = (uint32_t)pl[0] | ((uint32_t)pl[1] << 8) |
+ 				               ((uint32_t)pl[2] << 16) | ((uint32_t)pl[3] << 24);
+ 
+@@ -246,6 +257,12 @@ static void wio_data_rx_task(void *arg)
+ 					st_rx_gaps += (uint32_t)(seq - st_rx_seq_next);
+ 				st_rx_seq_next = seq + 1u;
+ 			}
++			d_give();
++
++			if (chan == WIO_DATA_CHAN_ETH)
++				wio_eth_to_air(pl, plen);
++
++			d_take();
+ 			d_rx_state[idx] = LD_FREE;
+ 			d_give();
+ 		}
+@@ -287,19 +304,28 @@ static void d_tx_release(int idx)
+ 	d_give();
+ }
+ 
+-int wio_link_data_send(uint8_t chan, const uint8_t *p, uint16_t n)
++/*
++ * Take a transmit slot.  Returns the writable PAYLOAD pointer (the two body header bytes
++ * are filled in by commit) and stores the slot in *@idx, or NULL when transmission is
++ * disabled or the pool is empty -- both counted as drops, which is what an
++ * Ethernet-carrying link is allowed to do.
++ *
++ * The slot is then held OUTSIDE the lock for as long as the caller takes to fill it.  That
++ * is safe because commit re-tests the state and the enable flag together; see the header.
++ */
++uint8_t *wio_link_data_tx_claim(int *idx_out)
+ {
+-	struct wio_data_buf *b;
+ 	unsigned i;
+ 	int idx = -1;
+ 
+-	if (n > WIO_DATA_PAYLOAD_MAX || (n != 0u && p == NULL))
+-		return -1;
++	if (idx_out == NULL)
++		return NULL;
++	*idx_out = -1;
+ 	d_take();
+ 	if (!d_tx_enabled) {
+ 		st_tx_drops++;
+ 		d_give();
+-		return -1;
++		return NULL;
+ 	}
+ 	for (i = 0u; i < WIO_DATA_TX_BUFS; i++) {
+ 		if (d_tx_state[i] == LD_FREE) {
+@@ -312,19 +338,34 @@ int wio_link_data_send(uint8_t chan, const uint8_t *p, uint16_t n)
+ 		st_tx_drops++;
+ 	d_give();
+ 	if (idx < 0)
+-		return -1;
++		return NULL;
++
++	*idx_out = idx;
++	return d_tx[idx].body + WIO_DATA_HDR;
++}
++
++/* Publish a claimed slot.  ONE locked step decides: a CFG(OFF) that landed while the
++ * payload was being written makes this fail, so the frame is never queued -- which is what
++ * keeps the acknowledgement the host already has from having been a lie. */
++int wio_link_data_tx_commit(int idx, uint8_t chan, uint16_t n)
++{
++	struct wio_data_buf *b;
+ 
++	if (idx < 0 || idx >= (int)WIO_DATA_TX_BUFS)
++		return -1;
++	if (n > WIO_DATA_PAYLOAD_MAX) {
++		/* The slot is a real one and it is ours, so give it back rather than leaking
++		 * it -- a caller that got its length wrong should not cost a buffer. */
++		wio_link_data_tx_drop(idx);
++		return -1;
++	}
+ 	b = &d_tx[idx];
+ 	b->body[0] = chan;
+ 	b->body[1] = 0u;
+-	if (n != 0u)
+-		memcpy(b->body + WIO_DATA_HDR, p, n);
+ 	b->len = (uint16_t)(WIO_DATA_HDR + n);
+ 
+ 	d_take();
+ 	if (d_tx_state[idx] != LD_BUSY || !d_tx_enabled) {
+-		/* CFG(OFF) landed while we were copying: this frame must NOT go out, or the
+-		 * acknowledgement the host already has would have been a lie. */
+ 		st_tx_drops++;
+ 		d_tx_state[idx] = LD_FREE;
+ 		d_give();
+@@ -340,6 +381,35 @@ int wio_link_data_send(uint8_t chan, const uint8_t *p, uint16_t n)
+ 	return 0;
+ }
+ 
++/* Give a claimed slot back unsent.  A no-op unless it is actually held, so every "give it
++ * back" path is safe to call unconditionally. */
++void wio_link_data_tx_drop(int idx)
++{
++	if (idx < 0 || idx >= (int)WIO_DATA_TX_BUFS)
++		return;
++	d_take();
++	if (d_tx_state[idx] == LD_BUSY) {
++		d_tx_state[idx] = LD_FREE;
++		st_tx_drops++;
++	}
++	d_give();
++}
++
++int wio_link_data_send(uint8_t chan, const uint8_t *p, uint16_t n)
++{
++	uint8_t *dst;
++	int idx;
++
++	if (n > WIO_DATA_PAYLOAD_MAX || (n != 0u && p == NULL))
++		return -1;
++	dst = wio_link_data_tx_claim(&idx);
++	if (dst == NULL)
++		return -1;
++	if (n != 0u)
++		memcpy(dst, p, n);
++	return wio_link_data_tx_commit(idx, chan, n);
++}
++
+ /* Deterministic filler, so the wire carries real transitions.  Integrity is the frame
+  * CRC's job, not the pattern's. */
+ static void d_fill(uint8_t *buf, uint32_t n, uint8_t seed)
+@@ -367,6 +437,21 @@ static void wio_data_tx_task(void *arg)
+ 	for (;;) {
+ 		int generating, idx = -1;
+ 
++		/*
++		 * The bridge's own deadline (issue #23 U2), checked here because this task is
++		 * the one thing guaranteed to run at least every 20 ms.  It is OUTSIDE the
++		 * locked step below and runs with d_tx_busy clear, because turning the bridge
++		 * off posts to the lwIP thread and waits for it.
++		 *
++		 * When it fires, finish the shutdown here: the tap is already gone, but the
++		 * mode and the transmit-enable flag belong to this file, and leaving them
++		 * saying BRIDGE would misreport the channel for the rest of the session.  The
++		 * OFF path's drain is trivially satisfied from this task -- it is the only
++		 * thing that sets d_tx_busy, and it is not set here.
++		 */
++		if (wio_eth_tick())
++			(void)wio_link_data_cfg(WIO_DATA_MODE_OFF, 0u, 0u, 0u);
++
+ 		/*
+ 		 * ONE locked step decides everything: whether the source may run, or which
+ 		 * queued frame is next, and it claims the writer at the same time.  That
+@@ -431,12 +516,27 @@ static void wio_data_tx_task(void *arg)
+ uint8_t wio_link_data_cfg(uint8_t mode, uint8_t seed, uint16_t bytes, uint32_t ms)
+ {
+ 	int spins;
++	uint8_t st;
+ 
+-	if ((mode & ~(WIO_DATA_MODE_SINK | WIO_DATA_MODE_SOURCE)) != 0u)
++	if ((mode & ~(WIO_DATA_MODE_SINK | WIO_DATA_MODE_SOURCE |
++	              WIO_DATA_MODE_BRIDGE)) != 0u)
+ 		return 1u;
+ 	if (bytes > WIO_DATA_PAYLOAD_MAX)
+ 		return 1u;
+ 
++	/*
++	 * Turning the bridge ON before the flags below would let the WiFi receive path
++	 * claim a transmit slot while d_tx_enabled is still 0, so it goes after; turning it
++	 * OFF has to come FIRST, so that by the time the drain below runs, the producer is
++	 * already gone.  A failure to install is reported rather than silently ignored --
++	 * the host would otherwise wait for frames that can never arrive.
++	 */
++	if (mode == WIO_DATA_MODE_OFF) {
++		st = wio_eth_bridge(0u, 0u);
++		if (st != 0u)
++			return st;
++	}
++
+ 	d_take();
+ 	d_mode       = mode;
+ 	d_tx_enabled = (mode != WIO_DATA_MODE_OFF) ? 1u : 0u;
+@@ -451,8 +551,22 @@ uint8_t wio_link_data_cfg(uint8_t mode, uint8_t seed, uint16_t bytes, uint32_t m
+ 	}
+ 	d_give();
+ 
+-	if (mode != WIO_DATA_MODE_OFF)
++	if (mode != WIO_DATA_MODE_OFF) {
++		if ((mode & WIO_DATA_MODE_BRIDGE) != 0u) {
++			/* @ms doubles as the bridge's watchdog: a host that dies mid-session
++			 * would otherwise leave the module forwarding into a link nobody reads
++			 * AND starving its own lwIP until `wifi reset`. */
++			st = wio_eth_bridge(1u, ms);
++			if (st != 0u) {
++				d_take();
++				d_mode       = WIO_DATA_MODE_OFF;
++				d_tx_enabled = 0u;
++				d_give();
++				return st;
++			}
++		}
+ 		return 0u;
++	}
+ 
+ 	/*
+ 	 * The OFF contract (see wio_link_data.h): do not answer until nothing more can go
+diff --git a/src/link/wio_link_data.h b/src/link/wio_link_data.h
+index ee0c30c..730cc9b 100644
+--- a/src/link/wio_link_data.h
++++ b/src/link/wio_link_data.h
+@@ -44,6 +44,13 @@ extern "C" {
+ #define WIO_DATA_MODE_OFF     0x00u
+ #define WIO_DATA_MODE_SINK    0x01u
+ #define WIO_DATA_MODE_SOURCE  0x02u
++/*
++ * BRIDGE (issue #23 U2) taps the WiFi netif so received Ethernet frames go out as DATA
++ * and DATA frames on WIO_DATA_CHAN_ETH go out over the air.  It is a MODE rather than a
++ * CTRL command of its own for one reason that matters: OFF's contract below then covers
++ * the bridge's producer too, without a second teardown protocol to get right.
++ */
++#define WIO_DATA_MODE_BRIDGE  0x04u
+ 
+ /* Counters, in the order wio_link_data_stats() writes them. */
+ #define WIO_DATA_STAT_WORDS   12u
+@@ -66,10 +73,33 @@ void     wio_link_data_commit(uint8_t *body, uint16_t body_len, uint16_t crc);
+ 
+ /* ---- transmit side ------------------------------------------------------------
+  * Queue one frame.  Copies @p, returns 0 or -1 when no buffer is free (a drop, which is
+- * what an Ethernet-carrying link is allowed to do).  U2's bridge calls this; U1 does not.
++ * what an Ethernet-carrying link is allowed to do).
+  */
+ int wio_link_data_send(uint8_t chan, const uint8_t *p, uint16_t n);
+ 
++/*
++ * The same thing in three steps, for a producer that would otherwise have to stage the
++ * payload somewhere first (issue #23 U2: the bridge copies a pbuf chain straight into the
++ * pool buffer, so there is no second copy and no 1.5 kB staging buffer anywhere).
++ *
++ *   claim   -> writable payload pointer (WIO_DATA_PAYLOAD_MAX bytes), or NULL when the
++ *              pool is empty or transmission is disabled; *@idx identifies the slot
++ *   commit  -> 0 once the payload is written, or -1 if the frame must be dropped
++ *   drop    -> give the slot back without sending
++ *
++ * THE SLOT IS HELD OUTSIDE THE LOCK between claim and commit, which is exactly the window
++ * OFF has to survive.  It does, because commit re-tests both the slot state and the
++ * transmit-enable flag in one locked step: a CFG(OFF) that lands mid-copy makes the commit
++ * fail, so the frame is never queued and can never reach the wire after OFF was
++ * acknowledged.  OFF deliberately does NOT reclaim a held slot -- doing so would hand it
++ * to a new claimant while the old holder still believed it owned it (ABA).
++ *
++ * wio_link_data_send() is literally claim + memcpy + commit, so there is one enqueue path.
++ */
++uint8_t *wio_link_data_tx_claim(int *idx);
++int      wio_link_data_tx_commit(int idx, uint8_t chan, uint16_t n);
++void     wio_link_data_tx_drop(int idx);
++
+ /*
+  * LINK_DATA_CFG.  @mode is a bitmask of WIO_DATA_MODE_*; SOURCE runs for @ms
+  * milliseconds or until it is switched off, whichever comes first.  Returns a CTRL
+diff --git a/src/link/wio_link_eth.c b/src/link/wio_link_eth.c
+new file mode 100644
+index 0000000..4502700
+--- /dev/null
++++ b/src/link/wio_link_eth.c
+@@ -0,0 +1,410 @@
++/*
++ * wio_link_eth -- the L2 bridge (issue #23 U2).  See wio_link_eth.h for why the tap is a
++ * swap of xnetif[0].input, why the netif address has to be zeroed, and why both of those
++ * happen on the tcpip thread.
++ *
++ * THREADS.  Four of them touch this file and they are all different:
++ *   - the WiFi driver's receive thread runs wio_l2_input()   (frames from the air)
++ *   - the DATA receive task runs wio_eth_to_air()            (frames from the host)
++ *   - the eRPC receive task runs wio_eth_bridge()/wio_eth_info() (LINK-CTRL)
++ *   - the DATA transmit task runs wio_eth_tick()             (the watchdog)
++ * The tcpip thread runs the one callback that actually mutates the netif.
++ *
++ * The counters are plain u32 incremented from two of those threads, so they are guarded by
++ * the shortest critical section FreeRTOS has.  They are diagnostics, but a diagnostic that
++ * silently loses counts is how U1's "is this a link failure or an Ethernet drop?" question
++ * became hard to answer, and the answer here has to stay trustworthy.
++ */
++
++#include "FreeRTOS.h"
++#include "task.h"
++#include "semphr.h"
++
++#include "lwip/opt.h"
++#include "lwip/err.h"
++#include "lwip/pbuf.h"
++#include "lwip/netif.h"
++#include "lwip/ip_addr.h"
++#include "lwip/tcpip.h"
++#include "ethernetif.h"
++#include "lwip_intf.h"
++#include "lwip_netconf.h"
++
++#include "wio_link_data.h"
++#include "wio_link_eth.h"
++
++#include <string.h>
++
++/*
++ * xnetif is a COMMON symbol in the prebuilt lib_arduino.a:lwip_netconf.o, 128 bytes, and
++ * index 0 is the station interface.  If this build's idea of struct netif does not match
++ * the one the prebuilt libraries were compiled against, every field offset touched here is
++ * wrong -- so make that a build failure rather than something to discover on the only
++ * surviving board.  (readelf on lwip_netconf.o: "128 OBJECT GLOBAL DEFAULT COM xnetif";
++ * autoconf.h defines CONFIG_CONCURRENT_MODE, hence NET_IF_NUM == 2.)
++ */
++extern struct netif xnetif[NET_IF_NUM];
++_Static_assert(NET_IF_NUM * sizeof(struct netif) == 128,
++               "struct netif does not match the prebuilt xnetif -- do not flash this");
++
++/* Set by LwIP_Init(), which the host triggers with rpc_tcpip_adapter_init during
++ * `wifi connect`.  Until then there is no tcpip thread to post a callback to. */
++extern int lwip_init_done;
++
++#define WIO_ETH_IF        0                      /* station interface */
++#define WIO_ETH_APPLY_TMO 500u                   /* ms to wait for the tcpip thread */
++#define WIO_ETH_GRACE_MS  50u                    /* ...and for one already in progress */
++
++/*
++ * Publish the state before the pointer that makes another thread act on it.  The WLAN
++ * receive thread is not serialised against the tcpip callback, so this ordering is what
++ * makes the stale-pointer window a counted drop instead of a use of half-updated state.
++ * Inline asm rather than CMSIS so this file needs no SoC header.
++ */
++#define WIO_ETH_PUBLISH() __asm volatile ("dmb 0xF" ::: "memory")
++
++static SemaphoreHandle_t e_lock;                 /* serialises wio_eth_bridge() */
++static SemaphoreHandle_t e_done;                 /* the tcpip callback has finished */
++
++static volatile uint8_t  e_bridged;
++static netif_input_fn    e_saved_input;
++static ip4_addr_t        e_saved_ip, e_saved_mask, e_saved_gw;
++
++static volatile uint32_t e_deadline;             /* tick count when the bridge times out */
++static volatile uint8_t  e_armed;
++
++/*
++ * Request identity.  @e_req_seq names the only request the tcpip callback is allowed to
++ * act on; bumping it ABANDONS whatever is still pending.  @e_done_seq says which request a
++ * completion token belongs to.  Both are written under e_lock (or by the callback, which
++ * exactly one request owns at a time) and read by the tcpip thread.
++ */
++static volatile uint32_t e_req_seq, e_done_seq;
++static volatile uint8_t  e_req_on;
++
++static uint32_t st_rx_frames, st_rx_bytes, st_rx_nobuf, st_rx_oversize;
++static uint32_t st_tx_frames, st_tx_bytes, st_tx_fail, st_tx_down;
++
++static void e_bump(uint32_t *ctr, uint32_t by)
++{
++	taskENTER_CRITICAL();
++	*ctr += by;
++	taskEXIT_CRITICAL();
++}
++
++/* ------------------------------------------------------------------ *
++ *  air -> host
++ * ------------------------------------------------------------------ */
++/*
++ * The tap.  Runs on the WiFi driver's receive thread.
++ *
++ * OWNERSHIP: ethernetif_recv() frees the pbuf only when input returns something other than
++ * ERR_OK, so this function owns @p -- copy it out, free it, return ERR_OK.  It must never
++ * hand the frame on to the saved input as well: a frame belongs to exactly one stack.
++ */
++static err_t wio_l2_input(struct pbuf *p, struct netif *nif)
++{
++	uint8_t *dst;
++	int idx;
++	u16_t n;
++
++	(void)nif;
++	if (p == NULL)
++		return ERR_OK;
++	n = p->tot_len;
++
++	if (!e_bridged) {
++		/* The pointer swap is not serialised against this thread, so one more frame
++		 * can still arrive through the old pointer after the bridge went down.  Own
++		 * it and drop it -- delivering it into a stack that is mid-teardown is the
++		 * one thing worse than losing it. */
++		e_bump(&st_rx_nobuf, 1u);
++		pbuf_free(p);
++		return ERR_OK;
++	}
++	if (n == 0u || n > WIO_DATA_PAYLOAD_MAX) {
++		e_bump(&st_rx_oversize, 1u);
++		pbuf_free(p);
++		return ERR_OK;
++	}
++
++	/* Straight from the pbuf chain into the pool buffer: no staging buffer anywhere, and
++	 * the slot is held outside the DATA lock only for this copy. */
++	dst = wio_link_data_tx_claim(&idx);
++	if (dst == NULL) {
++		e_bump(&st_rx_nobuf, 1u);        /* pool full or transmission disabled */
++		pbuf_free(p);
++		return ERR_OK;
++	}
++	if (pbuf_copy_partial(p, dst, n, 0) != n) {
++		wio_link_data_tx_drop(idx);
++		e_bump(&st_rx_oversize, 1u);
++		pbuf_free(p);
++		return ERR_OK;
++	}
++	pbuf_free(p);
++
++	if (wio_link_data_tx_commit(idx, WIO_DATA_CHAN_ETH, (uint16_t)n) == 0) {
++		taskENTER_CRITICAL();
++		st_rx_frames++;
++		st_rx_bytes += n;
++		taskEXIT_CRITICAL();
++	} else {
++		/* Refused: a CFG(OFF) landed while the copy was running.  That refusal is
++		 * exactly what keeps the acknowledgement the host already has honest. */
++		e_bump(&st_rx_nobuf, 1u);
++	}
++	return ERR_OK;
++}
++
++/* ------------------------------------------------------------------ *
++ *  host -> air
++ * ------------------------------------------------------------------ */
++void wio_eth_to_air(const uint8_t *p, uint16_t n)
++{
++	struct eth_drv_sg sg;
++
++	/* 14 = destination + source + ethertype.  Anything shorter is not a frame. */
++	if (p == NULL || n < 14u || n > WIO_DATA_PAYLOAD_MAX) {
++		e_bump(&st_tx_fail, 1u);
++		return;
++	}
++	if (!e_bridged || !rltk_wlan_running(WIO_ETH_IF)) {
++		e_bump(&st_tx_down, 1u);
++		return;
++	}
++
++	/* One scatter entry pointing at the DATA pool buffer is byte-for-byte what
++	 * low_level_output() would have built from a single-pbuf chain; rltk_wlan_send()
++	 * copies it into an skb, so the buffer is free again the moment it returns.  The
++	 * cast drops const: the driver only reads through this pointer. */
++	sg.buf = (unsigned int)(uintptr_t)p;
++	sg.len = n;
++	if (rltk_wlan_send(WIO_ETH_IF, &sg, 1, (int)n) == 0) {
++		taskENTER_CRITICAL();
++		st_tx_frames++;
++		st_tx_bytes += n;
++		taskEXIT_CRITICAL();
++	} else {
++		e_bump(&st_tx_fail, 1u);
++	}
++}
++
++/* ------------------------------------------------------------------ *
++ *  installing and removing the tap
++ * ------------------------------------------------------------------ */
++/*
++ * Runs ON THE TCPIP THREAD, which is the whole reason this is a callback: lwIP here is
++ * NO_SYS=0 with LWIP_TCPIP_CORE_LOCKING=0, so netif_set_addr() from an arbitrary task
++ * would race the stack's own use of the netif.
++ *
++ * ORDER, both directions:
++ *   on   save state -> zero the address -> publish e_bridged -> swap in the tap
++ *        (the address goes first: with a stale address the driver would filter unicast IP
++ *         before it ever reached us, so the tap must not be live before it is zeroed)
++ *   off  clear e_bridged -> restore the input -> restore the address
++ *        (e_bridged goes first: a frame arriving through the not-yet-restored pointer is
++ *         then dropped by the tap rather than delivered into a half-restored stack)
++ *
++ * @ctx is the REQUEST SEQUENCE, not a boolean, and the check against e_req_seq is what
++ * makes a bounded wait safe.  tcpip_callback_with_block() only blocks until the message is
++ * posted, so a requester that gives up would otherwise leave a callback able to mutate the
++ * netif minutes later, with nothing to say which completion belonged to whom.  Abandoning
++ * a request bumps e_req_seq, and a callback that finds it moved on changes NOTHING and
++ * signals NOBODY.
++ */
++static void wio_eth_apply(void *ctx)
++{
++	struct netif *nif = &xnetif[WIO_ETH_IF];
++	uint32_t seq = (uint32_t)(uintptr_t)ctx;
++	uint8_t on;
++	ip4_addr_t zero;
++
++	if (seq != e_req_seq)
++		return;                          /* abandoned before we started */
++	on = e_req_on;
++
++	if (on && !e_bridged) {
++		e_saved_input = nif->input;
++		ip4_addr_copy(e_saved_ip,   *ip_2_ip4(&nif->ip_addr));
++		ip4_addr_copy(e_saved_mask, *ip_2_ip4(&nif->netmask));
++		ip4_addr_copy(e_saved_gw,   *ip_2_ip4(&nif->gw));
++
++		ip4_addr_set_zero(&zero);
++		netif_set_addr(nif, &zero, &zero, &zero);
++
++		e_bridged = 1u;
++		WIO_ETH_PUBLISH();
++		nif->input = wio_l2_input;
++	} else if (!on && e_bridged) {
++		e_bridged = 0u;
++		WIO_ETH_PUBLISH();
++		nif->input = e_saved_input;
++		netif_set_addr(nif, &e_saved_ip, &e_saved_mask, &e_saved_gw);
++	}
++	e_done_seq = seq;                        /* whose completion this is */
++	WIO_ETH_PUBLISH();
++	xSemaphoreGive(e_done);
++}
++
++/*
++ * Wait for the completion of request @seq specifically.  A token from an ABANDONED earlier
++ * request (one that slipped past its sequence check just as it was given up on) is
++ * discarded rather than mistaken for ours -- which is the other half of why a bounded wait
++ * is safe here.
++ */
++static int e_wait_apply(uint32_t seq, uint32_t ms)
++{
++	TickType_t end = xTaskGetTickCount() + pdMS_TO_TICKS(ms);
++
++	for (;;) {
++		int32_t left = (int32_t)(end - xTaskGetTickCount());
++
++		if (left < 0)
++			left = 0;
++		if (xSemaphoreTake(e_done, (TickType_t)left) != pdTRUE)
++			return -1;
++		if (e_done_seq == seq)
++			return 0;
++	}
++}
++
++/* The body of wio_eth_bridge(), with e_lock already held. */
++static uint8_t e_bridge_locked(uint8_t on, uint32_t hold_ms)
++{
++	uint32_t seq;
++	uint8_t rc = 0u;
++
++	if (on) {
++		if (!lwip_init_done) {
++			/* No tcpip thread yet: the host has not run `wifi connect`, so
++			 * rpc_tcpip_adapter_init has not happened. */
++			return 3u;
++		}
++		if (hold_ms == 0u || hold_ms > WIO_ETH_HOLD_MAX_MS)
++			hold_ms = WIO_ETH_HOLD_DEF_MS;
++		/* Armed BEFORE anything can install the tap, and deliberately left armed if the
++		 * request below fails: if the tap did go in after all, the watchdog is what
++		 * takes it out again. */
++		e_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(hold_ms);
++		e_armed    = 1u;
++		if (e_bridged)
++			return 0u;               /* already up: only the deadline moved */
++		taskENTER_CRITICAL();
++		st_rx_frames = st_rx_bytes = st_rx_nobuf = st_rx_oversize = 0u;
++		st_tx_frames = st_tx_bytes = st_tx_fail  = st_tx_down     = 0u;
++		taskEXIT_CRITICAL();
++	} else {
++		if (!e_bridged) {
++			e_armed = 0u;
++			return 0u;
++		}
++	}
++
++	seq = ++e_req_seq;                       /* also abandons anything still pending */
++	e_req_on = on;
++	WIO_ETH_PUBLISH();
++	if (tcpip_callback_with_block(wio_eth_apply, (void *)(uintptr_t)seq, 1) != ERR_OK)
++		return 4u;
++
++	if (e_wait_apply(seq, WIO_ETH_APPLY_TMO) == 0) {
++		if (!on)
++			e_armed = 0u;            /* down for good: stop the watchdog retrying */
++		return 0u;
++	}
++
++	/*
++	 * Timed out.  Abandon the request: a callback that has not reached its sequence check
++	 * yet will now do nothing at all.  One already PAST that check is finishing right now
++	 * -- it is a handful of field writes on the tcpip thread -- so allow a short grace
++	 * before concluding that nothing changed, rather than reporting a failure that has
++	 * already taken effect.
++	 */
++	e_req_seq++;
++	if (e_wait_apply(seq, WIO_ETH_GRACE_MS) == 0) {
++		if (!on)
++			e_armed = 0u;
++		return 0u;
++	}
++	rc = 5u;
++	if (!on) {
++		/* The tap may still be in.  Leave the watchdog armed and already expired so
++		 * the DATA transmit task keeps retrying until it succeeds -- the alternative
++		 * is a module left bridged with nothing left to notice. */
++		e_deadline = xTaskGetTickCount();
++		e_armed    = 1u;
++	}
++	return rc;
++}
++
++uint8_t wio_eth_bridge(uint8_t on, uint32_t hold_ms)
++{
++	uint8_t rc;
++
++	if (e_lock == NULL || e_done == NULL)
++		return 2u;                       /* wio_eth_init() never ran */
++	xSemaphoreTake(e_lock, portMAX_DELAY);
++	rc = e_bridge_locked(on, hold_ms);
++	xSemaphoreGive(e_lock);
++	return rc;
++}
++
++int wio_eth_tick(void)
++{
++	uint8_t rc;
++
++	if (!e_armed || !e_bridged)
++		return 0;
++	if ((int32_t)(xTaskGetTickCount() - e_deadline) < 0)
++		return 0;
++	/*
++	 * The host is gone or stopped asking.  Take the tap down -- but NEVER block here on
++	 * the mutex: this runs on the DATA transmit task, and a CFG in progress on the eRPC
++	 * receive task can hold it for the tcpip timeout.  Missing a turn costs 20 ms.
++	 */
++	if (e_lock == NULL || xSemaphoreTake(e_lock, 0) != pdTRUE)
++		return 0;
++	rc = e_bridge_locked(0u, 0u);
++	xSemaphoreGive(e_lock);
++	/* Only report success: on failure the watchdog stays armed and expired, so this is
++	 * retried on the next pass rather than the mode being cleared under a live tap. */
++	return (rc == 0u) ? 1 : 0;
++}
++
++/* ------------------------------------------------------------------ *
++ *  reporting / init
++ * ------------------------------------------------------------------ */
++void wio_eth_info(uint8_t mac[6], uint8_t *flags, uint32_t st[WIO_ETH_STAT_WORDS])
++{
++	const unsigned char *hw = netif_get_hwaddr(WIO_ETH_IF);
++
++	if (mac != NULL) {
++		if (hw != NULL)
++			memcpy(mac, hw, 6);
++		else
++			memset(mac, 0, 6);
++	}
++	if (flags != NULL)
++		*flags = (uint8_t)((e_bridged ? WIO_ETH_F_BRIDGED : 0u) |
++		                   (rltk_wlan_running(WIO_ETH_IF) ? WIO_ETH_F_RUNNING : 0u));
++	if (st == NULL)
++		return;
++	taskENTER_CRITICAL();
++	st[0] = st_rx_frames;
++	st[1] = st_rx_bytes;
++	st[2] = st_rx_nobuf;
++	st[3] = st_rx_oversize;
++	st[4] = st_tx_frames;
++	st[5] = st_tx_bytes;
++	st[6] = st_tx_fail;
++	st[7] = st_tx_down;
++	taskEXIT_CRITICAL();
++}
++
++void wio_eth_init(void)
++{
++	if (e_lock != NULL)
++		return;
++	e_done = xSemaphoreCreateBinary();
++	e_lock = xSemaphoreCreateMutex();        /* last: it is what the others gate on */
++}
+diff --git a/src/link/wio_link_eth.h b/src/link/wio_link_eth.h
+new file mode 100644
+index 0000000..5fe81bb
+--- /dev/null
++++ b/src/link/wio_link_eth.h
+@@ -0,0 +1,113 @@
++/*
++ * wio_link_eth -- the L2 bridge (issue #23 U2, wio-lite-ai).
++ *
++ * Turns this firmware from a socket-offload server into a relay of RAW ETHERNET FRAMES, so
++ * the STM32 can run its own TCP/IP stack (issue #23 road B).  Frames received from the air
++ * leave over the link's DATA channel on WIO_DATA_CHAN_ETH; frames arriving on that channel
++ * go out over the air.  Nothing here parses IP -- that is the whole point.
++ *
++ * ---- how the tap works -------------------------------------------------------
++ *
++ * The receive chain inside the SDK is fixed and indexes a global array in the PREBUILT
++ * libraries, so it cannot be redirected by adding a netif of our own:
++ *
++ *   lib_wlan.a:rtk_wlan_if.o -> netif_rx(idx, len)             (lib_arduino.a:lwip_intf.o)
++ *                            -> ethernetif_recv(&xnetif[idx])  (lib_arduino.a:ethernetif.o)
++ *                            -> netif->input(pbuf, netif)      <-- the one hookable point
++ *
++ * So LwIP_Init() runs exactly as before (the host still calls rpc_tcpip_adapter_init) and
++ * the bridge simply SWAPS xnetif[0].input.  That also makes the bypass reversible: switch
++ * it off and the module's own lwIP is intact, which is what keeps `net ping`, `net echo`
++ * and the telnet console working as the regression test for everything else.
++ *
++ * ---- two things that are not obvious ------------------------------------------
++ *
++ * 1. THE WLAN DRIVER FILTERS RECEIVED IP PACKETS AGAINST THE NETIF'S ADDRESS.
++ *    netif_is_valid_IP() is an undefined reference in lib_wlan.a:rtk_wlan_if.o and
++ *    ethernet_rswlan.o, and it returns 1 unconditionally only when the netif's IPv4
++ *    address is 0.  A bridge session therefore has to ZERO xnetif[0]'s address (and put it
++ *    back afterwards), or unicast IP addressed to whatever the host's stack calls itself
++ *    is dropped before it ever reaches netif_rx().  ARP is not IP and is unaffected, which
++ *    is exactly why "ARP is visible" is a weaker test than "the bridge works".
++ *
++ * 2. lwIP here is NO_SYS=0 with LWIP_TCPIP_CORE_LOCKING=0, so a netif may not be mutated
++ *    from an arbitrary task.  Both the address change and the input swap are therefore
++ *    performed ON THE TCPIP THREAD through tcpip_callback_with_block(), which only blocks
++ *    until the message is POSTED -- so the callback signals a semaphore and the caller
++ *    waits for that, bounded, and reports a failure rather than assuming one.
++ *    The host additionally stops the DHCP client (over the existing eRPC path) before
++ *    asking for the bridge, because that is what the adapter's own header requires before
++ *    IP information is changed.
++ */
++#ifndef WIO_LINK_ETH_H
++#define WIO_LINK_ETH_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Counters, in the order wio_eth_info() writes them. */
++#define WIO_ETH_STAT_WORDS  8u
++
++/* Default and maximum watchdog window for a bridge session, in milliseconds. */
++#define WIO_ETH_HOLD_DEF_MS 10000u
++#define WIO_ETH_HOLD_MAX_MS 60000u
++
++/* Create the lock and the completion semaphore.  Call once from setup_erpc(); every other
++ * entry point here is inert until it has run, so a failure to allocate leaves the bridge
++ * unavailable rather than unsafe. */
++void wio_eth_init(void);
++
++/* wio_eth_info() flags. */
++#define WIO_ETH_F_BRIDGED   0x01u
++#define WIO_ETH_F_RUNNING   0x02u        /* rltk_wlan_running(0): the radio is up */
++
++/*
++ * Install (@on != 0) or remove the tap.  @hold_ms arms a watchdog: the bridge takes itself
++ * down that many milliseconds later, so a host that dies mid-session cannot leave the
++ * module forwarding into a link nobody reads while its own lwIP starves.  0 means "no
++ * deadline" and is only used by the OFF path.
++ *
++ * Returns a CTRL status byte: 0 accepted, non-zero refused -- 2 not initialised, 3 no
++ * tcpip thread yet (the host has not run `wifi connect`), 4 the callback could not be
++ * posted, 5 the tcpip thread did not answer within the bound.  Idempotent: turning it on
++ * twice only re-arms the deadline.
++ *
++ * What a non-zero return guarantees is NOT "nothing changed" -- it is that no change can be
++ * left standing with nobody to undo it.  tcpip_callback_with_block() blocks only until the
++ * message is posted, so every request carries a sequence number: giving up bumps it, and a
++ * callback that finds it moved on changes nothing and signals nobody.  One already past
++ * that check is finishing as we give up, so a short grace period catches its completion and
++ * the call succeeds after all.  What remains is a callback that lands later still, and the
++ * watchdog is what covers it: it is armed BEFORE the request that could install the tap and
++ * is left armed when that request fails, and a failed OFF re-arms it already expired so the
++ * DATA transmit task keeps retrying.  So the residual states are transient, not stuck.
++ *
++ * Called from the eRPC receive task (via wio_link_data_cfg) and from the DATA transmit
++ * task (via wio_eth_tick).  It BLOCKS on the tcpip thread, so it must not be called with
++ * the DATA channel's lock held.
++ */
++uint8_t wio_eth_bridge(uint8_t on, uint32_t hold_ms);
++
++/* Put one frame from the host on the air.  A no-op (counted) when the bridge is off or the
++ * radio is down.  Called from the DATA receive task with no lock held. */
++void wio_eth_to_air(const uint8_t *p, uint16_t n);
++
++/* LINK_ETH_INFO: the MAC the host must use as its source address, flags, and counters. */
++void wio_eth_info(uint8_t mac[6], uint8_t *flags, uint32_t st[WIO_ETH_STAT_WORDS]);
++
++/*
++ * Take the bridge down if its deadline has passed.  Cheap when idle; called once per loop
++ * of the DATA transmit task, OUTSIDE its locked step (this can block on the tcpip thread).
++ * Returns 1 when it just took the bridge down, so the caller -- which owns the DATA
++ * channel's mode -- can finish the shutdown; returns 0 otherwise.
++ */
++int wio_eth_tick(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* WIO_LINK_ETH_H */
+diff --git a/src/link/wio_uart_transport.h b/src/link/wio_uart_transport.h
+index 28f3f22..da8b898 100644
+--- a/src/link/wio_uart_transport.h
++++ b/src/link/wio_uart_transport.h
+@@ -41,6 +41,7 @@ extern "C" {
+ #include "task.h"
+ #include "wio_usi_uart.h"
+ #include "wio_link_data.h"
++#include "wio_link_eth.h"
+ }
+ 
+ /* Marker and bounds of the CTRL channel; mirrored by the host in app/erpc.h. */
+@@ -54,6 +55,7 @@ extern "C" {
+ #define WIO_CTRL_BENCH          4u
+ #define WIO_CTRL_DATA_CFG       5u            /* issue #23 U1: the DATA channel */
+ #define WIO_CTRL_DATA_STATS     6u
++#define WIO_CTRL_ETH_INFO       7u            /* issue #23 U2: the L2 bridge */
+ 
+ #define WIO_CTRL_DATA_MAGIC     0x44415441u   /* 'DATA' */
+ 
+@@ -377,6 +379,30 @@ private:
+ 			break;
+ 		}
+ 
++		case WIO_CTRL_ETH_INFO: {
++			/* issue #23 U2.  The MAC is not a nicety: it is the only source address
++			 * the host may put on a frame, and "is the radio actually up" is the
++			 * first thing a session that sees nothing needs to know.  Both travel
++			 * with the counters so a failing run needs one round trip, not three. */
++			uint32_t st[WIO_ETH_STAT_WORDS];
++			uint8_t mac[6], flags = 0u;
++			uint32_t i;
++
++			if (plen != 0u) {
++				status = 1u;
++				break;
++			}
++			wio_eth_info(mac, &flags, st);
++			for (i = 0u; i < 6u; i++)
++				m_ctrlTx[WIO_CTRL_HDR + i] = mac[i];
++			m_ctrlTx[WIO_CTRL_HDR + 6u] = flags;
++			m_ctrlTx[WIO_CTRL_HDR + 7u] = 0u;
++			for (i = 0u; i < WIO_ETH_STAT_WORDS; i++)
++				putU32(m_ctrlTx + WIO_CTRL_HDR + 8u + i * 4u, st[i]);
++			rlen = 8u + WIO_ETH_STAT_WORDS * 4u;
++			break;
++		}
++
+ 		default:
+ 			status = 1u;
+ 			break;

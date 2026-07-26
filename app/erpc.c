@@ -1355,6 +1355,18 @@ static int erpc_ctrl_settle(int fail_rc, int *len, uint8_t *status)
 	return rc;
 }
 
+/*
+ * The module's status byte from the exchange that most recently returned -3.  Written only
+ * here, read only by the caller that just got the -3; single-slot, single-owner CTRL is
+ * what makes that well defined (see erpc.h).
+ */
+static uint8_t erpc_ctrl_status_v;
+
+uint8_t erpc_ctrl_last_status(void)
+{
+	return erpc_ctrl_status_v;
+}
+
 int erpc_ctrl_call(uint8_t cmd, const uint8_t *req, uint16_t req_len,
                    uint8_t *out, uint16_t out_cap, uint32_t timeout_ms,
                    struct erpc_diag *diag)
@@ -1363,6 +1375,7 @@ int erpc_ctrl_call(uint8_t cmd, const uint8_t *req, uint16_t req_len,
 	struct erpc_counters snap;
 	ULONG deadline;
 
+	erpc_ctrl_status_v = 0u;
 	if (diag)
 		memset(diag, 0, sizeof(*diag));
 	if (!erpc_ready)
@@ -1410,13 +1423,16 @@ int erpc_ctrl_call(uint8_t cmd, const uint8_t *req, uint16_t req_len,
 			erpc_diag_delta(diag, &snap);
 			if (rc < 0)
 				return rc;
+			erpc_ctrl_status_v = status;
 			return (status != 0u) ? -3 : len;
 		}
 		if ((int32_t)(tx_time_get() - deadline) >= 0) {
 			rc = erpc_ctrl_settle(-2, &len, &status);
 			erpc_diag_delta(diag, &snap);
-			if (rc > 0)
+			if (rc > 0) {
+				erpc_ctrl_status_v = status;
 				return (status != 0u) ? -3 : len;  /* landed in the same instant */
+			}
 			if (diag)
 				diag->timeout++;
 			return rc;

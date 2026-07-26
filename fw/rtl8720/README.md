@@ -637,3 +637,102 @@ Acceptance (beyond the N5 regression set, with `wifi rpc ver` reading `2.1.3+wio
 `link dbench 1500 3 rx | tx | both` completes with **zero** loss on either end — no
 sequence gaps, no CRC failures, no pool drops, no ring drops, no FIFO overruns — and a
 10 s `both` run does the same with a telnet console attached and running a command.
+
+### N7 result
+
+`patches/0007-n7-l2-bridge.patch` — new `src/link/wio_link_eth.{c,h}`, a `WIO_DATA_MODE_BRIDGE`
+mode and a `tx_claim`/`tx_commit`/`tx_drop` split in `src/link/wio_link_data.{c,h}`, a
+`LINK_ETH_INFO` command in `src/link/wio_uart_transport.h`, and the build id becomes
+`2.1.3+wio-n7`. **The eRPC wire format is unchanged for the fifth time.**
+
+N6 proved the DATA channel can carry 1500-byte frames continuously. N7 puts **real** ones on
+it: the module stops handing received Ethernet frames to its own lwIP and sends them to the
+host instead, and frames arriving on `WIO_DATA_CHAN_ETH` go out over the air. That is issue
+#23 road B — the module becomes a relay and the STM32 gets to run the IP stack (U3).
+
+#### The tap, and why it is not a new netif
+
+The SDK's receive chain indexes a global array **inside the prebuilt libraries**, so adding a
+netif of our own would never receive anything:
+
+```
+lib_wlan.a:rtk_wlan_if.o -> netif_rx(idx, len)             (lib_arduino.a:lwip_intf.o)
+                         -> ethernetif_recv(&xnetif[idx])  (lib_arduino.a:ethernetif.o)
+                         -> netif->input(pbuf, netif)      <-- the one hookable point
+```
+
+So `LwIP_Init()` still runs exactly as before and the bridge **swaps `xnetif[0].input`**. That
+also makes it reversible: switch it off and the module's own lwIP is intact, which is what
+keeps `net ping`, `net echo` and the telnet console usable as the regression test for
+everything else. `ethernetif_recv()` frees the pbuf only when `input` returns something other
+than `ERR_OK`, so the tap owns it: copy out, free, return `ERR_OK`.
+
+#### Two things that are not obvious
+
+- 🔴 **The WLAN driver filters received IP packets against the netif's address.**
+  `netif_is_valid_IP()` is an undefined reference in `lib_wlan.a:rtk_wlan_if.o` and
+  `ethernet_rswlan.o`, and it returns 1 unconditionally only when the netif's IPv4 address is
+  0. A bridge session therefore has to **zero `xnetif[0]`'s address** and put it back
+  afterwards, or unicast IP addressed to whatever the host's stack calls itself is dropped
+  before it ever reaches `netif_rx()`. ARP is ethertype 0x0806, not IP, and is unaffected —
+  which is exactly why "ARP is visible" is a weaker claim than "the bridge works".
+- 🔴 **lwIP here is `NO_SYS=0` with `LWIP_TCPIP_CORE_LOCKING=0`** (`lwipopts.h:37`, `:385`), so
+  a netif may not be mutated from an arbitrary task — the firmware's own
+  `wifi_tcpip_adapter.c` precedent for calling `netif_set_addr()` off the tcpip thread is not
+  good enough, and the adapter header itself says to stop DHCP before changing IP information.
+  Both the address change and the input swap therefore run **on the tcpip thread** via
+  `tcpip_callback_with_block()`, which blocks only until the message is *posted* — hence the
+  completion semaphore and its 500 ms bound — and the **host stops the DHCP client first**
+  over the existing eRPC path (`wifi_rpc_dhcpc_stop`).
+
+#### Why BRIDGE is a mode and not a command
+
+`WIO_DATA_MODE_BRIDGE` (0x04) goes through `wio_link_data_cfg()`, so N6's `CFG(off)` contract —
+"no further DATA frame can be on the way" — covers the bridge's producer too, without a second
+teardown protocol that could disagree with it. That producer is new: the **WiFi receive
+thread**, which claims a transmit slot, spends a 1500-byte copy outside the lock, and commits.
+`wio_link_data_send()` is re-expressed as `tx_claim` + copy + `tx_commit` so there is one
+enqueue path, and the argument still holds in one locked step:
+
+- the ring is drained under the lock and nothing can be pushed back, because every
+  `tx_commit` now fails the `d_tx_enabled` test;
+- the writer is proved idle by `d_tx_busy == 0` read in that same step;
+- a slot still `LD_BUSY` in a receive-thread caller mid-copy **can never be enqueued**, so it
+  is not a frame on the way. Its holder releases it itself when the commit is refused.
+
+`CFG(off)` deliberately does **not** reclaim held slots — that would hand one to a new claimant
+while the old holder still believed it owned it (the same ABA argument as `app/link_data.c`).
+
+Two more safety properties: the `@ms` field of `CFG` doubles as a **watchdog** (the DATA
+transmit task takes the bridge down itself if the host dies mid-session, so the module cannot
+be left forwarding into a link nobody reads while its own lwIP starves), and the pointer swap
+is ordered against the WiFi receive thread by publishing the state before the pointer, with the
+tap dropping and counting any frame that reaches it after the bridge is down.
+
+`LINK_ETH_INFO` (CTRL command 7) returns the MAC — the only source address the host may put on
+a frame — plus "is the radio up" and eight counters. `rx_nobuf` is kept **separate** from the
+DATA channel's own drops: a full transmit pool under a LAN broadcast burst is an Ethernet-legal
+drop, and a DATA loss would mean the link failed.
+
+Cost: `.ram_image2.bss` 108,532 → 108,608 B (+76). The image grows by one sector,
+884,736 → 888,832 B, so the write range is 0x6000..0xdefff — still 155,648 B clear of the
+`0x105000` WiFi-settings sector.
+
+#### The watchdog cannot be exercised by resetting the host
+
+Worth writing down, because the obvious test does not test it. `rtl8720_init()` presets
+CHIP_EN (PC3) Low before switching the pad to output and drives it Low again immediately
+(`app/rtl8720.c`), so **a host reset power-cycles the module** — it comes back unbridged
+whatever the watchdog does, and the `wifi rpc ver` that follows prints "powering on
+RTL8720DN". On this board a host that dies takes the module with it.
+
+So the watchdog is not covering "the host lost power". What it does cover is the host
+staying alive while stopping asking: a `CFG(OFF)` that fails or times out, a future resident
+owner that goes away, or a bridge left up by a path that skips the session epilogue. Those
+are the cases where the module would otherwise sit bridged with its own lwIP starved and
+nothing left to notice.
+
+Acceptance (beyond the N6 regression set, with `wifi rpc ver` reading `2.1.3+wio-n7`):
+`link arp <gateway>` shows a `who-has` going out and an **`is-at` reply coming back** — which
+proves the whole path in both directions at once — and after the session `net info`,
+`net dhcp`, `net ping <gateway>` and the telnet console all work again unchanged.

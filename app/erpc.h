@@ -190,6 +190,8 @@ void erpc_link_closed(void);
  *   >= 4  the wire budget is lifted to ERPC_WIRE_BUDGET_FAST (n4 owns USI0 behind an
  *         8 kB ring, so the 127-byte input ring that shaped every request size is gone)
  *   >= 5  the LINK-CTRL channel below exists at all
+ *   >= 6  the DATA channel exists (`link dbench`)
+ *   >= 7  the L2 bridge exists (`link eth` / `link arp`)
  * The wire budget is DERIVED here rather than latched separately, so the two can never
  * disagree about the same module.
  */
@@ -230,8 +232,17 @@ enum {
 	ERPC_CTRL_BENCH      = 4,        /* u32 reply_bytes, u8 seed, u8 rsvd[3], data[] */
 	/* DATA channel control (issue #23 U1), firmware wio-n6 and later. */
 	ERPC_CTRL_DATA_CFG   = 5,        /* u8 mode, u8 seed, u16 bytes, u32 ms, u32 magic */
-	ERPC_CTRL_DATA_STATS = 6         /* -> u32 LE x 12, see cmd_link.c */
+	ERPC_CTRL_DATA_STATS = 6,        /* -> u32 LE x 12, see cmd_link.c */
+	/* L2 bridge (issue #23 U2), firmware wio-n7 and later. */
+	ERPC_CTRL_ETH_INFO   = 7         /* -> u8 mac[6], u8 flags, u8 rsvd, u32 LE x 8 */
 };
+
+/* ETH_INFO flags. */
+#define ERPC_ETH_F_BRIDGED      0x01u    /* the module's netif is tapped right now */
+#define ERPC_ETH_F_RUNNING      0x02u    /* the radio is up (rltk_wlan_running) */
+
+/* ETH_INFO counters: rx frames/bytes/no-buf/oversize, tx frames/bytes/fail/down. */
+#define ERPC_ETH_STAT_WORDS     8u
 
 /* Guards the one CTRL command with a side effect against a chance 0xFFFF alignment. */
 #define ERPC_CTRL_SETBAUD_MAGIC 0x42415544u   /* 'BAUD' */
@@ -249,6 +260,17 @@ enum {
 #define ERPC_DATA_MODE_OFF      0x00u
 #define ERPC_DATA_MODE_SINK     0x01u
 #define ERPC_DATA_MODE_SOURCE   0x02u
+/*
+ * BRIDGE (issue #23 U2, firmware wio-n7 and later) taps the module's WiFi netif: frames
+ * received from the air arrive as DATA on LINK_DATA_CHAN_ETH, and DATA frames sent on that
+ * channel go out over the air.  It is a MODE rather than a command of its own so that
+ * OFF's contract above covers the bridge's producer too -- the module's WiFi receive
+ * thread -- instead of needing a second teardown protocol that could disagree with it.
+ * The @ms field doubles as the module's watchdog: it takes the bridge down on its own that
+ * long after CFG, so a host that dies mid-session cannot leave the module forwarding into
+ * a link nobody reads while its own lwIP starves.
+ */
+#define ERPC_DATA_MODE_BRIDGE   0x04u
 
 /*
  * Send one CTRL command and wait for its reply.  Only ONE CTRL exchange may be in flight
@@ -260,10 +282,20 @@ enum {
  *   -1 bad args / no link / a CTRL exchange is already in flight / no service thread
  *   -2 timeout, or the link was torn down under us (erpc_abandon_all)
  *   -3 the module answered with a non-zero status byte
+ *
+ * -3 collapses every module-side refusal into one number, which is not enough once a
+ * command can refuse for more than one reason: erpc_ctrl_last_status() returns the byte
+ * itself so the caller can say WHY (issue #23 U2 -- `link eth` before `wifi connect` is a
+ * different problem from a malformed request, and the first is what a new user hits).
+ * Valid immediately after a -3 and nowhere else; it is well defined for the same reason
+ * the single reply slot is: one CTRL exchange at a time, held by one owner.
  */
 int erpc_ctrl_call(uint8_t cmd, const uint8_t *req, uint16_t req_len,
                    uint8_t *out, uint16_t out_cap, uint32_t timeout_ms,
                    struct erpc_diag *diag);
+
+/* The module's status byte from the exchange that just returned -3.  0 otherwise. */
+uint8_t erpc_ctrl_last_status(void);
 
 /*
  * ---- DATA channel (issue #23 U1) ------------------------------------------------

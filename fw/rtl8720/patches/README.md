@@ -1,4 +1,4 @@
-# N2..N5 patches land here (see ../README.md).  Applied in filename order to a
+# N2..N7 patches land here (see ../README.md).  Applied in filename order to a
 # pristine export of the pinned upstream commit -- the reference checkout in
 # _ref/seeed-ambd-firmware is never modified.
 #
@@ -68,3 +68,44 @@
 #       old rate then reprograms, so a lost ACK changes nothing.  Recovery from a rate
 #       mismatch is `wifi reset` -- the fallback the host attempts is best effort only.
 #       Verify with `link info`, `link sweep`, and a `link baud` round trip.
+#
+# N6 -- DATA channel (issue #23 U1), eRPC wire format unchanged:
+#
+#   0006-n6-link-data.patch
+#       New src/link/wio_link_data.{c,h}: a THIRD frame type
+#       (u16 0xFFFE | u16 len | u16 crc | body, body = u8 chan | u8 flags | payload)
+#       that is unsolicited, bidirectional and unacknowledged -- what a raw Ethernet
+#       frame needs.  src/link/wio_uart_transport.h gains handleData() and a public
+#       writeFramed() (the DATA task must take the SAME m_sendLock the N3 workers take,
+#       or two writers interleave bytes inside one frame); the receive ring doubles to
+#       16 kB; the build id becomes "2.1.3+wio-n6".  In U1 the endpoint is a sink/source
+#       bench, so the plumbing is measured before anything depends on it.
+#       The transmit queue is an index ring under the module's own mutex, NOT a FreeRTOS
+#       queue: LINK_DATA_CFG(off) can only promise "no further frame can be on the way"
+#       if taking the next frame and marking the writer busy happen in ONE locked step.
+#       Verify with `link dbench 1500 3 rx | tx | both` -- zero loss on either end.
+#
+# N7 -- L2 bridge (issue #23 U2), eRPC wire format unchanged:
+#
+#   0007-n7-l2-bridge.patch
+#       New src/link/wio_link_eth.{c,h}: the module stops handing received Ethernet
+#       frames to its own lwIP and sends them over DATA instead, and DATA frames on
+#       WIO_DATA_CHAN_ETH go out over the air.  It is a TAP, not a rewrite: LwIP_Init()
+#       still runs and the bridge swaps xnetif[0].input, so switching it off restores
+#       the module's own stack (and therefore `net ping`, `net echo` and telnet) intact.
+#       Two things that are not obvious and cost a board if got wrong:
+#         - the WLAN driver FILTERS received IP packets against the netif's address
+#           (netif_is_valid_IP, an undefined reference in lib_wlan.a), so the bridge
+#           must zero xnetif[0]'s address and restore it afterwards;
+#         - lwIP here is NO_SYS=0 with LWIP_TCPIP_CORE_LOCKING=0, so BOTH mutations go
+#           through tcpip_callback_with_block() -- which only blocks until the message
+#           is posted, hence the completion semaphore -- and the host stops the DHCP
+#           client over the existing eRPC path first.
+#       BRIDGE is a wio_link_data_cfg() MODE (0x04), not a command of its own, so N6's
+#       CFG(off) contract covers the bridge's producer too; wio_link_data_send() is
+#       re-expressed as tx_claim + copy + tx_commit so the WiFi receive path can copy a
+#       pbuf chain straight into the pool buffer with no staging buffer anywhere.  The
+#       CFG @ms field doubles as a watchdog: the module takes the bridge down itself if
+#       the host dies mid-session.  New CTRL command LINK_ETH_INFO (7) returns the MAC,
+#       whether the radio is up, and the bridge counters.  Build id "2.1.3+wio-n7".
+#       Verify with `link arp <gateway>` -- an `is-at` reply is the whole path proved.

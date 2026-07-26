@@ -318,6 +318,26 @@ time as the USB console. 21 commands:
   **(3)** `erpc_crc16()` is now table-driven (same polynomial, same values) — the
   bit-at-a-time loop was ~110 µs per 1500-byte frame on the link service thread.
 
+- **The L2 bridge** (issue #23 U2, `fw/rtl8720/patches/0007` + `link eth` / `link arp`).
+  The DATA channel stops carrying a bench pattern and starts carrying **real Ethernet
+  frames**: the module hands what it receives from the air to the host instead of to its own
+  lwIP, and frames sent on `LINK_DATA_CHAN_ETH` go out over the air. The host has no IP stack
+  yet — that is U3 — so `link eth [secs] [max]` just decodes what arrives (ARP in full, IPv4
+  addresses and protocol, everything else by ethertype) and `link arp <ip> [secs] [sender-ip]`
+  puts one well-formed request on the wire once a second. **An `is-at` reply is the test**: it
+  proves the host built a frame, the module transmitted it with its own MAC, a real machine
+  answered, the driver accepted the answer, the tap caught it before lwIP, and it survived the
+  link — passively watching broadcasts only ever exercises one direction.
+  It is a **tap, not a rewrite**: `LwIP_Init()` still runs and the bridge swaps
+  `xnetif[0].input`, so switching it off leaves the module's own stack — and therefore
+  `net ping`, `net echo` and the telnet console — intact. Two things had to be got right, and
+  neither is guessable: the WLAN driver **filters received IP packets against the netif's
+  address** (so a bridge session zeroes it and restores it), and this lwIP is `NO_SYS=0` with
+  `LWIP_TCPIP_CORE_LOCKING=0`, so both mutations run **on the tcpip thread** and the host stops
+  the DHCP client first. The session is foreground and bounded, and the module runs its own
+  watchdog over it, because while the tap is in the module's lwIP is deaf — `link eth` refuses
+  to start while a telnet console is armed, and says to run `net dhcp` afterwards.
+
 ## Key design points
 
 - **Never reprograms the clock tree.** The DFU bootloader sets HSE 25 MHz → PLL1

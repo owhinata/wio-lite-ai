@@ -9,7 +9,10 @@
  *   link info                     both ends' counters + the current rate and its error
  *   link baud <bps>               change the rate of the link (2M / 3M / 4M / 6M)
  *   link bench [bytes] [secs] [dir]   measured traffic; dir = rx | tx | both
+ *   link dbench [bytes] [secs] [dir]  the same, free-running on the DATA channel (U1)
  *   link sweep                    bench all three directions at the current rate
+ *   link eth [secs] [max]         L2 bridge: decode what the module hears (U2)
+ *   link arp <ip> [secs] [spa]    the same, plus an ARP request once a second (U2)
  *
  * Where `wifi` is L2 and `net` is L3, this is L1/L2 of the wire between the STM32 and the
  * companion chip.  It exists because issue #23 needs a number before it can commit: can a
@@ -42,6 +45,7 @@
 #include "link_data.h"
 #include "rtl_link.h"
 #include "rtl8720.h"
+#include "wifi_rpc.h"        /* `link eth` reads the address and stops DHCP first */
 
 #include "stm32h7xx_hal.h"   /* HAL_GetTick, TIM2 */
 
@@ -750,7 +754,7 @@ static int link_dbench_rx(void *ctx, uint8_t chan, uint8_t *p, uint16_t n)
 
 /* Tell the module what to do with the DATA channel.  @mode 0 stops it, and its
  * acknowledgement means the module's own transmit queue is drained (see erpc.h). */
-static int link_dbench_cfg(struct cli_instance *sh, uint8_t mode, uint16_t bytes,
+static int link_data_cfg(struct cli_instance *sh, uint8_t mode, uint16_t bytes,
                            uint32_t ms, uint8_t seed)
 {
 	struct erpc_diag diag = {0};
@@ -767,6 +771,33 @@ static int link_dbench_cfg(struct cli_instance *sh, uint8_t mode, uint16_t bytes
 	                   (uint16_t)sizeof(link_reply), LINK_DCFG_TMO_MS, &diag);
 	if (n < 0) {
 		cli_error(sh, "link: LINK_DATA_CFG(%u) failed (rc %d)\r\n", mode, n);
+		/*
+		 * -3 is "the module refused", which on its own says nothing about WHY -- and a
+		 * bridge can refuse for several reasons, one of which is the first thing a new
+		 * user does wrong.  Decode it (module statuses are in fw/rtl8720 wio_link_eth.h).
+		 */
+		if (n == -3) {
+			switch (erpc_ctrl_last_status()) {
+			case 3u:
+				cli_print(sh, "  the module has no TCP/IP stack yet -- run "
+				          "`wifi connect <ssid> ...` first (it is what brings "
+				          "lwIP up, and the bridge taps its interface)\r\n");
+				break;
+			case 2u:
+				cli_print(sh, "  the module's bridge never initialised (out of "
+				          "memory at boot) -- `wifi reset`\r\n");
+				break;
+			case 4u:
+			case 5u:
+				cli_print(sh, "  the module's TCP/IP thread did not answer; nothing "
+				          "was changed -- retry, then `wifi reset`\r\n");
+				break;
+			default:
+				cli_print(sh, "  the module rejected the request itself "
+				          "(status %u)\r\n", erpc_ctrl_last_status());
+				break;
+			}
+		}
 		return -1;
 	}
 	return 0;
@@ -838,7 +869,6 @@ static void link_dbench_report(struct cli_instance *sh, const char *dir, uint32_
 }
 
 /*
-/*
  * Wait for BOTH ends to be quiet before the channel is detached.  This is the ordering
  * rule from app/link_data.h, and the reason it is a state test rather than a delay: the
  * flush suppression that keeps DATA frames intact is lifted the instant the consumer
@@ -853,7 +883,7 @@ static void link_dbench_report(struct cli_instance *sh, const char *dir, uint32_
  * the DATA channel was.  Measured on board #2: the module reported queue 0 / in-use 0
  * (its promise kept) while this still timed out for a full second.
  */
-static int link_dbench_settle(struct cli_instance *sh)
+static int link_data_settle(struct cli_instance *sh)
 {
 	uint32_t st[LINK_DSTAT_WORDS];
 	int tries;
@@ -923,7 +953,7 @@ static int cmd_link_dbench(struct cli_instance *sh, int argc, char **argv)
 	cli_print(sh, "link: dbench %s %lu B for %lu s at %lu baud...\r\n", dir,
 	          (unsigned long)bytes, (unsigned long)secs,
 	          (unsigned long)rtl_link_erpc_baud());
-	if (link_dbench_cfg(sh, mode, (uint16_t)rx, secs * 1000u + 500u, 0x5Au) != 0) {
+	if (link_data_cfg(sh, mode, (uint16_t)rx, secs * 1000u + 500u, 0x5Au) != 0) {
 		rtl_link_end(sh);                /* closes the UART: nothing can arrive now */
 		link_data_detach();
 		return 1;
@@ -960,9 +990,9 @@ static int cmd_link_dbench(struct cli_instance *sh, int argc, char **argv)
 
 	/* Stop the far end and prove both ends are quiet BEFORE reading the counters, so
 	 * what is printed is a finished run rather than a moving one. */
-	if (link_dbench_cfg(sh, ERPC_DATA_MODE_OFF, 0u, 0u, 0u) != 0)
+	if (link_data_cfg(sh, ERPC_DATA_MODE_OFF, 0u, 0u, 0u) != 0)
 		rc = 1;
-	else if (link_dbench_settle(sh) != 0)
+	else if (link_data_settle(sh) != 0)
 		rc = 1;
 
 	if (link_get_dstats(sh, st) == 0)
@@ -987,6 +1017,435 @@ static int cmd_link_dbench(struct cli_instance *sh, int argc, char **argv)
 	rtl_link_end(sh);
 	link_data_detach();
 	return rc;
+}
+
+/* ---- link eth / link arp (issue #23 U2: the L2 bridge) -------------------- */
+
+/*
+ * `link dbench` proved the DATA channel can carry 1500-byte frames continuously.  This is
+ * where it starts carrying REAL ones: the module stops handing received Ethernet frames to
+ * its own lwIP and sends them here instead, and frames sent from here go out over the air.
+ * The host has no IP stack yet (that is U3) -- these two subcommands only look at what
+ * arrives and, for `link arp`, put one well-formed frame on the wire to make something
+ * arrive on purpose.
+ *
+ * WHY AN ARP REQUEST IS THE TEST.  A reply proves the whole path in both directions at
+ * once: the host built a frame, the module transmitted it with its own MAC, a real machine
+ * on the LAN answered, the module's driver accepted the answer, the tap intercepted it
+ * before lwIP, and it survived the link.  Nothing short of that proves the return path,
+ * because passively watching broadcasts only ever exercises one direction.
+ *
+ * THE SESSION IS FOREGROUND AND SHORT-LIVED, deliberately.  While the tap is installed the
+ * module's own lwIP receives nothing, so every eRPC socket -- `net ping`, `net echo`, the
+ * telnet console -- is deaf for the duration.  A resident bridge is U3's problem, and it
+ * needs the host stack that will consume the frames to exist first.  Everything here is
+ * restored on the way out, which is what keeps the rest of the firmware a regression test.
+ */
+#define LINK_ETH_CAP_N     32u   /* captured frames waiting for the CLI thread */
+#define LINK_ETH_CAP_B     64u   /* bytes kept of each: 14 Ethernet + 28 ARP + slack */
+#define LINK_ETH_SECS_DEF  10u
+#define LINK_ETH_PRINT_DEF 32u
+#define LINK_ETH_HDR_MIN   14u   /* destination + source + ethertype */
+#define LINK_ETH_ARP_LEN   42u   /* the Ethernet header plus an IPv4 ARP body */
+
+/* ETH_INFO reply: mac[6] + flags + rsvd, then this many u32 LE. */
+#define LINK_ETH_STAT_WORDS ERPC_ETH_STAT_WORDS
+
+struct link_eth_cap {
+	uint16_t len;                    /* the frame's real length */
+	uint8_t  b[LINK_ETH_CAP_B];      /* the first min(len, CAP_B) bytes of it */
+};
+
+/*
+ * Single-producer / single-consumer: the link service thread (priority 10) writes, the CLI
+ * thread reads, and neither takes a lock.  @head is written only by the producer and @tail
+ * only by the consumer, with one slot left empty so full and empty stay distinct.
+ */
+static struct link_eth_cap link_eth_ring[LINK_ETH_CAP_N];
+static volatile uint8_t    link_eth_head, link_eth_tail;
+static volatile uint32_t   link_eth_frames, link_eth_bytes, link_eth_missed;
+
+/* Transmit staging, static for the same reason as link_req: a CLI instance stack is
+ * CLI_INSTANCE_STACK_SIZE = 2048 bytes. */
+static uint8_t link_eth_tx[LINK_ETH_ARP_LEN];
+
+/*
+ * Runs ON THE LINK SERVICE THREAD, once per received DATA frame, with no link lock held.
+ * While it runs nothing is draining the UART's 16 kB receive ring, so it copies a fixed 64
+ * bytes and returns; the CLI thread does every bit of the printing.  Returns 0: the pool
+ * buffer goes straight back.
+ */
+static int link_eth_rx(void *ctx, uint8_t chan, uint8_t *p, uint16_t n)
+{
+	uint8_t head, next;
+
+	(void)ctx;
+	if (chan != LINK_DATA_CHAN_ETH)
+		return 0;                /* not ours (a stray bench frame) */
+	link_eth_frames++;
+	link_eth_bytes += n;
+
+	head = link_eth_head;
+	next = (uint8_t)((head + 1u) % LINK_ETH_CAP_N);
+	if (next == link_eth_tail) {
+		/* The console cannot keep up with the LAN.  That is a display limit, not a
+		 * link loss, so it is counted separately and said out loud. */
+		link_eth_missed++;
+		return 0;
+	}
+	link_eth_ring[head].len = n;
+	memcpy(link_eth_ring[head].b, p, (n < LINK_ETH_CAP_B) ? n : LINK_ETH_CAP_B);
+	__DMB();                         /* the frame is complete before it is published */
+	link_eth_head = next;
+	return 0;
+}
+
+/* Parse a dotted-quad into four octets.  Returns 0 on success. */
+static int link_parse_ipv4(const char *s, uint8_t out[4])
+{
+	unsigned i;
+
+	for (i = 0u; i < 4u; i++) {
+		uint32_t v = 0u;
+		int digits = 0;
+
+		while (*s >= '0' && *s <= '9') {
+			v = v * 10u + (uint32_t)(*s++ - '0');
+			if (++digits > 3 || v > 255u)
+				return -1;
+		}
+		if (digits == 0)
+			return -1;
+		out[i] = (uint8_t)v;
+		if (i < 3u) {
+			if (*s != '.')
+				return -1;
+			s++;
+		}
+	}
+	return (*s == '\0') ? 0 : -1;
+}
+
+static void link_put_mac(struct cli_instance *sh, const uint8_t *m)
+{
+	cli_print(sh, "%02x:%02x:%02x:%02x:%02x:%02x",
+	          m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+static void link_put_ip(struct cli_instance *sh, const uint8_t *a)
+{
+	cli_print(sh, "%u.%u.%u.%u", a[0], a[1], a[2], a[3]);
+}
+
+/*
+ * One line per frame.  ARP is decoded in full because it is the thing being looked for;
+ * IPv4 gets its addresses and protocol; anything else gets its ethertype, which is enough
+ * to recognise it.  @cap is how many bytes were actually captured, and every field read
+ * below is bounded by it -- these bytes came off the air and are attacker-influenced.
+ */
+static void link_eth_show(struct cli_instance *sh, const struct link_eth_cap *f)
+{
+	uint16_t cap = (f->len < LINK_ETH_CAP_B) ? f->len : LINK_ETH_CAP_B;
+	const uint8_t *b = f->b;
+	uint16_t type;
+
+	if (cap < LINK_ETH_HDR_MIN) {
+		cli_print(sh, "  %4u B  <runt>\r\n", f->len);
+		return;
+	}
+	cli_print(sh, "  %4u B  ", f->len);
+	link_put_mac(sh, b);
+	cli_print(sh, " <- ");
+	link_put_mac(sh, b + 6);
+	type = (uint16_t)(((uint16_t)b[12] << 8) | b[13]);
+	cli_print(sh, "  %04x ", type);
+
+	if (type == 0x0806u && cap >= 28u + LINK_ETH_HDR_MIN) {
+		const uint8_t *a = b + LINK_ETH_HDR_MIN;
+		uint16_t op = (uint16_t)(((uint16_t)a[6] << 8) | a[7]);
+
+		if (op == 1u) {
+			cli_print(sh, " ARP who-has ");
+			link_put_ip(sh, a + 24);
+			cli_print(sh, " tell ");
+			link_put_ip(sh, a + 14);
+		} else if (op == 2u) {
+			cli_print(sh, " ARP is-at ");
+			link_put_mac(sh, a + 8);
+			cli_print(sh, " for ");
+			link_put_ip(sh, a + 14);
+		} else {
+			cli_print(sh, " ARP op %u", op);
+		}
+	} else if (type == 0x0800u && cap >= 20u + LINK_ETH_HDR_MIN) {
+		const uint8_t *ip = b + LINK_ETH_HDR_MIN;
+
+		cli_print(sh, " IPv4 ");
+		link_put_ip(sh, ip + 12);
+		cli_print(sh, " > ");
+		link_put_ip(sh, ip + 16);
+		cli_print(sh, " proto %u", ip[9]);
+	}
+	cli_print(sh, "\r\n");
+}
+
+/* Build an ARP request for @tpa claiming to be @spa at @mac.  Returns its length. */
+static uint16_t link_eth_build_arp(uint8_t *f, const uint8_t mac[6],
+                                   const uint8_t spa[4], const uint8_t tpa[4])
+{
+	memset(f, 0xFF, 6);                      /* broadcast destination */
+	memcpy(f + 6, mac, 6);
+	f[12] = 0x08; f[13] = 0x06;              /* ethertype ARP */
+	f[14] = 0x00; f[15] = 0x01;              /* hardware type: Ethernet */
+	f[16] = 0x08; f[17] = 0x00;              /* protocol type: IPv4 */
+	f[18] = 6u;   f[19] = 4u;                /* address lengths */
+	f[20] = 0x00; f[21] = 0x01;              /* operation: request */
+	memcpy(f + 22, mac, 6);                  /* sender hardware address */
+	memcpy(f + 28, spa, 4);                  /* sender protocol address */
+	memset(f + 32, 0, 6);                    /* target hardware address: unknown */
+	memcpy(f + 38, tpa, 4);                  /* target protocol address */
+	return LINK_ETH_ARP_LEN;
+}
+
+/* LINK_ETH_INFO: the MAC to send from, whether the tap is in and the radio is up, and the
+ * module's bridge counters.  Returns 0 and fills the outputs, or -1 (message printed). */
+static int link_get_ethinfo(struct cli_instance *sh, uint8_t mac[6], uint8_t *flags,
+                            uint32_t st[LINK_ETH_STAT_WORDS])
+{
+	struct erpc_diag diag = {0};
+	int n = erpc_ctrl_call(ERPC_CTRL_ETH_INFO, NULL, 0u, link_reply,
+	                       (uint16_t)sizeof(link_reply), LINK_CTRL_TMO_MS, &diag);
+	unsigned i;
+
+	if (n < (int)(8u + LINK_ETH_STAT_WORDS * 4u)) {
+		cli_error(sh, "link: LINK_ETH_INFO failed (rc %d)\r\n", n);
+		return -1;
+	}
+	memcpy(mac, link_reply, 6);
+	*flags = link_reply[6];
+	for (i = 0u; i < LINK_ETH_STAT_WORDS; i++)
+		st[i] = get_u32le(link_reply + 8u + i * 4u);
+	return 0;
+}
+
+static void link_print_ethstats(struct cli_instance *sh,
+                                const uint32_t st[LINK_ETH_STAT_WORDS])
+{
+	/* no-buf is the module's DATA transmit pool being full when a frame arrived from
+	 * the air: an Ethernet-legal drop under a LAN burst, and NOT the same event as a
+	 * DATA channel loss, which would mean the link itself failed. */
+	cli_print(sh, "  mod eth rx: %lu frames, %lu B, no-buf %lu, oversize %lu\r\n",
+	          (unsigned long)st[0], (unsigned long)st[1],
+	          (unsigned long)st[2], (unsigned long)st[3]);
+	cli_print(sh, "  mod eth tx: %lu frames, %lu B, fail %lu, radio-down %lu\r\n",
+	          (unsigned long)st[4], (unsigned long)st[5],
+	          (unsigned long)st[6], (unsigned long)st[7]);
+}
+
+/*
+ * Everything both subcommands share.  @tpa non-NULL turns it into `link arp`.
+ *
+ * PROLOGUE ORDER MATTERS: the address is read BEFORE DHCP is stopped (stopping it can take
+ * the lease away, and that address is the only plausible sender address an ARP request
+ * has), and DHCP is stopped before the bridge is asked for (the module zeroes its netif
+ * address while bridged, and its own adapter requires the client stopped before IP
+ * information changes).
+ */
+static int link_eth_session(struct cli_instance *sh, uint32_t secs, uint32_t max_print,
+                            const uint8_t *tpa, const uint8_t *spa_override)
+{
+	uint32_t st[LINK_ETH_STAT_WORDS], dst[LINK_DSTAT_WORDS];
+	struct wifi_rpc_opts o;
+	struct erpc_diag diag = {0};
+	struct wifi_ip_info ipinfo;
+	uint8_t mac[6] = {0}, spa[4] = {0}, flags = 0u;
+	uint32_t t_start, printed = 0u, sent = 0u, next_arp = 0u;
+	int32_t result = -1;
+	int rc = 0;
+
+	if (rtl_link_begin(sh, false) != RTL_LINK_READY)
+		return 1;
+	/* NOT link_ctrl_ready_ex(sh, 1): unlike `link dbench`, a bridge session makes the
+	 * module's own lwIP deaf, so an armed telnet console would sit on an accept that can
+	 * no longer complete.  The quiescent-link gate refuses with exactly that advice. */
+	if (link_ctrl_ready(sh) != 0) {
+		rtl_link_end(sh);
+		return 1;
+	}
+	if (erpc_module_gen() < 7u) {
+		cli_error(sh, "link: the L2 bridge needs firmware 2.1.3+wio-n7 or later\r\n");
+		rtl_link_end(sh);
+		return 1;
+	}
+
+	/* 1) the address, while the module still has one. */
+	o.timeout_ms = 5000u;
+	o.should_abort = rtl_abort_cb;
+	o.abort_ctx = sh;
+	o.diag = &diag;
+	if (wifi_rpc_get_ip(&o, 0u, &ipinfo, &result) == 0 && result == WIFI_RPC_OK)
+		memcpy(spa, ipinfo.ip, 4);
+	if (spa_override != NULL)
+		memcpy(spa, spa_override, 4);
+
+	/*
+	 * 2) stop DHCP.  This is a PRECONDITION, not a courtesy: the module zeroes its netif
+	 * address for the duration (its WiFi driver filters received IP against it), and its
+	 * own adapter requires the client stopped before IP information changes.  So a
+	 * TRANSPORT failure -- where we do not know whether the client is running -- refuses
+	 * the whole session.  A non-zero module RESULT is different and is not fatal: the
+	 * module executed the stop, and "it was not running" is the state we wanted anyway.
+	 */
+	o.timeout_ms = 5000u;
+	result = -1;
+	rc = wifi_rpc_dhcpc_stop(&o, 0u, &result);
+	if (rc != 0) {
+		cli_error(sh, "link: could not stop the module's DHCP client (rc %d) -- "
+		          "refusing to bridge\r\n", rc);
+		rtl_link_end(sh);
+		return 1;
+	}
+
+	/* 3) attach BEFORE the bridge is enabled, so no frame can arrive with no consumer. */
+	link_eth_head = link_eth_tail = 0u;
+	link_eth_frames = link_eth_bytes = link_eth_missed = 0u;
+	if (link_data_attach(link_eth_rx, NULL) != 0) {
+		cli_error(sh, "link: the DATA channel already has a consumer\r\n");
+		rtl_link_end(sh);
+		return 1;
+	}
+
+	/* The module takes the bridge down on its own this long after the request, so a host
+	 * that dies here cannot leave it forwarding into a link nobody reads. */
+	if (link_data_cfg(sh, ERPC_DATA_MODE_BRIDGE, 0u, (secs + 2u) * 1000u, 0u) != 0) {
+		rtl_link_end(sh);                /* closes the UART: nothing can arrive now */
+		link_data_detach();
+		return 1;
+	}
+
+	if (link_get_ethinfo(sh, mac, &flags, st) == 0) {
+		cli_print(sh, "link: bridge up, mac ");
+		link_put_mac(sh, mac);
+		cli_print(sh, ", radio %s\r\n",
+		          (flags & ERPC_ETH_F_RUNNING) ? "up" : "DOWN -- `wifi connect` first");
+	}
+	if (tpa != NULL) {
+		cli_print(sh, "link: arp who-has ");
+		link_put_ip(sh, tpa);
+		cli_print(sh, " tell ");
+		link_put_ip(sh, spa);
+		cli_print(sh, " every second for %lu s\r\n", (unsigned long)secs);
+	} else {
+		cli_print(sh, "link: watching for %lu s (printing at most %lu frames)\r\n",
+		          (unsigned long)secs, (unsigned long)max_print);
+	}
+
+	t_start = HAL_GetTick();
+	for (;;) {
+		uint32_t elapsed = (uint32_t)(HAL_GetTick() - t_start);
+		uint8_t tail;
+
+		if (elapsed >= secs * 1000u || cli_cancel_requested(sh))
+			break;
+		if (tpa != NULL && elapsed >= next_arp) {
+			uint16_t n = link_eth_build_arp(link_eth_tx, mac, spa, tpa);
+
+			if (link_data_send(LINK_DATA_CHAN_ETH, link_eth_tx, n) == 0)
+				sent++;
+			next_arp = elapsed + 1000u;
+		}
+
+		tail = link_eth_tail;
+		if (tail == link_eth_head) {
+			cli_sleep(sh, 10u);
+			continue;
+		}
+		__DMB();                 /* pairs with the producer's publish of @head */
+		/* Print as they arrive rather than summarising at the end: after a Ctrl+C the
+		 * core discards handler output (issue #16), so a summary held back would
+		 * simply vanish -- which is how `net echo` first measured nothing at all. */
+		if (printed < max_print) {
+			link_eth_show(sh, &link_eth_ring[tail]);
+			printed++;
+			if (printed == max_print)
+				cli_print(sh, "  ... (still counting, no longer printing)\r\n");
+		}
+		link_eth_tail = (uint8_t)((tail + 1u) % LINK_ETH_CAP_N);
+	}
+
+	cli_print(sh, "link: %lu frames, %lu B received", (unsigned long)link_eth_frames,
+	          (unsigned long)link_eth_bytes);
+	if (tpa != NULL)
+		cli_print(sh, ", %lu ARP requests sent", (unsigned long)sent);
+	if (link_eth_missed != 0u)
+		cli_print(sh, ", %lu not shown (console too slow)",
+		          (unsigned long)link_eth_missed);
+	cli_print(sh, "\r\n");
+
+	/* Stop the module and prove both ends are quiet before reading any counter, so what
+	 * is printed describes a finished run rather than a moving one. */
+	if (link_data_cfg(sh, ERPC_DATA_MODE_OFF, 0u, 0u, 0u) != 0)
+		rc = 1;
+	else if (link_data_settle(sh) != 0)
+		rc = 1;
+
+	if (link_get_ethinfo(sh, mac, &flags, st) == 0)
+		link_print_ethstats(sh, st);
+	if (link_get_dstats(sh, dst) == 0)
+		link_print_dstats(sh, dst);
+	link_print_dhost(sh);
+	link_print_host(sh);
+
+	/* Same order and the same reasoning as cmd_link_dbench: detaching restores the
+	 * pre-request receive flush, so it must not happen while a DATA frame could still
+	 * arrive.  The settle proves the module has stopped; rtl_link_end() drops our UART
+	 * reference, which with no console resident closes the port outright. */
+	rtl_link_end(sh);
+	link_data_detach();
+
+	cli_print(sh, "link: bridge down -- run `net dhcp` to take a lease again\r\n");
+	return rc;
+}
+
+static int cmd_link_eth(struct cli_instance *sh, int argc, char **argv)
+{
+	uint32_t secs = LINK_ETH_SECS_DEF, max_print = LINK_ETH_PRINT_DEF;
+
+	if (argc > 1 && (parse_u32(argv[1], &secs) != 0 || secs == 0u ||
+	                 secs > LINK_BENCH_MAX_S)) {
+		cli_error(sh, "link: bad duration (1..%u s)\r\n", (unsigned)LINK_BENCH_MAX_S);
+		return 1;
+	}
+	if (argc > 2 && parse_u32(argv[2], &max_print) != 0) {
+		cli_error(sh, "link: bad frame count\r\n");
+		return 1;
+	}
+	return link_eth_session(sh, secs, max_print, NULL, NULL);
+}
+
+static int cmd_link_arp(struct cli_instance *sh, int argc, char **argv)
+{
+	uint32_t secs = LINK_ETH_SECS_DEF;
+	uint8_t tpa[4], spa[4];
+	int have_spa = 0;
+
+	if (link_parse_ipv4(argv[1], tpa) != 0) {
+		cli_error(sh, "link: bad address '%s' (use a.b.c.d)\r\n", argv[1]);
+		return 1;
+	}
+	if (argc > 2 && (parse_u32(argv[2], &secs) != 0 || secs == 0u ||
+	                 secs > LINK_BENCH_MAX_S)) {
+		cli_error(sh, "link: bad duration (1..%u s)\r\n", (unsigned)LINK_BENCH_MAX_S);
+		return 1;
+	}
+	if (argc > 3) {
+		if (link_parse_ipv4(argv[3], spa) != 0) {
+			cli_error(sh, "link: bad sender address '%s'\r\n", argv[3]);
+			return 1;
+		}
+		have_spa = 1;
+	}
+	return link_eth_session(sh, secs, LINK_ETH_PRINT_DEF, tpa, have_spa ? spa : NULL);
 }
 
 /* ---- link sweep ---------------------------------------------------------- */
@@ -1055,8 +1514,13 @@ CLI_SUBCMD_SET_CREATE(link_subcmds,
 	            cmd_link_dbench, 1, 3),
 	CLI_CMD_ARG(sweep, NULL, "bench all three directions at the current rate",
 	            cmd_link_sweep, 1, 0),
+	CLI_CMD_ARG(eth,   NULL, "L2 bridge: show frames off the air [secs] [max]",
+	            cmd_link_eth,   1, 2),
+	CLI_CMD_ARG(arp,   NULL, "L2 bridge + ARP request <a.b.c.d> [secs] [sender-ip]",
+	            cmd_link_arp,   2, 2),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(link, link_subcmds,
-                 "the RTL8720 UART link itself (info / baud / bench / dbench / sweep)",
+                 "the RTL8720 UART link itself (info / baud / bench / dbench / sweep / "
+                 "eth / arp)",
                  NULL, 1, 0);
