@@ -179,7 +179,7 @@ void erpc_link_closed(void);
  *
  * ONE latch answers every "may we do X on this link?" question, because they all depend
  * on the same fact: WHICH FIRMWARE IS ON THE MODULE.  That is module state, not link
- * state.  Deliberately NOT reset by erpc_link_opened/_closed: `wifi rpc ver`, the call
+ * state.  Deliberately NOT reset by erpc_link_opened/_closed: `wifi ver`, the call
  * that proves the firmware, drops the UART reference before it returns, so anything tied
  * to the UART "open" would revert the moment it was earned and could never take effect
  * (this is exactly the defect the issue #23 U0-2 plan had).  app/rtl_link.c clears it
@@ -191,8 +191,8 @@ void erpc_link_closed(void);
  *   >= 4  the wire budget is lifted to ERPC_WIRE_BUDGET_FAST (n4 owns USI0 behind an
  *         8 kB ring, so the 127-byte input ring that shaped every request size is gone)
  *   >= 5  the LINK-CTRL channel below exists at all
- *   >= 6  the DATA channel exists (`link dbench`)
- *   >= 7  the L2 bridge exists (`link eth` / `link arp`)
+ *   >= 6  the DATA channel exists (`wifi link dbench`)
+ *   >= 7  the L2 bridge exists (`wifi link arp`, `net up`)
  * The wire budget is DERIVED here rather than latched separately, so the two can never
  * disagree about the same module.
  */
@@ -228,12 +228,12 @@ uint16_t erpc_wire_budget(void);
 
 enum {
 	ERPC_CTRL_PING       = 1,        /* no payload; proves the link at this baud */
-	ERPC_CTRL_STATS      = 2,        /* -> u32 LE x 12, see cmd_link.c */
+	ERPC_CTRL_STATS      = 2,        /* -> u32 LE x 12, see cmd_wifi_link.c */
 	ERPC_CTRL_SETBAUD    = 3,        /* u32 baud + u32 magic; ACK on the OLD baud */
 	ERPC_CTRL_BENCH      = 4,        /* u32 reply_bytes, u8 seed, u8 rsvd[3], data[] */
 	/* DATA channel control (issue #23 U1), firmware wio-n6 and later. */
 	ERPC_CTRL_DATA_CFG   = 5,        /* u8 mode, u8 seed, u16 bytes, u32 ms, u32 magic */
-	ERPC_CTRL_DATA_STATS = 6,        /* -> u32 LE x 12, see cmd_link.c */
+	ERPC_CTRL_DATA_STATS = 6,        /* -> u32 LE x 12, see cmd_wifi_link.c */
 	/* L2 bridge (issue #23 U2), firmware wio-n7 and later. */
 	ERPC_CTRL_ETH_INFO   = 7         /* -> u8 mac[6], u8 flags, u8 rsvd, u32 LE x 8 */
 };
@@ -286,7 +286,7 @@ enum {
  *
  * -3 collapses every module-side refusal into one number, which is not enough once a
  * command can refuse for more than one reason: erpc_ctrl_last_status() returns the byte
- * itself so the caller can say WHY (issue #23 U2 -- `link eth` before `wifi connect` is a
+ * itself so the caller can say WHY (issue #23 U2 -- `wifi link arp` before `wifi connect` is a
  * different problem from a malformed request, and the first is what a new user hits).
  * Valid immediately after a -3 and nowhere else; it is well defined for the same reason
  * the single reply slot is: one CTRL exchange at a time, held by one owner.
@@ -328,8 +328,8 @@ int erpc_data_quiescent(void);
 /*
  * True when nothing at all is outstanding on the link: no eRPC token, no CTRL exchange,
  * no queued or half-received DATA frame, and no request bytes the module has not
- * answered.  `link baud` requires it -- changing the baud rate under an in-flight frame
- * would corrupt it at both ends -- and `link info` uses it to decide whether it may ask
+ * answered.  `wifi link baud` requires it -- changing the baud rate under an in-flight frame
+ * would corrupt it at both ends -- and `wifi link info` uses it to decide whether it may ask
  * the module anything.
  */
 int erpc_link_quiescent(void);

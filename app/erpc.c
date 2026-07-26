@@ -366,7 +366,7 @@ static uint32_t get_u32le(const uint8_t *p)
  * over every length 0..64 and 1500 with pseudo-random data (off-target check, U1).
  *
  * 512 B of BSS.  The lazy init costs 256 * 8 iterations once and is idempotent, so it
- * does not need erpc_service_init() to have run (cmd_link.c computes CRCs too).
+ * does not need erpc_service_init() to have run (cmd_wifi_link.c computes CRCs too).
  */
 static uint16_t erpc_crc_tab[256];
 static uint8_t  erpc_crc_tab_ready;
@@ -1111,7 +1111,7 @@ int erpc_link_quiescent(void)
 	erpc_lock_get();
 	quiet = (erpc_ctrl.state == ERPC_ST_FREE) && (erpc_bytes_on_wire() == 0u);
 	/* The DATA channel counts too (issue #23 U1): a queued frame is about to be
-	 * written, and a reader mid-frame means bytes are still coming.  `link baud`
+	 * written, and a reader mid-frame means bytes are still coming.  `wifi link baud`
 	 * relies on this -- changing the line rate under either would corrupt it. */
 	if (quiet && (link_data_tx_pending() || link_data_rx_ready() || rx_active))
 		quiet = 0;

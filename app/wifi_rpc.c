@@ -17,11 +17,11 @@
  * The eRPC service thread stages a request in a per-slot buffer (issue #21 increment 8),
  * so the largest request built here has to fit ERPC_REQ_MAX.
  *
- * That used to be wifi_rpc_lwip_send(); issue #23 U4 moved TCP onto the host's own stack
- * and deleted it, leaving wifi_rpc_lwip_recvfrom()'s reply as what WIFI_RPC_STREAM_MAX
- * still sizes.  The bound is kept as-is anyway: it is the ceiling on that constant, and
- * relaxing it to whatever the current largest REQUEST happens to be would mean revisiting
- * it every time a caller comes or goes. */
+ * The requests that used this ceiling (wifi_rpc_lwip_send in issue #23 U4, then the
+ * recvfrom reply) are gone with the service-16 wrappers, but the bound is kept: it is
+ * the ceiling on WIFI_RPC_STREAM_MAX itself (which wifi_rpc_send_chunk() still hands
+ * out), and relaxing it to whatever the current largest request happens to be would
+ * mean revisiting it every time a caller comes or goes. */
 _Static_assert(12u + WIFI_RPC_STREAM_MAX <= ERPC_REQ_MAX,
                "WIFI_RPC_STREAM_MAX exceeds the eRPC request staging buffer");
 
@@ -60,12 +60,11 @@ uint16_t wifi_rpc_send_chunk(void)
 /*
  * rpc_wifi_lwip (service 16) method IDs.  Values from the firmware's rpc_wifi_api.h.
  *
- * Only the datagram side is still called: `net ping`'s raw ICMP socket and `net conc`.
- * Issue #23 U4 moved everything that wanted a TCP connection onto the host's own stack,
- * so the wrappers for accept/bind/listen/recv/send/shutdown/getpeername were deleted --
- * dead code that claimed to be a supported path.  The IDs stay because they are the
- * record of the module's wire contract, not a cost, and #5's BSD-socket/TLS work would
- * start from them again.  The deleted wrappers are in this file's history at 41d1ff0~1.
+ * NOTHING calls this service any more: issue #23 U4 moved TCP onto the host's own stack
+ * (deleting accept/bind/listen/recv/send/shutdown/getpeername, history 41d1ff0~1) and
+ * issue #28 retired the datagram side with `net conc` and the module raw-ICMP ping.
+ * The IDs stay because they are the record of the module's wire contract, not a cost;
+ * a future module-side socket need would start from them again.
  */
 #define SVC_WIFI_LWIP       16u
 #define M_LWIP_ACCEPT        1u
@@ -81,10 +80,6 @@ uint16_t wifi_rpc_send_chunk(void)
 #define M_LWIP_SENDTO       17u
 #define M_LWIP_SOCKET       18u
 #define M_LWIP_ERRNO        24u
-
-/* A lwIP sockaddr_in on the wire is 16 bytes (sin_len, sin_family, sin_port,
- * sin_addr, sin_zero[8]) -- the only address size these wrappers deal in. */
-#define SOCKADDR_LEN        16u
 
 /* tcpip_adapter_ip_info_t on the wire: ip(4) + netmask(4) + gw(4). */
 #define IP_INFO_LEN         12u
@@ -448,180 +443,3 @@ int wifi_rpc_scan_record(const uint8_t *buf, uint16_t got, uint16_t idx,
 	rec->band     = get_u32le(r + 58);
 	return 0;
 }
-
-const char *wifi_rpc_errno_name(int32_t e)
-{
-	switch (e) {
-	case WIFI_LWIP_EAGAIN:        return "EAGAIN/EWOULDBLOCK";
-	case WIFI_LWIP_EPIPE:         return "EPIPE";
-	case WIFI_LWIP_ENOPROTOOPT:   return "ENOPROTOOPT";
-	case WIFI_LWIP_ECONNABORTED:  return "ECONNABORTED";
-	case WIFI_LWIP_ECONNRESET:    return "ECONNRESET";
-	case WIFI_LWIP_ENOTCONN:      return "ENOTCONN";
-	case WIFI_LWIP_ETIMEDOUT:     return "ETIMEDOUT";
-	default:                      return "?";
-	}
-}
-
-int wifi_rpc_lwip_socket(const struct wifi_rpc_opts *o, int32_t domain, int32_t type,
-                         int32_t protocol, int32_t *fd)
-{
-	uint8_t req[12], rep[16];
-	int plen, rc;
-
-	put_u32le(req + 0, (uint32_t)domain);
-	put_u32le(req + 4, (uint32_t)type);
-	put_u32le(req + 8, (uint32_t)protocol);
-	rc = do_call(o, SVC_WIFI_LWIP, M_LWIP_SOCKET, req, 12u, rep, sizeof(rep), &plen);
-	if (rc)
-		return rc;
-	if (plen < 4)
-		return WIFI_RPC_EDECODE;
-	*fd = (int32_t)get_u32le(rep);       /* raw socket fd (>=0) or lwIP error (<0) */
-	return 0;
-}
-
-int wifi_rpc_lwip_setsockopt(const struct wifi_rpc_opts *o, int32_t s, int32_t level,
-                             int32_t optname, const uint8_t *optval, uint16_t optlen,
-                             int32_t *ret)
-{
-	/* 4(s)+4(level)+4(optname) + 4+16(optval) + 4(optlen). */
-	uint8_t req[40], rep[16];
-	uint8_t *p = req;
-	int plen, rc;
-
-	if (optlen > 16u)
-		return WIFI_RPC_EDECODE;
-	put_u32le(p, (uint32_t)s);       p += 4;
-	put_u32le(p, (uint32_t)level);   p += 4;
-	put_u32le(p, (uint32_t)optname); p += 4;
-	p = put_binary(p, optval, optlen);
-	put_u32le(p, optlen);            p += 4;
-
-	rc = do_call(o, SVC_WIFI_LWIP, M_LWIP_SETSOCKOPT, req,
-	             (uint16_t)(p - req), rep, sizeof(rep), &plen);
-	if (rc)
-		return rc;
-	if (plen < 4)
-		return WIFI_RPC_EDECODE;
-	*ret = (int32_t)get_u32le(rep);
-	return 0;
-}
-
-int wifi_rpc_lwip_sendto(const struct wifi_rpc_opts *o, int32_t s,
-                         const uint8_t *data, uint16_t dlen, int32_t flags,
-                         const uint8_t *sa, uint16_t salen, int32_t *ret)
-{
-	/* worst case: 4(s) + 4+64(data) + 4(flags) + 4+32(sa) + 4(tolen). */
-	uint8_t req[128], rep[16];
-	uint8_t *p = req;
-	int plen, rc;
-
-	if (dlen > 64u || salen > 32u)
-		return WIFI_RPC_EDECODE;         /* caller passed an out-of-range arg */
-
-	put_u32le(p, (uint32_t)s);     p += 4;
-	p = put_binary(p, data, dlen);
-	put_u32le(p, (uint32_t)flags); p += 4;
-	p = put_binary(p, sa, salen);
-	put_u32le(p, salen);           p += 4;   /* tolen (== the sockaddr length) */
-
-	rc = do_call(o, SVC_WIFI_LWIP, M_LWIP_SENDTO, req,
-	             (uint16_t)(p - req), rep, sizeof(rep), &plen);
-	if (rc)
-		return rc;
-	if (plen < 4)
-		return WIFI_RPC_EDECODE;
-	*ret = (int32_t)get_u32le(rep);      /* bytes sent (>=0) or lwIP error (<0) */
-	return 0;
-}
-
-int wifi_rpc_lwip_recvfrom(const struct wifi_rpc_opts *o, int32_t s,
-                           uint8_t *buf, uint16_t buf_cap, int32_t flags,
-                           uint32_t timeout_ms, uint16_t *got, int32_t *ret)
-{
-	uint8_t req[20], rep[160];
-	uint32_t mlen, flen, off;
-	int plen, rc;
-
-	put_u32le(req + 0,  (uint32_t)s);
-	put_u32le(req + 4,  (uint32_t)buf_cap);   /* len: max bytes to receive */
-	put_u32le(req + 8,  (uint32_t)flags);
-	put_u32le(req + 12, 16u);                 /* fromlen: our from-buffer size */
-	put_u32le(req + 16, timeout_ms);
-	rc = do_call(o, SVC_WIFI_LWIP, M_LWIP_RECVFROM, req, 20u, rep, sizeof(rep), &plen);
-	if (rc)
-		return rc;
-
-	/* reply = mem(binary) + from(binary) + fromlen(u32) + ret(i32).  Reject a reply
-	 * larger than our scratch up-front so every subsequent offset (validated against
-	 * plen) also stays within rep[] -- erpc truncates to out_cap but returns the full
-	 * length, so a plen > sizeof(rep) would otherwise read uninitialised bytes. */
-	if (plen > (int)sizeof(rep) || plen < 4)
-		return WIFI_RPC_EDECODE;
-	mlen = get_u32le(rep);
-	if (mlen > buf_cap)                        /* would truncate -> fail, don't guess */
-		return WIFI_RPC_EDECODE;
-	off = 4u + mlen;
-	if ((uint32_t)plen < off + 4u)            /* need the from-length word */
-		return WIFI_RPC_EDECODE;
-	flen = get_u32le(rep + off);
-	if (flen > (uint32_t)sizeof(rep))         /* bound before the add so it cannot wrap */
-		return WIFI_RPC_EDECODE;
-	off += 4u + flen;
-	if ((uint32_t)plen < off + 8u)            /* need fromlen(u32) + ret(i32) */
-		return WIFI_RPC_EDECODE;
-
-	memcpy(buf, rep + 4, mlen);
-	*got = (uint16_t)mlen;
-	*ret = (int32_t)get_u32le(rep + off + 4u);   /* bytes received (>=0) or error (<0) */
-	return 0;
-}
-
-int wifi_rpc_lwip_recvfrom_begin(int32_t s, uint32_t len, int32_t flags,
-                                 uint32_t timeout_ms, uint8_t *out, uint16_t out_cap)
-{
-	uint8_t req[20];
-
-	if (len > 1024u)                          /* keep the module's reply within a frame */
-		return -1;
-	put_u32le(req + 0,  (uint32_t)s);
-	put_u32le(req + 4,  len);                  /* len: max bytes to receive */
-	put_u32le(req + 8,  (uint32_t)flags);
-	put_u32le(req + 12, 16u);                  /* fromlen: our from-buffer size */
-	put_u32le(req + 16, timeout_ms);
-	/* Fire and reserve a token; the caller drains the reply with erpc_wait()/cancel().
-	 * The reply (mem + from + fromlen + ret) is left undecoded on purpose. */
-	return erpc_begin(SVC_WIFI_LWIP, M_LWIP_RECVFROM, req, 20u, out, out_cap);
-}
-
-int wifi_rpc_lwip_close(const struct wifi_rpc_opts *o, int32_t s, int32_t *ret)
-{
-	uint8_t req[4], rep[16];
-	int plen, rc;
-
-	put_u32le(req, (uint32_t)s);
-	rc = do_call(o, SVC_WIFI_LWIP, M_LWIP_CLOSE, req, 4u, rep, sizeof(rep), &plen);
-	if (rc)
-		return rc;
-	if (plen < 4)
-		return WIFI_RPC_EDECODE;
-	*ret = (int32_t)get_u32le(rep);
-	return 0;
-}
-
-int wifi_rpc_lwip_errno(const struct wifi_rpc_opts *o, int32_t *err)
-{
-	uint8_t rep[16];
-	int plen, rc;
-
-	rc = do_call(o, SVC_WIFI_LWIP, M_LWIP_ERRNO, NULL, 0u, rep, sizeof(rep), &plen);
-	if (rc)
-		return rc;
-	if (plen < 4)
-		return WIFI_RPC_EDECODE;
-	*err = (int32_t)get_u32le(rep);
-	return 0;
-}
-
-/* ---- TCP stream sockets (issue #21) -------------------------------------- */

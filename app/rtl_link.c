@@ -207,8 +207,8 @@ void rtl_link_force_quiesce(void)
 	/* This is the recovery path (`wifi reset` and friends).  If the link went dirty
 	 * BECAUSE the host was wrong about the module -- its firmware, or the rate it is
 	 * listening at -- the recovery must undo those assumptions too, so everything
-	 * module-scoped goes back to what a freshly powered module actually is and `wifi rpc
-	 * ver` has to earn it again.  Costs one command; a stale belief costs a dead link. */
+	 * module-scoped goes back to what a freshly powered module actually is and
+	 * `wifi ver` has to earn it again.  Costs one command; a stale belief costs a dead link. */
 	rtl_link_forget_module();
 	erpc_link_closed();                  /* tokens abandoned; their waiters get -2 */
 	rtl8720_uart_close();
@@ -259,7 +259,7 @@ int rtl_link_begin(struct cli_instance *sh, bool power_on)
 		rtl8720_power(true);
 		/* CHIP_EN moved, but NOT through rtl_link_force_quiesce() -- so this path has
 		 * to forget the module itself.  It is the easiest of the four reset points to
-		 * overlook, and forgetting the baud here is what stops a `link baud 6000000`
+		 * overlook, and forgetting the baud here is what stops a `wifi link baud 6000000`
 		 * session from being followed by a 2 Mbaud open against a 2 Mbaud module. */
 		rtl_link_forget_module();
 		if (cli_sleep(sh, 1500u)) {            /* cancellable boot wait */

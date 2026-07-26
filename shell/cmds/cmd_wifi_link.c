@@ -3,26 +3,25 @@
  * Copyright (c) 2026 ThreadX Shell Project
  */
 /**
- * @file    cmd_link.c
- * @brief   `link` shell command (issue #23 U0-3): the RTL8720DN UART link itself.
+ * @file    cmd_wifi_link.c
+ * @brief   `wifi link` subcommands (issue #23): the RTL8720DN UART link itself.
  *
- *   link info                     both ends' counters + the current rate and its error
- *   link baud <bps>               change the rate of the link (2M / 3M / 4M / 6M)
- *   link bench [bytes] [secs] [dir]   measured traffic; dir = rx | tx | both
- *   link dbench [bytes] [secs] [dir]  the same, free-running on the DATA channel (U1)
- *   link sweep                    bench all three directions at the current rate
- *   link eth [secs] [max]         L2 bridge: decode what the module hears (U2)
- *   link arp <ip> [secs] [spa]    the same, plus an ARP request once a second (U2)
+ *   wifi link info                     both ends' counters + the current rate
+ *   wifi link baud <bps>               change the rate of the link (2M / 3M / 4M / 6M)
+ *   wifi link bench [bytes] [secs] [dir]   measured traffic; dir = rx | tx | both | all
+ *   wifi link dbench [bytes] [secs] [dir]  the same, free-running on the DATA channel (U1)
+ *   wifi link arp <ip> [secs] [spa]    L2 bridge + an ARP request once a second (U2)
  *
- * Where `wifi` is L2 and `net` is L3, this is L1/L2 of the wire between the STM32 and the
- * companion chip.  It exists because issue #23 needs a number before it can commit: can a
- * UART link carry 1500-byte Ethernet frames well enough to put a real TCP/IP stack on the
- * host (the "L2 bypass" road)?  Everything here feeds that go/no-go.
+ * Where `wifi` is L2 and `net` is L3, this is L1/L2 of the wire between the STM32 and
+ * the companion chip: the maintenance and diagnostics face of the link that issue #23
+ * built (the numbers here are what proved the "L2 bypass" road before `net up` shipped,
+ * and they remain the link's health monitors -- `ore`/drops must stay 0 -- and its
+ * regression witnesses: `dbench` for the DATA channel, `arp` for the bridge).
  *
  * It talks the LINK-CTRL channel (app/erpc.h), NOT eRPC -- a second frame type that the
  * link layer owns at both ends, so none of it required touching the generated eRPC server
  * shim on the module.  CTRL exists only in firmware 2.1.3+wio-n5 and later, and only the
- * `wifi rpc ver` command teaches the host which firmware is loaded, hence the
+ * `wifi ver` command teaches the host which firmware is loaded, hence the
  * erpc_module_gen() gate on every subcommand below.
  *
  * PRECONDITION, uniformly: CTRL is only issued on a QUIESCENT link (the U0 simplification
@@ -41,11 +40,12 @@
  * nothing more (XIP-safe).  Clean-room design.
  */
 #include "cli.h"
+#include "cmd_wifi_priv.h"
 #include "erpc.h"
 #include "link_data.h"
 #include "rtl_link.h"
 #include "rtl8720.h"
-#include "wifi_rpc.h"        /* `link eth` reads the address and stops DHCP first */
+#include "wifi_rpc.h"        /* `wifi link arp` reads the address and stops DHCP first */
 #include "nx_net.h"          /* the host stack owns the DATA channel while it is up */
 
 #include "stm32h7xx_hal.h"   /* HAL_GetTick, TIM2 */
@@ -214,9 +214,9 @@ static int link_ctrl_ready_ex(struct cli_instance *sh, int allow_busy)
 	/*
 	 * Every subcommand here is refused while the host stack owns the link, including
 	 * the read-only ones, and the reason is the same for all of them: they hold the
-	 * coarse mutex for as long as they run (`link sweep` is twelve benches back to
-	 * back), and the interface's watchdog refresh needs that mutex every eight seconds
-	 * or the module takes its own tap out.  `link dbench` and `link eth` additionally
+	 * coarse mutex for as long as they run (`wifi link bench ... all` is several
+	 * benches back to back), and the interface's watchdog refresh needs that mutex every eight seconds
+	 * or the module takes its own tap out.  `wifi link dbench` and `arp` additionally
 	 * want the DATA channel, which has exactly one consumer.  `net info` reports the
 	 * link and DATA counters while the stack is up.
 	 */
@@ -225,7 +225,7 @@ static int link_ctrl_ready_ex(struct cli_instance *sh, int allow_busy)
 	if (erpc_module_gen() < 5u) {
 		cli_error(sh, "link: this needs firmware 2.1.3+wio-n5 or later, and the host "
 		          "does not know which is loaded\r\n");
-		cli_print(sh, "  run `wifi rpc ver` first (it is what proves the firmware; the "
+		cli_print(sh, "  run `wifi ver` first (it is what proves the firmware; the "
 		          "answer is dropped again by any `wifi reset` or flash session)\r\n");
 		return 1;
 	}
@@ -383,8 +383,8 @@ static int cmd_link_baud(struct cli_instance *sh, int argc, char **argv)
 	uint32_t baud, old;
 	int rc;
 
-	if (argc < 2 || parse_u32(argv[1], &baud) != 0) {
-		cli_error(sh, "usage: link baud <2000000|3000000|4000000|6000000>\r\n");
+	if (parse_u32(argv[1], &baud) != 0) {
+		cli_error(sh, "usage: wifi link baud <2000000|3000000|4000000|6000000>\r\n");
 		return 1;
 	}
 	if (!rtl_link_rate_supported(baud)) {
@@ -577,6 +577,7 @@ static int cmd_link_bench(struct cli_instance *sh, int argc, char **argv)
 {
 	uint32_t bytes = LINK_BENCH_DEF, secs = LINK_BENCH_SECS, tx, rx;
 	const char *dir = "both";
+	int all;
 
 	if (argc > 1 && (parse_u32(argv[1], &bytes) != 0 || bytes == 0u ||
 	                 bytes > LINK_BENCH_MAX)) {
@@ -590,8 +591,9 @@ static int cmd_link_bench(struct cli_instance *sh, int argc, char **argv)
 	}
 	if (argc > 3)
 		dir = argv[3];
-	if (link_dir_sizes(dir, bytes, &tx, &rx) != 0) {
-		cli_error(sh, "link: direction must be rx, tx or both\r\n");
+	all = (strcmp(dir, "all") == 0);
+	if (!all && link_dir_sizes(dir, bytes, &tx, &rx) != 0) {
+		cli_error(sh, "link: direction must be rx, tx, both or all\r\n");
 		return 1;
 	}
 
@@ -600,6 +602,46 @@ static int cmd_link_bench(struct cli_instance *sh, int argc, char **argv)
 	if (link_ctrl_ready(sh) != 0) {
 		rtl_link_end(sh);
 		return 1;
+	}
+
+	if (all) {
+		/*
+		 * All three directions back to back at the CURRENT rate (this absorbed the
+		 * old `link sweep`).  It deliberately does NOT walk the baud rates: changing
+		 * the rate is the one operation whose failure needs a power cycle to undo,
+		 * and burying it inside a loop makes it much harder to say afterwards which
+		 * rate was being set when something stopped answering.  Run
+		 * `wifi link baud <b>` between runs.
+		 */
+		static const char *const dirs[] = { "rx", "tx", "both" };
+		uint32_t st0[LINK_STATS_WORDS], st1[LINK_STATS_WORDS];
+		int have_st0;
+		unsigned i;
+
+		cli_print(sh, "link: bench all at %lu baud, %lu B payload, %lu s per direction\r\n",
+		          (unsigned long)rtl_link_erpc_baud(), (unsigned long)bytes,
+		          (unsigned long)secs);
+		have_st0 = (link_get_stats(sh, st0) == 0);
+		for (i = 0u; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+			if (cli_cancel_requested(sh))
+				break;
+			(void)link_dir_sizes(dirs[i], bytes, &tx, &rx);
+			(void)link_bench_run(sh, bytes, secs, tx, rx, &link_run);
+			link_run_report(sh, dirs[i], bytes, &link_run);
+		}
+		link_print_host(sh);
+		if (have_st0 && link_get_stats(sh, st1) == 0) {
+			cli_print(sh, "  mod delta: irq %lu, bytes %lu, drops %lu, "
+			          "fifo-overrun %lu, framing %lu\r\n",
+			          (unsigned long)(st1[0] - st0[0]),
+			          (unsigned long)(st1[1] - st0[1]),
+			          (unsigned long)(st1[4] - st0[4]),
+			          (unsigned long)(st1[5] - st0[5]),
+			          (unsigned long)(st1[6] - st0[6]));
+			link_print_module(sh, st1);
+		}
+		rtl_link_end(sh);
+		return 0;
 	}
 
 	cli_print(sh, "link: bench %s %lu B for %lu s at %lu baud...\r\n", dir,
@@ -951,15 +993,15 @@ static int cmd_link_dbench(struct cli_instance *sh, int argc, char **argv)
 	return rc;
 }
 
-/* ---- link eth / link arp (issue #23 U2: the L2 bridge) -------------------- */
+/* ---- link arp (issue #23 U2: the L2 bridge) ------------------------------- */
 
 /*
- * `link dbench` proved the DATA channel can carry 1500-byte frames continuously.  This is
- * where it starts carrying REAL ones: the module stops handing received Ethernet frames to
- * its own lwIP and sends them here instead, and frames sent from here go out over the air.
- * The host has no IP stack yet (that is U3) -- these two subcommands only look at what
- * arrives and, for `link arp`, put one well-formed frame on the wire to make something
- * arrive on purpose.
+ * A one-shot L2 bridge session with an ARP request on it: the module stops handing
+ * received Ethernet frames to its own lwIP and sends them here instead, and the frames
+ * sent from here go out over the air -- the same tap `net up` installs, but transient
+ * and without the host IP stack.  This is the U2 bring-up test kept as the bridge's
+ * standalone regression witness: it proves the module firmware's L2 path with no NetX
+ * involved.
  *
  * WHY AN ARP REQUEST IS THE TEST.  A reply proves the whole path in both directions at
  * once: the host built a frame, the module transmitted it with its own MAC, a real machine
@@ -968,10 +1010,9 @@ static int cmd_link_dbench(struct cli_instance *sh, int argc, char **argv)
  * because passively watching broadcasts only ever exercises one direction.
  *
  * THE SESSION IS FOREGROUND AND SHORT-LIVED, deliberately.  While the tap is installed the
- * module's own lwIP receives nothing, so every eRPC socket -- `net ping`, `net echo`, the
- * telnet console -- is deaf for the duration.  A resident bridge is U3's problem, and it
- * needs the host stack that will consume the frames to exist first.  Everything here is
- * restored on the way out, which is what keeps the rest of the firmware a regression test.
+ * module's own lwIP receives nothing, so everything that runs on it is deaf for the
+ * duration.  Everything here is restored on the way out, which is what keeps the rest
+ * of the firmware a regression test.
  */
 #define LINK_ETH_CAP_N     32u   /* captured frames waiting for the CLI thread */
 #define LINK_ETH_CAP_B     64u   /* bytes kept of each: 14 Ethernet + 28 ARP + slack */
@@ -1175,7 +1216,8 @@ static void link_print_ethstats(struct cli_instance *sh,
 }
 
 /*
- * Everything both subcommands share.  @tpa non-NULL turns it into `link arp`.
+ * The bridge session.  @tpa non-NULL adds the once-a-second ARP request (`wifi link
+ * arp` always passes one; a NULL keeps the passive watch-only mode available).
  *
  * PROLOGUE ORDER MATTERS: the address is read BEFORE DHCP is stopped (stopping it can take
  * the lease away, and that address is the only plausible sender address an ARP request
@@ -1339,22 +1381,6 @@ static int link_eth_session(struct cli_instance *sh, uint32_t secs, uint32_t max
 	return rc;
 }
 
-static int cmd_link_eth(struct cli_instance *sh, int argc, char **argv)
-{
-	uint32_t secs = LINK_ETH_SECS_DEF, max_print = LINK_ETH_PRINT_DEF;
-
-	if (argc > 1 && (parse_u32(argv[1], &secs) != 0 || secs == 0u ||
-	                 secs > LINK_BENCH_MAX_S)) {
-		cli_error(sh, "link: bad duration (1..%u s)\r\n", (unsigned)LINK_BENCH_MAX_S);
-		return 1;
-	}
-	if (argc > 2 && parse_u32(argv[2], &max_print) != 0) {
-		cli_error(sh, "link: bad frame count\r\n");
-		return 1;
-	}
-	return link_eth_session(sh, secs, max_print, NULL, NULL);
-}
-
 static int cmd_link_arp(struct cli_instance *sh, int argc, char **argv)
 {
 	uint32_t secs = LINK_ETH_SECS_DEF;
@@ -1380,79 +1406,22 @@ static int cmd_link_arp(struct cli_instance *sh, int argc, char **argv)
 	return link_eth_session(sh, secs, LINK_ETH_PRINT_DEF, tpa, have_spa ? spa : NULL);
 }
 
-/* ---- link sweep ---------------------------------------------------------- */
-
-/*
- * All three directions at the CURRENT rate.  It deliberately does NOT walk the baud
- * rates: changing the rate is the one operation whose failure needs a power cycle to undo,
- * and burying it inside a loop makes it much harder to say afterwards which rate was
- * being set when something stopped answering.  Run `link baud <b>` between sweeps.
- */
-static int cmd_link_sweep(struct cli_instance *sh, int argc, char **argv)
-{
-	static const char *const dirs[] = { "rx", "tx", "both" };
-	uint32_t st0[LINK_STATS_WORDS], st1[LINK_STATS_WORDS];
-	int have_st0 = 0;
-	unsigned i;
-
-	(void)argc; (void)argv;
-
-	if (rtl_link_begin(sh, false) != RTL_LINK_READY)
-		return 1;
-	if (link_ctrl_ready(sh) != 0) {
-		rtl_link_end(sh);
-		return 1;
-	}
-
-	cli_print(sh, "link: sweep at %lu baud, %u B payload, %u s per direction\r\n",
-	          (unsigned long)rtl_link_erpc_baud(), (unsigned)LINK_BENCH_DEF,
-	          (unsigned)LINK_BENCH_SECS);
-	have_st0 = (link_get_stats(sh, st0) == 0);
-
-	for (i = 0u; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
-		uint32_t tx, rx;
-
-		if (cli_cancel_requested(sh))
-			break;
-		(void)link_dir_sizes(dirs[i], LINK_BENCH_DEF, &tx, &rx);
-		(void)link_bench_run(sh, LINK_BENCH_DEF, LINK_BENCH_SECS, tx, rx, &link_run);
-		link_run_report(sh, dirs[i], LINK_BENCH_DEF, &link_run);
-	}
-
-	link_print_host(sh);
-	if (have_st0 && link_get_stats(sh, st1) == 0) {
-		cli_print(sh, "  mod delta: irq %lu, bytes %lu, drops %lu, fifo-overrun %lu, "
-		          "framing %lu\r\n",
-		          (unsigned long)(st1[0] - st0[0]), (unsigned long)(st1[1] - st0[1]),
-		          (unsigned long)(st1[4] - st0[4]), (unsigned long)(st1[5] - st0[5]),
-		          (unsigned long)(st1[6] - st0[6]));
-		link_print_module(sh, st1);
-	}
-
-	rtl_link_end(sh);
-	return 0;
-}
-
 /* ---- registration -------------------------------------------------------- */
 
-CLI_SUBCMD_SET_CREATE(link_subcmds,
+/*
+ * Registered UNDER `wifi` (cmd_wifi.c holds the root table; cmd_wifi_priv.h is the
+ * seam), so this cannot be CLI_SUBCMD_SET_CREATE -- that macro makes the array static.
+ */
+const struct cli_cmd wifi_link_subcmds[] = {
 	CLI_CMD_ARG(info,  NULL, "both ends' UART counters + the current rate",
 	            cmd_link_info,  1, 0),
 	CLI_CMD_ARG(baud,  NULL, "change the link rate <2000000|3000000|4000000|6000000>",
 	            cmd_link_baud,  2, 0),
-	CLI_CMD_ARG(bench, NULL, "measured traffic [bytes] [secs] [rx|tx|both]",
+	CLI_CMD_ARG(bench, NULL, "measured traffic [bytes] [secs] [rx|tx|both|all]",
 	            cmd_link_bench, 1, 3),
 	CLI_CMD_ARG(dbench, NULL, "free-running DATA channel [bytes] [secs] [rx|tx|both]",
 	            cmd_link_dbench, 1, 3),
-	CLI_CMD_ARG(sweep, NULL, "bench all three directions at the current rate",
-	            cmd_link_sweep, 1, 0),
-	CLI_CMD_ARG(eth,   NULL, "L2 bridge: show frames off the air [secs] [max]",
-	            cmd_link_eth,   1, 2),
 	CLI_CMD_ARG(arp,   NULL, "L2 bridge + ARP request <a.b.c.d> [secs] [sender-ip]",
 	            cmd_link_arp,   2, 2),
-	CLI_SUBCMD_SET_END);
-
-CLI_CMD_REGISTER(link, link_subcmds,
-                 "the RTL8720 UART link itself (info / baud / bench / dbench / sweep / "
-                 "eth / arp)",
-                 NULL, 1, 0);
+	CLI_SUBCMD_SET_END
+};

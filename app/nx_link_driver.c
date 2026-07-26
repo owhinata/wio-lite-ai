@@ -303,7 +303,7 @@ VOID nx_link_driver(NX_IP_DRIVER *req)
 		break;
 	case NX_LINK_GET_SPEED:
 		/*
-		 * The link's actual bit rate (6,000,000 at the rate `link baud` currently
+		 * The link's actual bit rate (6,000,000 at the rate `wifi link baud` currently
 		 * uses), not a made-up Ethernet 10/100.  NetX does not act on this; it is a
 		 * status query, so the honest number is the useful one.
 		 */

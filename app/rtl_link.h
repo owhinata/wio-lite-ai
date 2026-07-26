@@ -92,7 +92,7 @@ bool rtl_link_uart_busy(void);
 /*
  * How many references are outstanding.  rtl_link_uart_busy() cannot answer "is anybody
  * ELSE holding it?", because a command that took its own reference (rtl_link_begin) always
- * sees true -- so `link baud`, which must exclude the RESIDENT holder (the telnet console
+ * sees true -- so `wifi link baud`, which must exclude the RESIDENT holder (the telnet console
  * service) and only itself, tests for exactly 1 while holding the coarse mutex.  That is
  * race-free because every reference is taken and dropped under that same mutex.
  */
@@ -101,7 +101,7 @@ unsigned rtl_link_uart_refs(void);
 /*
  * ---- the link's baud rate is MODULE state (issue #23 U0-3) ---------------------
  *
- * The eRPC link ran at a hard-coded 2 Mbaud everywhere until `link baud` made it
+ * The eRPC link ran at a hard-coded 2 Mbaud everywhere until `wifi link baud` made it
  * changeable.  The rate then has to be remembered somewhere that outlives a single UART
  * open -- otherwise the next rtl_link_begin() re-opens USART1 at 2 Mbaud while the module
  * is still at 6, and the link is dead until a power cycle.  It belongs with the module
@@ -133,7 +133,7 @@ void rtl_link_forget_module(void);
  *
  * That is only safe with no RESIDENT reference holder: app/net_shell.c detects that its
  * reference was revoked by comparing rtl_link_uart_gen(), and holding the generation
- * still here would hide a close/open from it.  `link baud` enforces
+ * still here would hide a close/open from it.  `wifi link baud` enforces
  * rtl_link_uart_refs() == 1 for exactly this reason -- it is a precondition of the
  * design, not a convenience.  Caller must hold the coarse mutex.  Returns 0, or -1 with
  * the link left CLOSED (the caller must then recover, e.g. by re-opening at the old rate).

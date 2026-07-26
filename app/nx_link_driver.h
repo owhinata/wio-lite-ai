@@ -53,7 +53,7 @@ VOID nx_link_driver_set_pool(NX_PACKET_POOL *pool);
 int nx_link_driver_set_mac(const uint8_t mac[6]);
 
 /* The link's real bit rate, reported verbatim by NX_LINK_GET_SPEED.  It is a property of
- * the UART, which `link baud` can change, so it is told to the driver rather than baked
+ * the UART, which `wifi link baud` can change, so it is told to the driver rather than baked
  * in as an Ethernet-shaped 10 or 100. */
 void nx_link_driver_set_speed(uint32_t bits_per_sec);
 

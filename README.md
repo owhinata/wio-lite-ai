@@ -27,7 +27,7 @@ time as the USB console. 22 commands:
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
-| wireless | `wifi` (L2: info/on/off/reset/log/probe/rpc · connect/status/disconnect/scan · flash*/img*) · `net` (L3: **up/down** · info/ip/dhcp/ping/conc · **echo/shell** = host stack only) · `link` (info/baud/bench/dbench/sweep/eth/arp) |
+| wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench/arp · flash*/img*) · `net` (L3: **up/down** · info/ip/dhcp · **ping/echo/shell** = host stack only) |
 | benchmarks | `coremark` · `membench` |
 
 - **`thread`** — lists the ThreadX threads with state / stack use and a **`top`-style
@@ -54,30 +54,31 @@ time as the USB console. 22 commands:
   subcommands (`clk`/`set`/`mr0`/`phase`/`wtune`/`mmapscan`) re-derive an operating
   point at a different clock without a reflash. `mmapscan` maps the true
   memory-mapped read eye across IWDG-recovered auto-reboots (issue #16).
-- **`wifi`** — an investigation probe for the on-board **RTL8720DN** Wi-Fi/BLE
-  companion (issue #17). The host reaches it over `CHIP_EN` (PC3), a **LOG UART**
-  (UART9 PD14/PD15) and an **AT/HS UART** (USART1 PA10/PB14); the module is held
-  powered-off (PC3 low) at boot. `wifi probe` powers it up and streams its boot log
-  to the console from `t=0` to identify the factory firmware (eRPC / AT / raw
-  Realtek); `wifi on`/`off`/`reset`/`log` control power and open a live bridge.
+- **`wifi`** — the on-board **RTL8720DN** Wi-Fi/BLE companion (issues #17/#5/#23).
+  The host reaches it over `CHIP_EN` (PC3), a **LOG UART** (UART9 PD14/PD15) and an
+  **AT/HS UART** (USART1 PA10/PB14); the module is held powered-off (PC3 low) at boot.
+  `wifi on`/`off`/`reset` control power; `wifi log` opens a live console bridge onto the
+  LOG UART, and `wifi log reset` power-cycles the module *after* the bridge is
+  listening, so the boot banner is captured from `t=0` (a separate `wifi reset; wifi
+  log` cannot do that — the banner is gone before the second command starts).
   Register-only (GPIO + UART9/USART1 clock gates); the baud is derived from the
   inherited PCLK2 = 137.5 MHz — it never touches the RCC clock tree.
   RX is **FIFO-threshold driven** (issue #23): `CR3.RXFTIE` with `RXFTCFG` at half of the
   16-deep RXFIFO plus `CR1.IDLEIE` for the tail of a burst, rather than an interrupt per
   byte — at 6 Mbaud the latter would be ~600 k IRQ/s. The threshold is a latency budget:
   RM0468 puts the overrun at the 18th datum, so `18 - threshold` byte times is all the
-  slack the ISR has, and `wifi rpc` / `wifi scan` print how much of it was used
+  slack the ISR has, and `wifi ver` / `wifi scan` print how much of it was used
   (`max N/G B per irq`) together with the three distinct losses — `ore` (the hardware
   FIFO overran), `ring-drops` (the consumer fell behind) and `framing` (a marginal baud).
   The ISR runs at NVIC priority 5, above OTG_HS, so a dwc2 interrupt cannot eat that slack.
-  `wifi rpc [ver] [baud]` (default 2 Mbaud) is the **eRPC link test** (issue #5): the
-  factory firmware is Seeed's eRPC image (UART @2 Mbaud on its `Serial3` = USART1),
-  and this round-trips a byte through `rpc_system_ack` — a valid CRC-framed echo
-  proves the eRPC transport end to end. `wifi rpc ver` additionally reads the module's
-  firmware build id (`rpc_system_version`) and prints `fw version: …` (`2.1.3+wio-n3`
-  for the issue-#20 N3 firmware currently on the board). `ver` is opt-in because the pre-N2 shim cannot answer
-  `version` safely — it corrupts the module heap (recoverable with `wifi reset`), so
-  only send it once N2 is flashed (see `fw/rtl8720/`); plain `wifi rpc` never does. The
+  `wifi ver` is the **eRPC link test and firmware proof** (issues #5/#20/#23): it
+  round-trips a byte through `rpc_system_ack` at the link's current rate — a valid
+  CRC-framed echo proves the eRPC transport end to end — and then reads the module's
+  firmware build id (`rpc_system_version`), printing `fw version: …`
+  (`2.1.3+wio-n7` for the firmware currently on the board). That build id is where every
+  firmware-gated capability is earned, so **`net up` requires a `wifi ver` first**.
+  CAUTION: against pre-N2 / stock firmware the version query corrupts the module heap
+  (RAM only — recoverable with `wifi reset`; see `fw/rtl8720/`). The
   eRPC path is a hand-written clean-room C client (`app/erpc.c`, FramedTransport +
   BasicCodec + CRC16/0xEF4A) with typed WiFi/tcpip wrappers (`app/wifi_rpc.c`) — no C++
   eRPC runtime.
@@ -132,8 +133,9 @@ time as the USB console. 22 commands:
   any soldering. Entry is a strap: the ROM samples `PA[7]` (= the module's `UART_LOG_TXD`,
   wired to our **PD14**) at reset, so PD14 is held low across the `CHIP_EN` (PC3) rising
   edge — a hold of **≥ 20 ms** is required — and the protocol then runs on the **LOG UART
-  (UART9)**, raised to 1.5 Mbaud. `wifi flashprobe` proves download-mode entry;
-  `wifi flashload` uploads Realtek's flashloader stub to module SRAM and reads flash;
+  (UART9)**, raised to 1.5 Mbaud (entry and the flashloader-stub upload live in the
+  protocol layer, `app/rtl8720_flash.c` — the M1/M2 bring-up commands that exposed them
+  were retired by issue #28).
   `wifi flashread <off> [n]` surveys sectors (erased vs data); `wifi flashinfo` reports
   the **real chip capacity** — measured by address wrap, comparing 8 KB at offset 0
   against 8 KB at 1/2/4/8 MB — plus the status registers and a device-side checksum;
@@ -142,9 +144,8 @@ time as the USB console. 22 commands:
   can be saved before anything is written. All of those are **read-only**.
   Going the other way, `wifi imgload` **receives** an image from the PC (`sb <file>`) into
   the PSRAM staging buffer at `0x90000000` (`app/rtl8720_img.c`; AXI-SRAM is far too small
-  for a 2 MB image), `wifi imginfo` re-verifies it against PSRAM and `wifi imgsend` streams
-  it back so a `cmp` on the host can prove byte equality. Those are read-only too — they
-  never power the module up. Use **`sb -k`**: plain `sb` sends 128-byte blocks and spends
+  for a 2 MB image) and `wifi imginfo` re-verifies it against PSRAM. Those are read-only
+  too — they never power the module up. Use **`sb -k`**: plain `sb` sends 128-byte blocks and spends
   most of the transfer waiting for per-block ACKs (~42 kB/s for 2 MB), while `-k` selects
   1024-byte blocks. A transfer's post-mortem (blocks accepted, CRC/sequence/short-read
   counts, console RX-ring drops) goes to **`dmesg`** as well as the console, because while
@@ -167,18 +168,17 @@ time as the USB console. 22 commands:
   the Wio port of `../stm32f746g-disco`'s `net` command. It has **two backends**, chosen
   by one predicate (`net up`, below): the RTL8720DN's **eRPC socket-offload**
   (`app/wifi_rpc.c`, the module's own lwIP) or **NetX Duo on this MCU**. Either way the L2
-  side (power + association) stays in `wifi`. Since issue #23 U4 the two things that want a
-  TCP connection — `net echo` and the telnet console — are on the host stack only; what
-  stays on the module's lwIP is `net info`/`ip`/`dhcp`/`ping`/`conc`, which is also what
-  keeps a regression test against an untouched module firmware alive. `net info` shows link + MAC + IP/mask/gw
+  side (power + association) stays in `wifi`. Since issue #23 U4 everything that moves
+  payload — `net ping`, `net echo` and the telnet console — is on the host stack only;
+  what stays on the module's lwIP is `net info`/`ip`/`dhcp`, which is also what
+  keeps a regression test against an untouched module firmware alive (the module
+  raw-ICMP ping and the `net conc` concurrency probe were retired by issue #28 — their
+  wire-level record is in this repo's history and `fw/rtl8720/README.md`).
+  `net info` shows link + MAC + which stack owns the address + IP/mask/gw
   (and dhcp-vs-static); `net ip <a.b.c.d/mask> [gw]` sets a static address (stops DHCP);
-  `net dhcp` (re)acquires a lease; `net ping <a.b.c.d> [count]` sends **real ICMP echoes**
-  over a raw socket (`rpc_lwip_socket(SOCK_RAW, IPPROTO_ICMP)`) — the shell builds the
-  ICMP message + checksum itself, and reports a **host-observed RTT** (it includes the
-  two eRPC UART round-trips, not just the network path). `net conc [ms]` is a diagnostic
-  (issue #20 N3): it holds a `recvfrom` (no data) open on the module and round-trips a
-  foreground ack while it is outstanding — a serial server (stock/N2) cannot answer the
-  ack until the receive returns, the N3 worker-dispatch server answers it in a few ms.
+  `net dhcp` (re)acquires a lease; `net ping <a.b.c.d> [count]` sends **real ICMP
+  echoes** built by NetX Duo on the host stack (`net up` first) — no eRPC round trip in
+  the measured RTT.
   `net echo [port]` (default 2323, Ctrl+C stops) runs a **TCP echo server on the host
   stack** (issue #23 U4-1, `app/nx_echo.c`) — it requires `net up`, and it is the bring-up
   rehearsal the telnet console follows. There is no RPC in its data path: bytes arrive as
@@ -226,10 +226,10 @@ time as the USB console. 22 commands:
   change is exclusive and manual"; what changed is the evidence, not the risk analysis. A
   module that refuses gets a warning and the bridge continues at 2 Mbaud.
 
-  While the host stack is up the module's own lwIP receives nothing, so `net conc`,
-  `wifi connect/disconnect/scan` and every `link` subcommand are refused with a message
-  saying to run `net down` (`net echo` and `net shell` went the other way: they now
-  *require* the host stack). `wifi on/off/reset`
+  While the host stack is up the module's own lwIP receives nothing, so
+  `wifi connect/disconnect/scan` and every `wifi link` subcommand are refused with a
+  message saying to run `net down` (`net ping`, `net echo` and `net shell` went the
+  other way: they now *require* the host stack). `wifi on/off/reset`
   stay allowed — they are the recovery path, and the owner notices the link being taken
   away and stands down cleanly. **The device firmware is unchanged** (`2.1.3+wio-n7`).
 
@@ -267,9 +267,9 @@ time as the USB console. 22 commands:
 
   Self-destruct avoidance only — there is no command policy. The telnet console refuses
   what would destroy the transport it runs on: `wifi on/off/reset` (CHIP_EN), any YMODEM
-  transfer (`xfer`, `wifi imgload`/`imgsend`), `net down`, and `net shell stop`. The
-  issue-#21 restriction on `net ping` / `net conc` is **gone** — the console no longer
-  occupies a module worker.
+  transfer (`xfer`, `wifi imgload`), `net down`, and `net shell stop`. The
+  issue-#21 restriction on module-side blocking calls is **gone** — the console no
+  longer occupies a module worker.
 
   `net shell status` separates the three reasons a write can be refused, because they mean
   opposite things: `tx waits` is the designed back-pressure (a 64 kB `dmesg` over telnet
@@ -286,11 +286,11 @@ time as the USB console. 22 commands:
   other for its whole run, and the flip side is that benchmark scores drop while both are
   busy.
 
-- **`link` — the UART link itself** (issue #23 U0-3 / U1, `shell/cmds/cmd_link.c`). Where
-  `wifi` is L2 and `net` is L3, this is the wire between the STM32 and the companion chip,
-  and it exists to produce a number: can a UART link carry 1500-byte Ethernet frames well
-  enough to justify putting a real TCP/IP stack on the host?
-  `link info` prints **both ends'** counters — the host's RX interrupt budget and error
+- **`wifi link` — the UART link itself** (issue #23, `shell/cmds/cmd_wifi_link.c`). Where
+  `wifi` is L2 and `net` is L3, this is the wire between the STM32 and the companion chip:
+  the numbers here are what proved the L2-bypass road before `net up` shipped, and they
+  remain the link's health monitors and regression witnesses.
+  `wifi link info` prints **both ends'** counters — the host's RX interrupt budget and error
   tally, and the module's own (interrupt count, ring peak, the three loss counters, free
   heap, current rate, and **how much of its FIFO grace one interrupt consumed**). Reading
   the module's side while traffic flows was impossible before: they go to the LOG UART,
@@ -298,18 +298,19 @@ time as the USB console. 22 commands:
   different questions — `entry` is FIFO occupancy when the interrupt *started*, which is
   the real margin; `burst` also counts bytes that landed during the drain, and those are
   free.
-  `link baud <2000000|3000000|4000000|6000000>` changes the line rate of the link.
-  `link bench [bytes] [secs] [rx|tx|both]` (default 1500 B / 3 s / both) and `link sweep`
-  generate measured traffic and report throughput plus the round-trip distribution
+  `wifi link baud <2000000|3000000|4000000|6000000>` changes the line rate of the link.
+  `wifi link bench [bytes] [secs] [rx|tx|both|all]` (default 1500 B / 3 s / both;
+  `all` runs the three directions back to back)
+  generates measured traffic and reports throughput plus the round-trip distribution
   (min / avg / p99 / max) — the **max** is the number that matters for carrying frames.
   All of it rides a **LINK-CTRL channel** (`u16 0xFFFF | u16 len | u16 crc | body`)
   multiplexed onto the same wire and owned by the link layer at both ends, so none of it
   required touching the generated eRPC server shim. It needs module firmware
   `2.1.3+wio-n5` (`fw/rtl8720/patches/0005`) and, because the host only learns which
-  firmware is loaded from `wifi rpc ver`, every subcommand asks you to run that first.
-  CTRL is only issued on a **quiescent** link, so `link` refuses while anything else holds
-  the eRPC UART, and while the host stack is up.
-  `link baud` is the one command whose failure costs the link: the module acknowledges on
+  firmware is loaded from `wifi ver`, every subcommand asks you to run that first.
+  CTRL is only issued on a **quiescent** link, so `wifi link` refuses while anything else
+  holds the eRPC UART, and while the host stack is up.
+  `wifi link baud` is the one command whose failure costs the link: the module acknowledges on
   the *old* rate and only then switches, so a lost acknowledgement changes nothing, but if
   the *new* rate does not work the host's attempt to put both ends back is best effort
   (the message telling the module to return is sent at that same bad rate). The sequence
@@ -324,7 +325,7 @@ time as the USB console. 22 commands:
   `u8 chan | u8 flags | payload` — and unlike eRPC and CTRL it is **unsolicited,
   bidirectional and unacknowledged**, which is what a raw Ethernet frame needs. U2 will
   hang the module's WiFi netif off it; U1 builds the plumbing and measures it against a
-  sink/source bench on the module (`link dbench [bytes] [secs] [rx|tx|both]`). Both magic
+  sink/source bench on the module (`wifi link dbench [bytes] [secs] [rx|tx|both]`). Both magic
   numbers are safe for the same reason, and it is about the SENDER, not the receiver: an
   eRPC frame's leading u16 is its message size, and neither end can produce one that large
   (host ≤ 8 + 320 B, module ≤ its 4096-byte buffer).
@@ -348,20 +349,20 @@ time as the USB console. 22 commands:
   **(3)** `erpc_crc16()` is now table-driven (same polynomial, same values) — the
   bit-at-a-time loop was ~110 µs per 1500-byte frame on the link service thread.
 
-- **The L2 bridge** (issue #23 U2, `fw/rtl8720/patches/0007` + `link eth` / `link arp`).
+- **The L2 bridge** (issue #23 U2, `fw/rtl8720/patches/0007` + `wifi link arp`).
   The DATA channel stops carrying a bench pattern and starts carrying **real Ethernet
   frames**: the module hands what it receives from the air to the host instead of to its own
-  lwIP, and frames sent on `LINK_DATA_CHAN_ETH` go out over the air. These two are the
+  lwIP, and frames sent on `LINK_DATA_CHAN_ETH` go out over the air. `wifi link arp` is the
   **diagnostic** view of that channel — the stack that consumes it for real is `net up`
-  above — so `link eth [secs] [max]` just decodes what arrives (ARP in full, IPv4
-  addresses and protocol, everything else by ethertype) and `link arp <ip> [secs] [sender-ip]`
+  above: `wifi link arp <ip> [secs] [sender-ip]` opens a transient bridge session, decodes
+  what arrives (ARP in full, IPv4 addresses and protocol, everything else by ethertype) and
   puts one well-formed request on the wire once a second. **An `is-at` reply is the test**: it
   proves the host built a frame, the module transmitted it with its own MAC, a real machine
   answered, the driver accepted the answer, the tap caught it before lwIP, and it survived the
   link — passively watching broadcasts only ever exercises one direction.
   It is a **tap, not a rewrite**: `LwIP_Init()` still runs and the bridge swaps
   `xnetif[0].input`, so switching it off leaves the module's own stack — and therefore
-  `net ping` and `net conc` — intact. Two things had to be got right, and
+  `net info`/`ip`/`dhcp` — intact. Two things had to be got right, and
   neither is guessable: the WLAN driver **filters received IP packets against the netif's
   address** (so a bridge session zeroes it and restores it), and this lwIP is `NO_SYS=0` with
   `LWIP_TCPIP_CORE_LOCKING=0`, so both mutations run **on the tcpip thread** and the host stops

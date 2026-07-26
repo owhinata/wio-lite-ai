@@ -30,7 +30,7 @@
  * moved the two things that wanted a TCP connection off it entirely: `net echo`
  * (app/nx_echo.c) and the telnet console now open NetX sockets on THIS interface, and
  * therefore REQUIRE the host stack rather than being refused by it.  What is left on the
- * module's lwIP -- `net info`, `net ip`, `net dhcp`, `net ping`, `net conc` -- keeps its
+ * module's lwIP -- `net info`, `net ip`, `net dhcp` -- keeps its
  * eRPC backend, which is also what keeps a regression test against an untouched module
  * firmware alive.
  *

@@ -4,37 +4,31 @@
  */
 /**
  * @file    cmd_net.c
- * @brief   `net` shell command (issue #5): IPv4 (L3) over the onboard RTL8720DN.
+ * @brief   `net` shell command (issues #5/#23): IPv4 (L3) over the onboard RTL8720DN.
  *
- *   net info                    connection state + MAC + IP / mask / gateway
+ *   net up | down                bring the HOST TCP/IP stack (NetX Duo) up over the
+ *                                L2 bridge / give the network back to the module
+ *   net info                     connection state + MAC + which stack + IP/mask/gw
  *   net ip <a.b.c.d/mask> [gw]   set a static address (stops DHCP)
  *   net dhcp                     (re)acquire an address via DHCP
- *   net ping <a.b.c.d> [count]   raw-ICMP echo (default 4) with host-observed RTT
- *   net conc [ms]                concurrency probe: is the module's eRPC server serial
- *                                or worker-dispatched (issue #20 N3)?
- *   net echo [port]              TCP echo server on the HOST stack (issue #23 U4-1):
- *                                the bring-up rehearsal for the telnet console -- see the
- *                                block above cmd_net_echo() and app/nx_echo.c
+ *   net ping <a.b.c.d> [count]   ICMP echo from the host stack (requires `net up`)
+ *   net echo [port]              TCP echo server on the host stack (issue #23 U4-1)
+ *   net shell start|stop|status  the telnet console (a NetX socket, issue #23 U4-2)
  *
- * This is the Wio port of ../stm32f746g-disco's `net` command.  There the backend is
- * NetX Duo over the on-chip Ethernet MAC; here it is the RTL8720DN's eRPC socket-
- * offload (app/wifi_rpc.c), so `net` is L3 only -- the L2 side (power + WiFi
- * association) stays in `wifi` (wifi connect / status / disconnect).  Association is
- * therefore a prerequisite: ip/dhcp/ping require an active `wifi connect` (they never
- * power the module), and `net info` reports "not connected" otherwise.
+ * This is the Wio counterpart of ../stm32f746g-disco's `net` command.  There the
+ * backend is NetX Duo over the on-chip Ethernet MAC; here there are TWO backends and
+ * `net up` switches between them (see the "host stack" section below): the host's own
+ * NetX Duo over the issue-#23 L2 bridge, or the module's lwIP reached over eRPC
+ * (info/ip/dhcp only -- the surviving module paths double as the regression witness
+ * that the unmodified firmware still works standalone).  The L2 side (power + WiFi
+ * association) stays in `wifi`; association is a prerequisite for everything here.
  *
- * Every subcommand runs its whole transaction inside one rtl_link_begin() ..
- * rtl_link_end() session (shared with `wifi`, see app/rtl_link.h): that claims the
- * console, takes the coarse link mutex -- so whole flows cannot interleave -- and
- * references the eRPC UART (USART1 @2 Mbaud).  The eRPC frames themselves are owned by
- * the resident service thread in app/erpc.c, which multiplexes several requests by
- * sequence number; `net conc` below is the diagnostic that shows that working.
- * Long / blocking calls carry the Ctrl+C abort hook (accept/recv deliberately do NOT --
- * see the `net echo` block comment).
- *
- * `net ping` opens a raw ICMP socket (rpc_lwip_socket(SOCK_RAW, IPPROTO_ICMP)) and
- * builds/parses the ICMP echo itself.  The reported RTT is host-observed: it includes
- * the two eRPC UART round-trips (sendto + recvfrom), not just the network path.
+ * The module-backend subcommands run their whole transaction inside one
+ * rtl_link_begin() .. rtl_link_end() session (shared with `wifi`, see app/rtl_link.h):
+ * that claims the console, takes the coarse link mutex -- so whole flows cannot
+ * interleave -- and references the eRPC UART.  The eRPC frames themselves are owned by
+ * the resident service thread in app/erpc.c.  The host-backend subcommands never touch
+ * the eRPC session at all.
  *
  * No clock/RCC/register work -- pure marshalling + orchestration (XIP-safe).
  * Clean-room design; no third-party code reused.
@@ -52,14 +46,8 @@
 #include <stdint.h>
 #include <string.h>
 
-/* The lwIP socket ABI constants live in app/wifi_rpc.h (WIFI_LWIP_*): they are part of
- * the module wire contract, shared with the issue-#21 telnet console backend. */
 
-#define ICMP_ECHO_REQUEST  8u
-#define ICMP_ECHO_REPLY    0u
-#define PING_ID            0xAB01u   /* our echo identifier (any fixed 16-bit value) */
-#define PING_PAYLOAD       32u
-#define PING_TIMEOUT_MS    1000u     /* per-probe receive wait (via SO_RCVTIMEO) */
+#define PING_TIMEOUT_MS    1000u     /* per-probe reply wait */
 
 /* ---- number / address parsing (ported from f746 cmd_net.c) --------------- */
 
@@ -215,9 +203,9 @@ static void net_print_ip(struct cli_instance *sh, const struct wifi_ip_info *ip)
  *   up   (`net up`)     NetX Duo on this MCU, over the L2 bridge (app/nx_net.c)
  *
  * They are mutually exclusive by construction, not by policy: while the bridge is in,
- * the module's WiFi netif is tapped and its own lwIP receives nothing at all, so
- * `net ping`/`conc`/`echo` and the telnet console -- all of which run on that lwIP --
- * are refused rather than left to time out mysteriously.
+ * the module's WiFi netif is tapped and its own lwIP receives nothing at all, so the
+ * module-backend paths below are refused rather than left to time out mysteriously.
+ * `net ping`/`echo` and the telnet console run on the HOST stack and require `net up`.
  *
  * Note what does NOT change: association, MAC and RSSI come from the module's WiFi
  * DRIVER (eRPC service 14), which the tap does not touch, so `net info` reports them the
@@ -524,68 +512,12 @@ static int cmd_net_dhcp(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
-/* ---- raw ICMP ping ------------------------------------------------------- */
-
-/* One's-complement (internet) checksum over @n bytes, treated as big-endian 16-bit
- * words; returns the value to store big-endian in the checksum field. */
-static uint16_t inet_csum(const uint8_t *d, size_t n)
-{
-	uint32_t sum = 0;
-
-	while (n > 1) { sum += (uint32_t)((d[0] << 8) | d[1]); d += 2; n -= 2; }
-	if (n)        sum += (uint32_t)(d[0] << 8);
-	while (sum >> 16)
-		sum = (sum & 0xFFFFu) + (sum >> 16);
-	return (uint16_t)~sum;
-}
-
-/* Build an ICMP echo request (8-byte header + PING_PAYLOAD) into @pkt. */
-static void build_icmp_echo(uint8_t *pkt, uint16_t id, uint16_t seq)
-{
-	uint16_t c;
-	unsigned i;
-
-	pkt[0] = (uint8_t)ICMP_ECHO_REQUEST;
-	pkt[1] = 0u;                         /* code */
-	pkt[2] = 0u; pkt[3] = 0u;            /* checksum (zero while computing) */
-	pkt[4] = (uint8_t)(id >> 8);  pkt[5] = (uint8_t)id;
-	pkt[6] = (uint8_t)(seq >> 8); pkt[7] = (uint8_t)seq;
-	for (i = 0u; i < PING_PAYLOAD; i++)
-		pkt[8u + i] = (uint8_t)(0x40u + (i & 0x3Fu));
-	c = inet_csum(pkt, 8u + PING_PAYLOAD);
-	pkt[2] = (uint8_t)(c >> 8); pkt[3] = (uint8_t)c;
-}
-
-/* Build a 16-byte lwIP sockaddr_in for @ip_host (host order) and @port (host order;
- * 0 where the protocol has no port, e.g. the raw ICMP socket). */
-static void build_sockaddr_in(uint8_t sa[16], uint32_t ip_host, uint16_t port)
-{
-	memset(sa, 0, 16);
-	sa[0] = 16u;                         /* sin_len */
-	sa[1] = (uint8_t)WIFI_LWIP_AF_INET;        /* sin_family */
-	sa[2] = (uint8_t)(port >> 8);        /* sin_port, network byte order */
-	sa[3] = (uint8_t)port;
-	u32_to_octets(ip_host, sa + 4);      /* sin_addr, network byte order */
-	/* sa[8..15] sin_zero = 0 */
-}
-
 static int cmd_net_ping(struct cli_instance *sh, int argc, char **argv)
 {
-	struct wifi_rpc_opts o;
-	struct erpc_diag diag;
 	uint32_t dst, c;
 	int count = 4, ok = 0, i;
 	unsigned rmin = 0xFFFFFFFFu, rmax = 0, rsum = 0;
-	int32_t fd = -1, ret = -1, cerr = 0;
-	uint16_t seq = 0;
-	int rc;
 
-	/* Each probe parks a blocking recvfrom on the module for up to PING_TIMEOUT_MS.  With
-	 * the telnet console armed that is the second of the firmware's two workers, so a
-	 * console send would have to queue behind BOTH -- long enough for the shell's own TX
-	 * deadline (CLI_TX_TIMEOUT) to expire and drop characters.  Refuse instead of
-	 * corrupting the other console's output; `net shell stop` frees the worker.
-	 * (A device firmware built with more N3_WORKERS would lift this -- see fw/rtl8720/.) */
 	if (parse_ipv4(argv[1], &dst) != 0) {
 		cli_error(sh, "net: bad address '%s'\r\n", argv[1]);
 		return 1;
@@ -604,8 +536,7 @@ static int cmd_net_ping(struct cli_instance *sh, int argc, char **argv)
 		/*
 		 * A real ICMP echo: built by NetX, its destination resolved by our own ARP
 		 * cache, put on the wire by app/nx_link_driver.c and relayed by the module.
-		 * The RTT is measured across nx_icmp_ping() alone, so unlike the offload path
-		 * below it does not include any eRPC round trip.
+		 * The RTT is measured across nx_icmp_ping() alone -- no eRPC round trip.
 		 */
 		for (i = 0; i < count; i++) {
 			unsigned rtt = 0;
@@ -636,217 +567,10 @@ static int cmd_net_ping(struct cli_instance *sh, int argc, char **argv)
 		return ok ? 0 : 1;
 	}
 
-	/* Each probe parks a blocking recvfrom on the module for up to PING_TIMEOUT_MS.  With
-	 * the telnet console armed that is the second of the firmware's two workers (see the
-	 * comment above). */
-
-	if (net_session_connected(sh, &o, &diag) != RTL_LINK_READY)
-		return 1;
-
-	o.timeout_ms = 5000u;
-	rc = wifi_rpc_lwip_socket(&o, WIFI_LWIP_AF_INET, WIFI_LWIP_SOCK_RAW, WIFI_LWIP_IPPROTO_ICMP, &fd);
-	if (rc || fd < 0) {
-		if (rc == 0 && fd < 0 && wifi_rpc_lwip_errno(&o, &cerr) == 0)
-			cli_error(sh, "net: raw ICMP socket unavailable (errno %ld) -- the RTL8720 "
-			          "firmware may lack SOCK_RAW\r\n", (long)cerr);
-		else
-			cli_error(sh, "net: raw ICMP socket failed (rc %d, fd %ld)\r\n", rc, (long)fd);
-		rtl_link_end(sh);
-		return 1;
-	}
-
-	/* The factory rpc_lwip_recvfrom IGNORES its timeout argument and blocks in
-	 * lwip_recvfrom; a no-reply probe would then hang the module's single-threaded
-	 * eRPC server (so a later close is never serviced -> wedged until `wifi reset`).
-	 * Set SO_RCVTIMEO so lwip_recvfrom instead returns after PING_TIMEOUT_MS.  The
-	 * firmware's own rpc_lwip_available uses SO_RCVTIMEO as a 4-byte int of ms. */
-	{
-		uint8_t ms[4];
-		int32_t sret = -1;
-
-		ms[0] = (uint8_t)PING_TIMEOUT_MS;       ms[1] = (uint8_t)(PING_TIMEOUT_MS >> 8);
-		ms[2] = (uint8_t)(PING_TIMEOUT_MS >> 16); ms[3] = (uint8_t)(PING_TIMEOUT_MS >> 24);
-		o.timeout_ms = 5000u;
-		rc = wifi_rpc_lwip_setsockopt(&o, fd, WIFI_LWIP_SOL_SOCKET, WIFI_LWIP_SO_RCVTIMEO,
-		                              ms, 4u, &sret);
-		if (rc || sret < 0) {
-			cli_error(sh, "net: SO_RCVTIMEO setup failed (rc %d, ret %ld) -- aborting "
-			          "ping so a blocking recv cannot wedge the module\r\n",
-			          rc, (long)sret);
-			o.timeout_ms = 3000u;
-			(void)wifi_rpc_lwip_close(&o, fd, &sret);
-			rtl_link_end(sh);
-			return 1;
-		}
-	}
-
-	cli_print(sh, "PING %s, %d probes (raw ICMP over eRPC; RTT is host-observed):\r\n",
-	          argv[1], count);
-	for (i = 0; i < count; i++) {
-		uint8_t pkt[8u + PING_PAYLOAD];
-		uint8_t sa[16];
-		uint8_t rbuf[96];
-		uint16_t got = 0;
-		uint32_t t0;
-
-		if (cli_cancel_requested(sh))
-			break;
-		seq++;
-		build_icmp_echo(pkt, PING_ID, seq);
-		build_sockaddr_in(sa, dst, 0u);
-
-		t0 = HAL_GetTick();
-		o.timeout_ms = 3000u;
-		rc = wifi_rpc_lwip_sendto(&o, fd, pkt, (uint16_t)sizeof(pkt), 0,
-		                          sa, (uint16_t)sizeof(sa), &ret);
-		if (rc == -4)
-			break;
-		if (rc || ret < 0) {
-			cli_error(sh, "  probe %d: send error (rc %d, ret %ld)\r\n",
-			          i + 1, rc, (long)ret);
-		} else {
-			int matched = 0;
-
-			/* lwip_recvfrom returns within SO_RCVTIMEO (PING_TIMEOUT_MS, set above);
-			 * give the host eRPC wait headroom past that so it does not fire first.
-			 * The recvfrom `timeout` argument itself is ignored by the firmware. */
-			o.timeout_ms = PING_TIMEOUT_MS + 2000u;
-			rc = wifi_rpc_lwip_recvfrom(&o, fd, rbuf, (uint16_t)sizeof(rbuf), 0,
-			                            PING_TIMEOUT_MS, &got, &ret);
-			if (rc == -4)
-				break;
-			if (rc == 0 && ret > 0 && got >= 28u && (rbuf[0] >> 4) == 4u) {
-				unsigned ihl = (unsigned)(rbuf[0] & 0x0Fu) * 4u;
-
-				if (ihl >= 20u && got >= ihl + 8u) {
-					const uint8_t *icmp = rbuf + ihl;
-					uint16_t rid  = (uint16_t)((icmp[4] << 8) | icmp[5]);
-					uint16_t rseq = (uint16_t)((icmp[6] << 8) | icmp[7]);
-
-					if (icmp[0] == ICMP_ECHO_REPLY && rid == PING_ID && rseq == seq) {
-						unsigned rtt = (unsigned)(HAL_GetTick() - t0);
-
-						cli_print(sh, "  reply %d: %u ms\r\n", i + 1, rtt);
-						ok++;
-						rsum += rtt;
-						if (rtt < rmin) rmin = rtt;
-						if (rtt > rmax) rmax = rtt;
-						matched = 1;
-					}
-				}
-			}
-			if (!matched)
-				cli_print(sh, "  probe %d: timeout\r\n", i + 1);
-		}
-		if (i + 1 < count && cli_sleep(sh, 1000u))
-			break;                          /* Ctrl+C between probes */
-	}
-
-	o.timeout_ms = 3000u;
-	(void)wifi_rpc_lwip_close(&o, fd, &ret);
-	rtl_link_end(sh);
-
-	cli_print(sh, "%d/%d received", ok, count);
-	if (ok > 0)
-		cli_print(sh, ", rtt min/avg/max %u/%u/%u ms",
-		          rmin, rsum / (unsigned)ok, rmax);
-	cli_print(sh, "\r\n");
-	return 0;
-}
-
-/* ---- concurrency probe (issue #20 N3) ------------------------------------ */
-
-/*
- * Decide whether the module's eRPC server is the stock single-task serial one or the N3
- * worker-dispatch one, using only existing wrappers.  Open a raw ICMP socket like `net
- * ping` but never send an echo request, then issue recvfrom asynchronously: with no data
- * arriving it blocks on the module for up to `ms`.  While it is outstanding, round-trip a
- * foreground system-ack.  A serial server cannot answer the ack until recvfrom returns
- * (so it times out); a worker server answers it in a few ms.
- *
- * WARNING: recvfrom is only bounded on N2+ firmware (which honours the timeout).  On
- * stock / N1 firmware recvfrom blocks forever and wedges the single-task server -- the
- * ack times out AND the module needs `wifi reset` afterwards.
- */
-static int cmd_net_conc(struct cli_instance *sh, int argc, char **argv)
-{
-	struct wifi_rpc_opts o;
-	struct erpc_diag diag, adiag;
-	uint32_t block_ms = 3000u;
-	uint8_t rcvbuf[96];
-	uint8_t echoed = 0u;
-	int32_t fd = -1, ret = -1;
-	int token, rc, an, ack_dt;
-	uint32_t t0;
-
-	/* Holds a blocking recvfrom open for `block_ms`.  With the telnet console armed that
-	 * would be the SECOND long-blocking call on a firmware that has two workers -- both
-	 * would be parked and every other RPC (including the console's own output) would queue
-	 * behind them. */
-	if (nx_net_guard(sh, "net conc"))
-		return 1;
-	if (argc >= 2) {
-		if (parse_uint(argv[1], &block_ms) != 0 || block_ms < 500u || block_ms > 20000u) {
-			cli_error(sh, "net: bad ms '%s' (500..20000)\r\n", argv[1]);
-			return 1;
-		}
-	}
-	if (net_session_connected(sh, &o, &diag) != RTL_LINK_READY)
-		return 1;
-
-	o.timeout_ms = 5000u;
-	rc = wifi_rpc_lwip_socket(&o, WIFI_LWIP_AF_INET, WIFI_LWIP_SOCK_RAW, WIFI_LWIP_IPPROTO_ICMP, &fd);
-	if (rc || fd < 0) {
-		cli_error(sh, "net: raw ICMP socket failed (rc %d, fd %ld)\r\n", rc, (long)fd);
-		rtl_link_end(sh);
-		return 1;
-	}
-
-	cli_print(sh, "net: concurrency probe -- recvfrom(%lu ms, no data) held open, "
-	          "then a foreground ack\r\n", (unsigned long)block_ms);
-	cli_print(sh, "     (stock/N1 FW would wedge here -- `wifi reset` if the ack never "
-	          "returns)\r\n");
-
-	/* Fire the blocking recvfrom (it will not reply for ~block_ms), then immediately
-	 * round-trip a system ack.  erpc_begin does NOT flush the RX while this token is in
-	 * flight: the link service never flushes the RX while a frame is on the wire, so the
-	 * ack's reply and the recvfrom's reply are routed to their tokens by sequence. */
-	token = wifi_rpc_lwip_recvfrom_begin(fd, 64u, 0, block_ms,
-	                                     rcvbuf, (uint16_t)sizeof(rcvbuf));
-	if (token < 0) {
-		cli_error(sh, "net: recvfrom_begin failed (%d)\r\n", token);
-		o.timeout_ms = 3000u;
-		(void)wifi_rpc_lwip_close(&o, fd, &ret);
-		rtl_link_end(sh);
-		return 1;
-	}
-
-	t0 = HAL_GetTick();
-	an = erpc_system_ack(0x5Au, &echoed, &adiag);
-	ack_dt = (int)(HAL_GetTick() - t0);
-
-	if (an == 0 && echoed == 0x5Au)
-		cli_print(sh, "  ack: echoed 0x5A in %d ms  =>  server is CONCURRENT "
-		          "(N3 worker dispatch)\r\n", ack_dt);
-	else
-		cli_print(sh, "  ack: no reply within %d ms (rc %d)  =>  server is SERIAL "
-		          "(stock/N2: ack waits behind recvfrom)\r\n", ack_dt, an);
-
-	/* Collect the recvfrom reply so the link is left clean (it returns after ~block_ms
-	 * on N2+; give the wait headroom).  The datagram itself is not decoded. */
-	rc = erpc_wait(token, block_ms + 3000u, &diag, rtl_abort_cb, sh);
-	if (rc < 0) {
-		erpc_cancel(token);
-		cli_print(sh, "  recvfrom: no reply (rc %d) -- module may be wedged; "
-		          "run `wifi reset`\r\n", rc);
-	} else {
-		cli_print(sh, "  recvfrom: returned after the ack (payload %d B)\r\n", rc);
-	}
-
-	o.timeout_ms = 3000u;
-	(void)wifi_rpc_lwip_close(&o, fd, &ret);
-	rtl_link_end(sh);
-	return 0;
+	/* The module-side raw-ICMP path was removed by issue #28: the surviving module
+	 * backend is info/ip/dhcp only, and ping belongs to the host stack. */
+	cli_error(sh, "net: the host stack is down -- run `net up` first\r\n");
+	return 1;
 }
 
 /* ---- `net echo`: TCP echo server on the host stack (issue #23 U4-1) ------- */
@@ -966,7 +690,7 @@ static int cmd_net_shell_status(struct cli_instance *sh, int argc, char **argv)
 CLI_SUBCMD_SET_CREATE(net_shell_subcmds,
 	CLI_CMD_ARG(start,  NULL, "arm the telnet console [port] (default 23)",
 	            cmd_net_shell_start,  1, 1),
-	CLI_CMD_ARG(stop,   NULL, "close it and release the eRPC UART",
+	CLI_CMD_ARG(stop,   NULL, "close the console + disable auto-arm (frees `net down`)",
 	            cmd_net_shell_stop,   1, 0),
 	CLI_CMD_ARG(status, NULL, "state / address / counters",
 	            cmd_net_shell_status, 1, 0),
@@ -979,8 +703,8 @@ CLI_SUBCMD_SET_CREATE(net_subcmds,
 	CLI_CMD_ARG(info, NULL, "connection + IP / mask / gateway",   cmd_net_info, 1, 0),
 	CLI_CMD_ARG(ip,   NULL, "set static <a.b.c.d/mask> [gw]",     cmd_net_ip,   2, 1),
 	CLI_CMD_ARG(dhcp, NULL, "(re)acquire an address via DHCP",    cmd_net_dhcp, 1, 0),
-	CLI_CMD_ARG(ping, NULL, "raw ICMP echo <a.b.c.d> [count]",    cmd_net_ping, 2, 1),
-	CLI_CMD_ARG(conc, NULL, "eRPC server concurrency probe [ms]", cmd_net_conc, 1, 1),
+	CLI_CMD_ARG(ping, NULL, "ICMP echo <a.b.c.d> [count] (host stack -- `net up` first)",
+	            cmd_net_ping, 2, 1),
 	CLI_CMD_ARG(echo, NULL, "TCP echo server [port] on the host stack (Ctrl+C stops)",
 	            cmd_net_echo, 1, 1),
 	CLI_CMD_ARG(shell, net_shell_subcmds,
@@ -988,5 +712,6 @@ CLI_SUBCMD_SET_CREATE(net_subcmds,
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(net, net_subcmds,
-                 "IPv4 (L3) over the onboard RTL8720 (info / ip / dhcp / ping / echo / shell)",
+                 "IPv4 (L3) over the onboard RTL8720 (up / down / info / ip / dhcp / "
+                 "ping / echo / shell)",
                  NULL, 1, 0);

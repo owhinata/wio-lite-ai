@@ -10,6 +10,14 @@ Nothing here touches the STM32 firmware. This directory only produces an image f
 *other* chip; issue #19 gave us the on-device flasher (`wifi imgload` +
 `wifi flashwrite`) that puts it there, with no host programmer and no soldering.
 
+> **Shell command names below are as they were at the time** (this file doubles as the
+> per-generation acceptance record). Issue #28 later reshaped the STM32 command surface;
+> when following any procedure here, map: `wifi rpc ver` / `wifi rpc` → **`wifi ver`**,
+> `link <sub>` → **`wifi link <sub>`**, `link sweep` → **`wifi link bench … all`**,
+> `wifi probe` → **`wifi log reset`**. `net conc`, the module-side `net ping` path,
+> `wifi flashprobe` / `flashload` / `imgsend` and `link eth` were removed (their
+> wire-level behaviour is recorded here and in git history).
+
 **Why rebuild it at all** (issue #20): the shipped firmware has two structural problems
 that cap what `net` can do.
 

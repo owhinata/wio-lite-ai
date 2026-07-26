@@ -467,7 +467,7 @@ out:
 }
 
 /*
- * Bring the interface up.  The prologue order is `link eth`'s (shell/cmds/cmd_link.c) and
+ * Bring the interface up.  The prologue order is `wifi link arp`'s (shell/cmds/cmd_wifi_link.c) and
  * every step is in that position for a reason recorded there.
  */
 static void nxn_arm(void)
@@ -515,7 +515,7 @@ static void nxn_arm(void)
 
 	if (erpc_module_gen() < NXN_MIN_MODULE_GEN) {
 		nxn_why = "the module firmware has no L2 bridge (needs 2.1.3+wio-n7; "
-		          "run `wifi rpc ver`)";
+		          "run `wifi ver`)";
 		goto unref;
 	}
 
@@ -774,7 +774,7 @@ static void nxn_entry(ULONG arg)
 			 * reference -- because it could not prove they were safe to give
 			 * back.  `wifi reset` is what makes them safe, and it shows up here
 			 * as the quiesce generation moving.  Without this the latch would
-			 * never clear and `link eth` would be refused forever.
+			 * never clear and `wifi link arp` would be refused forever.
 			 */
 			if (rtl_link_quiesce_gen() != nxn_failed_at) {
 				link_data_detach();

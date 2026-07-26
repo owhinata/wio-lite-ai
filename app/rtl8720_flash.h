@@ -73,7 +73,9 @@ void     rtl_dl_digest_init(struct rtl_dl_digest *d);
 void     rtl_dl_digest_add(struct rtl_dl_digest *d, const uint8_t *p, uint32_t n);
 uint32_t rtl_dl_digest_value(const struct rtl_dl_digest *d);
 
-/* Result of an M1 download-mode probe (all diagnostic; printed by `wifi flashprobe`). */
+/* Result of an M1 download-mode probe (all diagnostic; the `wifi flashprobe` command
+ * that printed it was retired by issue #28 -- the probe stays as the protocol layer's
+ * entry self-test). */
 struct rtl_dl_result {
 	int      entered;      /* 1 if a valid read-word reply frame (0x31..0x15) was seen */
 	int      slip;         /* 1 if SLIP framing was used for the reply, 0 if raw */

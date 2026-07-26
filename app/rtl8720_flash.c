@@ -188,7 +188,7 @@ int rtl_dl_enter(uint32_t hold_us, int (*should_abort)(void *), void *ctx)
 	/* Whatever the host believed about the module is void from here on: this session
 	 * exists to change that flash, it drives CHIP_EN below, and even an aborted one can
 	 * leave a half-written image.  Forgetting now means the proof has to be re-earned
-	 * (`wifi rpc ver`) afterwards, rather than a stale "it is wio-n4" surviving a
+	 * (`wifi ver`) afterwards, rather than a stale "it is wio-n4" surviving a
 	 * downgrade to an image whose UART ring is 127 bytes, a stale "it is wio-n5" leaving
 	 * `link` talking CTRL to firmware that has none, or -- the one that bites hardest --
 	 * a stale 6 Mbaud link rate against a module that has just rebooted at 2. */
@@ -212,7 +212,7 @@ int rtl_dl_enter(uint32_t hold_us, int (*should_abort)(void *), void *ctx)
 	 * input BEFORE the ROM can drive PA[7] as its LOG-UART TX (Wio Terminal holds this
 	 * strap low for 500 ms on the same module; our tens of ms is well within that).
 	 * M1 on board #2: 2 ms is too short (strap not latched -> normal boot), ~20 ms
-	 * latches -> download mode; the caller (`wifi flashprobe`) defaults to 30 ms. */
+	 * latches -> download mode; callers default to 30 ms. */
 	rtl8720_power(true);
 	if (hold_us)
 		udelay(hold_us);

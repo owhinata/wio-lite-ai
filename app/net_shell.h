@@ -141,9 +141,9 @@ bool net_shell_is_console(const struct cli_instance *sh);
  * issue #49 P4); this is only self-destruct avoidance, so it refuses on the telnet console
  * alone.
  *
- * (issue #21's net_shell_guard_link() is gone: the console no longer occupies one of the
- * module firmware's two workers, so `net ping` / `net conc` have nothing to be protected
- * from.)
+ * (issue #21's net_shell_guard_link() is gone: since issue #23 U4-2 the console is a
+ * NetX socket and no longer occupies one of the module firmware's workers, so there is
+ * nothing left to protect module-side eRPC callers from.)
  */
 int net_shell_guard(struct cli_instance *sh, const char *what);
 

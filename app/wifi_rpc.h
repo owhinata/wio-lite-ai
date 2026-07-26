@@ -197,101 +197,25 @@ int wifi_rpc_scan_record(const uint8_t *buf, uint16_t got, uint16_t idx,
                          struct wifi_ap_record *rec);
 
 /*
- * ---- raw BSD-socket offload (rpc_wifi_lwip, service 16), for `net ping` ----
+ * ---- what used to be here (rpc_wifi_lwip, service 16) ----------------------------
  *
- * DIFFERENT return convention from the calls above: these mirror lwIP's own syscall
- * return, NOT the module int32 `result`.  The @fd / @ret out-parameter holds the
- * syscall's value directly -- fd >= 0 or a byte count on success, < 0 on error (call
- * wifi_rpc_lwip_errno() for the reason).  The function's int return is still the
- * transport code: 0 (round-trip ok, @fd/@ret valid), a negative erpc_call_ex code
- * (-1/-2/-4) or WIFI_RPC_EDECODE (malformed reply).
- */
-/*
- * lwIP ABI constants.  These are NOT a caller's choice: the module's rpc_lwip_* handlers
- * hand them straight to its own lwIP, so they are part of the wire contract (Ameba-D uses
- * the standard lwIP values).  They live here so every socket user -- `net`, the issue-#21
- * telnet console, anything later -- agrees on one copy.
- */
-#define WIFI_LWIP_AF_INET        2
-#define WIFI_LWIP_SOCK_STREAM    1
-#define WIFI_LWIP_SOCK_RAW       3
-#define WIFI_LWIP_IPPROTO_ICMP   1
-#define WIFI_LWIP_IPPROTO_TCP    6
-#define WIFI_LWIP_SOL_SOCKET     0xFFF   /* lwIP SOL_SOCKET */
-#define WIFI_LWIP_SO_REUSEADDR   0x0004
-#define WIFI_LWIP_SO_KEEPALIVE   0x0008
-#define WIFI_LWIP_SO_RCVTIMEO    0x1006  /* an int of milliseconds here */
-#define WIFI_LWIP_TCP_NODELAY    0x01    /* at level IPPROTO_TCP */
-#define WIFI_LWIP_MSG_PEEK       0x01
-#define WIFI_LWIP_MSG_DONTWAIT   0x08
-
-/* lwIP errno values worth naming in a message (lwip/errno.h). */
-#define WIFI_LWIP_EAGAIN         11      /* == EWOULDBLOCK */
-#define WIFI_LWIP_EPIPE          32
-#define WIFI_LWIP_ENOPROTOOPT    92
-#define WIFI_LWIP_ECONNABORTED  103
-#define WIFI_LWIP_ECONNRESET    104
-#define WIFI_LWIP_ENOTCONN      107
-#define WIFI_LWIP_ETIMEDOUT     110
-
-/* Name of an lwIP errno for diagnostics; "?" for anything not listed above. */
-const char *wifi_rpc_errno_name(int32_t e);
-
-int wifi_rpc_lwip_socket(const struct wifi_rpc_opts *o, int32_t domain, int32_t type,
-                         int32_t protocol, int32_t *fd);
-/* Set a socket option (rpc_lwip_setsockopt).  @level / @optname are passed straight to
- * the module's lwip_setsockopt(), so use lwIP's numeric constants (e.g. SOL_SOCKET
- * 0xfff, SO_RCVTIMEO 0x1006 with a 4-byte int millisecond @optval).  NOTE: the factory
- * rpc_lwip_recv/recvfrom IGNORE their timeout argument and block, so a caller that
- * needs a bounded receive MUST set SO_RCVTIMEO here first (else a no-reply recv wedges
- * the module's single-threaded eRPC server until `wifi reset`). */
-int wifi_rpc_lwip_setsockopt(const struct wifi_rpc_opts *o, int32_t s, int32_t level,
-                             int32_t optname, const uint8_t *optval, uint16_t optlen,
-                             int32_t *ret);
-int wifi_rpc_lwip_sendto(const struct wifi_rpc_opts *o, int32_t s,
-                         const uint8_t *data, uint16_t dlen, int32_t flags,
-                         const uint8_t *sa, uint16_t salen, int32_t *ret);
-/* Blocking receive up to @timeout_ms on the module side.  On a round-trip the received
- * datagram (mem, incl. the IPv4 header for a raw socket) is copied into @buf (fails
- * WIFI_RPC_EDECODE rather than truncating if it exceeds @buf_cap), its length in @got,
- * and the raw recvfrom() return in @ret.  The source address is decoded and discarded. */
-int wifi_rpc_lwip_recvfrom(const struct wifi_rpc_opts *o, int32_t s,
-                           uint8_t *buf, uint16_t buf_cap, int32_t flags,
-                           uint32_t timeout_ms, uint16_t *got, int32_t *ret);
-/*
- * Asynchronous recvfrom for the `net conc` diagnostic (issue #20 N3): encode a recvfrom
- * request and send it with erpc_begin(), returning an eRPC token (>= 0) to collect later
- * with erpc_wait()/erpc_cancel(), or a negative erpc_begin() code (-1).  It lets the
- * caller keep a (bounded) blocking receive outstanding on the module while it issues
- * another request, to show the N3 server serves the second one concurrently instead of
- * queueing behind the receive.  @out receives the raw, UNDECODED reply payload (the
- * diagnostic only cares that the round-trips overlap) and must stay valid until the
- * token is waited/cancelled.  @len is bounded so the module's reply fits one frame.
- */
-int wifi_rpc_lwip_recvfrom_begin(int32_t s, uint32_t len, int32_t flags,
-                                 uint32_t timeout_ms, uint8_t *out, uint16_t out_cap);
-int wifi_rpc_lwip_close(const struct wifi_rpc_opts *o, int32_t s, int32_t *ret);
-int wifi_rpc_lwip_errno(const struct wifi_rpc_opts *o, int32_t *err);
-
-/*
- * ---- what used to be here --------------------------------------------------------
- *
- * bind / listen / accept / recv / send / shutdown / getpeername lived here for issue #21:
- * a TCP server on the module's lwIP, reached one eRPC round trip at a time.  Issue #23 U4
- * moved `net echo` and the telnet console onto the host's own NetX Duo stack, which left
- * them with no callers, so they were deleted rather than kept as a path that looks
- * supported and is not.  Their firmware quirks -- accept never filling in the peer
- * address, recv reporting failure only through @ret, the SO_RCVTIMEO handling from issue
- * #20 N2 -- are recorded with the code in this file's history at 41d1ff0~1, and the
- * method IDs are still listed in wifi_rpc.c.
- *
- * What remains below is the datagram side, which `net ping` (raw ICMP) and `net conc`
- * still use, plus socket/setsockopt/close/errno underneath them.
+ * The socket-offload wrappers lived here in two waves, and both are gone.  bind /
+ * listen / accept / recv / send / shutdown / getpeername served issue #21's
+ * TCP-on-the-module era; issue #23 U4 moved `net echo` and the telnet console onto the
+ * host's own NetX Duo stack and they were deleted with it (history: 41d1ff0~1).  The
+ * datagram side -- socket / setsockopt / sendto / recvfrom (+ its async _begin) /
+ * close / errno, which carried `net ping`'s raw ICMP and the `net conc` diagnostic --
+ * followed in issue #28 when ping became host-stack-only and conc was retired.  The
+ * firmware quirks they encoded (accept never filling in the peer address, the recvfrom
+ * timeout honoured only on N2+ firmware, the SO_RCVTIMEO handling from issue #20 N2)
+ * are recorded with the code in this file's history, and the service-16 method IDs
+ * remain listed in wifi_rpc.c as the record of the module's wire contract -- a future
+ * module-side socket need would start from them again (issue #5's BSD sockets are the
+ * host stack's job and do not).
  */
 
-/* Maximum payload carried by one recv/send round-trip.  Bounds the wrappers' on-stack
- * request/reply scratch (<= 268 B, comfortable on the 4 KB shell thread stack).  Raising
- * this means moving that scratch out of the locals into static storage. */
+/* Maximum payload of one streamed eRPC request the link contract allows; today only
+ * wifi_rpc_send_chunk() below derives from it. */
 #define WIFI_RPC_STREAM_MAX      256u
 
 /*
@@ -331,11 +255,9 @@ int wifi_rpc_lwip_errno(const struct wifi_rpc_opts *o, int32_t *err);
  * Hence WIFI_RPC_SEND_SAFE is 96: inside the ring with a little headroom, and measured at
  * 6 ms per 256 B echoed versus 8 ms for 64 B chunks.  (The guarantee assumes one request
  * frame in flight at a time, which is how the shell drives the link; two back-to-back
- * erpc_begin() frames could still exceed the ring together.)  The wrappers still ACCEPT
- * up to WIFI_RPC_STREAM_MAX so the sweep above stays reproducible, but anything that just
- * wants to move bytes reliably -- the issue #21 telnet console's output path included --
- * must chunk at WIFI_RPC_SEND_SAFE.  Receiving may keep using the full
- * WIFI_RPC_STREAM_MAX.
+ * erpc_begin() frames could still exceed the ring together.)  Anything that wants to
+ * move bytes reliably over eRPC against an unproven module must chunk at
+ * WIFI_RPC_SEND_SAFE; receiving may use the full WIFI_RPC_STREAM_MAX.
  *
  * THE FIRMWARE FIX IS NOW IN (issue #23 U0-2, fw/rtl8720/patches/0004): the module owns
  * USI0 directly behind an 8 kB ring and reads it in bulk, so none of the three causes
@@ -349,15 +271,11 @@ int wifi_rpc_lwip_errno(const struct wifi_rpc_opts *o, int32_t *err);
 
 /*
  * Largest request payload that is safe to send RIGHT NOW: WIFI_RPC_STREAM_MAX on a link
- * proved to be wio-n4 (`wifi rpc ver`), WIFI_RPC_SEND_SAFE otherwise.  Derived from
+ * proved to be wio-n4 or later (`wifi ver`), WIFI_RPC_SEND_SAFE otherwise.  Derived from
  * erpc_wire_budget(), so it follows the same generation-scoped latch and drops back to
  * the conservative answer the moment the link is reopened, reset or reflashed -- callers
- * must therefore read it per burst rather than caching it.
- *
- * Anything streaming bytes (the issue #21 telnet console's output path) should use this.
- * The wrappers still ACCEPT up to WIFI_RPC_STREAM_MAX regardless, so `net echo` can keep
- * reproducing the measured cliff on a stock module.  Receiving may always use the full
- * WIFI_RPC_STREAM_MAX.
+ * must therefore read it per burst rather than caching it.  (No caller streams today;
+ * `wifi ver` reports it as part of the link's capability summary.)
  */
 uint16_t wifi_rpc_send_chunk(void);
 
