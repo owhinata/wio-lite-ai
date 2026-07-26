@@ -48,10 +48,12 @@
  * instances (16) so a connection is accepted while a command computes.  Same slot the
  * f746 port uses. */
 #define NSH_PRIORITY        14u
-/* Sized for first hardware validation, not measured: the accept/dispatch work is shallow
- * (command execution happens in the bound CLI instance, not here), but issue #23 U4-3
- * shrinks it against a `thread` high-water mark rather than a guess. */
-#define NSH_STACK           3072u
+/*
+ * From the measured high-water mark, not a guess: 596 B after a telnet session that ran
+ * `dmesg` and `thread` (issue #23 U4-3).  Command execution happens in the bound CLI
+ * instance, not here, so this thread only ever orchestrates.  2.6x the peak.
+ */
+#define NSH_STACK           1536u
 
 #define NSH_RX_RING         512u
 #define NSH_WINDOW          2048u    /* advertised TCP receive window                */

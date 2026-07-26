@@ -88,13 +88,17 @@
  * path (including a 1992-byte scan reply and the `net echo` data loop) the high-water
  * mark was 268 B of 1536.
  *
- * Issue #23 U3 raised it to 3072.  That 268 B was measured when the DATA receive callback
- * did nothing but count bytes; the callback is now a NetX driver that allocates a packet,
- * copies up to 1514 bytes into it and queues it for the IP thread.  The right time to
- * find that out is not from a stack overflow on the only surviving board, so the headroom
- * goes in first and comes back out later against a measured `thread` high-water. */
+ * Issue #23 U3 raised it to 3072 on the argument that the DATA receive callback had become
+ * a NetX driver -- allocating a packet, copying up to 1514 bytes into it and queueing it
+ * for the IP thread -- and that a stack overflow on the only surviving board is not how
+ * one wants to learn the new figure.  U4 then drove 2.5 MB of TCP and a telnet console
+ * through that callback and measured 332 B.  The driver costs 64 B, not 2 kB, because it
+ * does not recurse into the stack: the deferred-receive call only queues.
+ *
+ * So it comes back to 1536, which is 4.6x the measured peak, and the 3072 is retired as
+ * what it always was -- headroom held until there was a number. */
 #define ERPC_SVC_PRIORITY    10u
-#define ERPC_SVC_STACK       3072u
+#define ERPC_SVC_STACK       1536u
 
 /* Event flags: one "work posted" bit, one CTRL completion bit, one completion bit per
  * eRPC slot.  ERPC_F_CTRL sits next to ERPC_F_WORK, clear of the 0x100.. DONE group. */

@@ -140,6 +140,42 @@ void rtl_link_forget_module(void);
  */
 int rtl_link_uart_rebaud(uint32_t baud);
 
+/* Return codes of rtl_link_set_rate(). */
+#define RTL_RATE_OK        0    /* now at the requested rate                          */
+#define RTL_RATE_UNCHANGED (-1) /* the module never switched; the link is still healthy */
+#define RTL_RATE_DEAD      (-2) /* no answer at either rate -- `wifi reset` required   */
+
+/*
+ * Change the rate of the link, both ends.
+ *
+ * The caller must already hold the coarse mutex and a UART reference, and must have
+ * established that the module firmware speaks LINK CTRL (erpc_module_gen() >= 5).
+ *
+ * The sequence is the delicate part and there is exactly ONE implementation of it, here,
+ * because two would eventually disagree:
+ *
+ *   - LINK_PING first.  The module requires LINK_SETBAUD to carry the sequence byte
+ *     following the last CTRL frame it accepted, so pinging makes that true by
+ *     construction rather than by hoping nothing has been lost; it also proves the link
+ *     is alive at the current rate immediately before we change it.
+ *   - the module ACKs on the OLD rate and only then switches, so a lost ACK leaves both
+ *     ends where they were and this returns RTL_RATE_UNCHANGED having changed nothing.
+ *   - after switching, the host verifies with LINK_PING and, if that fails, tries to put
+ *     both ends back.  That fallback is BEST EFFORT and nothing more: the "come back"
+ *     message is sent at the rate that just failed, so if the rate failed for signal
+ *     reasons it will not arrive either.  RTL_RATE_DEAD says that happened.
+ *
+ * The guaranteed recovery is `wifi reset` -- a CHIP_EN power cycle, after which the module
+ * is at 2 Mbaud and rtl_link_forget_module() has put the host there too.
+ *
+ * Blocks for up to ~350 ms.  Uses tx_thread_sleep(), never cli_sleep(), so it is callable
+ * from a service thread that has no console.
+ */
+int rtl_link_set_rate(uint32_t baud);
+
+/* Is @baud one of the rates both ends support? */
+bool rtl_link_rate_supported(uint32_t baud);
+
 /*
  * ---- generation counters, for a RESIDENT reference holder (issue #21 increment 9) ------
  *

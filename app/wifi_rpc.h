@@ -274,37 +274,19 @@ int wifi_rpc_lwip_close(const struct wifi_rpc_opts *o, int32_t s, int32_t *ret);
 int wifi_rpc_lwip_errno(const struct wifi_rpc_opts *o, int32_t *err);
 
 /*
- * ---- TCP stream sockets (rpc_wifi_lwip, service 16), for `net echo` -- issue #21 ----
+ * ---- what used to be here --------------------------------------------------------
  *
- * Same return convention as the raw-socket calls above: the function's int return is the
- * transport code (0 = round-trip ok, -1 bad args, -2 timeout, -4 aborted, or
- * WIFI_RPC_EDECODE for a malformed reply), and the lwIP syscall's own value lands in
- * @ret / @fd (>= 0 on success, < 0 with the reason in wifi_rpc_lwip_errno()).
+ * bind / listen / accept / recv / send / shutdown / getpeername lived here for issue #21:
+ * a TCP server on the module's lwIP, reached one eRPC round trip at a time.  Issue #23 U4
+ * moved `net echo` and the telnet console onto the host's own NetX Duo stack, which left
+ * them with no callers, so they were deleted rather than kept as a path that looks
+ * supported and is not.  Their firmware quirks -- accept never filling in the peer
+ * address, recv reporting failure only through @ret, the SO_RCVTIMEO handling from issue
+ * #20 N2 -- are recorded with the code in this file's history at 41d1ff0~1, and the
+ * method IDs are still listed in wifi_rpc.c.
  *
- * These are what a TCP server needs on top of the existing socket/setsockopt/close:
- * bind -> listen -> accept -> recv/send.  Three firmware quirks are baked into the
- * wrappers (all verified against seeed-ambd-firmware's generated shim + wifi_api.c):
- *
- *   1. accept's reply carries TWO words (u32 addrlen + i32 result), unlike every other
- *      call here, and the firmware never fills the peer address in: it passes
- *      &addr->dataLength (not the addrlen argument) to lwip_accept and then drops the
- *      buffer.  So accept yields the fd only -- use wifi_rpc_lwip_getpeername() if the
- *      caller wants to know who connected.
- *   2. recv reports failure ONLY through @ret: the firmware hands back a one-byte dummy
- *      blob whenever lwip_recv() returns <= 0, so the payload length must never be used
- *      to decide whether data arrived.
- *   3. recv's @timeout_ms drives the module's SO_RCVTIMEO (issue #20 N2), and a zero
- *      there means "leave the socket as it is" == a BLOCKING receive.  A blocking recv
- *      with no data pins that fd forever, and the N3 firmware's per-fd lifecycle rule
- *      then forbids closing it (a close racing an in-flight recv on the same fd is
- *      unsafe) -- the socket is effectively lost until `wifi reset`.  So the wrapper
- *      REJECTS timeout_ms == 0 outright rather than let a caller ask for that.
- *
- * NOTE on cancellation: do NOT pass a should_abort hook for accept / recv.  Aborting only
- * ends the HOST's wait -- the module keeps running the call, so an aborted accept can
- * complete into a socket whose fd the host never learns (unclosable, and it consumes one
- * of the module's few netconns), and an aborted recv leaves the fd busy so it must not be
- * closed either.  Poll the cancel flag between calls instead (see shell/cmds/cmd_net.c).
+ * What remains below is the datagram side, which `net ping` (raw ICMP) and `net conc`
+ * still use, plus socket/setsockopt/close/errno underneath them.
  */
 
 /* Maximum payload carried by one recv/send round-trip.  Bounds the wrappers' on-stack
@@ -379,43 +361,5 @@ int wifi_rpc_lwip_errno(const struct wifi_rpc_opts *o, int32_t *err);
  */
 uint16_t wifi_rpc_send_chunk(void);
 
-/* @sa / @salen are a raw lwIP sockaddr (16-byte sockaddr_in here), as built by the
- * caller in network byte order. */
-int wifi_rpc_lwip_bind(const struct wifi_rpc_opts *o, int32_t s,
-                       const uint8_t *sa, uint16_t salen, int32_t *ret);
-int wifi_rpc_lwip_listen(const struct wifi_rpc_opts *o, int32_t s, int32_t backlog,
-                         int32_t *ret);
-/* Accept one connection; *@fd is the accepted socket (>= 0) or the lwIP error (< 0).
- * The call BLOCKS on the module until a client arrives or its internal cap expires
- * (10 s, issue #20 N2 -- it then returns -1/ETIMEDOUT), so give @o a timeout that
- * outlasts that cap or the host abandons a call the module is still running. */
-int wifi_rpc_lwip_accept(const struct wifi_rpc_opts *o, int32_t s, int32_t *fd);
-/* Receive up to @buf_cap (<= WIFI_RPC_STREAM_MAX) bytes.  @timeout_ms must be non-zero
- * (see quirk 3) and @o's timeout should exceed it.  On a completed round-trip *@ret is
- * lwip_recv()'s return: > 0 = bytes (copied into @buf, *@got = count), 0 = peer closed,
- * < 0 = error (EAGAIN when the receive timed out with no data). */
-int wifi_rpc_lwip_recv(const struct wifi_rpc_opts *o, int32_t s,
-                       uint8_t *buf, uint16_t buf_cap, int32_t flags,
-                       uint32_t timeout_ms, uint16_t *got, int32_t *ret);
-/* Send 1..WIFI_RPC_STREAM_MAX bytes; *@ret is lwip_send()'s return, which may be SHORT --
- * the caller must loop until everything is out.  Pass no more than WIFI_RPC_SEND_SAFE
- * unless you are deliberately probing the request-size limit (see the ASYMMETRY note). */
-int wifi_rpc_lwip_send(const struct wifi_rpc_opts *o, int32_t s,
-                       const uint8_t *data, uint16_t dlen, int32_t flags, int32_t *ret);
-int wifi_rpc_lwip_shutdown(const struct wifi_rpc_opts *o, int32_t s, int32_t how,
-                           int32_t *ret);
-/*
- * Peer address of a connected socket, into the 16-byte @sa (*@got = bytes the module
- * actually returned, zero-padded to 16).
- *
- * BEST EFFORT ONLY -- the firmware's shim passes an UNINITIALISED socklen to
- * lwip_getpeername (it erpc_malloc()s the binary_t and never sets dataLength before the
- * call), so lwIP may copy fewer than 16 bytes and leave the rest of the address unset.
- * It cannot overrun anything (the destination is a fixed 16-byte sockaddr), but the
- * VALUE may be partial: validate it (sin_len == 16 && sin_family == AF_INET) before
- * believing it, and treat a failed check as "unknown peer", never as an error.
- */
-int wifi_rpc_lwip_getpeername(const struct wifi_rpc_opts *o, int32_t s,
-                              uint8_t sa[16], uint16_t *got, int32_t *ret);
 
 #endif /* APP_WIFI_RPC_H */

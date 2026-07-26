@@ -27,7 +27,7 @@ time as the USB console. 22 commands:
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
-| wireless | `wifi` (L2: info/on/off/reset/log/probe/rpc · connect/status/disconnect/scan · flash*/img*) · `net` (L3: **up/down** · info/ip/dhcp/ping/conc/echo · **shell** = telnet console) · `link` (info/baud/bench/dbench/sweep/eth/arp) |
+| wireless | `wifi` (L2: info/on/off/reset/log/probe/rpc · connect/status/disconnect/scan · flash*/img*) · `net` (L3: **up/down** · info/ip/dhcp/ping/conc · **echo/shell** = host stack only) · `link` (info/baud/bench/dbench/sweep/eth/arp) |
 | benchmarks | `coremark` · `membench` |
 
 - **`thread`** — lists the ThreadX threads with state / stack use and a **`top`-style
@@ -85,8 +85,9 @@ time as the USB console. 22 commands:
   issue #21 increment 8): it is the only reader of the USART1 RX ring and the only
   writer of request frames, and it routes replies to whoever is waiting by **sequence
   number**, so several requests can be outstanding at once — which is what the N3
-  firmware's worker pool enables, and what lets the telnet console (`net shell`, below)
-  keep a blocking `accept`/`recv` parked on the module while the shell runs other commands. It sleeps
+  firmware's worker pool enables. (The telnet console used to be the reason that mattered,
+  parking a blocking `accept`/`recv` on the module; since issue #23 U4-2 it makes no RPCs at
+  all.) It sleeps
   (touching neither the UART nor the ring) whenever nothing is in flight, so the
   `wifi log` bridge and the `wifi flash*` downloader can own the same peripheral.
   Ownership of the module as a whole — the coarse mutex that serialises whole flows
@@ -98,8 +99,8 @@ time as the USB console. 22 commands:
   away first (abandoning in-flight calls, whose callers get a transport error), because
   "run `wifi reset`" has to work exactly when the link is stuck. And since several
   frames may be in flight, the service thread caps the request bytes it leaves
-  unanswered on the wire at the module's 127-byte input ring (see the asymmetry note
-  under `net echo` below) — a lone frame is still sent whatever its size.
+  unanswered on the wire at the module's 127-byte input ring (the eRPC asymmetry note under
+  `net echo` below) — a lone frame is still sent whatever its size.
   `wifi connect <ssid> [password] [security_hex]` then actually **joins an AP**
   (issue #5): it brings up the module's lwIP stack (the factory firmware leaves it
   uninitialised at boot), switches to STA mode, associates, runs the DHCP client and
@@ -163,10 +164,13 @@ time as the USB console. 22 commands:
   RTL8720DN is a separate chip from the STM32 and its download mode lives in mask ROM, so
   it stays recoverable regardless.
 - **`net`** — the IPv4 (L3) layer on top of a `wifi connect` association (issue #5),
-  the Wio port of `../stm32f746g-disco`'s `net` command. Where f746 drives NetX Duo over
-  the on-chip Ethernet MAC, here the backend is the RTL8720DN's **eRPC socket-offload**
-  (`app/wifi_rpc.c`) — the module runs lwIP internally, so `net` is L3-only and the L2
-  side (power + association) stays in `wifi`. `net info` shows link + MAC + IP/mask/gw
+  the Wio port of `../stm32f746g-disco`'s `net` command. It has **two backends**, chosen
+  by one predicate (`net up`, below): the RTL8720DN's **eRPC socket-offload**
+  (`app/wifi_rpc.c`, the module's own lwIP) or **NetX Duo on this MCU**. Either way the L2
+  side (power + association) stays in `wifi`. Since issue #23 U4 the two things that want a
+  TCP connection — `net echo` and the telnet console — are on the host stack only; what
+  stays on the module's lwIP is `net info`/`ip`/`dhcp`/`ping`/`conc`, which is also what
+  keeps a regression test against an untouched module firmware alive. `net info` shows link + MAC + IP/mask/gw
   (and dhcp-vs-static); `net ip <a.b.c.d/mask> [gw]` sets a static address (stops DHCP);
   `net dhcp` (re)acquires a lease; `net ping <a.b.c.d> [count]` sends **real ICMP echoes**
   over a raw socket (`rpc_lwip_socket(SOCK_RAW, IPPROTO_ICMP)`) — the shell builds the
@@ -175,38 +179,24 @@ time as the USB console. 22 commands:
   (issue #20 N3): it holds a `recvfrom` (no data) open on the module and round-trips a
   foreground ack while it is outstanding — a serial server (stock/N2) cannot answer the
   ack until the receive returns, the N3 worker-dispatch server answers it in a few ms.
-  `net echo [port] [txchunk]` (default 2323 / 64 B, Ctrl+C stops) runs a **TCP echo
-  server** on the module — socket/bind/listen/accept/recv/send over the same offload — as
-  the bring-up rehearsal for the telnet shell console (issue #21): it reports accept
-  latency, the firmware's 10 s accept cap, whether `MSG_DONTWAIT` works, the echo
-  round-trip time and the eRPC diagnostics, which is exactly what that console's design
-  needs measured. It also established a constraint nothing before it had hit: **eRPC is
-  asymmetric — a big reply is fine, a big request is not.** The module's transport reads
-  the UART one byte at a time behind a 127-byte Arduino ring that silently drops on
-  overflow, and our side writes a frame as a gap-free polled burst, so a request larger
-  than that ring loses its tail and is never answered (measured on board #2: a 264-byte
-  reply arrives intact, a 280-byte request does not). The swept cliff sits between 184 and
-  280 bytes rather than at 127 — the module drains while we write, so what must stay under
-  the ring is the backlog during its longest mid-frame stall, which makes anything above
-  127 a load-dependent race. Sends therefore chunk at `WIFI_RPC_SEND_SAFE` (96 B → a
-  120-byte frame, the largest round size that still fits **entirely** inside the ring and
-  so cannot be dropped however long the reader stalls) while receives keep using the full
-  256 B; `txchunk` exists so the sweep stays reproducible. Two more rules
-  it establishes carry over: **accept/recv must never be aborted host-side** (the module
-  keeps running the call, so an aborted accept yields a socket whose fd the host never
-  learns and cannot close — hence Ctrl+C is honoured only between calls, up to ~12 s),
-  and a host-side timeout leaves the link **dirty**, in which case the sockets are
-  deliberately not closed (a close racing an in-flight accept/recv is unsafe on this
-  firmware) and `wifi reset` reclaims them.
-  ip/dhcp/ping/conc/echo require an active association (they never power the module) and
-  share the same `app/rtl_link.c` session (console claim + coarse mutex + eRPC UART
-  reference) as `wifi`. Pure marshalling on the STM32 side — no RCC/register work.
+  `net echo [port]` (default 2323, Ctrl+C stops) runs a **TCP echo server on the host
+  stack** (issue #23 U4-1, `app/nx_echo.c`) — it requires `net up`, and it is the bring-up
+  rehearsal the telnet console follows. There is no RPC in its data path: bytes arrive as
+  raw Ethernet frames and NetX Duo reassembles them here. It reports throughput, the
+  packet-pool low-water mark, the link's own loss ledger and why the session ended, to the
+  console **and to the log** — Ctrl+C is the only way to stop it and the core discards a
+  cancelled handler's output, so a report printed only to the console is a report you never
+  see. Measured on board #2: 512 kB echoed losslessly at 305 kB/s over a 2 Mbaud link and
+  391–505 kB/s at 6 Mbaud, with every host- and module-side loss counter at zero.
 
-  The RTL8720 device firmware itself is rebuilt (non-blocking socket handlers, then a
-  worker-dispatch eRPC server so multiple requests run at once) under `fw/rtl8720/`
-  (issue #20); the STM32 client keeps several requests in flight over the one link with
-  `app/erpc.c`'s `erpc_begin`/`erpc_wait`/`erpc_cancel`.
-
+  It also taught the increment two things. **`nx_tcp_server_socket_accept()` may not be
+  re-entered**: every entry from LISTEN regenerates the ISN, and the timeout path restores
+  LISTEN without unbinding, so a SYN arriving in between leaves a bound-but-LISTEN socket
+  whose completing ACK NetX drops for ever (its state machine has no LISTEN case). The
+  passive open is therefore armed exactly once with `NX_NO_WAIT` and the waiting is done by
+  `nx_tcp_socket_state_wait()`, which touches nothing. And the eRPC version it replaced had
+  established the constraint that shaped issues #21–#23: **eRPC is asymmetric — a big reply
+  is fine, a big request is not.**
 - **`net up` / `net down` — the host's own TCP/IP stack** (issue #23 U3,
   `app/nx_net.c` + `app/nx_link_driver.c`). `net up` turns the module into the L2 relay
   U2 built and brings **Eclipse NetX Duo up on the STM32**: our own ARP cache, our own
@@ -229,63 +219,72 @@ time as the USB console. 22 commands:
   cannot be proved the interface goes to `FAILED` and says `wifi reset`, because
   detaching early would re-arm a stale-byte flush in the middle of a frame.
 
+  `net up` also **raises the link to 6 Mbaud** (issue #23 U4-3). Every module boots at
+  2 Mbaud — that is its firmware — so the rate can only be reached by asking, once per
+  module boot, and `net up` is the command that says "I want throughput on this link"
+  (measured: 305 vs 500 kB/s of echoed TCP). This deliberately reverses U0-3's "the rate
+  change is exclusive and manual"; what changed is the evidence, not the risk analysis. A
+  module that refuses gets a warning and the bridge continues at 2 Mbaud.
+
   While the host stack is up the module's own lwIP receives nothing, so `net conc`,
-  `net echo`, `net shell start`, `wifi connect/disconnect/scan` and every `link`
-  subcommand are refused with a message saying to run `net down`. `wifi on/off/reset`
+  `wifi connect/disconnect/scan` and every `link` subcommand are refused with a message
+  saying to run `net down` (`net echo` and `net shell` went the other way: they now
+  *require* the host stack). `wifi on/off/reset`
   stay allowed — they are the recovery path, and the owner notices the link being taken
   away and stands down cleanly. **The device firmware is unchanged** (`2.1.3+wio-n7`).
 
-- **`net shell` — the telnet console** (issue #21, `app/net_shell.c`). `telnet <board-ip>`
-  gets **the same shell as USB CDC, at the same time**: a second `cli_instance`
-  (prompt `wio-net> `) bound to a transport whose bytes ride the eRPC socket offload.
-  It **arms itself when an address comes up** (`wifi connect` / `net dhcp` / `net ip`);
-  `net shell start [port]` / `stop` / `status` are the manual controls. Ported from
-  `../stm32f746g-disco`'s `port/netxduo/nx_shell.c` — same transport vtable, `connected`
-  write gate, telnet IAC handling and single-session instance reuse — but with an eRPC
-  link instead of a local TCP stack underneath, which changes three things:
+- **`net shell` — the telnet console** (issue #23 U4-2, `app/net_shell.c`).
+  `telnet <board-ip>` gets **the same shell as USB CDC, at the same time**: a second
+  `cli_instance` (prompt `wio-net> `) on a **NetX Duo TCP socket on this MCU**. It
+  therefore **requires `net up`**, and **arms itself when the host stack takes an address**
+  (`net dhcp` / `net ip`); `net shell start [port]` / `stop` / `status` are the manual
+  controls. Ported from `../stm32f746g-disco`'s `port/netxduo/nx_shell.c` — same transport
+  vtable, `connected` write gate, telnet IAC handling and single-session instance reuse.
 
-  - **One service thread, one blocking call.** The N3 firmware has a receive task plus
-    **two** workers, and only the blocking socket receives run in parallel. Our
-    `accept`/`recv` permanently occupies one; a second blocking call would leave the shell's
-    own RPCs no worker at all. So a single thread (priority 12) owns the sockets, and
-    **no `accept` is issued while a session is live** — a second telnet client simply waits
-    in the listen backlog and is served the moment the first leaves. For the same reason
-    `net ping`, `net conc` and `net echo` are refused **from either console** while it is
-    armed — each of them parks a blocking receive of its own, and with both workers busy the
-    console's output would queue past `CLI_TX_TIMEOUT` and lose characters. `net shell stop`
-    frees the worker; building the device firmware with a larger `N3_WORKERS`
-    (`fw/rtl8720/`) would lift the restriction altogether.
-  - **Latency vs. link occupancy.** With output pending it sends up to 4 × 96 B and then
-    polls RX (`MSG_DONTWAIT`) so a Ctrl+C interrupts a long report within ~26 ms; idle, it
-    parks in a 250 ms receive (≈4 RPC/s, under 1 % of the link). After handing keystrokes
-    to the shell it waits up to 20 ms for the answer before re-arming that receive —
-    without it the echo would wait out the whole idle window, because the service thread
-    runs *above* the shell instance and would otherwise re-block before the shell ran.
-  - **Host timeouts are deliberately huge** (module time + 45 s). Everything except the
-    blocking receives takes the module's single serial mutex, so while the other console
-    runs `wifi connect`/`net dhcp` our output can be stuck behind it for 20–30 s. A shorter
-    timeout would be a *false* "link dirty" verdict, costing the session and leaking fds.
-    Recovery stays instant regardless: `wifi reset` force-quiesces the link and wakes every
-    waiting call immediately.
+  Until U4-2 it rode the module's lwIP over eRPC, and everything about it was shaped by
+  that: one blocking module call at a time (the firmware has two workers and ours held
+  one), no aborting an accept or a receive, a "dirty" latch and deliberately leaked file
+  descriptors when a call did not come back, and output chunked to the module's UART ring.
+  **None of that exists now** — the stack is on this side of the link. What replaced it:
 
-  Self-destruct avoidance only — there is no command policy. What the telnet console
-  refuses is what would destroy the transport it is running on: `wifi on/off/reset`
-  (CHIP_EN), any YMODEM transfer (`xfer`, `wifi imgload`/`imgsend`), and `net shell stop`.
-  `wifi connect`/`disconnect` are **allowed**, and will drop your session — the module stays
-  up, so the console re-arms on the new address. Conversely, while the console is armed it
-  holds the eRPC UART referenced, so `wifi log`/`probe`/`rpc` and every `wifi flash*` are
-  refused **from either console** until `net shell stop`.
+  - **Three threads, strictly divided.** A server thread (priority 14) is the only caller
+    of create/listen/accept/relisten/disconnect/unaccept/unlisten/delete — which is what
+    lets the teardown prove what it proves. The NetX callbacks on the IP thread only push
+    bytes into a ring and set flags. The CLI threads appear solely inside `write()`.
+  - **No transmit ring and no polling.** Output goes straight into an `NX_PACKET`, and
+    back-pressure is TCP's own: a refused send makes `write()` return short, the core waits
+    on `CLI_EVT_TX`, and NetX's window-update / queue-depth notifications resume it. The
+    server waits on `nx_tcp_socket_establish_notify()` rather than polling for a connection
+    — `nx_tcp_socket_state_wait()` is a `tx_thread_sleep(1)` loop, which a command can
+    afford and a resident service cannot. The board idles at 98.9 % with the console up.
+  - **Teardown is a proof, not an attempt.** `net down` cannot drop the interface under a
+    live socket: detaching the DATA consumer restores the link service thread's stale-byte
+    flush, and those bytes are the middle of a frame if anything can still transmit. So
+    `net_shell_stop_sync()` returns success **only when `nx_tcp_socket_delete()` returned
+    `NX_SUCCESS`** — the socket gone, not merely idle — and the interface takes its `FAILED`
+    path if that cannot be shown. On hardware the log reads `nshell: stopped (requested)`
+    two milliseconds before `host stack down`.
 
-  Known limits: telnet freezes for the duration of a `wifi connect`/`net dhcp` on the other
-  console (module serial mutex + the 127-byte wire budget), and output may be dropped after
-  `CLI_TX_TIMEOUT`; a host-side timeout leaks the module's sockets and latches the console
-  until a `wifi reset` (`net shell status` says so). `printf()` follows the console of the
-  thread that ran the command — `_write` hands a non-CDC instance's output to that
-  instance's transport — which is what puts the CoreMark report (`ee_printf` → `printf`) on
-  the telnet session that started it. Because two interactive
-  instances now share priority 16, `cli_start()` gives them a **time slice**
-  (`CLI_INSTANCE_TIME_SLICE`) — otherwise `coremark` on one console would freeze the other
-  for its whole run; the flip side is that benchmark scores drop while both are busy.
+  Self-destruct avoidance only — there is no command policy. The telnet console refuses
+  what would destroy the transport it runs on: `wifi on/off/reset` (CHIP_EN), any YMODEM
+  transfer (`xfer`, `wifi imgload`/`imgsend`), `net down`, and `net shell stop`. The
+  issue-#21 restriction on `net ping` / `net conc` is **gone** — the console no longer
+  occupies a module worker.
+
+  `net shell status` separates the three reasons a write can be refused, because they mean
+  opposite things: `tx waits` is the designed back-pressure (a 64 kB `dmesg` over telnet
+  produces thousands and that is health), `no-buf` means output was competing with the
+  receive path for packets, and `busy` means the teardown held the socket. It is emitted to
+  the log as well as the console — the console's own status is most wanted exactly when
+  that console is in trouble.
+
+  Known limits: `printf()` follows the console of the thread that ran the command —
+  `_write` hands a non-CDC instance's output to that instance's transport — which is what
+  puts the CoreMark report (`ee_printf` → `printf`) on the telnet session that started it.
+  Because two interactive instances share priority 16, `cli_start()` gives them a **time
+  slice** (`CLI_INSTANCE_TIME_SLICE`); otherwise `coremark` on one console would freeze the
+  other for its whole run, and the flip side is that benchmark scores drop while both are
+  busy.
 
 - **`link` — the UART link itself** (issue #23 U0-3 / U1, `shell/cmds/cmd_link.c`). Where
   `wifi` is L2 and `net` is L3, this is the wire between the STM32 and the companion chip,
@@ -309,11 +308,14 @@ time as the USB console. 22 commands:
   `2.1.3+wio-n5` (`fw/rtl8720/patches/0005`) and, because the host only learns which
   firmware is loaded from `wifi rpc ver`, every subcommand asks you to run that first.
   CTRL is only issued on a **quiescent** link, so `link` refuses while anything else holds
-  the eRPC UART — in practice, stop the telnet console (`net shell stop`).
+  the eRPC UART, and while the host stack is up.
   `link baud` is the one command whose failure costs the link: the module acknowledges on
   the *old* rate and only then switches, so a lost acknowledgement changes nothing, but if
   the *new* rate does not work the host's attempt to put both ends back is best effort
-  (the message telling the module to return is sent at that same bad rate). **`wifi reset`
+  (the message telling the module to return is sent at that same bad rate). The sequence
+  itself lives in `rtl_link_set_rate()` (`app/rtl_link.c`) because issue #23 U4-3 made
+  `net up` raise the rate too, and two implementations of something this delicate would
+  eventually disagree. **`wifi reset`
   is the guaranteed recovery** — the module boots at 2 Mbaud and the host resets its own
   belief to match.
 
@@ -359,13 +361,13 @@ time as the USB console. 22 commands:
   link — passively watching broadcasts only ever exercises one direction.
   It is a **tap, not a rewrite**: `LwIP_Init()` still runs and the bridge swaps
   `xnetif[0].input`, so switching it off leaves the module's own stack — and therefore
-  `net ping`, `net echo` and the telnet console — intact. Two things had to be got right, and
+  `net ping` and `net conc` — intact. Two things had to be got right, and
   neither is guessable: the WLAN driver **filters received IP packets against the netif's
   address** (so a bridge session zeroes it and restores it), and this lwIP is `NO_SYS=0` with
   `LWIP_TCPIP_CORE_LOCKING=0`, so both mutations run **on the tcpip thread** and the host stops
   the DHCP client first. The session is foreground and bounded, and the module runs its own
-  watchdog over it, because while the tap is in the module's lwIP is deaf — `link eth` refuses
-  to start while a telnet console is armed, and says to run `net dhcp` afterwards.
+  watchdog over it, because while the tap is in the module's lwIP is deaf; it says to run
+  `net dhcp` afterwards.
 
 ## Key design points
 

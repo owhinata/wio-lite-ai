@@ -15,6 +15,10 @@
 #include "erpc.h"
 #include "rtl8720.h"
 
+/* Rate-change timings (issue #23 U4-3).  The CTRL timeout matches `link`'s. */
+#define RTL_RATE_CTRL_TMO_MS  500u
+#define RTL_RATE_SETTLE_MS    100u
+
 /* Coarse link mutex: serialises whole command flows against each other.  The eRPC
  * service thread deliberately does NOT take it -- that is what lets another thread's
  * RPCs slip in between the RPCs of a running command (issue #21 increment 9). */
@@ -300,4 +304,93 @@ void rtl_link_hw_release(struct cli_instance *sh)
 {
 	rtl_link_unclaim();
 	cli_console_release(sh);
+}
+
+/* ---- link rate (issue #23 U0-3, made shareable in U4-3) ------------------- */
+
+/*
+ * Both ends' supported rates.  The module's UART tops out at 6 Mbaud
+ * (rtl8721d_uart.h "BaudRate: 110~6000000") and USART1 at 8.59 (PCLK2 137.5 MHz / 16),
+ * so 6 M is the crossing point rather than an arbitrary choice.
+ */
+static const uint32_t rl_rates[] = { 2000000u, 3000000u, 4000000u, 6000000u };
+
+bool rtl_link_rate_supported(uint32_t baud)
+{
+	unsigned i;
+
+	for (i = 0u; i < sizeof(rl_rates) / sizeof(rl_rates[0]); i++)
+		if (rl_rates[i] == baud)
+			return true;
+	return false;
+}
+
+static int rl_ping(void)
+{
+	struct erpc_diag diag = {0};
+	uint8_t reply[64];
+
+	return erpc_ctrl_call(ERPC_CTRL_PING, NULL, 0u, reply, (uint16_t)sizeof(reply),
+	                      RTL_RATE_CTRL_TMO_MS, &diag);
+}
+
+/* Tell the module to switch.  0 = it acknowledged (on the OLD rate) and will switch. */
+static int rl_setbaud_module(uint32_t baud)
+{
+	struct erpc_diag diag = {0};
+	uint8_t reply[64];
+	uint8_t req[8];
+
+	/* See the header: this ping is what makes the module's sequence-continuity gate
+	 * true by construction, not a liveness nicety. */
+	if (rl_ping() < 0)
+		return -1;
+
+	req[0] = (uint8_t)baud;         req[1] = (uint8_t)(baud >> 8);
+	req[2] = (uint8_t)(baud >> 16); req[3] = (uint8_t)(baud >> 24);
+	req[4] = (uint8_t)ERPC_CTRL_SETBAUD_MAGIC;
+	req[5] = (uint8_t)(ERPC_CTRL_SETBAUD_MAGIC >> 8);
+	req[6] = (uint8_t)(ERPC_CTRL_SETBAUD_MAGIC >> 16);
+	req[7] = (uint8_t)(ERPC_CTRL_SETBAUD_MAGIC >> 24);
+	if (erpc_ctrl_call(ERPC_CTRL_SETBAUD, req, (uint16_t)sizeof(req), reply,
+	                   (uint16_t)sizeof(reply), RTL_RATE_CTRL_TMO_MS, &diag) < 0)
+		return -1;
+	return 0;
+}
+
+/* Re-open USART1 at @baud and prove the link with up to 3 pings.  0 = alive. */
+static int rl_switch_host(uint32_t baud)
+{
+	int try;
+
+	/* The module needs a moment after its ACK to drain its TX FIFO and reprogram. */
+	tx_thread_sleep(RTL_RATE_SETTLE_MS);
+	if (rtl_link_uart_rebaud(baud) != 0)
+		return -1;
+	for (try = 0; try < 3; try++) {
+		if (rl_ping() >= 0)
+			return 0;
+		tx_thread_sleep(50u);
+	}
+	return -1;
+}
+
+int rtl_link_set_rate(uint32_t baud)
+{
+	uint32_t old = rtl_link_erpc_baud();
+
+	if (baud == old)
+		return RTL_RATE_OK;
+	if (!rtl_link_rate_supported(baud))
+		return RTL_RATE_UNCHANGED;
+
+	if (rl_setbaud_module(baud) != 0)
+		return RTL_RATE_UNCHANGED;   /* it never switched: the link is still healthy */
+	if (rl_switch_host(baud) == 0)
+		return RTL_RATE_OK;
+
+	/* Best effort only -- see the header. */
+	if (rl_setbaud_module(old) == 0 && rl_switch_host(old) == 0)
+		return RTL_RATE_UNCHANGED;
+	return RTL_RATE_DEAD;
 }

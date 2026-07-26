@@ -39,8 +39,15 @@
  * many as NXN_TCP_SOCKETS_MAX of them -- on top of whatever is in flight on the receive
  * side.  Running the pool dry does not merely slow things down: nx_link_driver_rx()
  * allocates with NX_NO_WAIT, so an empty pool is a dropped frame and, for a stream, a
- * retransmit timeout.  `net info` reports the low-water mark; issue #23 U4-3 settles the
- * final number from it rather than from this estimate.
+ * retransmit timeout.
+ *
+ * U4-3 measured it and DELIBERATELY DID NOT SHRINK IT.  The low-water mark across 2.5 MB
+ * of echoed TCP, DHCP and a telnet console was 25 of 29 -- four packets ever in use -- so
+ * the U3 figure of 19 would have been ample and would have returned 16 kB of DTCM.  It is
+ * not taken because the trade is bad in both directions: nothing else on this MCU is
+ * asking for that DTCM (the region is under half used), while being wrong costs exactly
+ * the failure this whole increment exists to prevent.  Cheap insurance against an
+ * expensive mistake is worth buying even when the premium looks unnecessary.
  */
 #define NXN_PAYLOAD        1600u
 #define NXN_POOL_BYTES     (48u * 1024u)
@@ -85,8 +92,13 @@
 
 #define NXN_EVT_CMD        0x1u
 
-/* Firmware generation that first has the L2 bridge (2.1.3+wio-n7). */
+/* Firmware generation that first has the L2 bridge (2.1.3+wio-n7).  It also implies the
+ * LINK CTRL channel that NXN_LINK_RATE needs, which arrived in n5. */
 #define NXN_MIN_MODULE_GEN 7u
+
+/* The rate the interface runs the link at.  Both ends' ceiling (the module's UART is
+ * documented 110..6000000, USART1 reaches 8.59 M), and worth ~1.6x on echoed TCP. */
+#define NXN_LINK_RATE      6000000u
 
 /* ---- state ------------------------------------------------------------------ */
 
@@ -514,6 +526,41 @@ static void nxn_arm(void)
 	if (wifi_rpc_is_connected(&o, &result) != 0 || result != WIFI_RPC_OK) {
 		nxn_why = "the module is not associated (run `wifi connect <ssid> ...`)";
 		goto unref;
+	}
+
+	/*
+	 * Take the link to its full rate before anything rides on it.
+	 *
+	 * Every module boots at 2 Mbaud -- that is its firmware, and this increment does not
+	 * reflash it -- so 6 M can only ever be reached by asking, once per module boot.
+	 * `net up` is the right place to ask: it is the command that says "I want throughput
+	 * on this link", and issue #23 measured the difference at 305 vs 500 kB/s of echoed
+	 * TCP.
+	 *
+	 * ⚠️ This DELIBERATELY REVERSES issue #23 U0-3's "the rate change is exclusive and
+	 * manual", and the reason it was manual has not gone away: a rate change is the one
+	 * operation here that can cost the link, and its guaranteed recovery is `wifi reset`.
+	 * What changed is the evidence -- U1 through U4-2 have driven 6 Mbaud through
+	 * full-duplex saturation, five 512 kB TCP transfers and the telnet console without a
+	 * single rate-change failure -- and the cost of being wrong, which is a power cycle
+	 * of a companion chip, not a flash operation.
+	 *
+	 * A refusal is NOT fatal: 2 Mbaud carries everything here, just slower, so a module
+	 * that will not switch gets a warning and the bridge continues.  Only RTL_RATE_DEAD
+	 * is terminal, and it is terminal for the whole link rather than for us.
+	 */
+	if (rtl_link_erpc_baud() != NXN_LINK_RATE) {
+		int rc = rtl_link_set_rate(NXN_LINK_RATE);
+
+		if (rc == RTL_RATE_DEAD) {
+			nxn_why = "the link died changing rate -- run `wifi reset`";
+			goto unref;
+		}
+		if (rc != RTL_RATE_OK)
+			LOG_WRN("staying at %lu baud: the module would not change rate",
+			        (unsigned long)rtl_link_erpc_baud());
+		else
+			LOG_INF("link raised to %lu baud", (unsigned long)NXN_LINK_RATE);
 	}
 
 	/* Last point at which giving up is free: nothing has been told to the module and

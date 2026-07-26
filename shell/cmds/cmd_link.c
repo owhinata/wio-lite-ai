@@ -63,12 +63,6 @@
 #define LINK_TIM_HZ       275000000u
 #define LINK_TIM_PER_US   (LINK_TIM_HZ / 1000000u)
 
-/* The rates worth measuring.  Also the allow-list `link baud` accepts, which is what
- * stops a stray CTRL frame from parking the module at some rate we cannot reach:
- * 2 M is where every module boots, and 6 M is its documented ceiling
- * (rtl8721d_usi_uart.h "BaudRate: 110~6000000"). */
-static const uint32_t link_bauds[] = { 2000000u, 3000000u, 4000000u, 6000000u };
-
 /* Bench payload bound.  1500 is the number that matters (the Ethernet MTU the L2-bypass
  * road would have to carry); the headroom keeps the CTRL body inside ERPC_CTRL_MAX. */
 #define LINK_BENCH_MAX    1536u
@@ -266,12 +260,6 @@ static int link_ctrl_ready(struct cli_instance *sh)
 
 /* ---- CTRL wrappers ------------------------------------------------------- */
 
-static int link_ping(struct erpc_diag *diag)
-{
-	return erpc_ctrl_call(ERPC_CTRL_PING, NULL, 0u, link_reply,
-	                      (uint16_t)sizeof(link_reply), LINK_CTRL_TMO_MS, diag);
-}
-
 /* Module-side counters.  Returns 0 and fills @st, or -1 (message printed). */
 static int link_get_stats(struct cli_instance *sh, uint32_t st[LINK_STATS_WORDS])
 {
@@ -384,83 +372,22 @@ static int cmd_link_info(struct cli_instance *sh, int argc, char **argv)
 /* ---- link baud ----------------------------------------------------------- */
 
 /*
- * Change the rate of the link.  This is the one command here with a side effect that can
- * cost the link, so it is deliberately exclusive and deliberately manual:
- *
- *   - the module ACKs on the OLD rate and only then switches, so a lost ACK leaves both
- *     ends where they were and the command aborts having changed nothing;
- *   - after switching the host verifies with LINK_PING and, if that fails, tries to put
- *     both ends back at 2 Mbaud.  That is BEST EFFORT and nothing more: if the new rate
- *     fails because of signal quality, the LINK_SETBAUD(2M) telling the module to come
- *     back is sent at that same bad rate and will not arrive either.
- *   - the guaranteed recovery is `wifi reset` -- a CHIP_EN power cycle, after which the
- *     module is at 2 Mbaud and rtl_link_forget_module() has put the host there too.
+ * Change the rate of the link.  The sequence itself -- ping, LINK_SETBAUD, re-open,
+ * verify, best-effort fall back -- lives in rtl_link_set_rate() (app/rtl_link.h), because
+ * since issue #23 U4-3 `net up` raises the rate too and two implementations of something
+ * this delicate would eventually disagree.  What stays here is the part that is genuinely
+ * this command's: argument checking, the session, and saying what happened.
  */
-static int link_setbaud_module(struct cli_instance *sh, uint32_t baud)
-{
-	struct erpc_diag diag = {0};
-	uint8_t req[8];
-	int n;
-
-	/* The module additionally requires that LINK_SETBAUD carry the sequence byte after
-	 * the last CTRL frame it accepted -- one more thing a stream that aligned on 0xFFFF
-	 * by chance would have to get right.  Pinging first makes that true by construction
-	 * (and proves the link is alive at the current rate, immediately before we change
-	 * it), instead of relying on nothing having been lost since the last CTRL call. */
-	if (link_ping(&diag) < 0) {
-		cli_error(sh, "link: no answer at the current rate -- not changing it\r\n");
-		return -1;
-	}
-
-	put_u32le(req + 0, baud);
-	put_u32le(req + 4, ERPC_CTRL_SETBAUD_MAGIC);
-	n = erpc_ctrl_call(ERPC_CTRL_SETBAUD, req, (uint16_t)sizeof(req), link_reply,
-	                   (uint16_t)sizeof(link_reply), LINK_CTRL_TMO_MS, &diag);
-	if (n < 0) {
-		cli_error(sh, "link: the module did not acknowledge %lu baud (rc %d) -- "
-		          "nothing changed\r\n", (unsigned long)baud, n);
-		return -1;
-	}
-	return 0;
-}
-
-/* Re-open the host UART at @baud and prove the link with up to 3 pings.  0 = alive. */
-static int link_switch_host(struct cli_instance *sh, uint32_t baud)
-{
-	struct erpc_diag diag = {0};
-	int try;
-
-	/* The module needs a moment after its ACK to drain its TX FIFO and reprogram. */
-	if (cli_sleep(sh, 100u))
-		return -1;
-	if (rtl_link_uart_rebaud(baud) != 0) {
-		cli_error(sh, "link: USART1 would not re-open at %lu baud\r\n",
-		          (unsigned long)baud);
-		return -1;
-	}
-	for (try = 0; try < 3; try++) {
-		if (link_ping(&diag) >= 0)
-			return 0;
-		if (cli_sleep(sh, 50u))
-			break;
-	}
-	return -1;
-}
-
 static int cmd_link_baud(struct cli_instance *sh, int argc, char **argv)
 {
 	uint32_t baud, old;
-	unsigned i;
-	int ok = 0;
+	int rc;
 
 	if (argc < 2 || parse_u32(argv[1], &baud) != 0) {
 		cli_error(sh, "usage: link baud <2000000|3000000|4000000|6000000>\r\n");
 		return 1;
 	}
-	for (i = 0u; i < sizeof(link_bauds) / sizeof(link_bauds[0]); i++)
-		if (link_bauds[i] == baud)
-			ok = 1;
-	if (!ok) {
+	if (!rtl_link_rate_supported(baud)) {
 		cli_error(sh, "link: %lu is not one of the supported rates "
 		          "(2000000 / 3000000 / 4000000 / 6000000)\r\n", (unsigned long)baud);
 		return 1;
@@ -481,29 +408,22 @@ static int cmd_link_baud(struct cli_instance *sh, int argc, char **argv)
 
 	cli_print(sh, "link: %lu -> %lu baud...\r\n", (unsigned long)old,
 	          (unsigned long)baud);
-	if (link_setbaud_module(sh, baud) != 0) {
-		rtl_link_end(sh);                /* module never switched: link still healthy */
-		return 1;
-	}
-	if (link_switch_host(sh, baud) == 0) {
+	rc = rtl_link_set_rate(baud);
+	rtl_link_end(sh);
+
+	if (rc == RTL_RATE_OK) {
 		cli_print(sh, "link: now at %lu baud (LINK_PING answered)\r\n",
 		          (unsigned long)baud);
 		link_print_rate(sh, baud);
-		rtl_link_end(sh);
 		return 0;
 	}
-
-	/* Best effort only -- see the block comment above. */
-	cli_warn(sh, "link: no answer at %lu baud, trying to fall back to %lu...\r\n",
-	         (unsigned long)baud, (unsigned long)old);
-	if (link_setbaud_module(sh, old) == 0 && link_switch_host(sh, old) == 0) {
-		cli_print(sh, "link: back at %lu baud\r\n", (unsigned long)old);
-		rtl_link_end(sh);
+	if (rc == RTL_RATE_UNCHANGED) {
+		cli_warn(sh, "link: the rate was not changed -- still at %lu baud\r\n",
+		         (unsigned long)rtl_link_erpc_baud());
 		return 1;
 	}
 	cli_error(sh, "link: the link is down at both rates -- run `wifi reset` to "
 	          "power-cycle the module (it always comes back at 2000000)\r\n");
-	rtl_link_end(sh);
 	return 1;
 }
 

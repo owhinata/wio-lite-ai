@@ -66,9 +66,10 @@
 
 /* Largest request parameter block one call may carry.  The service thread sends from a
  * per-slot buffer of 8 + ERPC_REQ_MAX bytes (8 = eRPC message header + sequence), so a
- * caller's own request bytes never have to outlive its erpc_begin().  The biggest
- * request in the tree is wifi_rpc_lwip_send()'s 12 + WIFI_RPC_STREAM_MAX = 268 B
- * (app/wifi_rpc.c static-asserts against this). */
+ * caller's own request bytes never have to outlive its erpc_begin().  It is bounded by
+ * app/wifi_rpc.c's _Static_assert on 12 + WIFI_RPC_STREAM_MAX = 268 B, which was the
+ * size of wifi_rpc_lwip_send() before issue #23 U4 moved TCP off the module and deleted
+ * it; the assert is kept as the ceiling on WIFI_RPC_STREAM_MAX itself. */
 #define ERPC_REQ_MAX      320u
 
 /*
