@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "tx_api.h"
+#include "stm32h7xx_hal.h"   /* __get_PRIMASK / __disable_irq / __set_PRIMASK */
 #include "nx_api.h"
 #include "nxd_dhcp_client.h"
 
@@ -18,6 +19,7 @@
 #include "cli_instance.h"
 #include "erpc.h"
 #include "link_data.h"
+#define LOG_TAG "nx"
 #include "log.h"
 #include "net_shell.h"
 #include "nx_link_driver.h"
@@ -29,13 +31,19 @@
 
 /*
  * Packet pool.  1600 leaves room above a 1514-byte frame for the 2-byte receive pad and
- * the NX_PHYSICAL_HEADER/TRAILER reservation.  32 kB is about 19 packets, sized for what
- * U3 actually runs -- ARP, DHCP and ICMP.  TCP is compiled in so that U4 adds a socket
- * rather than a build change, and this depth (together with the link's 8-buffer transmit
- * pool) is on U4's list to revisit before a console rides on one.
+ * the NX_PHYSICAL_HEADER/TRAILER reservation.
+ *
+ * 48 kB is about 29 packets (U3 ran 32 kB / 19, which was sized for ARP, DHCP and ICMP
+ * alone).  U4 puts TCP sockets on this interface, and a socket holds packets that the pool
+ * cannot reclaim until they are acknowledged -- up to NXN_TCP_TX_DEPTH per socket, for as
+ * many as NXN_TCP_SOCKETS_MAX of them -- on top of whatever is in flight on the receive
+ * side.  Running the pool dry does not merely slow things down: nx_link_driver_rx()
+ * allocates with NX_NO_WAIT, so an empty pool is a dropped frame and, for a stream, a
+ * retransmit timeout.  `net info` reports the low-water mark; issue #23 U4-3 settles the
+ * final number from it rather than from this estimate.
  */
 #define NXN_PAYLOAD        1600u
-#define NXN_POOL_BYTES     (32u * 1024u)
+#define NXN_POOL_BYTES     (48u * 1024u)
 
 #define NXN_IP_PRIORITY    11u        /* just below the link service thread (10)     */
 #define NXN_IP_STACK       2048u
@@ -199,7 +207,7 @@ static int nxn_data_cfg(uint8_t mode, uint32_t ms)
 	n = erpc_ctrl_call(ERPC_CTRL_DATA_CFG, req, (uint16_t)sizeof req, nxn_reply,
 	                   (uint16_t)sizeof nxn_reply, NXN_DCFG_TMO_MS, &diag);
 	if (n < 0) {
-		LOG_ERR("nx: DATA_CFG(%u) rc %d status %u", (unsigned)mode, n,
+		LOG_ERR("DATA_CFG(%u) rc %d status %u", (unsigned)mode, n,
 		        (unsigned)((n == -3) ? erpc_ctrl_last_status() : 0u));
 		return -1;
 	}
@@ -229,6 +237,17 @@ static int nxn_data_stats(uint32_t st[NXN_DSTAT_WORDS])
  */
 static void nxn_mod_accumulate(const uint32_t st[NXN_DSTAT_WORDS])
 {
+	/*
+	 * Interrupts masked for the whole update, and likewise for the read in
+	 * nx_net_modstats_get(), so a reader can never catch the ledger half-folded.
+	 * Individual aligned words could not tear on this core anyway -- what this buys is
+	 * that the NINE of them are consistent WITH EACH OTHER, which is the only reason
+	 * anyone reads them: "frames vs drops" is a ratio, and a snapshot spliced from two
+	 * different moments quietly lies about it.  A few dozen cycles, once per refresh.
+	 */
+	uint32_t pm = __get_PRIMASK();
+
+	__disable_irq();
 	nxn_mod.rx_frames   += st[0];
 	nxn_mod.rx_bytes    += st[1];
 	nxn_mod.rx_drops    += st[2];
@@ -238,6 +257,7 @@ static void nxn_mod_accumulate(const uint32_t st[NXN_DSTAT_WORDS])
 	nxn_mod.tx_frames   += st[6];
 	nxn_mod.tx_bytes    += st[7];
 	nxn_mod.tx_drops    += st[8];
+	__set_PRIMASK(pm);
 }
 
 static int nxn_eth_info(uint8_t mac[6], uint8_t *flags)
@@ -260,7 +280,7 @@ static void nxn_dhcp_state_cb(NX_DHCP *dhcp, UCHAR new_state)
 	(void)dhcp;
 	/* 2=INIT 3=SELECTING(discover sent) 4=REQUESTING(offer seen) 5=BOUND.  A stall at
 	 * SELECTING is "no OFFER came back", which on this board means the bridge. */
-	LOG_INF("nx: dhcp state -> %u", (unsigned)new_state);
+	LOG_INF("dhcp state -> %u", (unsigned)new_state);
 }
 
 /*
@@ -343,7 +363,7 @@ static void nxn_enter_failed(const char *why)
 	nxn_failed_at = rtl_link_quiesce_gen();
 	nxn_why = why;
 	nxn_state = NX_NET_FAILED;
-	LOG_ERR("nx: %s -- the host stack could not be shut down cleanly; run `wifi reset`",
+	LOG_ERR("%s -- the host stack could not be shut down cleanly; run `wifi reset`",
 	        why);
 }
 
@@ -370,7 +390,7 @@ static void nxn_stop(const char *why)
 		nxn_why = "the link stayed busy";
 		nxn_failed_at = rtl_link_quiesce_gen();
 		nxn_state = NX_NET_FAILED;
-		LOG_ERR("nx: could not take the link to shut down; run `wifi reset`");
+		LOG_ERR("could not take the link to shut down; run `wifi reset`");
 		return;
 	}
 	claimed = 1;
@@ -394,7 +414,7 @@ static void nxn_stop(const char *why)
 	nxn_uart_gen = 0u;
 	nxn_why = why;
 	nxn_state = NX_NET_OFF;
-	LOG_INF("nx: host stack down (%s)", why);
+	LOG_INF("host stack down (%s)", why);
 
 out:
 	if (claimed)
@@ -538,7 +558,7 @@ static void nxn_arm(void)
 	/* A stop that arrived while the bridge was going in is honoured by the next pass of
 	 * the owner loop, now that the state it has to unwind is fully established -- that
 	 * is the whole point of only letting nxn_stop() end an armed session. */
-	LOG_INF("nx: host stack up, mac %02x:%02x:%02x:%02x:%02x:%02x",
+	LOG_INF("host stack up, mac %02x:%02x:%02x:%02x:%02x:%02x",
 	        nxn_mac[0], nxn_mac[1], nxn_mac[2], nxn_mac[3], nxn_mac[4], nxn_mac[5]);
 	return;
 
@@ -561,7 +581,7 @@ refuse:
 	if (claimed)
 		rtl_link_unclaim();
 	nxn_state = NX_NET_OFF;
-	LOG_WRN("nx: cannot bring the host stack up -- %s", nxn_why);
+	LOG_WRN("cannot bring the host stack up -- %s", nxn_why);
 }
 
 /*
@@ -615,7 +635,7 @@ static void nxn_link_revoked(void)
 	nxn_uart_gen = 0u;
 	nxn_why = "the RTL8720 link was taken away (wifi on/off/reset)";
 	nxn_state = NX_NET_OFF;
-	LOG_WRN("nx: %s", nxn_why);
+	LOG_WRN("%s", nxn_why);
 }
 
 static void nxn_entry(ULONG arg)
@@ -677,7 +697,7 @@ static void nxn_entry(ULONG arg)
 				nxn_uart_gen = 0u;
 				nxn_why = "recovered by a module power cycle";
 				nxn_state = NX_NET_OFF;
-				LOG_INF("nx: %s", nxn_why);
+				LOG_INF("%s", nxn_why);
 				break;
 			}
 			(void)tx_event_flags_get(&nxn_evt, NXN_EVT_CMD, TX_OR_CLEAR, &flags,
@@ -703,7 +723,7 @@ int nx_net_init(void)
 	s = nx_packet_pool_create(&nxn_pool, "nx-link", NXN_PAYLOAD, nxn_pool_mem,
 	                          sizeof nxn_pool_mem);
 	if (s != NX_SUCCESS) {
-		LOG_ERR("nx: packet pool create failed (0x%02x)", (unsigned)s);
+		LOG_ERR("packet pool create failed (0x%02x)", (unsigned)s);
 		return NXN_ERR;
 	}
 
@@ -713,7 +733,7 @@ int nx_net_init(void)
 	s = nx_ip_create(&nxn_ip, "nx-link", 0, 0xFFFFFF00UL, &nxn_pool, nx_link_driver,
 	                 (VOID *)nxn_ip_stack, sizeof nxn_ip_stack, NXN_IP_PRIORITY);
 	if (s != NX_SUCCESS) {
-		LOG_ERR("nx: ip create failed (0x%02x)", (unsigned)s);
+		LOG_ERR("ip create failed (0x%02x)", (unsigned)s);
 		return NXN_ERR;
 	}
 
@@ -729,7 +749,7 @@ int nx_net_init(void)
 		nx_dhcp_state_change_notify(&nxn_dhcp, nxn_dhcp_state_cb);
 		nxn_dhcp_created = true;
 	} else {
-		LOG_WRN("nx: dhcp create failed; use `net ip` for a static address");
+		LOG_WRN("dhcp create failed; use `net ip` for a static address");
 	}
 
 	if (tx_mutex_create(&nxn_addr_lock, "nx-addr", TX_INHERIT) != TX_SUCCESS)
@@ -742,7 +762,7 @@ int nx_net_init(void)
 		return NXN_ERR;
 
 	nxn_ready = true;
-	LOG_INF("nx: NetX Duo ready (pool %u B in DTCM, IP prio %u)",
+	LOG_INF("NetX Duo ready (pool %u B in DTCM, IP prio %u)",
 	        (unsigned)NXN_POOL_BYTES, (unsigned)NXN_IP_PRIORITY);
 	return NXN_OK;
 }
@@ -921,7 +941,29 @@ void nx_net_mac_get(uint8_t mac[6])
 
 void nx_net_modstats_get(struct nx_net_modstats *out)
 {
+	/* Paired with nxn_mod_accumulate(): a consistent snapshot, not nine independent
+	 * reads (`net info` and `net echo` both quote drops as a fraction of frames). */
+	uint32_t pm = __get_PRIMASK();
+
+	__disable_irq();
 	*out = nxn_mod;
+	__set_PRIMASK(pm);
+}
+
+/*
+ * The NetX objects, for whoever puts a socket on this interface.  Handing them out only
+ * once nxn_ready is set is the whole safety argument: before that the control blocks are
+ * uninitialised memory, and nx_tcp_socket_create() would happily scribble on an IP
+ * instance that does not exist yet.
+ */
+void *nx_net_ip(void)
+{
+	return nxn_ready ? (void *)&nxn_ip : NULL;
+}
+
+void *nx_net_pool(void)
+{
+	return nxn_ready ? (void *)&nxn_pool : NULL;
 }
 
 /* ---- reporting / guard --------------------------------------------------------- */

@@ -25,9 +25,14 @@
  * which side" is the question this whole issue has been decided by, and a session that
  * zeroed its own evidence every 8 s could not answer it.
  *
- * While the tap is in, the module's own lwIP receives nothing.  `net ping`, `net echo`
- * and the telnet console all run on that lwIP, so they are refused while the host stack
- * is up -- see nx_net_guard().
+ * While the tap is in, the module's own lwIP receives nothing, so anything that runs on
+ * that lwIP is refused while the host stack is up -- see nx_net_guard().  Issue #23 U4
+ * moved the two things that wanted a TCP connection off it entirely: `net echo`
+ * (app/nx_echo.c) and the telnet console now open NetX sockets on THIS interface, and
+ * therefore REQUIRE the host stack rather than being refused by it.  What is left on the
+ * module's lwIP -- `net info`, `net ip`, `net dhcp`, `net ping`, `net conc` -- keeps its
+ * eRPC backend, which is also what keeps a regression test against an untouched module
+ * firmware alive.
  *
  * ---- the failure rule ----------------------------------------------------------
  *
@@ -55,6 +60,56 @@
 #include <stdint.h>
 
 struct cli_instance;
+
+/*
+ * ---- the transmit budget (issue #23 U4) ---------------------------------------
+ *
+ * Every frame this stack transmits ends up in the link's DATA transmit pool
+ * (LINK_DATA_TX_BUFS, app/link_data.h), and a full pool there is a silent drop -- correct
+ * for Ethernet, but a TCP retransmit timeout for anything running a stream on top.  So the
+ * pool has to be at least as deep as the most NetX can hand the driver before the link
+ * service thread has drained any of it:
+ *
+ *   LINK_DATA_TX_BUFS >= NXN_TCP_SOCKETS_MAX * NXN_TCP_TX_DEPTH
+ *                        + NX_ARP_MAX_QUEUE_DEPTH
+ *                        + NXN_TX_SPARE
+ *
+ * The ARP term is the one that is easy to miss: NetX queues packets per ARP entry while an
+ * address is being resolved and flushes the whole list to the driver at once when the reply
+ * arrives (_nx_arp_queue_send()), so it is a BURST, not a steady-state occupancy.
+ * NXN_TX_SPARE covers the single frames -- an ICMP echo, a DHCP renewal, an ARP request or
+ * response -- that can coincide with such a flush.
+ *
+ * This is an upper-bound ESTIMATE, not a proof: how many packets NetX can pass down in one
+ * go depends on the configuration and the path.  It is checked on hardware instead --
+ * `net info` reports `nx tx no-buf`, which must stay at zero.  It is deliberately NOT
+ * claimed to survive a hostile ICMP flood or arbitrary IP fragmentation; those are
+ * legitimate Ethernet drops.
+ *
+ * The _Static_assert that ties these to LINK_DATA_TX_BUFS lives in app/nx_echo.c, which
+ * already includes nx_api.h for NX_ARP_MAX_QUEUE_DEPTH -- putting it in app/link_data.h
+ * would make the DATA channel depend on NetX headers.
+ */
+#define NXN_TCP_TX_DEPTH      4u   /* nx_tcp_socket_transmit_configure max_queue_depth  */
+#define NXN_TCP_SOCKETS_MAX   2u   /* telnet console + `net echo` can be live together  */
+#define NXN_TX_SPARE          4u   /* room for single ICMP / DHCP / ARP frames          */
+
+/*
+ * Initial TCP retransmit timeout, in ThreadX ticks (= ms, NX_IP_PERIODIC_RATE is 1000),
+ * and the same value the f746 port uses.
+ *
+ * A shorter one is tempting -- this link's round trip is 1-5 ms, so 2 s to notice a lost
+ * segment is a long time to stare at a console.  U4-1 tried 200 ms and it is NOT a free
+ * choice: nx_tcp_socket_transmit_configure() writes nx_tcp_socket_timeout_rate, which NetX
+ * also uses as the SYN+ACK retransmit timer during a passive open
+ * (nx_tcp_packet_process.c:765-770), so it changes how a handshake behaves and not just
+ * how a stall recovers.  Tuning it is therefore an experiment of its own with its own
+ * evidence -- issue #23 U4-3, against nx_tcp_socket_info_get()'s retransmit counter --
+ * and not something to carry into a first bring-up.
+ */
+#define NXN_TCP_RTO_MS        (2u * 1000u)
+#define NXN_TCP_RTO_RETRIES   10u
+#define NXN_TCP_RTO_SHIFT     1u
 
 /* Return codes, mirroring the f746 nx_glue.h. */
 #define NXN_OK          0
@@ -111,6 +166,21 @@ int  nx_net_ping(uint32_t ip, unsigned timeout_ms, unsigned *rtt_ms);
 /* The MAC the interface transmits with (the module's), valid once up. */
 void nx_net_mac_get(uint8_t mac[6]);
 void nx_net_modstats_get(struct nx_net_modstats *out);
+
+/*
+ * The NetX objects, for the things that put a socket on this interface (app/nx_echo.c,
+ * app/net_shell.c).  Typed as void * so that a caller which only needs to pass them along
+ * does not have to include nx_api.h; cast to NX_IP * / NX_PACKET_POOL *.
+ *
+ * NULL until nx_net_init() has succeeded.  Both are valid from then on regardless of the
+ * session state -- the IP instance exists from boot with address 0.0.0.0 and the link
+ * down -- so a caller still has to ask nx_net_is_up() before expecting traffic to move.
+ *
+ * (The f746 nx_glue.h has the same pair.  U3 deliberately did not port them because
+ * nothing on this board created a socket yet; U4 does.)
+ */
+void *nx_net_ip(void);
+void *nx_net_pool(void);
 
 /* Print the host-stack section of `net info` / the result of `net up`. */
 void nx_net_print_status(struct cli_instance *sh);

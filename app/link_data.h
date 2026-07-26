@@ -69,9 +69,24 @@ enum {
 	LINK_DATA_CHAN_BENCH = 1         /* U1 sink/source measurement traffic */
 };
 
-/* Pool depths.  8 x 1544 B each way = ~25 kB of AXI-SRAM BSS. */
+/*
+ * Pool depths, 1544 B per buffer of AXI-SRAM BSS.
+ *
+ * RECEIVE is a staging depth only: the service thread dispatches a completed frame to the
+ * consumer, which returns having already copied it, so buffers come straight back.  8 is
+ * plenty.
+ *
+ * TRANSMIT is different, and issue #23 U4 is why it grew from 8 to 16.  The producer above
+ * it is now a real TCP/IP stack, which can hand down a burst -- several sockets' queued
+ * segments plus a whole ARP waiting list flushed the moment an address resolves -- before
+ * the service thread has written a single one of them out.  A full pool here is a silent
+ * drop, which is exactly right for Ethernet and exactly wrong for a stream: TCP pays for
+ * it with a retransmit timeout measured in hundreds of milliseconds.  The bound this
+ * number has to satisfy is written down in app/nx_net.h ("the transmit budget") and
+ * checked by a _Static_assert in app/nx_echo.c.
+ */
 #define LINK_DATA_RX_BUFS     8u
-#define LINK_DATA_TX_BUFS     8u
+#define LINK_DATA_TX_BUFS     16u
 
 struct link_data_stats {
 	uint32_t tx_frames;
