@@ -52,9 +52,6 @@ uint16_t wifi_rpc_send_chunk(void)
 /* rpc_wifi_tcpip (service 15) method IDs. */
 #define SVC_WIFI_TCPIP      15u
 #define M_TCPIP_INIT         1u
-#define M_TCPIP_GET_IP_INFO  7u
-#define M_TCPIP_SET_IP_INFO  8u
-#define M_TCPIP_DHCPC_START 13u
 #define M_TCPIP_DHCPC_STOP  14u
 
 /*
@@ -81,8 +78,6 @@ uint16_t wifi_rpc_send_chunk(void)
 #define M_LWIP_SOCKET       18u
 #define M_LWIP_ERRNO        24u
 
-/* tcpip_adapter_ip_info_t on the wire: ip(4) + netmask(4) + gw(4). */
-#define IP_INFO_LEN         12u
 
 /* ---- little-endian codec helpers (BasicCodec is a packed LE byte stream) ---- */
 static void put_u32le(uint8_t *p, uint32_t v)
@@ -112,15 +107,6 @@ static uint8_t *put_string(uint8_t *p, const char *s)
 	return p + n;
 }
 
-/* Append a BasicCodec binary (u32 length + raw bytes) at @p; returns the new cursor.
- * Callers pre-bound @n so the request buffer cannot overflow. */
-static uint8_t *put_binary(uint8_t *p, const uint8_t *b, uint32_t n)
-{
-	put_u32le(p, n);
-	p += 4;
-	memcpy(p, b, n);
-	return p + n;
-}
 
 /* Run one round-trip; on transport failure return that (<0), else 0 with the reply
  * length in *@plen.  Centralises the erpc_call_ex option plumbing. */
@@ -264,45 +250,7 @@ int wifi_rpc_tcpip_init(const struct wifi_rpc_opts *o, int32_t *result)
 	return decode_result(rep, plen, result);
 }
 
-int wifi_rpc_dhcpc_start(const struct wifi_rpc_opts *o, uint32_t itf, int32_t *result)
-{
-	uint8_t req[4], rep[16];
-	int plen, rc;
 
-	put_u32le(req, itf);
-	rc = do_call(o, SVC_WIFI_TCPIP, M_TCPIP_DHCPC_START, req, 4u, rep, sizeof(rep), &plen);
-	if (rc)
-		return rc;
-	return decode_result(rep, plen, result);
-}
-
-int wifi_rpc_get_ip(const struct wifi_rpc_opts *o, uint32_t itf,
-                    struct wifi_ip_info *ip, int32_t *result)
-{
-	uint8_t req[4], rep[32];
-	uint32_t len;
-	int plen, rc;
-
-	put_u32le(req, itf);
-	rc = do_call(o, SVC_WIFI_TCPIP, M_TCPIP_GET_IP_INFO, req, 4u, rep, sizeof(rep), &plen);
-	if (rc)
-		return rc;
-	/* reply = binary{u32 len + len bytes} + result(i32).  Bound len BEFORE any
-	 * "4 + len + 4" arithmetic so a corrupted huge len cannot wrap the u32 and slip
-	 * past the checks (which would OOB-read at rep + 4 + len below). */
-	if (plen < 4)
-		return WIFI_RPC_EDECODE;
-	len = get_u32le(rep);
-	if (len < IP_INFO_LEN || len > (uint32_t)sizeof(rep) - 8u)
-		return WIFI_RPC_EDECODE;                 /* need ip+mask+gw, and len+8 must fit rep */
-	if ((uint32_t)plen < 8u + len)               /* frame shorter than len bytes + result */
-		return WIFI_RPC_EDECODE;
-	memcpy(ip->ip,      rep + 4,  4);
-	memcpy(ip->netmask, rep + 8,  4);
-	memcpy(ip->gw,      rep + 12, 4);
-	*result = (int32_t)get_u32le(rep + 4 + len);
-	return 0;
-}
 
 int wifi_rpc_dhcpc_stop(const struct wifi_rpc_opts *o, uint32_t itf, int32_t *result)
 {
@@ -316,26 +264,6 @@ int wifi_rpc_dhcpc_stop(const struct wifi_rpc_opts *o, uint32_t itf, int32_t *re
 	return decode_result(rep, plen, result);
 }
 
-int wifi_rpc_set_ip_info(const struct wifi_rpc_opts *o, uint32_t itf,
-                         const struct wifi_ip_info *ip, int32_t *result)
-{
-	uint8_t req[4 + 4 + IP_INFO_LEN], rep[16];
-	uint8_t ipbuf[IP_INFO_LEN];
-	uint8_t *p = req;
-	int plen, rc;
-
-	memcpy(ipbuf + 0, ip->ip,      4);   /* network byte order, as get_ip returns */
-	memcpy(ipbuf + 4, ip->netmask, 4);
-	memcpy(ipbuf + 8, ip->gw,      4);
-	put_u32le(p, itf); p += 4;
-	p = put_binary(p, ipbuf, IP_INFO_LEN);
-
-	rc = do_call(o, SVC_WIFI_TCPIP, M_TCPIP_SET_IP_INFO, req,
-	             (uint16_t)(p - req), rep, sizeof(rep), &plen);
-	if (rc)
-		return rc;
-	return decode_result(rep, plen, result);
-}
 
 /* ---- AP scan (rpc_wifi_drv 64..67) -- see the header for the async sequence ---- */
 

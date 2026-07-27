@@ -478,7 +478,6 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 	const char *pass = (argc >= 3) ? argv[2] : NULL;
 	struct wifi_rpc_opts o;
 	struct erpc_diag diag;
-	struct wifi_ip_info ip;
 	uint32_t security;
 	int32_t result = -1;
 	int rc;
@@ -534,36 +533,17 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 		goto fail;
 	}
 
-	/* 3) DHCP.  The module's LwIP_DHCP(DHCP_START) blocks until a lease is assigned,
-	 * retrying internally -- that can run past 15 s on a slow network, so give the
-	 * host wait generous headroom (Ctrl+C still aborts; IWDG is a separate thread). */
-	cli_print(sh, "wifi: associated; requesting DHCP lease (up to ~30s)...\r\n");
-	o.timeout_ms = 30000u;
-	rc = wifi_rpc_dhcpc_start(&o, 0u, &result);
-	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto fail; }
-	if (rc || result != WIFI_RPC_OK) {
-		cli_error(sh, "wifi: DHCP failed (rc %d, result %ld)\r\n", rc, (long)result);
-		goto fail;
-	}
-	rtl_set_ip_mode(RTL_IP_DHCP);               /* address obtained via DHCP */
-
-	/* 4) read back the assigned address. */
-	o.timeout_ms = 3000u;
-	rc = wifi_rpc_get_ip(&o, 0u, &ip, &result);
-	if (rc || result != WIFI_RPC_OK) {
-		cli_error(sh, "wifi: get IP failed (rc %d, result %ld)\r\n", rc, (long)result);
-		goto fail;
-	}
-
+	/*
+	 * ...and that is the whole command (issue #30 B1).  It used to run the MODULE's DHCP
+	 * client here and print the lease, which is why `wifi` (L2) ended up owning an L3
+	 * step; the address it produced belongs to the module's lwIP, and the host stack --
+	 * the only thing that carries traffic since issue #23 U4 -- throws it away
+	 * immediately (`net up` stops that DHCP client and zeroes the netif address, because
+	 * the WLAN driver filters received IP against it).  So association is all that
+	 * happens here, and L3 lives entirely in `net`.
+	 */
 	rtl_link_end(sh);
-	/* No net_shell_autoarm() here any more: this address belongs to the MODULE's lwIP,
-	 * and since issue #23 U4-2 the telnet console is a NetX socket on the host stack.
-	 * `net up` + `net dhcp` is what arms it now. */
-	cli_print(sh, "wifi: connected\r\n");
-	cli_print(sh, "  ip   %u.%u.%u.%u\r\n", ip.ip[0], ip.ip[1], ip.ip[2], ip.ip[3]);
-	cli_print(sh, "  mask %u.%u.%u.%u\r\n",
-	          ip.netmask[0], ip.netmask[1], ip.netmask[2], ip.netmask[3]);
-	cli_print(sh, "  gw   %u.%u.%u.%u\r\n", ip.gw[0], ip.gw[1], ip.gw[2], ip.gw[3]);
+	cli_print(sh, "wifi: connected -- run `net up` then `net dhcp` for an address\r\n");
 	return 0;
 
 fail:
@@ -602,7 +582,6 @@ static int cmd_wifi_disconnect(struct cli_instance *sh, int argc, char **argv)
 		wifi_fail_diag(sh, &diag);
 		return 1;
 	}
-	rtl_set_ip_mode(RTL_IP_UNKNOWN);            /* association dropped: no address */
 	cli_print(sh, "wifi: disconnected\r\n");
 	return 0;
 }
@@ -612,7 +591,6 @@ static int cmd_wifi_status(struct cli_instance *sh, int argc, char **argv)
 {
 	struct wifi_rpc_opts o;
 	struct erpc_diag diag;
-	struct wifi_ip_info ip;
 	char mac[18];
 	int32_t connected = -1, rssi = 0, result = -1;
 	int rc, link;
@@ -644,16 +622,11 @@ static int cmd_wifi_status(struct cli_instance *sh, int argc, char **argv)
 	if (connected == WIFI_RPC_OK) {
 		if (wifi_rpc_get_rssi(&o, &rssi, &result) == 0 && result == WIFI_RPC_OK)
 			cli_print(sh, "  rssi %ld dBm\r\n", (long)rssi);
-		if (wifi_rpc_get_ip(&o, 0u, &ip, &result) == 0 && result == WIFI_RPC_OK) {
-			cli_print(sh, "  ip   %u.%u.%u.%u\r\n",
-			          ip.ip[0], ip.ip[1], ip.ip[2], ip.ip[3]);
-			cli_print(sh, "  mask %u.%u.%u.%u\r\n",
-			          ip.netmask[0], ip.netmask[1], ip.netmask[2], ip.netmask[3]);
-			cli_print(sh, "  gw   %u.%u.%u.%u\r\n",
-			          ip.gw[0], ip.gw[1], ip.gw[2], ip.gw[3]);
-		}
 	}
 	rtl_link_end(sh);
+	/* No address here: L3 belongs to `net` (issue #30 B1).  The module's own lwIP no
+	 * longer takes one, so printing it would only ever show 0.0.0.0. */
+	cli_print(sh, "  (`net info` for the address)\r\n");
 	return 0;
 }
 

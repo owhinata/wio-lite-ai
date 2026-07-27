@@ -59,14 +59,6 @@
  * malformed to decode (distinct from erpc_call_ex's -1/-2/-4 transport codes). */
 #define WIFI_RPC_EDECODE         (-10)
 
-/* Decoded IPv4 config from rpc_tcpip_adapter_get_ip_info.  Each field is stored in
- * network byte order, so the four bytes print directly as a.b.c.d. */
-struct wifi_ip_info {
-	uint8_t ip[4];
-	uint8_t netmask[4];
-	uint8_t gw[4];
-};
-
 /*
  * Per-call options common to every wrapper.  @should_abort / @abort_ctx are
  * forwarded to erpc_call_ex() (poll a cancel flag; NULL = never abort); @diag
@@ -95,14 +87,14 @@ int wifi_rpc_is_connected(const struct wifi_rpc_opts *o, int32_t *result);
 int wifi_rpc_get_rssi(const struct wifi_rpc_opts *o, int32_t *rssi, int32_t *result);
 int wifi_rpc_get_mac(const struct wifi_rpc_opts *o, char mac[18], int32_t *result);
 int wifi_rpc_tcpip_init(const struct wifi_rpc_opts *o, int32_t *result);
-int wifi_rpc_dhcpc_start(const struct wifi_rpc_opts *o, uint32_t itf, int32_t *result);
+/*
+ * get_ip_info / set_ip_info / dhcpc_start were here until issue #30 B1.  They drove the
+ * MODULE's L3 -- an address the host stack throws away the moment the bridge goes in
+ * (`net up` stops the DHCP client and the module zeroes its netif, because the WLAN
+ * driver filters received IP against it).  L3 is the host's alone now; what remains of
+ * service 15 is the two calls the BRIDGE itself needs.
+ */
 int wifi_rpc_dhcpc_stop(const struct wifi_rpc_opts *o, uint32_t itf, int32_t *result);
-int wifi_rpc_get_ip(const struct wifi_rpc_opts *o, uint32_t itf,
-                    struct wifi_ip_info *ip, int32_t *result);
-/* Set a static address (rpc_tcpip_adapter_set_ip_info); @ip fields are network byte
- * order (as get_ip returns them).  Stop DHCP first so it will not overwrite it. */
-int wifi_rpc_set_ip_info(const struct wifi_rpc_opts *o, uint32_t itf,
-                         const struct wifi_ip_info *ip, int32_t *result);
 
 /*
  * ---- AP scan (rpc_wifi_drv 64..67), for `wifi scan` --------------------------------

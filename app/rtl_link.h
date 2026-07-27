@@ -222,15 +222,10 @@ bool rtl_tcpip_inited(void);
 void rtl_tcpip_set_inited(bool v);
 
 /*
- * Host-side memo of how the current IPv4 address was obtained, for `net info`
- * (mirrors f746 nx_net_info.dhcp_mode).  It is only what the host last did -- it is
- * set to DHCP / STATIC on a *successful* `wifi connect`/`net dhcp` / `net ip`, and
- * back to UNKNOWN whenever the module is powered off / reset / freshly powered on or
- * disconnected.  It is not a query of the module.
+ * (The host-side memo of how the address was obtained -- rtl_ip_mode() -- lived here
+ * until issue #30 B1.  The module no longer takes an address at all, and the host
+ * stack keeps its own dhcp-vs-static flag in struct nx_net_info.)
  */
-enum rtl_ipmode { RTL_IP_UNKNOWN = 0, RTL_IP_DHCP, RTL_IP_STATIC };
-enum rtl_ipmode rtl_ip_mode(void);
-void            rtl_set_ip_mode(enum rtl_ipmode m);
 
 /* ---- (b) shell adapters ------------------------------------------------------- */
 

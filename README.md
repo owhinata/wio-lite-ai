@@ -27,7 +27,7 @@ time as the USB console. 22 commands:
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
-| wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench/arp · flash*/img*) · `net` (L3: **up/down** · info/ip/dhcp · **ping/echo/shell** = host stack only) |
+| wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench/arp · flash*/img*) · `net` (L3 = **host NetX Duo only**: up/down · info/ip/dhcp/ping/echo/shell) |
 | benchmarks | `coremark` · `membench` |
 
 - **`thread`** — lists the ThreadX threads with state / stack use and a **`top`-style
@@ -92,8 +92,8 @@ time as the USB console. 22 commands:
   (touching neither the UART nor the ring) whenever nothing is in flight, so the
   `wifi log` bridge and the `wifi flash*` downloader can own the same peripheral.
   Ownership of the module as a whole — the coarse mutex that serialises whole flows
-  (`wifi connect` = init → off → on → connect → DHCP → get_ip), the reference count on
-  the eRPC UART, and the lwIP/IP-mode lifecycle state — lives in `app/rtl_link.c`.
+  (`wifi connect` = lwIP init → off → on(STA) → associate), the reference count on
+  the eRPC UART, and the lwIP lifecycle state — lives in `app/rtl_link.c`.
   Two consequences worth knowing: a command that needs the UART to itself (`wifi log` /
   `probe`, every `wifi flash*`) is **refused while an eRPC session holds it**, while the
   recovery commands (`wifi on`/`off`/`reset`) deliberately are not — they take the link
@@ -104,9 +104,11 @@ time as the USB console. 22 commands:
   `net echo` below) — a lone frame is still sent whatever its size.
   `wifi connect <ssid> [password] [security_hex]` then actually **joins an AP**
   (issue #5): it brings up the module's lwIP stack (the factory firmware leaves it
-  uninitialised at boot), switches to STA mode, associates, runs the DHCP client and
-  prints the leased `ip`/`mask`/`gw`. `wifi status` reports connected state, RSSI, IP
-  config and MAC; `wifi disconnect` drops the association.
+  uninitialised at boot, and the L2 bridge is a tap on the netif that creates), switches
+  to STA mode and associates. **That is all it does** — since issue #30 B1 it runs no
+  DHCP and prints no address, because L3 belongs entirely to `net` on the host stack.
+  `wifi status` reports connected state, RSSI and MAC; `wifi disconnect` drops the
+  association.
   `wifi scan` lists the visible APs — channel, band, RSSI, security mode, BSSID and SSID
   (the module is dual-band). The **band is derived from the channel number**, because the
   scan record's own `band` field came back 0 (`RTW_802_11_BAND_5GHZ`) for every result on
@@ -165,20 +167,19 @@ time as the USB console. 22 commands:
   RTL8720DN is a separate chip from the STM32 and its download mode lives in mask ROM, so
   it stays recoverable regardless.
 - **`net`** — the IPv4 (L3) layer on top of a `wifi connect` association (issue #5),
-  the Wio port of `../stm32f746g-disco`'s `net` command. It has **two backends**, chosen
-  by one predicate (`net up`, below): the RTL8720DN's **eRPC socket-offload**
-  (`app/wifi_rpc.c`, the module's own lwIP) or **NetX Duo on this MCU**. Either way the L2
-  side (power + association) stays in `wifi`. Since issue #23 U4 everything that moves
-  payload — `net ping`, `net echo` and the telnet console — is on the host stack only;
-  what stays on the module's lwIP is `net info`/`ip`/`dhcp`, which is also what
-  keeps a regression test against an untouched module firmware alive (the module
-  raw-ICMP ping and the `net conc` concurrency probe were retired by issue #28 — their
-  wire-level record is in this repo's history and `fw/rtl8720/README.md`).
-  `net info` shows link + MAC + which stack owns the address + IP/mask/gw
-  (and dhcp-vs-static); `net ip <a.b.c.d/mask> [gw]` sets a static address (stops DHCP);
-  `net dhcp` (re)acquires a lease; `net ping <a.b.c.d> [count]` sends **real ICMP
-  echoes** built by NetX Duo on the host stack (`net up` first) — no eRPC round trip in
-  the measured RTT.
+  the Wio counterpart of `../stm32f746g-disco`'s `net` command. Since **issue #30 B1**
+  there is exactly **one L3 backend**: **NetX Duo on this MCU**, over the issue-#23 L2
+  bridge (`net up`, below). The module's own lwIP still exists — the bridge is a tap on
+  its netif, so it has to — but nothing drives it any more, and the L2 side (power +
+  association) stays in `wifi`. The module-side socket offload it replaced was retired in
+  two steps: TCP in #23 U4, then the datagram side, the module raw-ICMP ping and the
+  `net conc` probe in #28/#30; their wire-level record is in this repo's history and in
+  `fw/rtl8720/README.md`.
+  `net info` shows association + MAC (asked of the WiFi **driver**, which the tap does not
+  touch) plus the host stack's IP/mask/gw and dhcp-vs-static; `net ip <a.b.c.d/mask> [gw]`
+  sets a static address; `net dhcp` (re)acquires a lease; `net ping <a.b.c.d> [count]`
+  sends **real ICMP echoes** built by NetX Duo — no eRPC round trip in the measured RTT.
+  All of them need `net up` first.
   `net echo [port]` (default 2323, Ctrl+C stops) runs a **TCP echo server on the host
   stack** (issue #23 U4-1, `app/nx_echo.c`) — it requires `net up`, and it is the bring-up
   rehearsal the telnet console follows. There is no RPC in its data path: bytes arrive as
@@ -200,11 +201,10 @@ time as the USB console. 22 commands:
 - **`net up` / `net down` — the host's own TCP/IP stack** (issue #23 U3,
   `app/nx_net.c` + `app/nx_link_driver.c`). `net up` turns the module into the L2 relay
   U2 built and brings **Eclipse NetX Duo up on the STM32**: our own ARP cache, our own
-  DHCP client, our own ICMP. `net` keeps its command names and picks the backend from
-  **one predicate**, so `net info` prints `stack: host (NetX Duo, module bridged)` or
-  `stack: module (lwIP offload)` and `net dhcp` / `net ip` / `net ping` follow it. With
-  the host stack up, `net ping` is a real echo request built by NetX and put on the wire
-  by our driver — no eRPC round trip in the RTT at all.
+  DHCP client, our own ICMP. Everything with an address in it requires it (one predicate,
+  `nx_net_is_up()`, so no subcommand can disagree with its neighbour about who answered).
+  **Issue #30 B2 will fold the arm into `wifi connect`**, at which point these two stop
+  being user commands and the bridge is simply always there.
 
   NetX Duo's "Ethernet MAC" here is the link's DATA channel: a transmit is a 14-byte
   header prepended in place and one `link_data_send()`, a receive is a copy into an

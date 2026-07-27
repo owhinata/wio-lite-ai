@@ -44,9 +44,6 @@ static uint32_t g_erpc_baud = RTL_ERPC_BAUD_DEFAULT;
  * rtl_link.h; reset on every power off / reset / fresh power-on, set after tcpip init. */
 static bool g_tcpip_inited;
 
-/* Host-side memo of DHCP-vs-static for `net info` (see rtl_link.h). */
-static enum rtl_ipmode g_ip_mode;
-
 /*
  * Everything the host believes about the module in front of it, dropped in one place.
  * Called from every point where that identity can change; keeping it a single function
@@ -57,7 +54,6 @@ void rtl_link_forget_module(void)
 	g_erpc_baud = RTL_ERPC_BAUD_DEFAULT;   /* the module always boots at 2 Mbaud */
 	erpc_set_module_gen(0u);               /* ... and its firmware must be re-proved */
 	g_tcpip_inited = false;
-	g_ip_mode      = RTL_IP_UNKNOWN;
 }
 
 /* ------------------------------------------------------------------ *
@@ -217,9 +213,6 @@ void rtl_link_force_quiesce(void)
 
 bool rtl_tcpip_inited(void)          { return g_tcpip_inited; }
 void rtl_tcpip_set_inited(bool v)    { g_tcpip_inited = v; }
-
-enum rtl_ipmode rtl_ip_mode(void)         { return g_ip_mode; }
-void            rtl_set_ip_mode(enum rtl_ipmode m) { g_ip_mode = m; }
 
 /* ------------------------------------------------------------------ *
  *  shell adapters

@@ -8,27 +8,25 @@
  *
  *   net up | down                bring the HOST TCP/IP stack (NetX Duo) up over the
  *                                L2 bridge / give the network back to the module
- *   net info                     connection state + MAC + which stack + IP/mask/gw
- *   net ip <a.b.c.d/mask> [gw]   set a static address (stops DHCP)
+ *   net info                     association + MAC + IP/mask/gw
+ *   net ip <a.b.c.d/mask> [gw]   set a static address
  *   net dhcp                     (re)acquire an address via DHCP
- *   net ping <a.b.c.d> [count]   ICMP echo from the host stack (requires `net up`)
+ *   net ping <a.b.c.d> [count]   ICMP echo from the host stack
  *   net echo [port]              TCP echo server on the host stack (issue #23 U4-1)
  *   net shell start|stop|status  the telnet console (a NetX socket, issue #23 U4-2)
  *
- * This is the Wio counterpart of ../stm32f746g-disco's `net` command.  There the
- * backend is NetX Duo over the on-chip Ethernet MAC; here there are TWO backends and
- * `net up` switches between them (see the "host stack" section below): the host's own
- * NetX Duo over the issue-#23 L2 bridge, or the module's lwIP reached over eRPC
- * (info/ip/dhcp only -- the surviving module paths double as the regression witness
- * that the unmodified firmware still works standalone).  The L2 side (power + WiFi
- * association) stays in `wifi`; association is a prerequisite for everything here.
+ * This is the Wio counterpart of ../stm32f746g-disco's `net` command.  There the backend
+ * is NetX Duo over the on-chip Ethernet MAC; here it is NetX Duo over the issue-#23 L2
+ * bridge, which is the SINGLE L3 backend since issue #30 B1 -- everything below `net up`
+ * is the host's own stack.  The module's lwIP still exists (the bridge is a tap on its
+ * netif, so it has to), but nothing here drives it any more.  The L2 side (power +
+ * association) stays in `wifi`, and association is a prerequisite for everything here.
  *
- * The module-backend subcommands run their whole transaction inside one
+ * Only `net info` still speaks eRPC, and only to the WiFi DRIVER (service 14) for
+ * association and MAC -- the tap does not touch those.  It runs inside one
  * rtl_link_begin() .. rtl_link_end() session (shared with `wifi`, see app/rtl_link.h):
- * that claims the console, takes the coarse link mutex -- so whole flows cannot
- * interleave -- and references the eRPC UART.  The eRPC frames themselves are owned by
- * the resident service thread in app/erpc.c.  The host-backend subcommands never touch
- * the eRPC session at all.
+ * that claims the console, takes the coarse link mutex and references the eRPC UART.
+ * Every other subcommand talks to NetX only.
  *
  * No clock/RCC/register work -- pure marshalling + orchestration (XIP-safe).
  * Clean-room design; no third-party code reused.
@@ -130,15 +128,13 @@ static unsigned mask_bits(uint32_t mask)
 	return n;
 }
 
-/* host-order u32 -> network-order octets (a.b.c.d -> [a,b,c,d]). */
-static void u32_to_octets(uint32_t v, uint8_t out[4])
-{
-	out[0] = (uint8_t)(v >> 24); out[1] = (uint8_t)(v >> 16);
-	out[2] = (uint8_t)(v >> 8);  out[3] = (uint8_t)v;
-}
+/* ---- eRPC option helper -------------------------------------------------- */
 
-/* ---- eRPC option / session helpers --------------------------------------- */
-
+/*
+ * `net info` still asks the module's WiFi DRIVER for association / MAC (service 14,
+ * which the bridge does not touch).  Everything L3 moved to the host stack in issue
+ * #30 B1, so this is the only eRPC left in this file.
+ */
 static void net_opts(struct wifi_rpc_opts *o, struct cli_instance *sh,
                      struct erpc_diag *diag, uint32_t timeout_ms)
 {
@@ -148,68 +144,17 @@ static void net_opts(struct wifi_rpc_opts *o, struct cli_instance *sh,
 	o->diag         = diag;
 }
 
-/*
- * Open a net (L3) session that needs an active association.  Claims the console and
- * opens the eRPC UART (never powers the module -- that is `wifi connect`'s job), then
- * checks the module reports connected.  On RTL_LINK_READY the session is open and the
- * caller must rtl_link_end(); otherwise it has already released + printed the reason.
- */
-static int net_session_connected(struct cli_instance *sh, struct wifi_rpc_opts *o,
-                                 struct erpc_diag *diag)
-{
-	int32_t connected = -1;
-	int rc, link;
-
-	link = rtl_link_begin(sh, false);
-	if (link == RTL_LINK_OFF) {
-		cli_error(sh, "net: RTL8720 powered off (`wifi connect <ssid> ...` first)\r\n");
-		return RTL_LINK_ERR;
-	}
-	if (link != RTL_LINK_READY)
-		return RTL_LINK_ERR;
-
-	net_opts(o, sh, diag, 3000u);
-	rc = wifi_rpc_is_connected(o, &connected);
-	if (rc || connected != WIFI_RPC_OK) {
-		cli_error(sh, "net: not connected (`wifi connect <ssid> ...` first)\r\n");
-		rtl_link_end(sh);
-		return RTL_LINK_ERR;
-	}
-	return RTL_LINK_READY;
-}
-
-static void net_print_ip(struct cli_instance *sh, const struct wifi_ip_info *ip)
-{
-	uint32_t mask = ((uint32_t)ip->netmask[0] << 24) | ((uint32_t)ip->netmask[1] << 16) |
-	                ((uint32_t)ip->netmask[2] << 8)  |  (uint32_t)ip->netmask[3];
-	const char *mode = (rtl_ip_mode() == RTL_IP_DHCP)   ? "dhcp"   :
-	                   (rtl_ip_mode() == RTL_IP_STATIC) ? "static" : "?";
-
-	cli_print(sh, "ip:    %u.%u.%u.%u/%u\r\n",
-	          ip->ip[0], ip->ip[1], ip->ip[2], ip->ip[3], mask_bits(mask));
-	cli_print(sh, "gw:    %u.%u.%u.%u (%s)\r\n",
-	          ip->gw[0], ip->gw[1], ip->gw[2], ip->gw[3], mode);
-}
-
 /* ---- host stack (issue #23 U3) ------------------------------------------- */
 
 /*
- * `net` now has two possible backends and picks between them with ONE predicate,
- * nx_net_is_up(), so no subcommand can disagree with its neighbour about which stack
- * answered:
+ * `net up` installs the L2 bridge and brings NetX Duo up on it (app/nx_net.c); `net down`
+ * gives the module its network back.  Since issue #30 B1 there is no second backend to
+ * switch to, so everything with an address in it simply requires the stack to be up and
+ * says so -- one predicate, nx_net_is_up(), and no subcommand can disagree with its
+ * neighbour about who answered.
  *
- *   down (the default)  the module's lwIP, reached over eRPC -- everything below the
- *                       U3 section, unchanged
- *   up   (`net up`)     NetX Duo on this MCU, over the L2 bridge (app/nx_net.c)
- *
- * They are mutually exclusive by construction, not by policy: while the bridge is in,
- * the module's WiFi netif is tapped and its own lwIP receives nothing at all, so the
- * module-backend paths below are refused rather than left to time out mysteriously.
- * `net ping`/`echo` and the telnet console run on the HOST stack and require `net up`.
- *
- * Note what does NOT change: association, MAC and RSSI come from the module's WiFi
- * DRIVER (eRPC service 14), which the tap does not touch, so `net info` reports them the
- * same way either way.  Only the address changes hands.
+ * (Issue #30 B2 will make the arm implicit in `wifi connect`, at which point these two
+ * disappear as user commands.)
  */
 
 #define NET_NX_POLL_MS      100u
@@ -332,7 +277,6 @@ static int cmd_net_info(struct cli_instance *sh, int argc, char **argv)
 {
 	struct wifi_rpc_opts o;
 	struct erpc_diag diag;
-	struct wifi_ip_info ip;
 	char mac[18];
 	int32_t connected = -1, result = -1;
 	int rc, link;
@@ -346,6 +290,9 @@ static int cmd_net_info(struct cli_instance *sh, int argc, char **argv)
 	if (link != RTL_LINK_READY)
 		return 1;
 
+	/* Association, MAC and RSSI come from the module's WiFi DRIVER (service 14), which
+	 * the bridge does not touch -- so they read the same whether the host stack is up or
+	 * not.  The ADDRESS is the host stack's alone since issue #30 B1. */
 	net_opts(&o, sh, &diag, 3000u);
 	rc = wifi_rpc_is_connected(&o, &connected);
 	if (rc) {
@@ -357,12 +304,8 @@ static int cmd_net_info(struct cli_instance *sh, int argc, char **argv)
 	          connected == WIFI_RPC_OK ? "up (associated)" : "down (not connected)");
 	if (wifi_rpc_get_mac(&o, mac, &result) == 0 && result == WIFI_RPC_OK)
 		cli_print(sh, "mac:   %s\r\n", mac);
+	rtl_link_end(sh);
 
-	/* Which stack owns the address decides who is asked for it.  Say so on its own
-	 * line: an A/B between the two backends is worthless if the output is ambiguous. */
-	cli_print(sh, "stack: %s\r\n",
-	          nx_net_is_up() ? "host (NetX Duo, module bridged)"
-	                         : "module (lwIP offload)");
 	if (nx_net_is_up()) {
 		struct nx_net_info ni;
 
@@ -370,13 +313,9 @@ static int cmd_net_info(struct cli_instance *sh, int argc, char **argv)
 			net_print_nx_ip(sh, &ni);
 		else
 			cli_print(sh, "ip:    none (run `net dhcp`)\r\n");
-	} else if (connected == WIFI_RPC_OK) {
-		if (wifi_rpc_get_ip(&o, 0u, &ip, &result) == 0 && result == WIFI_RPC_OK)
-			net_print_ip(sh, &ip);
-		else
-			cli_print(sh, "ip:    none\r\n");
+	} else {
+		cli_print(sh, "ip:    none (the host stack is down -- run `net up`)\r\n");
 	}
-	rtl_link_end(sh);
 
 	/*
 	 * Unconditionally, even when the host stack is OFF.  Its one-line summary carries
@@ -391,12 +330,8 @@ static int cmd_net_info(struct cli_instance *sh, int argc, char **argv)
 
 static int cmd_net_ip(struct cli_instance *sh, int argc, char **argv)
 {
-	struct wifi_rpc_opts o;
-	struct erpc_diag diag;
-	struct wifi_ip_info ip;
+	struct nx_net_info ni;
 	uint32_t a, mask, gw = 0;
-	int32_t result = -1;
-	int rc;
 
 	if (parse_ipv4_cidr(argv[1], &a, &mask) != 0) {
 		cli_error(sh, "net: bad address '%s' (use a.b.c.d/mask)\r\n", argv[1]);
@@ -408,107 +343,52 @@ static int cmd_net_ip(struct cli_instance *sh, int argc, char **argv)
 	}
 	if (net_nx_settled(sh) != 0)
 		return 1;
-	if (nx_net_is_up()) {
-		struct nx_net_info ni;
-
-		if (nx_net_set_static(a, mask, gw) != NXN_OK) {
-			cli_error(sh, "net: NetX refused the static address\r\n");
-			return 1;
-		}
-		cli_print(sh, "net: static address set (host stack)\r\n");
-		net_shell_autoarm();
-		if (nx_net_info_get(&ni) == NXN_OK)
-			net_print_nx_ip(sh, &ni);
-		return 0;
-	}
-	if (net_session_connected(sh, &o, &diag) != RTL_LINK_READY)
-		return 1;
-
-	u32_to_octets(a,    ip.ip);
-	u32_to_octets(mask, ip.netmask);
-	u32_to_octets(gw,   ip.gw);
-
-	/* Stop DHCP first so it will not overwrite the static address (best effort). */
-	o.timeout_ms = 5000u;
-	(void)wifi_rpc_dhcpc_stop(&o, 0u, &result);
-	o.timeout_ms = 5000u;
-	rc = wifi_rpc_set_ip_info(&o, 0u, &ip, &result);
-	rtl_link_end(sh);
-
-	if (rc || result != WIFI_RPC_OK) {
-		cli_error(sh, "net: set static failed (rc %d, result %ld)\r\n", rc, (long)result);
+	if (!nx_net_is_up()) {
+		cli_error(sh, "net: the host stack is down -- run `net up` first\r\n");
 		return 1;
 	}
-	rtl_set_ip_mode(RTL_IP_STATIC);
+	if (nx_net_set_static(a, mask, gw) != NXN_OK) {
+		cli_error(sh, "net: NetX refused the static address\r\n");
+		return 1;
+	}
 	cli_print(sh, "net: static address set\r\n");
-	cli_print(sh, "ip:    %u.%u.%u.%u/%u\r\n",
-	          ip.ip[0], ip.ip[1], ip.ip[2], ip.ip[3], mask_bits(mask));
-	cli_print(sh, "gw:    %u.%u.%u.%u (static)\r\n", ip.gw[0], ip.gw[1], ip.gw[2], ip.gw[3]);
+	net_shell_autoarm();
+	if (nx_net_info_get(&ni) == NXN_OK)
+		net_print_nx_ip(sh, &ni);
 	return 0;
 }
 
 static int cmd_net_dhcp(struct cli_instance *sh, int argc, char **argv)
 {
-	struct wifi_rpc_opts o;
-	struct erpc_diag diag;
-	struct wifi_ip_info ip;
-	int32_t result = -1;
-	int rc;
+	struct nx_net_info ni;
+	unsigned waited = 0u;
 
 	(void)argc; (void)argv;
 	if (net_nx_settled(sh) != 0)
 		return 1;
-	if (nx_net_is_up()) {
-		struct nx_net_info ni;
-		unsigned waited = 0u;
-
-		if (nx_net_dhcp_renew() != NXN_OK) {
-			cli_error(sh, "net: NetX DHCP client would not start\r\n");
+	if (!nx_net_is_up()) {
+		cli_error(sh, "net: the host stack is down -- run `net up` first\r\n");
+		return 1;
+	}
+	if (nx_net_dhcp_renew() != NXN_OK) {
+		cli_error(sh, "net: NetX DHCP client would not start\r\n");
+		return 1;
+	}
+	cli_print(sh, "net: requesting DHCP lease (up to ~30s, Ctrl+C to stop)...\r\n");
+	for (;;) {
+		if (nx_net_info_get(&ni) == NXN_OK && ni.ip_valid)
+			break;
+		if (cli_cancel_requested(sh) || waited >= NET_NX_DHCP_WAIT_MS) {
+			cli_error(sh, "net: no lease yet\r\n");
 			return 1;
 		}
-		cli_print(sh, "net: requesting DHCP lease with the host stack "
-		          "(up to ~30s, Ctrl+C to stop)...\r\n");
-		for (;;) {
-			if (nx_net_info_get(&ni) == NXN_OK && ni.ip_valid)
-				break;
-			if (cli_cancel_requested(sh) || waited >= NET_NX_DHCP_WAIT_MS) {
-				cli_error(sh, "net: no lease yet\r\n");
-				return 1;
-			}
-			cli_sleep(sh, NET_NX_POLL_MS);
-			waited += NET_NX_POLL_MS;
-		}
-		/* The host stack has an address: this is where the telnet console belongs
-		 * since U4-2, and where it is armed from. */
-		net_shell_autoarm();
-		net_print_nx_ip(sh, &ni);
-		return 0;
+		cli_sleep(sh, NET_NX_POLL_MS);
+		waited += NET_NX_POLL_MS;
 	}
-	if (net_session_connected(sh, &o, &diag) != RTL_LINK_READY)
-		return 1;
-
-	cli_print(sh, "net: requesting DHCP lease (up to ~30s, Ctrl+C to stop)...\r\n");
-	o.timeout_ms = 30000u;
-	rc = wifi_rpc_dhcpc_start(&o, 0u, &result);
-	if (rc == -4) { cli_print(sh, "net: aborted\r\n"); rtl_link_end(sh); return 1; }
-	if (rc || result != WIFI_RPC_OK) {
-		cli_error(sh, "net: DHCP failed (rc %d, result %ld)\r\n", rc, (long)result);
-		rtl_link_end(sh);
-		return 1;
-	}
-	rtl_set_ip_mode(RTL_IP_DHCP);
-
-	o.timeout_ms = 3000u;
-	rc = wifi_rpc_get_ip(&o, 0u, &ip, &result);
-	rtl_link_end(sh);
-	if (rc || result != WIFI_RPC_OK) {
-		cli_error(sh, "net: get IP failed (rc %d, result %ld)\r\n", rc, (long)result);
-		return 1;
-	}
-	/* No net_shell_autoarm() on this path: since issue #23 U4-2 the telnet console is a
-	 * NetX socket on the HOST stack, so an address the MODULE's lwIP just took is not
-	 * one it can listen on. */
-	net_print_ip(sh, &ip);
+	/* The host stack has an address: this is where the telnet console belongs since
+	 * U4-2, and where it is armed from. */
+	net_shell_autoarm();
+	net_print_nx_ip(sh, &ni);
 	return 0;
 }
 

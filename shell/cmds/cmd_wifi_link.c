@@ -575,7 +575,7 @@ static int link_dir_sizes(const char *dir, uint32_t bytes, uint32_t *tx, uint32_
 
 static int cmd_link_bench(struct cli_instance *sh, int argc, char **argv)
 {
-	uint32_t bytes = LINK_BENCH_DEF, secs = LINK_BENCH_SECS, tx, rx;
+	uint32_t bytes = LINK_BENCH_DEF, secs = LINK_BENCH_SECS, tx = 0u, rx = 0u;
 	const char *dir = "both";
 	int all;
 
@@ -1231,7 +1231,6 @@ static int link_eth_session(struct cli_instance *sh, uint32_t secs, uint32_t max
 	uint32_t st[LINK_ETH_STAT_WORDS], dst[LINK_DSTAT_WORDS];
 	struct wifi_rpc_opts o;
 	struct erpc_diag diag = {0};
-	struct wifi_ip_info ipinfo;
 	uint8_t mac[6] = {0}, spa[4] = {0}, flags = 0u;
 	uint32_t t_start, printed = 0u, sent = 0u, next_arp = 0u;
 	int32_t result = -1;
@@ -1252,13 +1251,15 @@ static int link_eth_session(struct cli_instance *sh, uint32_t secs, uint32_t max
 		return 1;
 	}
 
-	/* 1) the address, while the module still has one. */
-	o.timeout_ms = 5000u;
+	/*
+	 * 1) the sender address.  It used to be read off the module, but since issue #30 B1
+	 * the module's lwIP never takes one (L3 is the host stack's alone), so it comes from
+	 * the caller or stays 0.0.0.0 -- which is a legal ARP probe (RFC 5227) and still
+	 * draws a reply, so the is-at round trip this command exists for is unaffected.
+	 */
 	o.should_abort = rtl_abort_cb;
 	o.abort_ctx = sh;
 	o.diag = &diag;
-	if (wifi_rpc_get_ip(&o, 0u, &ipinfo, &result) == 0 && result == WIFI_RPC_OK)
-		memcpy(spa, ipinfo.ip, 4);
 	if (spa_override != NULL)
 		memcpy(spa, spa_override, 4);
 

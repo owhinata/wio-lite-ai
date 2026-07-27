@@ -170,7 +170,6 @@ static uint8_t  nxn_mac[6];
 static uint8_t  nxn_radio_up;
 static uint8_t  nxn_reply[ERPC_CTRL_MAX];
 static struct nx_net_modstats nxn_mod;
-static struct wifi_ip_info    nxn_saved_ip;   /* the module's address before we took it */
 
 /* Why the interface last went down or refused, for `net info`. */
 static const char *nxn_why = "";
@@ -570,14 +569,6 @@ static void nxn_arm(void)
 		nxn_why = "cancelled";
 		goto unref;
 	}
-	/*
-	 * Read the module's address BEFORE stopping DHCP and before the bridge zeroes the
-	 * netif: it is the state we restore the user's expectations to afterwards, and once
-	 * the tap is in it is gone.
-	 */
-	memset(&nxn_saved_ip, 0, sizeof nxn_saved_ip);
-	(void)wifi_rpc_get_ip(&o, 0u, &nxn_saved_ip, &result);
-
 	/*
 	 * Stop the module's DHCP client.  A TRANSPORT failure refuses the whole session --
 	 * "we do not know whether it stopped" is not good enough when the bridge is about
