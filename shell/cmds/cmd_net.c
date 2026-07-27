@@ -37,6 +37,7 @@
 #include "net_shell.h"
 #include "nx_echo.h"  /* `net echo` on the host stack (issue #23 U4-1) */
 #include "nx_net.h"   /* the host stack: `net up` switches the backend (issue #23 U3) */
+#include "nx_link_driver.h" /* link state for the `net ping` precondition (issue #30 B2a) */
 
 #include "stm32h7xx_hal.h"   /* HAL_GetTick (1 ms SysTick, fed via tx_glue.c) */
 
@@ -417,6 +418,14 @@ static int cmd_net_ping(struct cli_instance *sh, int argc, char **argv)
 	if (net_nx_settled(sh) != 0)
 		return 1;
 	if (nx_net_is_up()) {
+		/* Say WHY rather than letting NetX refuse every probe in turn: with the link
+		 * down (issue #30 B2a) the interface still has an address and looks configured,
+		 * so four "NetX error" lines are the least informative possible answer. */
+		if (!nx_link_driver_link_up()) {
+			cli_error(sh, "net: the link is down (not associated) -- "
+			          "`wifi connect` first\r\n");
+			return 1;
+		}
 		/*
 		 * A real ICMP echo: built by NetX, its destination resolved by our own ARP
 		 * cache, put on the wire by app/nx_link_driver.c and relayed by the module.
