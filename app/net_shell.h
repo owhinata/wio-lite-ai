@@ -92,7 +92,9 @@ void net_shell_autoarm(void);
  * net_shell_start() returns 0 when the request was posted, -1 when it was refused (already
  * armed, or the host stack is not up) with the reason in *@why.
  * net_shell_stop() also disables auto-arm, so a later `net dhcp` does not silently bring
- * the console back.
+ * the console back.  It is the ONLY thing that clears that latch: stopping because the
+ * INTERFACE is going away (net_shell_stop_sync(), below) must leave it set, or one
+ * `net down` kills telnet until an explicit `net shell start`.
  */
 int  net_shell_start(uint16_t port, const char **why);
 void net_shell_stop(void);

@@ -658,7 +658,12 @@ static void nsh_entry(ULONG arg)
 
 		if (g_req_stop && g_state != NET_SHELL_ARMING) {
 			g_req_stop = 0u;
-			g_autoarm  = 0u;           /* an explicit stop stays stopped */
+			/* The auto-arm latch is NOT touched here.  Whether the console
+			 * should come back on its own depends on WHY it is stopping, which
+			 * only the requester knows: net_shell_stop() (the operator said so)
+			 * clears it before asking, net_shell_stop_sync() (the interface is
+			 * going away) leaves it alone.  Deciding it here as well made
+			 * `net down` disable telnet for good -- one policy, one place. */
 			if (g_state != NET_SHELL_OFF)
 				nsh_do_stop("requested");
 			else
