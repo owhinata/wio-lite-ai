@@ -971,6 +971,18 @@ int nx_net_dhcp_renew(void)
 		nx_dhcp_reinitialize(&nxn_dhcp);
 		nxn_dhcp_started = false;
 	}
+	/*
+	 * Drop the address we hold BEFORE the client starts, so "the interface has an
+	 * address" means "a lease arrived" and nothing else.  The DHCP client zeroes it
+	 * itself on the way into INIT, but it does that on its OWN thread -- so a caller
+	 * that starts the client and then watches for an address (shell/cmds/cmd_net.c)
+	 * races it and can read the previous one.  Measured on board #2: `net ip
+	 * 192.168.11.99/24` followed by `net dhcp` reported "192.168.11.99 (dhcp)" at once
+	 * while the real lease (192.168.11.44) landed seconds later -- a wrong answer that
+	 * looked exactly like a right one.  Clearing here is also what "renew" means.
+	 */
+	(void)nx_ip_address_set(&nxn_ip, 0u, 0u);
+	nx_ip_gateway_address_set(&nxn_ip, 0u);
 	s = nx_dhcp_start(&nxn_dhcp);
 	/* ALREADY_STARTED means the state we wanted is the state we have -- that is a
 	 * success, not a failure, and treating it as one is how a second `net dhcp` ends up

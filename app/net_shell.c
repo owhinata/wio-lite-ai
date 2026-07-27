@@ -779,13 +779,21 @@ int net_shell_start(uint16_t port, const char **why)
 	return 0;
 }
 
+/* Ask the service thread to close the session.  Leaves the auto-arm latch alone: WHY we
+ * are stopping decides whether the console should come back on its own, and only the
+ * caller knows that. */
+static void nsh_request_stop(void)
+{
+	g_req_stop = 1u;
+	(void)tx_event_flags_set(&g_evt, NSH_EVT_CMD, TX_OR);
+}
+
 void net_shell_stop(void)
 {
 	if (!g_ready)
 		return;
 	g_autoarm  = 0u;      /* an explicit stop must not be undone by the next `net dhcp` */
-	g_req_stop = 1u;
-	(void)tx_event_flags_set(&g_evt, NSH_EVT_CMD, TX_OR);
+	nsh_request_stop();
 }
 
 int net_shell_stop_sync(uint32_t timeout_ms)
@@ -812,7 +820,14 @@ int net_shell_stop_sync(uint32_t timeout_ms)
 
 	/* Clear any stale completion before asking, so what we wait for is OURS. */
 	(void)tx_event_flags_get(&g_evt, NSH_EVT_DONE, TX_OR_CLEAR, &f, TX_NO_WAIT);
-	net_shell_stop();
+	/*
+	 * nsh_request_stop(), NOT net_shell_stop(): this is the INTERFACE going away
+	 * (nx_net.c calls it while unwinding), not the operator saying "I do not want a
+	 * console".  Clearing the auto-arm latch here made `net down` disable telnet for
+	 * good -- the following `net up` + `net dhcp` armed nothing and the only way back
+	 * was an explicit `net shell start`.  Found on board #2 (issue #30 B1 testing).
+	 */
+	nsh_request_stop();
 
 	while (waited < timeout_ms) {
 		ULONG slice = (timeout_ms - waited > NSH_IDLE_MS) ? NSH_IDLE_MS
