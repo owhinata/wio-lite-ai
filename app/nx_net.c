@@ -184,6 +184,10 @@ static uint8_t  nxn_radio_up;
  * on a link transition or a successful lease, so a torn read is not a thing. */
 static uint8_t  nxn_link_down_run;
 static bool     nxn_lease_stale;
+/* Association poll tally, so a spurious link-down can be told apart from a real one:
+ * "the module said no" and "the module did not answer" are different failures and only
+ * the first is the network's fault. */
+static uint32_t nxn_assoc_yes, nxn_assoc_no, nxn_assoc_noanswer;
 static uint8_t  nxn_reply[ERPC_CTRL_MAX];
 static struct nx_net_modstats nxn_mod;
 
@@ -616,6 +620,7 @@ static void nxn_arm(void)
 
 	nxn_link_down_run = 0u;
 	nxn_lease_stale   = false;
+	nxn_assoc_yes = nxn_assoc_no = nxn_assoc_noanswer = 0u;
 	armed = 1;                       /* from here on, only nxn_stop() may end this */
 	if (nxn_data_cfg(ERPC_DATA_MODE_BRIDGE, NXN_HOLD_MS) != 0) {
 		nxn_why = "the module refused to bridge (see the log; `wifi connect` first?)";
@@ -696,6 +701,10 @@ refuse:
 static void nxn_publish_link(int assoc)
 {
 	int up = nx_link_driver_link_up();
+
+	if (assoc > 0)      nxn_assoc_yes++;
+	else if (assoc == 0) nxn_assoc_no++;
+	else                 nxn_assoc_noanswer++;
 
 	if (assoc > 0) {
 		nxn_link_down_run = 0u;
@@ -1171,6 +1180,10 @@ void nx_net_print_status(struct cli_instance *sh)
 	          nx_link_driver_link_up() ? "up" : "DOWN",
 	          nxn_radio_up ? "started" : "stopped",
 	          nxn_lease_stale ? "  <-- lease may be stale, run `net dhcp`" : "");
+
+	cli_print(sh, "  assoc polls: %lu associated, %lu not, %lu no answer\r\n",
+	          (unsigned long)nxn_assoc_yes, (unsigned long)nxn_assoc_no,
+	          (unsigned long)nxn_assoc_noanswer);
 
 	nx_link_driver_get_stats(&st);
 	cli_print(sh, "  nx rx: %lu frames, %lu B, no-buf %lu, oversize %lu, undersize %lu, "
