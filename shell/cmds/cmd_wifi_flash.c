@@ -38,6 +38,7 @@
 #include "psram.h"           /* #19 M5: PSRAM_BASE_ADDR + the OCTOSPI1 guard */
 #include "log.h"             /* #19 M5: transfer post-mortem into the dmesg ring */
 #include "rtl_link.h"
+#include "nx_net.h"        /* the bridge has to be given back before we take the link */
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -66,6 +67,57 @@ static int parse_u32(const char *s, uint32_t *out)
 		val = val * base + d;
 	}
 	*out = val;
+	return 0;
+}
+
+/*
+ * Take the link for a download session (issue #30 B2b).
+ *
+ * Since the bridge became permanent, the interface owner holds a UART reference for as
+ * long as the host stack is up -- so the plain busy-reject claim these commands used
+ * would refuse EVERY flash command, i.e. it would take away the issue-#19 recovery path
+ * exactly when it is most needed.  Flashing is a recovery path and has to work when the
+ * link is occupied, like `wifi on/off/reset`.
+ *
+ * The order matters and each step earns its place:
+ *   1. ask the interface to unwind PROPERLY (the DATA consumer detaches and the telnet
+ *      console releases its socket under their own contracts -- yanking the link instead
+ *      would leave NetX holding a socket on an interface that no longer receives);
+ *   2. claim with allow_busy, because after step 1 nothing should hold it and if
+ *      something still does, this is the command that must win;
+ *   3. re-check the state UNDER the claim: nx_net_down() only posts a request and does
+ *      not hold the coarse mutex while it unwinds, so between step 1 finishing and step 2
+ *      succeeding another console could have started `wifi connect` and armed it again.
+ */
+#define FLASH_STOP_POLL_MS   100u
+#define FLASH_STOP_WAIT_MS   10000u
+
+static int flash_claim(struct cli_instance *sh)
+{
+	unsigned waited = 0u;
+
+	if (nx_net_state() != NX_NET_OFF) {
+		cli_print(sh, "wifi: taking the host stack down first (flashing needs the "
+		          "link)...\r\n");
+		nx_net_down();
+		while (nx_net_state() != NX_NET_OFF && waited < FLASH_STOP_WAIT_MS) {
+			if (cli_sleep(sh, FLASH_STOP_POLL_MS))
+				return -1;                  /* Ctrl+C */
+			waited += FLASH_STOP_POLL_MS;
+		}
+		if (nx_net_state() != NX_NET_OFF) {
+			cli_error(sh, "wifi: the host stack would not go down -- "
+			          "`net shell stop` then retry, or `wifi reset`\r\n");
+			return -1;
+		}
+	}
+	if (rtl_link_hw_claim(sh, true) != 0)
+		return -1;
+	if (nx_net_state() != NX_NET_OFF) {
+		rtl_link_hw_release(sh);
+		cli_error(sh, "wifi: the host stack came back up just now -- retry\r\n");
+		return -1;
+	}
 	return 0;
 }
 
@@ -136,9 +188,7 @@ int cmd_wifi_flashread(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "wifi: bad nsectors (1..64)\r\n");
 		return 1;
 	}
-	/* bg-reject / busy-reject (the download path re-opens the UART itself), and the
-	 * coarse link mutex for the whole session: no HW is touched until both are held. */
-	if (rtl_link_hw_claim(sh, false) != 0)
+	if (flash_claim(sh) != 0)
 		return 1;
 
 	cli_print(sh, "wifi: reading flash (NON-DESTRUCTIVE)...\r\n");
@@ -190,9 +240,7 @@ int cmd_wifi_flashtest(struct cli_instance *sh, int argc, char **argv)
 		          "Re-run `wifi flashtest 0x%lX confirm` to proceed.\r\n", (unsigned long)offset);
 		return 1;
 	}
-	/* bg-reject / busy-reject (the download path re-opens the UART itself), and the
-	 * coarse link mutex for the whole session: no HW is touched until both are held. */
-	if (rtl_link_hw_claim(sh, false) != 0)
+	if (flash_claim(sh) != 0)
 		return 1;
 
 	cli_print(sh, "wifi: flash erase/write/verify self-test @0x%lX "
@@ -263,9 +311,7 @@ int cmd_wifi_flashinfo(struct cli_instance *sh, int argc, char **argv)
 
 	(void)argc; (void)argv;
 
-	/* bg-reject / busy-reject (the download path re-opens the UART itself), and the
-	 * coarse link mutex for the whole session: no HW is touched until both are held. */
-	if (rtl_link_hw_claim(sh, false) != 0)
+	if (flash_claim(sh) != 0)
 		return 1;
 
 	cli_print(sh, "wifi: identifying RTL8720 flash (NON-DESTRUCTIVE)...\r\n");
@@ -444,9 +490,7 @@ int cmd_wifi_flashbackup(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "wifi: range past the protocol's 16 MB (24-bit offset) limit\r\n");
 		return 1;
 	}
-	/* bg-reject / busy-reject (the download path re-opens the UART itself), and the
-	 * coarse link mutex for the whole session: no HW is touched until both are held. */
-	if (rtl_link_hw_claim(sh, false) != 0)
+	if (flash_claim(sh) != 0)
 		return 1;
 
 	cli_print(sh, "wifi: flash backup (NON-DESTRUCTIVE)...\r\n");
@@ -713,9 +757,7 @@ int cmd_wifi_flashwrite(struct cli_instance *sh, int argc, char **argv)
 		cli_warn(sh, "wifi: NOTE this range covers 0x105000, the factory WiFi settings "
 		         "sector -- the stored SSID/password will be replaced\r\n");
 
-	/* bg-reject / busy-reject (the download path re-opens the UART itself), and the
-	 * coarse link mutex for the whole session: no HW is touched until both are held. */
-	if (rtl_link_hw_claim(sh, false) != 0)
+	if (flash_claim(sh) != 0)
 		return 1;
 	if (!psram_acquire()) {                 /* the image is read straight out of PSRAM */
 		rtl_link_hw_release(sh);

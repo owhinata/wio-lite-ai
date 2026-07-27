@@ -422,6 +422,75 @@ static int cmd_wifi_ver(struct cli_instance *sh, int argc, char **argv)
 	return (rc == 0 && echoed == 0x5Au) ? 0 : 1;
 }
 
+/*
+ * Coordinate a long eRPC flow with the L2 bridge (issue #30 B2b).
+ *
+ * These flows used to be REFUSED while the host stack was up (`nx_net_guard`), which is
+ * why recovering from an AP outage meant tearing the whole interface down.  Two things
+ * made the refusal obsolete: issue #30 B1 stopped `wifi connect` touching the module's
+ * lwIP address and DHCP client, and the SDK shows the tap survives the off->on(STA)
+ * cycle (`netif_add()` runs only inside LwIP_Init(); wifi_on/off only move netif
+ * up/down flags, never netif->input).
+ *
+ * What DOES still conflict is time: the owner refreshes the module's bridge watchdog by
+ * taking the coarse mutex, and these flows hold it far longer than the hold.  So instead
+ * of refusing, hold the watchdog open first -- and if that cannot be done, refuse after
+ * all, because starting the flow would drop the bridge somewhere in the middle of it.
+ *
+ * Call with the session open (coarse mutex held).  Returns 0 to proceed.
+ */
+static int wifi_hold_bridge(struct cli_instance *sh, const char *what)
+{
+	if (nx_net_hold_extend() == 0)
+		return 0;
+	cli_error(sh, "%s: refused -- the module did not renew the L2 bridge, and starting "
+	          "now would drop it mid-flow; retry, then `wifi reset`\r\n", what);
+	return 1;
+}
+
+/*
+ * Bring the L2 bridge up after a successful association (issue #30 B2b).  MUST be called
+ * with the eRPC session already closed -- see the note at the call site.  Prints what
+ * happened and returns the command's exit status.
+ */
+#define WIFI_ARM_POLL_MS   100u
+#define WIFI_ARM_WAIT_MS   20000u
+
+static int wifi_arm_bridge(struct cli_instance *sh)
+{
+	const char *why = "";
+	unsigned waited = 0u;
+
+	if (nx_net_state() != NX_NET_OFF) {
+		/* Already bridged: re-associating did not disturb the tap (it survives the
+		 * off->on(STA) cycle), so there is nothing to do.  The link flag follows on
+		 * the owner's next association poll, within NXN_REFRESH_MS. */
+		cli_print(sh, "  the host stack is already up (link follows within ~8s)\r\n");
+		return 0;
+	}
+	if (nx_net_up(&why) != 0) {
+		cli_error(sh, "  the host stack did not come up -- %s\r\n", why);
+		return 1;
+	}
+	cli_print(sh, "  bringing the host stack up...\r\n");
+	while (nx_net_state() == NX_NET_ARMING && waited < WIFI_ARM_WAIT_MS) {
+		/* Ctrl+C stops WAITING, not the owner: a half-installed bridge must be
+		 * unwound by the owner, never by a second thread (app/nx_net.h). */
+		if (cli_cancel_requested(sh)) {
+			cli_print(sh, "  still arming in the background; `net info` to check\r\n");
+			return 1;
+		}
+		cli_sleep(sh, WIFI_ARM_POLL_MS);
+		waited += WIFI_ARM_POLL_MS;
+	}
+	if (!nx_net_is_up()) {
+		nx_net_print_status(sh);
+		return 1;
+	}
+	cli_print(sh, "  host stack up -- run `net dhcp` for an address\r\n");
+	return 0;
+}
+
 /* The Ctrl+C-abortable option block every eRPC call in this file uses. */
 static void wifi_opts(struct wifi_rpc_opts *o, struct cli_instance *sh,
                       struct erpc_diag *diag)
@@ -491,13 +560,16 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 		security = pass ? WIFI_RPC_SEC_WPA2_AES_PSK : WIFI_RPC_SEC_OPEN;
 	}
 
-	/* Re-associating underneath a live host stack would take the module's lwIP,
-	 * DHCP client and netif address out from under the bridge, and this flow holds
-	 * the coarse mutex for longer than the bridge's watchdog (issue #23 U3). */
-	if (nx_net_guard(sh, "wifi connect"))
+	/* Not from the telnet console: dropping the association takes the very session
+	 * running this command away.  Run it from USB CDC. */
+	if (net_shell_guard(sh, "wifi connect"))
 		return 1;
 	if (rtl_link_begin(sh, true) != RTL_LINK_READY)
 		return 1;
+	if (wifi_hold_bridge(sh, "wifi connect")) {
+		rtl_link_end(sh);
+		return 1;
+	}
 
 	wifi_opts(&o, sh, &diag);
 
@@ -543,8 +615,17 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 	 * happens here, and L3 lives entirely in `net`.
 	 */
 	rtl_link_end(sh);
-	cli_print(sh, "wifi: connected -- run `net up` then `net dhcp` for an address\r\n");
-	return 0;
+	cli_print(sh, "wifi: connected\r\n");
+	/*
+	 * Bring the bridge up as part of associating (issue #30 B2b), so there is no
+	 * user-visible "which stack owns the network" mode left.
+	 *
+	 * ORDER IS LOAD-BEARING: rtl_link_end() above released the coarse mutex and our
+	 * UART reference FIRST.  nxn_arm() runs on the owner thread and takes exactly those
+	 * two, in that order -- so arming while we still held them could never succeed; it
+	 * would spin until NXN_ARM_CLAIM_MS and report "the link stayed busy".
+	 */
+	return wifi_arm_bridge(sh);
 
 fail:
 	rtl_link_end(sh);
@@ -561,7 +642,9 @@ static int cmd_wifi_disconnect(struct cli_instance *sh, int argc, char **argv)
 	int rc, link;
 
 	(void)argc; (void)argv;
-	if (nx_net_guard(sh, "wifi disconnect"))
+	/* Dropping the association is a link-down event, not a teardown: the bridge stays
+	 * (issue #30 B2b treats an operator disconnect exactly like the AP going away). */
+	if (net_shell_guard(sh, "wifi disconnect"))
 		return 1;
 	link = rtl_link_begin(sh, false);
 	if (link == RTL_LINK_OFF) {
@@ -813,11 +896,14 @@ static int cmd_wifi_scan(struct cli_instance *sh, int argc, char **argv)
 	int rc;
 
 	(void)argc; (void)argv;
-	/* A scan retunes the radio, which is the one the bridge is relaying through. */
-	if (nx_net_guard(sh, "wifi scan"))
-		return 1;
+	/* A scan retunes the radio, which is the one the bridge is relaying through -- so
+	 * traffic pauses for its duration, but the tap itself is untouched. */
 	if (rtl_link_begin(sh, true) != RTL_LINK_READY)
 		return 1;
+	if (wifi_hold_bridge(sh, "wifi scan")) {
+		rtl_link_end(sh);
+		return 1;
+	}
 
 	wifi_opts(&o, sh, &diag);
 

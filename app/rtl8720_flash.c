@@ -177,22 +177,40 @@ static int slip_decode(const uint8_t *in, int n, uint8_t *out, int cap)
 
 int rtl_dl_enter(uint32_t hold_us, int (*should_abort)(void *), void *ctx)
 {
-	/* Close any open UART9 first so the ISR cannot run against the strap reconfig, then
-	 * put PD14 in a known-safe INPUT state up front.  This makes the cleanup contract
-	 * (PD14 is NEVER returned as a driven-low output) hold on EVERY path -- including the
-	 * first abort below -- regardless of PD14's state on entry.  An input / pull-up does
-	 * not contend even if the RTL8720 is currently driving PA[7] as its LOG-UART TX. */
-	rtl8720_uart_close();
-	dl_strap_release_input();
+	/*
+	 * FORCE-QUIESCE FIRST, and it has to be first (issue #30 B2b).
+	 *
+	 * This used to be a bare rtl8720_uart_close() plus rtl_link_forget_module().  That
+	 * was sound only while callers proved the link was idle before entering: the
+	 * ownership rule in app/rtl8720.h lets this downloader open and close UART9 at will
+	 * on the strength of rtl_link_uart_busy() == false, which the busy-reject claim
+	 * established.  Since the L2 bridge became permanent the interface owner holds a
+	 * reference for as long as the host stack is up, so callers now claim with
+	 * allow_busy -- and a raw close would then be racing the link service thread, not
+	 * just here but through every re-open the download protocol performs afterwards.
+	 *
+	 * rtl_link_force_quiesce() does the whole job under the eRPC lock: it drops the
+	 * reference count to zero, advances BOTH generations (which is how the interface
+	 * owner learns its link was taken away -- rtl_link_forget_module() alone never told
+	 * it), abandons in-flight tokens and closes the UART.  Afterwards
+	 * rtl_link_uart_busy() is false again, so the rest of this file is back on the
+	 * footing its ownership contract assumes.  Caller holds the coarse mutex, which is
+	 * exactly how force_quiesce is meant to be called.
+	 *
+	 * It also subsumes the old forget_module(): whatever the host believed about the
+	 * module is void from here on -- this session exists to change that flash, it drives
+	 * CHIP_EN below, and even an aborted one can leave a half-written image.  The proof
+	 * has to be re-earned with `wifi ver` afterwards, rather than a stale "it is wio-n4"
+	 * surviving a downgrade to an image whose UART ring is 127 bytes, or -- the one that
+	 * bites hardest -- a stale 6 Mbaud rate against a module that just rebooted at 2.
+	 */
+	rtl_link_force_quiesce();
 
-	/* Whatever the host believed about the module is void from here on: this session
-	 * exists to change that flash, it drives CHIP_EN below, and even an aborted one can
-	 * leave a half-written image.  Forgetting now means the proof has to be re-earned
-	 * (`wifi ver`) afterwards, rather than a stale "it is wio-n4" surviving a
-	 * downgrade to an image whose UART ring is 127 bytes, a stale "it is wio-n5" leaving
-	 * `link` talking CTRL to firmware that has none, or -- the one that bites hardest --
-	 * a stale 6 Mbaud link rate against a module that has just rebooted at 2. */
-	rtl_link_forget_module();
+	/* PD14 to a known-safe INPUT state up front, so the cleanup contract (PD14 is NEVER
+	 * returned as a driven-low output) holds on EVERY path -- including the first abort
+	 * below -- regardless of its state on entry.  An input / pull-up does not contend
+	 * even if the RTL8720 is currently driving PA[7] as its LOG-UART TX. */
+	dl_strap_release_input();
 
 	/* Power the module OFF before driving the strap: if it were running, its PA[7]
 	 * (LOG-UART TX) would be a live output and driving PD14 low against it would be a

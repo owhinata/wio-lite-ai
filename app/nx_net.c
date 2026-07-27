@@ -66,6 +66,9 @@
  * of those.
  */
 #define NXN_HOLD_MS        30000u
+/* The module's ceiling (fw/rtl8720 WIO_ETH_HOLD_MAX_MS).  Used only by
+ * nx_net_hold_extend() to cover a long eRPC flow that cannot refresh. */
+#define NXN_HOLD_MAX_MS    60000u
 #define NXN_REFRESH_MS     8000u
 
 #define NXN_CTRL_TMO_MS    500u
@@ -1210,7 +1213,31 @@ int nx_net_guard(struct cli_instance *sh, const char *what)
 		          "cleanly; run `wifi reset`\r\n", what);
 	else
 		cli_error(sh, "%s: refused -- the host stack owns the module's network "
-		          "(state %s); run `net down` first\r\n", what,
-		          nxn_state_name(nxn_state));
+		          "(state %s)\r\n", what, nxn_state_name(nxn_state));
 	return 1;
+}
+
+/*
+ * Hold the module's bridge watchdog open across a long eRPC flow (issue #30 B2b).
+ *
+ * The owner refreshes the tap every NXN_REFRESH_MS by taking the coarse mutex -- so a
+ * command that holds that mutex for longer than NXN_HOLD_MS silently loses the bridge
+ * mid-flow.  `wifi connect` blocks up to 15 s on the module and `wifi scan` up to 15 s
+ * twice (waiting out a previous scan, then its own), which is well past it.
+ *
+ * CONTRACT: the caller already holds the coarse mutex, exactly like
+ * rtl_link_force_quiesce().  This issues one CTRL with the module's maximum hold; the
+ * next ordinary refresh puts it back to NXN_HOLD_MS.  Re-arming is idempotent on the
+ * module (fw/rtl8720 e_bridge_locked() just moves the deadline), so calling it between
+ * the phases of a long flow is free.
+ *
+ * Returns 0 when the bridge is not up (nothing to hold) or the extension was
+ * acknowledged, -1 when the module did not answer -- and a caller that gets -1 MUST NOT
+ * start the long flow, because the alternative is losing the bridge in the middle of it.
+ */
+int nx_net_hold_extend(void)
+{
+	if (nxn_state != NX_NET_UP)
+		return 0;
+	return (nxn_data_cfg(ERPC_DATA_MODE_BRIDGE, NXN_HOLD_MAX_MS) == 0) ? 0 : -1;
 }

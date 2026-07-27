@@ -202,4 +202,11 @@ void nx_net_print_status(struct cli_instance *sh);
  */
 int nx_net_guard(struct cli_instance *sh, const char *what);
 
+/*
+ * Keep the module's bridge alive across a long eRPC flow (issue #30 B2b).  Caller must
+ * hold the rtl_link coarse mutex.  Returns 0 (nothing to hold, or held) / -1 (the module
+ * did not answer -- do NOT start the flow).  See the definition for why.
+ */
+int nx_net_hold_extend(void);
+
 #endif /* APP_NX_NET_H */

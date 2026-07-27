@@ -67,7 +67,12 @@ void rtl8720_reset(void);
  *       rtl_link_hw_claim() checks; with no live token the service thread is parked
  *       and touches neither the UART nor the ring).
  * The flash downloader (app/rtl8720_flash.c) opens/closes UART9 at several baud rates
- * internally and relies on (b)'s second form.
+ * internally and relies on (b)'s second form.  Since issue #30 B2b it no longer INHERITS
+ * that condition from its caller -- the L2 bridge is permanent, so the interface owner
+ * holds a reference whenever the host stack is up and the caller claims with allow_busy.
+ * rtl_dl_enter() therefore ESTABLISHES it, by calling rtl_link_force_quiesce() before it
+ * touches the peripheral: that revokes the reference under the eRPC lock and leaves
+ * rtl_link_uart_busy() == false for the rest of the session.
  */
 int rtl8720_uart_open(enum rtl8720_uart which, uint32_t baud);
 
