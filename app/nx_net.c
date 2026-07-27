@@ -87,6 +87,13 @@
 #define NXN_SETTLE_TRIES   50         /* x 20 ms = 1 s, as link_data_settle()         */
 #define NXN_REFRESH_FAILS  2          /* consecutive CFG failures before STOP         */
 
+/*
+ * Consecutive association samples that must be non-positive before the link is declared
+ * down (issue #30 B2a).  Two at NXN_REFRESH_MS = up to ~16 s of latency on a real
+ * disconnect, which is the price of not dropping every socket on one lost round trip.
+ */
+#define NXN_LINK_DOWN_SAMPLES 2
+
 #define NXN_DSTAT_WORDS    12u        /* LINK_DATA_STATS reply                        */
 #define NXN_ETH_REPLY_MIN  (8u + ERPC_ETH_STAT_WORDS * 4u)
 
@@ -168,6 +175,12 @@ static volatile uint8_t  nxn_req_stop;
 static uint32_t nxn_uart_gen;
 static uint8_t  nxn_mac[6];
 static uint8_t  nxn_radio_up;
+
+/* Association tracking for the link state (issue #30 B2a).  Owner thread only, except
+ * nxn_lease_stale which readers sample without the lock -- a bool that only ever moves
+ * on a link transition or a successful lease, so a torn read is not a thing. */
+static uint8_t  nxn_link_down_run;
+static bool     nxn_lease_stale;
 static uint8_t  nxn_reply[ERPC_CTRL_MAX];
 static struct nx_net_modstats nxn_mod;
 
@@ -598,6 +611,8 @@ static void nxn_arm(void)
 		goto unref;
 	}
 
+	nxn_link_down_run = 0u;
+	nxn_lease_stale   = false;
 	armed = 1;                       /* from here on, only nxn_stop() may end this */
 	if (nxn_data_cfg(ERPC_DATA_MODE_BRIDGE, NXN_HOLD_MS) != 0) {
 		nxn_why = "the module refused to bridge (see the log; `wifi connect` first?)";
@@ -661,12 +676,53 @@ refuse:
 }
 
 /*
+ * Turn an association sample into the interface's link state (issue #30 B2a).
+ *
+ * @assoc: 1 associated, 0 not, -1 no answer (transport failure / refresh skipped).
+ *
+ * HYSTERESIS, and only in the down direction: a single missed round trip must not tear
+ * a TCP session down, so it takes NXN_LINK_DOWN_SAMPLES consecutive non-positive samples
+ * (8 s apart) to declare the link down.  Coming back needs one good sample -- being late
+ * to say "up" costs nothing, being early to say "down" costs every socket.
+ *
+ * The write itself goes through nx_link_driver_set_link(), which only flags the change
+ * and lets the IP thread run the status callback; nx_interface_link_up is never written
+ * from this thread.  Nothing here starts DHCP: that lock-order cycle is documented at
+ * nxn_link_status_cb() and the lease is instead latched stale for `net info` to report.
+ */
+static void nxn_publish_link(int assoc)
+{
+	int up = nx_link_driver_link_up();
+
+	if (assoc > 0) {
+		nxn_link_down_run = 0u;
+		if (!up) {
+			nx_link_driver_set_link(1);
+			LOG_INF("link up (associated)");
+		}
+		return;
+	}
+	if (assoc < 0 && !up)
+		return;                      /* no answer and already down: nothing to say */
+
+	if (nxn_link_down_run < 0xFFu)
+		nxn_link_down_run++;
+	if (!up || nxn_link_down_run < NXN_LINK_DOWN_SAMPLES)
+		return;
+
+	nx_link_driver_set_link(0);
+	nxn_lease_stale = true;          /* the address outlived the association */
+	LOG_WRN("link down (%s)", (assoc == 0) ? "not associated" : "module did not answer");
+}
+
+/*
  * Feed the module's watchdog, and take its loss ledger before doing so: every non-OFF
  * DATA_CFG zeroes the module's DATA counters.
  */
 static void nxn_refresh(void)
 {
 	uint32_t st[NXN_DSTAT_WORDS];
+	int assoc = -1;                  /* -1 = not asked / no answer */
 
 	if (rtl_link_claim(NXN_CLAIM_MS) != 0)
 		return;                      /* skipped, not failed -- 30 s absorbs a few */
@@ -678,14 +734,32 @@ static void nxn_refresh(void)
 		nxn_refresh_fails++;
 	} else {
 		uint8_t mac[6], flags = 0u;
+		struct wifi_rpc_opts o;
+		int32_t connected = -1;
 
 		nxn_refresh_fails = 0;
 		if (nxn_eth_info(mac, &flags) == 0) {
 			memcpy(nxn_mac, mac, sizeof mac);
 			nxn_radio_up = (flags & ERPC_ETH_F_RUNNING) ? 1u : 0u;
 		}
+		/*
+		 * Association, piggy-backed on the refresh we are already here for (issue #30
+		 * B2a).  It is the ONLY reliable source: the ETH_INFO flag above is
+		 * rltk_wlan_running(), which says the WiFi DRIVER is started -- not that it is
+		 * joined to an AP -- so using it as the link signal would report "up" while the
+		 * AP is gone.  One extra eRPC round trip per NXN_REFRESH_MS, on a thread that
+		 * already holds the coarse mutex, so the lock order (coarse -> erpc) is the
+		 * established one and nothing new can deadlock.
+		 */
+		nxn_opts(&o, NXN_RPC_TMO_MS);
+		if (wifi_rpc_is_connected(&o, &connected) == 0)
+			assoc = (connected == WIFI_RPC_OK) ? 1 : 0;
 	}
 	rtl_link_unclaim();
+
+	/* Outside the coarse mutex: publishing touches NetX, and the owner must never block
+	 * on a NetX mutex while holding the lock every shell command needs. */
+	nxn_publish_link(assoc);
 
 	if (nxn_refresh_fails >= NXN_REFRESH_FAILS) {
 		nxn_refresh_fails = 0;
@@ -909,6 +983,11 @@ int nx_net_info_get(struct nx_net_info *out)
 	out->mask      = (uint32_t)mask;
 	out->gw        = (uint32_t)gw;
 	out->ip_valid  = (ip != 0);
+	/* Set when the link went down under a live address (issue #30 B2a).  The lease is
+	 * not renewed automatically -- starting the DHCP client from the link transition is
+	 * the lock-order cycle nxn_link_status_cb() documents -- so the address on the
+	 * interface may be one the network no longer agrees with. */
+	out->lease_stale = nxn_lease_stale;
 	/* Under the lock like every other reader of it: the cost is a mutex on a reporting
 	 * path, and the alternative is a rule with an exception, which is the kind of thing
 	 * that is true right up until somebody adds the next caller. */
@@ -938,6 +1017,7 @@ int nx_net_set_static(uint32_t ip, uint32_t mask, uint32_t gw)
 		nxn_dhcp_started = false;
 	}
 	nxn_static_mode = true;
+	nxn_lease_stale = false;         /* the operator just said what the address is */
 	if (nx_ip_address_set(&nxn_ip, ip, mask) != NX_SUCCESS)
 		rc = NXN_ERR;
 	else
@@ -983,6 +1063,7 @@ int nx_net_dhcp_renew(void)
 	 */
 	(void)nx_ip_address_set(&nxn_ip, 0u, 0u);
 	nx_ip_gateway_address_set(&nxn_ip, 0u);
+	nxn_lease_stale = false;         /* whatever we get next is by definition fresh */
 	s = nx_dhcp_start(&nxn_dhcp);
 	/* ALREADY_STARTED means the state we wanted is the state we have -- that is a
 	 * success, not a failure, and treating it as one is how a second `net dhcp` ends up
@@ -1078,10 +1159,15 @@ void nx_net_print_status(struct cli_instance *sh)
 	if (nxn_state == NX_NET_OFF)
 		return;
 
-	cli_print(sh, "  mac: %02x:%02x:%02x:%02x:%02x:%02x, radio %s, link %s\r\n",
+	/* `link` is the ASSOCIATION (issue #30 B2a), which is what decides whether a frame
+	 * can reach the air.  `driver` is rltk_wlan_running() -- the WiFi driver being
+	 * started -- which stays up across an AP going away, so it is reported separately
+	 * rather than being allowed to masquerade as the link state. */
+	cli_print(sh, "  mac: %02x:%02x:%02x:%02x:%02x:%02x, link %s, driver %s%s\r\n",
 	          nxn_mac[0], nxn_mac[1], nxn_mac[2], nxn_mac[3], nxn_mac[4], nxn_mac[5],
-	          nxn_radio_up ? "up" : "DOWN",
-	          nx_link_driver_link_up() ? "up" : "down");
+	          nx_link_driver_link_up() ? "up" : "DOWN",
+	          nxn_radio_up ? "started" : "stopped",
+	          nxn_lease_stale ? "  <-- lease may be stale, run `net dhcp`" : "");
 
 	nx_link_driver_get_stats(&st);
 	cli_print(sh, "  nx rx: %lu frames, %lu B, no-buf %lu, oversize %lu, undersize %lu, "

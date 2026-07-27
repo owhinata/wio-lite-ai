@@ -128,6 +128,7 @@ enum nx_net_state {
 struct nx_net_info {
 	bool     ip_valid;
 	bool     dhcp_mode;
+	bool     lease_stale;    /* the link went down while this address was live */
 	uint32_t ip;             /* host byte order */
 	uint32_t mask;
 	uint32_t gw;
