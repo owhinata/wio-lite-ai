@@ -153,6 +153,10 @@ int  nx_net_init(void);
 bool nx_net_is_up(void);
 enum nx_net_state nx_net_state(void);
 
+/* "off" / "arming" / "up" / "stopping" / "FAILED" -- so a refusal can name the state it
+ * was refused in rather than just saying no. */
+const char *nx_net_state_name(enum nx_net_state s);
+
 /* Ask the owner thread to bring the interface up / take it down.  nx_net_up() returns 0
  * once the request is accepted (state becomes ARMING before it returns, so guards close
  * immediately); *why explains a refusal.  Poll nx_net_state() for the outcome. */
@@ -183,7 +187,7 @@ void nx_net_modstats_get(struct nx_net_modstats *out);
 void *nx_net_ip(void);
 void *nx_net_pool(void);
 
-/* Print the host-stack section of `net info` / the result of `net up`. */
+/* Print the host-stack section of `net info` / the result of arming the interface. */
 void nx_net_print_status(struct cli_instance *sh);
 
 /*

@@ -131,7 +131,7 @@ void tx_application_define(void *first_unused_memory)
 
   /* The host's own IP stack (issue #23 U3): NetX Duo plus the thread that owns a bridge
    * session.  Object creation only -- the IP instance comes up with address 0.0.0.0 and
-   * the link DOWN, and nothing touches the RTL8720 until `net up`.  Fail-soft: without
+   * the link DOWN, and nothing touches the RTL8720 until `wifi connect`.  Fail-soft: without
    * it `net` keeps working through the module's lwIP exactly as before. */
   (void) nx_net_init();
 

@@ -1149,7 +1149,7 @@ void *nx_net_pool(void)
 
 /* ---- reporting / guard --------------------------------------------------------- */
 
-static const char *nxn_state_name(enum nx_net_state s)
+const char *nx_net_state_name(enum nx_net_state s)
 {
 	switch (s) {
 	case NX_NET_OFF:      return "off";
@@ -1166,7 +1166,7 @@ void nx_net_print_status(struct cli_instance *sh)
 	struct nx_net_modstats ms;
 	ULONG avail = 0, total = 0, empty = 0, waits = 0, invalid = 0;
 
-	cli_print(sh, "  host stack: %s%s%s\r\n", nxn_state_name(nxn_state),
+	cli_print(sh, "  host stack: %s%s%s\r\n", nx_net_state_name(nxn_state),
 	          (nxn_why && nxn_why[0]) ? " -- " : "", (nxn_why) ? nxn_why : "");
 	if (nxn_state == NX_NET_OFF)
 		return;
@@ -1226,7 +1226,7 @@ int nx_net_guard(struct cli_instance *sh, const char *what)
 		          "cleanly; run `wifi reset`\r\n", what);
 	else
 		cli_error(sh, "%s: refused -- the host stack owns the module's network "
-		          "(state %s)\r\n", what, nxn_state_name(nxn_state));
+		          "(state %s)\r\n", what, nx_net_state_name(nxn_state));
 	return 1;
 }
 

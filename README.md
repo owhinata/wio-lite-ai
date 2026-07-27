@@ -27,7 +27,7 @@ time as the USB console. 22 commands:
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
-| wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench/arp · flash*/img*) · `net` (L3 = **host NetX Duo only**: up/down · info/ip/dhcp/ping/echo/shell) |
+| wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench · flash*/img*) · `net` (L3 = **host NetX Duo only**: info/ip/dhcp/ping/echo/shell) |
 | benchmarks | `coremark` · `membench` |
 
 - **`thread`** — lists the ThreadX threads with state / stack use and a **`top`-style
@@ -76,7 +76,7 @@ time as the USB console. 22 commands:
   CRC-framed echo proves the eRPC transport end to end — and then reads the module's
   firmware build id (`rpc_system_version`), printing `fw version: …`
   (`2.1.3+wio-n7` for the firmware currently on the board). That build id is where every
-  firmware-gated capability is earned, so **`net up` requires a `wifi ver` first**.
+  firmware-gated capability is earned, so **the L2 bridge requires a `wifi ver` first**.
   CAUTION: against pre-N2 / stock firmware the version query corrupts the module heap
   (RAM only — recoverable with `wifi reset`; see `fw/rtl8720/`). The
   eRPC path is a hand-written clean-room C client (`app/erpc.c`, FramedTransport +
@@ -169,7 +169,7 @@ time as the USB console. 22 commands:
 - **`net`** — the IPv4 (L3) layer on top of a `wifi connect` association (issue #5),
   the Wio counterpart of `../stm32f746g-disco`'s `net` command. Since **issue #30 B1**
   there is exactly **one L3 backend**: **NetX Duo on this MCU**, over the issue-#23 L2
-  bridge (`net up`, below). The module's own lwIP still exists — the bridge is a tap on
+  bridge (below). The module's own lwIP still exists — the bridge is a tap on
   its netif, so it has to — but nothing drives it any more, and the L2 side (power +
   association) stays in `wifi`. The module-side socket offload it replaced was retired in
   two steps: TCP in #23 U4, then the datagram side, the module raw-ICMP ping and the
@@ -179,9 +179,9 @@ time as the USB console. 22 commands:
   touch) plus the host stack's IP/mask/gw and dhcp-vs-static; `net ip <a.b.c.d/mask> [gw]`
   sets a static address; `net dhcp` (re)acquires a lease; `net ping <a.b.c.d> [count]`
   sends **real ICMP echoes** built by NetX Duo — no eRPC round trip in the measured RTT.
-  All of them need `net up` first.
+  All of them need the interface up, which `wifi connect` does.
   `net echo [port]` (default 2323, Ctrl+C stops) runs a **TCP echo server on the host
-  stack** (issue #23 U4-1, `app/nx_echo.c`) — it requires `net up`, and it is the bring-up
+  stack** (issue #23 U4-1, `app/nx_echo.c`) — it needs the interface up, and it is the bring-up
   rehearsal the telnet console follows. There is no RPC in its data path: bytes arrive as
   raw Ethernet frames and NetX Duo reassembles them here. It reports throughput, the
   packet-pool low-water mark, the link's own loss ledger and why the session ended, to the
@@ -198,8 +198,8 @@ time as the USB console. 22 commands:
   `nx_tcp_socket_state_wait()`, which touches nothing. And the eRPC version it replaced had
   established the constraint that shaped issues #21–#23: **eRPC is asymmetric — a big reply
   is fine, a big request is not.**
-- **`net up` / `net down` — the host's own TCP/IP stack** (issue #23 U3,
-  `app/nx_net.c` + `app/nx_link_driver.c`). `net up` turns the module into the L2 relay
+- **The host's own TCP/IP stack** (issue #23 U3, `app/nx_net.c` + `app/nx_link_driver.c`;
+  armed by `wifi connect` since #30 B2). Arming turns the module into the L2 relay
   U2 built and brings **Eclipse NetX Duo up on the STM32**: our own ARP cache, our own
   DHCP client, our own ICMP. Everything with an address in it requires it (one predicate,
   `nx_net_is_up()`, so no subcommand can disagree with its neighbour about who answered).
@@ -219,24 +219,27 @@ time as the USB console. 22 commands:
   cannot be proved the interface goes to `FAILED` and says `wifi reset`, because
   detaching early would re-arm a stale-byte flush in the middle of a frame.
 
-  `net up` also **raises the link to 6 Mbaud** (issue #23 U4-3). Every module boots at
+  Arming also **raises the link to 6 Mbaud** (issue #23 U4-3). Every module boots at
   2 Mbaud — that is its firmware — so the rate can only be reached by asking, once per
-  module boot, and `net up` is the command that says "I want throughput on this link"
+  module boot, and associating is the point at which throughput starts to matter
   (measured: 305 vs 500 kB/s of echoed TCP). This deliberately reverses U0-3's "the rate
   change is exclusive and manual"; what changed is the evidence, not the risk analysis. A
   module that refuses gets a warning and the bridge continues at 2 Mbaud.
 
-  While the host stack is up the module's own lwIP receives nothing, so
-  `wifi connect/disconnect/scan` and every `wifi link` subcommand are refused with a
-  message saying to run `net down` (`net ping`, `net echo` and `net shell` went the
-  other way: they now *require* the host stack). `wifi on/off/reset`
+  While the bridge is up the module's own lwIP receives nothing. Since **#30 B2** that no
+  longer means refusing the L2 commands: `wifi connect`/`disconnect`/`scan` hold the
+  module's bridge watchdog open across their long eRPC flows instead (and refuse only if
+  that cannot be arranged, because starting anyway would drop the bridge mid-flow). The
+  `wifi link` benches still need it down — they hold the coarse mutex for seconds and
+  `dbench` wants the DATA channel, whose only consumer is the NetX driver — so they run
+  before associating, and `wifi reset` is the way back to that state. `wifi on/off/reset`
   stay allowed — they are the recovery path, and the owner notices the link being taken
   away and stands down cleanly. **The device firmware is unchanged** (`2.1.3+wio-n7`).
 
 - **`net shell` — the telnet console** (issue #23 U4-2, `app/net_shell.c`).
   `telnet <board-ip>` gets **the same shell as USB CDC, at the same time**: a second
   `cli_instance` (prompt `wio-net> `) on a **NetX Duo TCP socket on this MCU**. It
-  therefore **requires `net up`**, and **arms itself when the host stack takes an address**
+  therefore **requires the interface up**, and **arms itself when it takes an address**
   (`net dhcp` / `net ip`); `net shell start [port]` / `stop` / `status` are the manual
   controls. Ported from `../stm32f746g-disco`'s `port/netxduo/nx_shell.c` — same transport
   vtable, `connected` write gate, telnet IAC handling and single-session instance reuse.
@@ -257,7 +260,7 @@ time as the USB console. 22 commands:
     server waits on `nx_tcp_socket_establish_notify()` rather than polling for a connection
     — `nx_tcp_socket_state_wait()` is a `tx_thread_sleep(1)` loop, which a command can
     afford and a resident service cannot. The board idles at 98.9 % with the console up.
-  - **Teardown is a proof, not an attempt.** `net down` cannot drop the interface under a
+  - **Teardown is a proof, not an attempt.** The unwind cannot drop the interface under a
     live socket: detaching the DATA consumer restores the link service thread's stale-byte
     flush, and those bytes are the middle of a frame if anything can still transmit. So
     `net_shell_stop_sync()` returns success **only when `nx_tcp_socket_delete()` returned
@@ -267,7 +270,7 @@ time as the USB console. 22 commands:
 
   Self-destruct avoidance only — there is no command policy. The telnet console refuses
   what would destroy the transport it runs on: `wifi on/off/reset` (CHIP_EN), any YMODEM
-  transfer (`xfer`, `wifi imgload`), `net down`, and `net shell stop`. The
+  transfer (`xfer`, `wifi imgload`), `wifi connect`/`disconnect`, and `net shell stop`. The
   issue-#21 restriction on module-side blocking calls is **gone** — the console no
   longer occupies a module worker.
 
@@ -288,7 +291,7 @@ time as the USB console. 22 commands:
 
 - **`wifi link` — the UART link itself** (issue #23, `shell/cmds/cmd_wifi_link.c`). Where
   `wifi` is L2 and `net` is L3, this is the wire between the STM32 and the companion chip:
-  the numbers here are what proved the L2-bypass road before `net up` shipped, and they
+  the numbers here are what proved the L2-bypass road before the host stack shipped, and they
   remain the link's health monitors and regression witnesses.
   `wifi link info` prints **both ends'** counters — the host's RX interrupt budget and error
   tally, and the module's own (interrupt count, ring peak, the three loss counters, free
@@ -315,7 +318,7 @@ time as the USB console. 22 commands:
   the *new* rate does not work the host's attempt to put both ends back is best effort
   (the message telling the module to return is sent at that same bad rate). The sequence
   itself lives in `rtl_link_set_rate()` (`app/rtl_link.c`) because issue #23 U4-3 made
-  `net up` raise the rate too, and two implementations of something this delicate would
+  arming raises the rate too, and two implementations of something this delicate would
   eventually disagree. **`wifi reset`
   is the guaranteed recovery** — the module boots at 2 Mbaud and the host resets its own
   belief to match.
@@ -349,17 +352,18 @@ time as the USB console. 22 commands:
   **(3)** `erpc_crc16()` is now table-driven (same polynomial, same values) — the
   bit-at-a-time loop was ~110 µs per 1500-byte frame on the link service thread.
 
-- **The L2 bridge** (issue #23 U2, `fw/rtl8720/patches/0007` + `wifi link arp`).
+- **The L2 bridge** (issue #23 U2, `fw/rtl8720/patches/0007`; permanent since #30 B2).
   The DATA channel stops carrying a bench pattern and starts carrying **real Ethernet
   frames**: the module hands what it receives from the air to the host instead of to its own
-  lwIP, and frames sent on `LINK_DATA_CHAN_ETH` go out over the air. `wifi link arp` is the
-  **diagnostic** view of that channel — the stack that consumes it for real is `net up`
-  above: `wifi link arp <ip> [secs] [sender-ip]` opens a transient bridge session, decodes
-  what arrives (ARP in full, IPv4 addresses and protocol, everything else by ethertype) and
-  puts one well-formed request on the wire once a second. **An `is-at` reply is the test**: it
-  proves the host built a frame, the module transmitted it with its own MAC, a real machine
-  answered, the driver accepted the answer, the tap caught it before lwIP, and it survived the
-  link — passively watching broadcasts only ever exercises one direction.
+  lwIP, and frames sent on `LINK_DATA_CHAN_ETH` go out over the air — which is what the
+  host stack above runs on. U2 proved it with a transient `wifi link arp` session whose
+  **`is-at` reply** showed the whole path in both directions at once: the host built a
+  frame, the module transmitted it with its own MAC, a real machine answered, the driver
+  accepted the answer, the tap caught it before lwIP, and it survived the link. That
+  command went in **#30 B2c** — with the bridge permanent, `net dhcp` (DISCOVER out, OFFER
+  back) and `net ping` (NetX resolving the gateway by ARP itself) prove the same round
+  trip, and a transient session cannot coexist with the resident one anyway: the DATA
+  channel has exactly one consumer.
   It is a **tap, not a rewrite**: `LwIP_Init()` still runs and the bridge swaps
   `xnetif[0].input`, so switching it off leaves the module's own stack — and therefore
   `net info`/`ip`/`dhcp` — intact. Two things had to be got right, and

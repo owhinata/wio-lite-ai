@@ -6,8 +6,6 @@
  * @file    cmd_net.c
  * @brief   `net` shell command (issues #5/#23): IPv4 (L3) over the onboard RTL8720DN.
  *
- *   net up | down                bring the HOST TCP/IP stack (NetX Duo) up over the
- *                                L2 bridge / give the network back to the module
  *   net info                     association + MAC + IP/mask/gw
  *   net ip <a.b.c.d/mask> [gw]   set a static address
  *   net dhcp                     (re)acquire an address via DHCP
@@ -17,7 +15,7 @@
  *
  * This is the Wio counterpart of ../stm32f746g-disco's `net` command.  There the backend
  * is NetX Duo over the on-chip Ethernet MAC; here it is NetX Duo over the issue-#23 L2
- * bridge, which is the SINGLE L3 backend since issue #30 B1 -- everything below `net up`
+ * bridge, which is the SINGLE L3 backend since issue #30 B1 -- everything below here
  * is the host's own stack.  The module's lwIP still exists (the bridge is a tap on its
  * netif, so it has to), but nothing here drives it any more.  The L2 side (power +
  * association) stays in `wifi`, and association is a prerequisite for everything here.
@@ -36,7 +34,7 @@
 #include "rtl_link.h"
 #include "net_shell.h"
 #include "nx_echo.h"  /* `net echo` on the host stack (issue #23 U4-1) */
-#include "nx_net.h"   /* the host stack: `net up` switches the backend (issue #23 U3) */
+#include "nx_net.h"   /* the host stack (issue #23 U3), armed by `wifi connect` */
 #include "nx_link_driver.h" /* link state for the `net ping` precondition (issue #30 B2a) */
 
 #include "stm32h7xx_hal.h"   /* HAL_GetTick (1 ms SysTick, fed via tx_glue.c) */
@@ -148,14 +146,10 @@ static void net_opts(struct wifi_rpc_opts *o, struct cli_instance *sh,
 /* ---- host stack (issue #23 U3) ------------------------------------------- */
 
 /*
- * `net up` installs the L2 bridge and brings NetX Duo up on it (app/nx_net.c); `net down`
- * gives the module its network back.  Since issue #30 B1 there is no second backend to
- * switch to, so everything with an address in it simply requires the stack to be up and
- * says so -- one predicate, nx_net_is_up(), and no subcommand can disagree with its
- * neighbour about who answered.
- *
- * (Issue #30 B2 will make the arm implicit in `wifi connect`, at which point these two
- * disappear as user commands.)
+ * The interface itself is armed by `wifi connect` and unwound by a CHIP_EN move
+ * (issue #30 B2) -- there is no user-visible switch here any more.  Everything with an
+ * address in it just needs the stack up, tested with ONE predicate, nx_net_is_up(), so no
+ * subcommand can disagree with its neighbour about who answered.
  */
 
 #define NET_NX_POLL_MS      100u
@@ -204,77 +198,14 @@ static int net_nx_settled(struct cli_instance *sh)
 	return 0;
 }
 
-static int cmd_net_up(struct cli_instance *sh, int argc, char **argv)
-{
-	const char *why = "";
-	unsigned waited = 0u;
-
-	(void)argc; (void)argv;
-
-	if (nx_net_is_up()) {
-		cli_print(sh, "net: the host stack is already up\r\n");
-		nx_net_print_status(sh);
-		return 0;
-	}
-	if (net_nx_settled(sh) != 0)
-		return 1;
-	if (nx_net_up(&why) != 0) {
-		cli_error(sh, "net: %s\r\n", why);
-		return 1;
-	}
-
-	cli_print(sh, "net: bringing the host stack up (bridging the module)...\r\n");
-	while (nx_net_state() == NX_NET_ARMING) {
-		if (waited >= NET_NX_ARM_WAIT_MS)
-			break;
-		/* Ctrl+C stops WAITING, not the owner: aborting a half-installed bridge from
-		 * a second thread is exactly the unwind app/nx_net.h refuses to improvise. */
-		if (cli_cancel_requested(sh)) {
-			cli_print(sh, "net: still arming in the background; `net info` to "
-			          "check\r\n");
-			return 1;
-		}
-		cli_sleep(sh, NET_NX_POLL_MS);
-		waited += NET_NX_POLL_MS;
-	}
-
-	nx_net_print_status(sh);
-	if (!nx_net_is_up())
-		return 1;
-	cli_print(sh, "net: run `net dhcp` to take a lease with the host stack\r\n");
-	return 0;
-}
-
-static int cmd_net_down(struct cli_instance *sh, int argc, char **argv)
-{
-	unsigned waited = 0u;
-
-	(void)argc; (void)argv;
-
-	/* Since U4-2 the telnet console IS a socket on this interface, so taking the
-	 * interface down from that console cuts the branch it is sitting on -- and the
-	 * teardown deliberately refuses to proceed until the console is gone, so it would
-	 * deadlock on itself rather than merely disconnect. */
-	if (net_shell_guard(sh, "net down"))
-		return 1;
-	if (nx_net_state() == NX_NET_OFF) {
-		cli_print(sh, "net: the host stack is already down\r\n");
-		return 0;
-	}
-	nx_net_down();
-	cli_print(sh, "net: taking the host stack down...\r\n");
-	while (nx_net_state() != NX_NET_OFF && nx_net_state() != NX_NET_FAILED) {
-		if (waited >= NET_NX_ARM_WAIT_MS)
-			break;
-		cli_sleep(sh, NET_NX_POLL_MS);
-		waited += NET_NX_POLL_MS;
-	}
-	nx_net_print_status(sh);
-	if (nx_net_state() != NX_NET_OFF)
-		return 1;
-	cli_print(sh, "net: the module owns the network again -- `net dhcp` for a lease\r\n");
-	return 0;
-}
+/*
+ * `net up` and `net down` lived here until issue #30 B2d.  They armed and unwound the
+ * bridge by hand, which is the "which stack owns the network" mode this issue set out to
+ * delete: `wifi connect` arms it now (B2b) and a CHIP_EN move -- `wifi off`, `wifi reset`,
+ * any flash session -- takes it away.  nx_net_up()/nx_net_down() are still the API; the
+ * callers are cmd_wifi.c (associate, then bring the interface up) and cmd_wifi_flash.c
+ * (give the link back before entering download mode).  History: 3413170~1.
+ */
 
 /* ---- subcommands --------------------------------------------------------- */
 
@@ -319,7 +250,7 @@ static int cmd_net_info(struct cli_instance *sh, int argc, char **argv)
 		else
 			cli_print(sh, "ip:    none (run `net dhcp`)\r\n");
 	} else {
-		cli_print(sh, "ip:    none (the host stack is down -- run `net up`)\r\n");
+		cli_print(sh, "ip:    none (no host stack -- `wifi connect` brings it up)\r\n");
 	}
 
 	/*
@@ -349,7 +280,7 @@ static int cmd_net_ip(struct cli_instance *sh, int argc, char **argv)
 	if (net_nx_settled(sh) != 0)
 		return 1;
 	if (!nx_net_is_up()) {
-		cli_error(sh, "net: the host stack is down -- run `net up` first\r\n");
+		cli_error(sh, "net: no host stack -- `wifi connect` brings it up\r\n");
 		return 1;
 	}
 	if (nx_net_set_static(a, mask, gw) != NXN_OK) {
@@ -372,7 +303,7 @@ static int cmd_net_dhcp(struct cli_instance *sh, int argc, char **argv)
 	if (net_nx_settled(sh) != 0)
 		return 1;
 	if (!nx_net_is_up()) {
-		cli_error(sh, "net: the host stack is down -- run `net up` first\r\n");
+		cli_error(sh, "net: no host stack -- `wifi connect` brings it up\r\n");
 		return 1;
 	}
 	if (nx_net_dhcp_renew() != NXN_OK) {
@@ -462,7 +393,7 @@ static int cmd_net_ping(struct cli_instance *sh, int argc, char **argv)
 
 	/* The module-side raw-ICMP path was removed by issue #28: the surviving module
 	 * backend is info/ip/dhcp only, and ping belongs to the host stack. */
-	cli_error(sh, "net: the host stack is down -- run `net up` first\r\n");
+	cli_error(sh, "net: no host stack -- `wifi connect` brings it up\r\n");
 	return 1;
 }
 
@@ -489,8 +420,7 @@ static int cmd_net_echo(struct cli_instance *sh, int argc, char **argv)
 	if (net_nx_settled(sh) != 0)
 		return 1;
 	if (!nx_net_is_up()) {
-		cli_error(sh, "net echo: the host stack is not up -- run `net up` first "
-		          "(issue #23 U4 moved the echo server onto NetX Duo)\r\n");
+		cli_error(sh, "net echo: no host stack -- `wifi connect` brings it up\r\n");
 		return 1;
 	}
 	if (argc >= 2) {
@@ -506,13 +436,15 @@ static int cmd_net_echo(struct cli_instance *sh, int argc, char **argv)
 /* ---- `net shell`: the telnet console (issue #23 U4-2) --------------------- */
 /*
  * The console itself lives in app/net_shell.c; these are just its controls.  Since U4-2 it
- * is a NetX socket on the HOST stack, so it REQUIRES `net up`, and it arms itself when the
- * host stack takes an address (`net dhcp` / `net ip` above call net_shell_autoarm()).
+ * is a NetX socket on the HOST stack, so it needs the interface up (`wifi connect`), and
+ * it arms itself when the stack takes an address (`net dhcp` / `net ip` call
+ * net_shell_autoarm()).
  * `start` is therefore for a different port or after a `stop`.
  *
  * `stop` is no longer about freeing the eRPC UART -- the console does not touch it any
- * more.  It exists because `net down` refuses to unwind the interface while a socket on it
- * is alive, and because a resident console is not always wanted.
+ * more.  It exists because the interface refuses to unwind while a socket on it is alive
+ * (a flash session has to wait for this), and because a resident console is not always
+ * wanted.
  */
 #define NET_SHELL_WAIT_MS   10000u
 #define NET_SHELL_POLL_MS     100u
@@ -583,20 +515,17 @@ static int cmd_net_shell_status(struct cli_instance *sh, int argc, char **argv)
 CLI_SUBCMD_SET_CREATE(net_shell_subcmds,
 	CLI_CMD_ARG(start,  NULL, "arm the telnet console [port] (default 23)",
 	            cmd_net_shell_start,  1, 1),
-	CLI_CMD_ARG(stop,   NULL, "close the console + disable auto-arm (frees `net down`)",
+	CLI_CMD_ARG(stop,   NULL, "close the console + disable auto-arm",
 	            cmd_net_shell_stop,   1, 0),
 	CLI_CMD_ARG(status, NULL, "state / address / counters",
 	            cmd_net_shell_status, 1, 0),
 	CLI_SUBCMD_SET_END);
 
 CLI_SUBCMD_SET_CREATE(net_subcmds,
-	CLI_CMD_ARG(up,   NULL, "bring the host TCP/IP stack up (bridge the module)",
-	            cmd_net_up,   1, 0),
-	CLI_CMD_ARG(down, NULL, "give the network back to the module",  cmd_net_down, 1, 0),
 	CLI_CMD_ARG(info, NULL, "connection + IP / mask / gateway",   cmd_net_info, 1, 0),
 	CLI_CMD_ARG(ip,   NULL, "set static <a.b.c.d/mask> [gw]",     cmd_net_ip,   2, 1),
 	CLI_CMD_ARG(dhcp, NULL, "(re)acquire an address via DHCP",    cmd_net_dhcp, 1, 0),
-	CLI_CMD_ARG(ping, NULL, "ICMP echo <a.b.c.d> [count] (host stack -- `net up` first)",
+	CLI_CMD_ARG(ping, NULL, "ICMP echo <a.b.c.d> [count]",
 	            cmd_net_ping, 2, 1),
 	CLI_CMD_ARG(echo, NULL, "TCP echo server [port] on the host stack (Ctrl+C stops)",
 	            cmd_net_echo, 1, 1),
@@ -605,6 +534,5 @@ CLI_SUBCMD_SET_CREATE(net_subcmds,
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(net, net_subcmds,
-                 "IPv4 (L3) over the onboard RTL8720 (up / down / info / ip / dhcp / "
-                 "ping / echo / shell)",
+                 "IPv4 (L3) over the onboard RTL8720 (info / ip / dhcp / ping / echo / shell)",
                  NULL, 1, 0);

@@ -12,7 +12,7 @@
  *   wifi log [reset]              bridge the LOG UART (UART9 @115200) <-> console;
  *                                 `reset` power-cycles first, capturing boot from t=0
  *   wifi ver                      prove the eRPC link (rpc_system_ack) + read the FW
- *                                 build id = the capability gate `net up` requires
+ *                                 build id = the capability gate the L2 bridge requires
  *   wifi connect <ssid> [pw] [sec]  associate (STA) + DHCP, print the IP (#5 inc 3)
  *   wifi disconnect               drop the current association
  *   wifi status                   connected? + RSSI + IP/mask/gw + MAC
@@ -252,8 +252,8 @@ static int cmd_wifi_log(struct cli_instance *sh, int argc, char **argv)
  * round-trip a byte through rpc_system_ack -- a valid CRC-framed echo proves the link
  * (transport + framing + codec + the Serial3<->USART1 mapping) end to end -- then read
  * rpc_system_version.  That query is the ONLY place the host learns which firmware it
- * is talking to, so it is where every firmware-gated capability is earned; `net up`
- * refuses until it has run.  CAUTION: on pre-N2 / stock firmware the version query
+ * is talking to, so it is where every firmware-gated capability is earned; the L2
+ * bridge refuses until it has run.  CAUTION: on pre-N2 / stock firmware the version query
  * corrupts the module heap (the factory shim erpc_free()s a string literal) -- RAM
  * only, `wifi reset` recovers, flash is untouched (issue #20). */
 /*
@@ -610,7 +610,7 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 	 * client here and print the lease, which is why `wifi` (L2) ended up owning an L3
 	 * step; the address it produced belongs to the module's lwIP, and the host stack --
 	 * the only thing that carries traffic since issue #23 U4 -- throws it away
-	 * immediately (`net up` stops that DHCP client and zeroes the netif address, because
+	 * immediately (arming the bridge stops that DHCP client and zeroes the netif address, because
 	 * the WLAN driver filters received IP against it).  So association is all that
 	 * happens here, and L3 lives entirely in `net`.
 	 */
@@ -1031,7 +1031,7 @@ CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(reset, NULL, "power-cycle CHIP_EN (low 80ms -> high)",    cmd_wifi_reset, 1, 0),
 	CLI_CMD_ARG(log,   NULL, "bridge LOG UART (UART9 @115200); `log reset` captures boot from t=0",
 	            cmd_wifi_log, 1, 1),
-	CLI_CMD_ARG(ver,   NULL, "prove the eRPC link + read the FW build id (required before `net up`)",
+	CLI_CMD_ARG(ver,   NULL, "prove the eRPC link + read the FW build id (required before `wifi connect`)",
 	            cmd_wifi_ver, 1, 0),
 	CLI_CMD_ARG(connect,    NULL, "associate with an AP: connect <ssid> [pw] [sec_hex]", cmd_wifi_connect,    2, 2),
 	CLI_CMD_ARG(disconnect, NULL, "drop the current WiFi association",     cmd_wifi_disconnect, 1, 0),

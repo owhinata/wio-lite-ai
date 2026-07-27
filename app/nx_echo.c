@@ -382,7 +382,7 @@ int nx_echo_run(struct cli_instance *sh, uint16_t port)
 	UINT s;
 
 	if (ip == NX_NULL || pool == NX_NULL || !nx_net_is_up()) {
-		cli_error(sh, "net: the host stack is not up -- run `net up` first\r\n");
+		cli_error(sh, "net: no host stack -- `wifi connect` brings it up\r\n");
 		return 1;
 	}
 	if (!nxe_claim()) {
@@ -438,7 +438,7 @@ int nx_echo_run(struct cli_instance *sh, uint16_t port)
 		if (cli_cancel_requested(sh))
 			break;
 		/*
-		 * The other console can run `net down` while this is listening.  Checking the
+		 * The other console can take the interface down while this is listening.  Checking the
 		 * predicate every round -- not just once at entry -- is what keeps this
 		 * command from outliving the stack it runs on; the interface going away is a
 		 * normal end, not an error.
