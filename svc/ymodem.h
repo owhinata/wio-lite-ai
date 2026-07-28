@@ -14,7 +14,7 @@
  * unit-tested on the host (shell/test/test_ymodem.c) against mock IO.
  *
  * Ported verbatim from ../stm32f746g-disco (its issue #50) for issue #19 M4: the
- * RTL8720DN full-chip flash backup (`wifi flashbackup`) needs to stream megabytes
+ * RTL8720DN full-chip flash backup (`wifi flash backup`) needs to stream megabytes
  * off the board, and this is the shell's designed binary-transfer path.  The shell
  * wires @ref ym_io to cli_read_byte()/cli_write() (see shell/cmds/cmd_xfer.c) and
  * @ref ym_source to the RTL8720 download-protocol flash reader.

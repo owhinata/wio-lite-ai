@@ -332,16 +332,15 @@ extern const uint32_t rtl8720_flashloader_len;
 #define RTL_DL_BAUD_IDX_115200   0x0Du
 #define RTL_DL_BAUD_IDX_1500000  0x18u
 
-/* M3: flash erase/write bounds (destructive -- see rtl_dl_flash_selftest). */
+/* M3: flash erase/write bounds (destructive -- see rtl_dl_flash_program). */
 #define RTL_DL_ERASE             0x17u
 #define RTL_DL_FLASH_BASE        0x08000000u   /* a block's addr carries this base for flash */
-#define RTL_DL_SELFTEST_MIN      0x00100000u   /* flashtest sector must sit past the app (~0xE2000) */
 
 /*
  * Flash range caps.  READ and WRITE are deliberately DIFFERENT (issue #19 M4):
  *
  *  - WRITE_MAX stays at the original conservative 2 MB.  Every destructive path
- *    (dl_erase_sectors / dl_send_flash / rtl_dl_flash_selftest) keeps exactly the
+ *    (dl_erase_sectors / dl_send_flash / rtl_dl_flash_program) keeps exactly the
  *    bounds it had before M4 -- the chip may be smaller than we think, and a write
  *    that wrapped past the die onto the boot image would be unrecoverable.
  *  - READ_MAX is the protocol's own ceiling: the read/erase/checksum commands carry
@@ -592,7 +591,7 @@ static int dl_flash_range_ok(uint32_t off, uint32_t len, uint32_t max)
 
 /* PRIVATE flash block-write (M3): the block-transfer with the flash base OR'd into the
  * address.  Bounded by dl_flash_range_ok.  No public general flash-write API exists -- the
- * only caller is rtl_dl_flash_selftest, which additionally gates on an erasable sector. */
+ * only caller is rtl_dl_flash_program, which adds the gates documented on it. */
 static int dl_send_flash(const uint8_t *data, uint32_t len, uint32_t flash_off,
                          int (*ab)(void *), void *ctx)
 {
@@ -917,108 +916,6 @@ int rtl_dl_read_flash(uint32_t offset, uint32_t nsectors, uint8_t *buf, uint32_t
 		}
 	}
 	return (int)copied;
-}
-
-int rtl_dl_flash_selftest(uint32_t offset, uint32_t hold_us, struct rtl_dl_selftest *r,
-                          int (*ab)(void *), void *ctx)
-{
-	static uint8_t buf[4096];   /* one sector; function-static, off the 4 KB shell stack */
-	uint32_t i;
-	int rc, all_ff, all_pat, attempt;
-
-	memset(r, 0, sizeof(*r));
-
-	/* Range gate: only a 4 KB-aligned sector in [SELFTEST_MIN, WRITE_MAX) -- past the app,
-	 * within the conservative 2 MB destructive cap (unchanged by M4's wider READ cap).
-	 * `offset > MAX - 4096` is overflow-safe. */
-	if ((offset & 0xFFFu) != 0u ||
-	    offset < RTL_DL_SELFTEST_MIN ||
-	    offset > RTL_DL_FLASH_WRITE_MAX - 4096u)
-		return -1;
-
-	/* Phase 1: enter download + load the flashloader (this routine owns the session). */
-	if (rtl_dl_enter(hold_us, ab, ctx) != 0 ||
-	    rtl_dl_load_flashloader(1500000u, ab, ctx) != 0)
-		return -2;
-
-	/* Content gate: read the whole sector; only proceed if it is erasable -- all 0xFF
-	 * (unused) or exactly our own test pattern (a previous DIRTY run then self-heals).
-	 * Any foreign data => refuse to erase/write (protects boot/app/other data). */
-	rc = rtl_dl_read_flash(offset, 1u, buf, sizeof(buf), ab, ctx);
-	if (rc < (int)sizeof(buf))
-		return -2;
-	memcpy(r->found, buf, sizeof(r->found));
-	all_ff = 1; all_pat = 1;
-	for (i = 0u; i < sizeof(buf); i++) {
-		if (buf[i] != 0xFFu)               all_ff = 0;
-		if (buf[i] != (uint8_t)(i & 0xFFu)) all_pat = 0;
-	}
-	if (!all_ff && !all_pat)
-		return -3;                          /* foreign data */
-	r->gate_ok = 1;
-	r->gate_was_ff = all_ff;
-
-	/* Erase -> verify all 0xFF. */
-	if (dl_erase_sectors(offset, 1u, ab, ctx))
-		return -4;
-	rc = rtl_dl_read_flash(offset, 1u, buf, sizeof(buf), ab, ctx);
-	if (rc < (int)sizeof(buf))
-		return -4;
-	for (i = 0u; i < sizeof(buf); i++)
-		if (buf[i] != 0xFFu)
-			return -4;
-	r->erase_ok = 1;
-
-	/* Write the i&0xFF test pattern -> read back -> verify.  From here the sector holds
-	 * data, so any failure marks it dirty (re-running flashtest self-heals via the pattern
-	 * gate).  Distinct codes split the sub-steps: -5 send, -7 read-back, -8 mismatch. */
-	for (i = 0u; i < sizeof(buf); i++)
-		buf[i] = (uint8_t)(i & 0xFFu);
-	if (dl_send_flash(buf, sizeof(buf), offset, ab, ctx)) {
-		r->dirty = 1;
-		return -5;
-	}
-	r->dirty = 1;                               /* pattern now on flash */
-
-	/* Phase 2: the flashloader goes unresponsive after a flash program (only a power-cycle
-	 * revives it), so re-enter download + reload the stub.  The flash content persists
-	 * across the reset; then read it back to verify. */
-	if (rtl_dl_enter(hold_us, ab, ctx) != 0 ||
-	    rtl_dl_load_flashloader(1500000u, ab, ctx) != 0)
-		return -7;
-	rc = rtl_dl_read_flash(offset, 1u, buf, sizeof(buf), ab, ctx);
-	r->rc_detail = rc;
-	r->read_attempts = 1;
-	if (rc < (int)sizeof(buf)) {
-		r->dirty = 1;
-		return -7;
-	}
-	for (i = 0u; i < sizeof(buf); i++)
-		if (buf[i] != (uint8_t)(i & 0xFFu)) {
-			r->dirty = 1;
-			return -8;
-		}
-	r->write_ok = 1;
-
-	/* Restore: re-erase back to all 0xFF (retry once). */
-	for (attempt = 0; attempt < 2; attempt++) {
-		if (dl_erase_sectors(offset, 1u, ab, ctx))
-			continue;
-		rc = rtl_dl_read_flash(offset, 1u, buf, sizeof(buf), ab, ctx);
-		if (rc < (int)sizeof(buf))
-			continue;
-		all_ff = 1;
-		for (i = 0u; i < sizeof(buf); i++)
-			if (buf[i] != 0xFFu) { all_ff = 0; break; }
-		if (all_ff) {
-			r->restore_ok = 1;
-			break;
-		}
-	}
-	if (!r->restore_ok)
-		return -6;                          /* left with data; re-running flashtest self-heals */
-	r->dirty = 0;                               /* sector restored to 0xFF */
-	return 0;
 }
 
 /* ------------------------------------------------------------------ *

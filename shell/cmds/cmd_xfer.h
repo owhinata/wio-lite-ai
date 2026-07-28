@@ -7,7 +7,7 @@
  * @brief   Shared YMODEM-over-console send entry point.
  *
  * cmd_xfer.c owns the console hand-over + YMODEM driving for an injected byte
- * source, so every future sender (issue #19's `wifi flashbackup`, and an `xfer
+ * source, so every future sender (issue #19's `wifi flash backup`, and an `xfer
  * send <path>` once #6 brings a filesystem) shares one copy of the RX flush /
  * progress messaging / result mapping.
  *
@@ -32,7 +32,7 @@ struct cli_instance;
  * ymodem_send(), flushes RX again and prints a one-line result.
  *
  * Use this from a command that must keep the console claimed across the whole
- * operation (e.g. `wifi flashbackup`, which holds an RTL8720 download session
+ * operation (e.g. `wifi flash backup`, which holds an RTL8720 download session
  * open around the transfer): cli_console_claim() is NOT reentrant -- it sets the
  * plain `cli_xfer_active` flag that cli_console_release() unconditionally clears
  * (shell/core/cli_core.c), so a nested claim/release pair would drop raw mode
@@ -62,7 +62,7 @@ int xfer_send_source(struct cli_instance *sh, const struct ym_source *src);
  * Receive a YMODEM file from the PC into @p sink over the shell's console,
  * assuming the caller ALREADY holds it (cli_console_claim).  The mirror of
  * xfer_send_source_locked(): flushes RX, runs ymodem_recv(), flushes RX again and
- * prints a one-line result.  Added for issue #19 M5 (`wifi imgload`).
+ * prints a one-line result.  Added for issue #19 M5 (`wifi flash imgload`).
  *
  * CRITICAL -- console RX ownership: exactly as on the send side, for the duration
  * of ymodem_recv() the ONLY permitted reader of the console RX ring is this

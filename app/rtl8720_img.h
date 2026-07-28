@@ -94,7 +94,7 @@ const uint8_t *rtl_img_data(void);
 
 /*
  * Recompute the digest by re-reading PSRAM.  Commands are separate transactions, so
- * between `wifi imgload` and `wifi flashwrite` another command (`psram test`,
+ * between `wifi flash imgload` and `wifi flash write` another command (`psram test`,
  * `membench`, `devmem`) could have overwritten the staging area.  Comparing this against
  * rtl_img_get()->digest catches that before anything is erased.  Returns 0 if no image
  * is staged.

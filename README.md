@@ -27,7 +27,7 @@ time as the USB console. 22 commands:
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
-| wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench · flash*/img*) · `net` (L3 = **host NetX Duo only**: info/ip/dhcp/ping/echo/shell) |
+| wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench · **flash** info/read/backup/imgload/imginfo/write) · `net` (L3 = **host NetX Duo only**: info/ip/dhcp/ping/echo/shell) |
 | benchmarks | `coremark` · `membench` |
 
 - **`thread`** — lists the ThreadX threads with state / stack use and a **`top`-style
@@ -90,12 +90,12 @@ time as the USB console. 22 commands:
   parking a blocking `accept`/`recv` on the module; since issue #23 U4-2 it makes no RPCs at
   all.) It sleeps
   (touching neither the UART nor the ring) whenever nothing is in flight, so the
-  `wifi log` bridge and the `wifi flash*` downloader can own the same peripheral.
+  `wifi log` bridge and the `wifi flash` downloader can own the same peripheral.
   Ownership of the module as a whole — the coarse mutex that serialises whole flows
   (`wifi connect` = lwIP init → off → on(STA) → associate), the reference count on
   the eRPC UART, and the lwIP lifecycle state — lives in `app/rtl_link.c`.
   Two consequences worth knowing: a command that needs the UART to itself (`wifi log` /
-  `probe`, every `wifi flash*`) is **refused while an eRPC session holds it**, while the
+  `probe`, every `wifi flash <sub>`) is **refused while an eRPC session holds it**, while the
   recovery commands (`wifi on`/`off`/`reset`) deliberately are not — they take the link
   away first (abandoning in-flight calls, whose callers get a transport error), because
   "run `wifi reset`" has to work exactly when the link is stuck. And since several
@@ -129,7 +129,7 @@ time as the USB console. 22 commands:
   eRPC subcommands take the console (`cli_console_claim`) for single-owner access to
   the SPSC RX ring. Register-only on the STM32 side (GPIO + UART clock gates, baud from
   the inherited PCLK2 = 137.5 MHz) — it never touches the RCC clock tree.
-  The `wifi flash*` subcommands are the **on-device RTL8720DN flasher** (issue #19):
+  The `wifi flash <sub>` subtree is the **on-device RTL8720DN flasher** (issue #19):
   the STM32 alone drives the module's mask-ROM **UART download mode** and speaks the
   AmebaD download protocol itself, so its firmware can be replaced without a host PC or
   any soldering. Entry is a strap: the ROM samples `PA[7]` (= the module's `UART_LOG_TXD`,
@@ -138,26 +138,26 @@ time as the USB console. 22 commands:
   (UART9)**, raised to 1.5 Mbaud (entry and the flashloader-stub upload live in the
   protocol layer, `app/rtl8720_flash.c` — the M1/M2 bring-up commands that exposed them
   were retired by issue #28).
-  `wifi flashread <off> [n]` surveys sectors (erased vs data); `wifi flashinfo` reports
+  `wifi flash read <off> [n]` surveys sectors (erased vs data); `wifi flash info` reports
   the **real chip capacity** — measured by address wrap, comparing 8 KB at offset 0
   against 8 KB at 1/2/4/8 MB — plus the status registers and a device-side checksum;
-  `wifi flashbackup [off] [len]` streams the whole chip to the PC over **YMODEM**
+  `wifi flash backup [off] [len]` streams the whole chip to the PC over **YMODEM**
   (`svc/ymodem.c`; receive with `rb`, or `Ctrl+A Ctrl+R` in picocom) so the factory image
   can be saved before anything is written. All of those are **read-only**.
-  Going the other way, `wifi imgload` **receives** an image from the PC (`sb <file>`) into
+  Going the other way, `wifi flash imgload` **receives** an image from the PC (`sb <file>`) into
   the PSRAM staging buffer at `0x90000000` (`app/rtl8720_img.c`; AXI-SRAM is far too small
-  for a 2 MB image) and `wifi imginfo` re-verifies it against PSRAM. Those are read-only
+  for a 2 MB image) and `wifi flash imginfo` re-verifies it against PSRAM. Those are read-only
   too — they never power the module up. Use **`sb -k`**: plain `sb` sends 128-byte blocks and spends
   most of the transfer waiting for per-block ACKs (~42 kB/s for 2 MB), while `-k` selects
   1024-byte blocks. A transfer's post-mortem (blocks accepted, CRC/sequence/short-read
   counts, console RX-ring drops) goes to **`dmesg`** as well as the console, because while
   `sb`/`rb` is running it owns the terminal and eats anything the board prints.
-  There are two destructive entry points. `wifi flashtest <off> confirm` is a hard-gated
-  erase/write/verify self-test restricted to a single unused 4 KB sector in
-  `[0x100000, 0x200000)` that it restores to `0xFF`. `wifi flashwrite <off> confirm`
+  There is exactly one destructive entry point: `wifi flash write <off> confirm`
   programs the staged image for real — including the module's boot sectors — and is what
-  makes the saved factory image restorable. Both power-cycle the module mid-operation,
-  because the flashloader stops responding after a flash program; `flashwrite` uses that
+  makes the saved factory image restorable. (M3's `wifi flashtest`, a hard-gated
+  erase/write/verify self-test on a single unused sector, was retired in issue #28: every
+  real write has exercised that path since.) It power-cycles the module mid-operation,
+  because the flashloader stops responding after a flash program, and uses that
   second session to verify by asking the module for its own checksum of the written range
   (a **sum of 32-bit little-endian words**, identified on hardware) and comparing it with
   ours, so a multi-megabyte image needs no read-back. Its gates: 4 KB alignment, a 2 MB
@@ -270,7 +270,7 @@ time as the USB console. 22 commands:
 
   Self-destruct avoidance only — there is no command policy. The telnet console refuses
   what would destroy the transport it runs on: `wifi on/off/reset` (CHIP_EN), any YMODEM
-  transfer (`xfer`, `wifi imgload`), `wifi connect`/`disconnect`, and `net shell stop`. The
+  transfer (`xfer`, `wifi flash imgload`), `wifi connect`/`disconnect`, and `net shell stop`. The
   issue-#21 restriction on module-side blocking calls is **gone** — the console no
   longer occupies a module worker.
 
@@ -466,7 +466,7 @@ lib/        git submodules: cmsis_core/device_h7, stm32h7xx_hal_driver, tinyusb,
             threadx, netxduo, coremark
 boot/       standalone USB DFU bootloader (internal 0x08000000) — see boot/README.md
 fw/rtl8720/ reproducible build of the RTL8720DN's own firmware (the eRPC server that
-            wifi/net drive) — host-side only, flashed by `wifi flashwrite`; see its README
+            wifi/net drive) — host-side only, flashed by `wifi flash write`; see its README
 ```
 
 ## Memory map (`ldscript/STM32H725AEIx_XIP.ld`)

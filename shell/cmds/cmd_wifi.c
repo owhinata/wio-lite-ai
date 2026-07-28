@@ -18,7 +18,7 @@
  *   wifi status                   connected? + RSSI + IP/mask/gw + MAC
  *   wifi scan                     list visible APs: ch/band/rssi/security/bssid/ssid
  *   wifi link <sub>               the UART link itself -- cmd_wifi_link.c (issue #23)
- *   wifi flash* / img*            issue-#19 firmware flashing -- cmd_wifi_flash.c
+ *   wifi flash <sub>              the module's own SPI flash -- cmd_wifi_flash.c (#19)
  *
  * The log bridge takes over the console (f746g-disco issue #50 raw API): RTL8720DN RX
  * bytes stream to the CDC console and console keystrokes go to the module's TX, so
@@ -1063,13 +1063,8 @@ CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(scan,       NULL, "list visible APs (ch/band/rssi/security/bssid/ssid)", cmd_wifi_scan, 1, 0),
 	CLI_CMD_ARG(link, wifi_link_subcmds,
 	            "the RTL8720 UART link itself (info / baud / bench / dbench)", NULL, 1, 0),
-	CLI_CMD_ARG(flashread,  NULL, "read flash <offset> [nsectors] (non-destructive survey)", cmd_wifi_flashread, 2, 1),
-	CLI_CMD_ARG(flashtest,  NULL, "DESTRUCTIVE erase/write/verify test <offset> confirm", cmd_wifi_flashtest, 2, 1),
-	CLI_CMD_ARG(flashinfo,  NULL, "identify flash: capacity / status regs / checksum", cmd_wifi_flashinfo, 1, 0),
-	CLI_CMD_ARG(flashbackup, NULL, "back up flash to the PC over YMODEM [offset] [len]", cmd_wifi_flashbackup, 1, 2),
-	CLI_CMD_ARG(imgload,    NULL, "receive a firmware image from the PC into PSRAM (YMODEM `sb`)", cmd_wifi_imgload, 1, 0),
-	CLI_CMD_ARG(imginfo,    NULL, "show + re-verify the staged firmware image",        cmd_wifi_imginfo, 1, 0),
-	CLI_CMD_ARG(flashwrite, NULL, "DESTRUCTIVE program staged image: flashwrite <offset> confirm", cmd_wifi_flashwrite, 2, 1),
+	CLI_CMD_ARG(flash, wifi_flash_subcmds,
+	            "the module's own SPI flash: survey / backup / reprogram", NULL, 1, 0),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(wifi, wifi_subcmds,

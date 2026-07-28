@@ -16,17 +16,13 @@
 
 #include "cli.h"
 
-/* cmd_wifi_flash.c: the issue-#19 flash/image handlers, registered by cmd_wifi.c. */
-int cmd_wifi_flashread(struct cli_instance *sh, int argc, char **argv);
-int cmd_wifi_flashtest(struct cli_instance *sh, int argc, char **argv);
-int cmd_wifi_flashinfo(struct cli_instance *sh, int argc, char **argv);
-int cmd_wifi_flashbackup(struct cli_instance *sh, int argc, char **argv);
-int cmd_wifi_imgload(struct cli_instance *sh, int argc, char **argv);
-int cmd_wifi_imginfo(struct cli_instance *sh, int argc, char **argv);
-int cmd_wifi_flashwrite(struct cli_instance *sh, int argc, char **argv);
-
-/* cmd_wifi_link.c: the `wifi link <sub>` table (CLI_SUBCMD_SET_END-terminated), nested
- * into the wifi table the same way `net shell` nests its own. */
+/* The two nested tables (CLI_SUBCMD_SET_END-terminated) the wifi table points at, the
+ * same way `net shell` nests its own.  Each subtree's handlers are static to its TU --
+ * the table pointer is the whole seam.
+ *   cmd_wifi_flash.c: `wifi flash <sub>`, the issue-#19 download-mode flasher
+ *   cmd_wifi_link.c:  `wifi link <sub>`,  the issue-#23 link diagnostics
+ */
+extern const struct cli_cmd wifi_flash_subcmds[];
 extern const struct cli_cmd wifi_link_subcmds[];
 
 #endif /* CMD_WIFI_PRIV_H */

@@ -224,43 +224,14 @@ int rtl_dl_flash_jedec(struct rtl_dl_jedec *j, int (*should_abort)(void *ctx), v
 int rtl_dl_flash_chksum(uint32_t off, uint32_t len, uint32_t timeout_ms, uint32_t *out,
                         int (*should_abort)(void *ctx), void *abort_ctx);
 
-/* ---- M3: flash erase / write / verify (DESTRUCTIVE, gated to one unused sector) ---- */
-
-/* Per-step result of rtl_dl_flash_selftest (fields are 0/1 unless noted). */
-struct rtl_dl_selftest {
-	int     gate_ok;      /* the sector was erasable (all 0xFF, or our own test pattern) */
-	int     gate_was_ff;  /* 1 = all 0xFF (fresh), 0 = our leftover pattern (self-heal) */
-	int     erase_ok;     /* erase + read-back all 0xFF */
-	int     write_ok;     /* test-pattern write + read-back verify */
-	int     restore_ok;   /* final re-erase + read-back all 0xFF (sector restored) */
-	int     dirty;        /* 1 = sector left NOT all 0xFF (restore failed -- re-run to heal) */
-	int     rc_detail;    /* read-back-after-write: the rtl_dl_read_flash return (diagnostic) */
-	int     read_attempts;/* read-back-after-write: attempts made (retry diagnostic) */
-	uint8_t found[16];    /* first 16 bytes read at the gate (diagnostic on a foreign-data refusal) */
-};
-
-/*
- * DESTRUCTIVE self-test of the flash erase/write/verify path on ONE 4 KB sector at @offset.
- * Owns the whole flow: it enters download mode (strap+reset, @hold_us), loads the flashloader,
- * gates, erases, writes the test pattern, then -- because the flashloader goes unresponsive
- * after a flash program (only a power-cycle revives it) -- POWER-CYCLES and re-enters to
- * read-back verify and re-erase (restore).  So the caller only needs the RTL link claim
- * (rtl_link_hw_claim(sh, false), see the header note above) + a final rtl8720_reset;
- * do NOT rtl_dl_enter/load before calling.
+/* ---- M5: program a host-supplied firmware image (DESTRUCTIVE, the real thing) ---- *
  *
- * Safe on the only board because it is hard-gated: @offset must be 4 KB-aligned and in
- * [0x00100000, 0x00200000) (past the app, within a conservative 2 MB cap), AND the sector
- * must read back erasable -- all 0xFF (unused) or exactly this routine's own i&0xFF test
- * pattern (a previous DIRTY run self-heals); any other content is refused.  A passing run
- * restores 0xFF and never touches boot/app.  All erase/write primitives are private and
- * range-checked; this is the ONLY public entry that writes flash.  Fills @r with per-step
- * results.  Returns 0 on full pass (restored), negative otherwise (@r.dirty marks a sector
- * left with data -- re-running self-heals).  @should_abort (may be NULL) is polled to cancel.
+ * M3's single-sector erase/write/verify self-test (`wifi flashtest`, rtl_dl_flash_selftest)
+ * lived here until issue #28.  It proved the erase/write/verify path on one gated sector
+ * before there was a real writer; rtl_dl_flash_program below has exercised that same path
+ * on every real flash since M5, so the test window and its bespoke gates went.  The erase
+ * and block-write primitives it shared with the programmer stay private and range-checked.
  */
-int rtl_dl_flash_selftest(uint32_t offset, uint32_t hold_us, struct rtl_dl_selftest *r,
-                          int (*should_abort)(void *ctx), void *abort_ctx);
-
-/* ---- M5: program a host-supplied firmware image (DESTRUCTIVE, the real thing) ---- */
 
 /* First 8 bytes of an AmebaD km0_boot image -- checked before anything may be written
  * at offset 0.  Confirmed twice: _ref/ambd/firmware/km0_boot_all.bin, and the M2 read
@@ -268,7 +239,7 @@ int rtl_dl_flash_selftest(uint32_t offset, uint32_t hold_us, struct rtl_dl_selft
 #define RTL_DL_KM0_MAGIC_LEN  8u
 extern const uint8_t rtl_dl_km0_magic[RTL_DL_KM0_MAGIC_LEN];
 
-/* Per-step result of rtl_dl_flash_program (printed by `wifi flashwrite`). */
+/* Per-step result of rtl_dl_flash_program (printed by `wifi flash write`). */
 struct rtl_dl_program {
 	uint32_t sectors;      /* sectors the range covers */
 	uint32_t erased;       /* sectors successfully erased */
@@ -284,13 +255,13 @@ struct rtl_dl_program {
 
 /*
  * DESTRUCTIVE: erase [offset, offset+len) and program @data into it, then verify.
- * This is the only public API that can write outside rtl_dl_flash_selftest's tiny
- * test window -- it is what actually (re)flashes the RTL8720DN's firmware, so read
- * the gates below before changing anything here.
+ * This is the ONLY public API that writes flash at all -- it is what actually
+ * (re)flashes the RTL8720DN's firmware, so read the gates below before changing
+ * anything here.
  *
- * Owns the whole session, like rtl_dl_flash_selftest: the caller only needs the RTL link
- * claim (rtl_link_hw_claim(sh, false)) + a final rtl8720_reset; do NOT rtl_dl_enter/load
- * first.
+ * Owns the whole session: the caller only needs the RTL link claim
+ * (rtl_link_hw_claim(sh, false), see the header note above) + a final rtl8720_reset;
+ * do NOT rtl_dl_enter/load first.
  * Two phases, because a flash program leaves the flashloader unresponsive until a
  * power-cycle (established in M3):
  *   Phase 1  enter -> load flashloader -> detect capacity -> erase -> block-transfer

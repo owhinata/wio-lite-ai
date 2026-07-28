@@ -7,16 +7,20 @@ server** that exports the module's WiFi and lwIP sockets over UART, which is wha
 STM32's [`wifi`](../../README.md) (L2) and `net` (L3) commands drive.
 
 Nothing here touches the STM32 firmware. This directory only produces an image for the
-*other* chip; issue #19 gave us the on-device flasher (`wifi imgload` +
-`wifi flashwrite`) that puts it there, with no host programmer and no soldering.
+*other* chip; issue #19 gave us the on-device flasher (`wifi flash imgload` +
+`wifi flash write`) that puts it there, with no host programmer and no soldering.
 
 > **Shell command names below are as they were at the time** (this file doubles as the
 > per-generation acceptance record). Issue #28 later reshaped the STM32 command surface;
 > when following any procedure here, map: `wifi rpc ver` / `wifi rpc` → **`wifi ver`**,
 > `link <sub>` → **`wifi link <sub>`**, `link sweep` → **`wifi link bench … all`**,
-> `wifi probe` → **`wifi log reset`**. `net conc`, the module-side `net ping` path,
-> `wifi flashprobe` / `flashload` / `imgsend` and `link eth` were removed (their
-> wire-level behaviour is recorded here and in git history).
+> `wifi probe` → **`wifi log reset`**, and the flat `wifi flashXXX` / `wifi imgXXX`
+> commands → the **`wifi flash <sub>`** subtree (`flashread` → `flash read`,
+> `flashinfo` → `flash info`, `flashbackup` → `flash backup`, `imgload`/`imginfo` →
+> `flash imgload`/`flash imginfo`, `flashwrite` → `flash write`). `net conc`, the
+> module-side `net ping` path, `wifi flashprobe` / `flashload` / `imgsend` /
+> `flashtest` and `link eth` were removed (their wire-level behaviour is recorded here
+> and in git history).
 
 **Why rebuild it at all** (issue #20): the shipped firmware has two structural problems
 that cap what `net` can do.
@@ -152,8 +156,8 @@ covers a specific way the module could be left unreachable.
 The summary also prints the **device digest**: the module's own checksum algorithm (sum
 of 32-bit little-endian words, identified on hardware in issue #19 and reimplemented on
 the STM32 as `rtl_dl_digest_*`). This is what ties the gate report to the bytes that
-actually get programmed. `wifi imgload` stages whatever you send it — the gates cannot
-reach across the YMODEM transfer — so compare this number against `wifi imginfo` before
+actually get programmed. `wifi flash imgload` stages whatever you send it — the gates cannot
+reach across the YMODEM transfer — so compare this number against `wifi flash imginfo` before
 typing `confirm`. As a check of the implementation, the 2 MB stock backup digests to
 `0x464A5FFD`, the value the module itself reported in issue #19 M5.
 
@@ -193,9 +197,9 @@ The module is programmed by the STM32 itself (issue #19). Nothing else is needed
 host programmer, no soldering.
 
 ```
-wio> wifi imgload                    # then send out/km0_km4_image2.bin with `sb -k`
-wio> wifi imginfo                    # re-verify the staged image against PSRAM
-wio> wifi flashwrite 0x6000 confirm  # DESTRUCTIVE: erase + program + device-side digest
+wio> wifi flash imgload                 # then send out/km0_km4_image2.bin with `sb -k`
+wio> wifi flash imginfo                 # re-verify the staged image against PSRAM
+wio> wifi flash write 0x6000 confirm    # DESTRUCTIVE: erase + program + device-side digest
 ```
 
 Use **`sb -k`** (1024-byte YMODEM blocks); plain `sb` sends 128-byte blocks and is
@@ -203,7 +207,7 @@ roughly an order of magnitude slower. The image is exactly `0xd6000` bytes, whic
 already sector-aligned and covers the whole image2 partition, so the erase removes every
 sector the previous image2 occupied — no manual `0xFF` padding is needed.
 
-`flashwrite` verifies by asking the module for its own checksum of the written range and
+`flash write` verifies by asking the module for its own checksum of the written range and
 comparing, so the write is proven byte-correct before the module is reset.
 
 ### Acceptance (N1)
@@ -227,9 +231,9 @@ The RTL8720DN's download mode lives in **mask ROM** and is entered by a strap pl
 unbrickable, and the restore path was proven end-to-end in issue #19 (M5):
 
 ```
-wio> wifi imgload                    # send _ref/ambd/board2-stock/rtl8720_000000_200000.bin
-wio> wifi imginfo                    # 2 MB, digest 0x464A5FFD
-wio> wifi flashwrite 0x0 confirm     # full-chip restore, boot sectors included
+wio> wifi flash imgload                 # send _ref/ambd/board2-stock/rtl8720_000000_200000.bin
+wio> wifi flash imginfo                 # 2 MB, digest 0x464A5FFD
+wio> wifi flash write 0x0 confirm       # full-chip restore, boot sectors included
 ```
 
 > The full-chip backup contains the factory WiFi settings sector at `0x105000` with the

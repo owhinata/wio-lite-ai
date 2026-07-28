@@ -255,7 +255,7 @@ int wifi_rpc_scan_record(const uint8_t *buf, uint16_t got, uint16_t idx,
  * USI0 directly behind an 8 kB ring and reads it in bulk, so none of the three causes
  * above survives and a full WIFI_RPC_STREAM_MAX payload is safe.  But the host must keep
  * working against an older module -- the two are flashed separately and the recovery path
- * (`wifi imgload` / `flashwrite`) exists precisely to put an older image back -- so the
+ * (`wifi flash imgload` / `flash write`) exists precisely to put an older image back -- so the
  * chunk size is a RUNTIME question, not a compile-time one: see wifi_rpc_send_chunk().
  * WIFI_RPC_SEND_SAFE remains the answer for a link we have no proof about.
  */

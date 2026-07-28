@@ -4,28 +4,33 @@
  */
 /**
  * @file    cmd_wifi_flash.c
- * @brief   `wifi flash* / img*` subcommands (issue #19): rewriting the RTL8720DN's
- *          own SPI flash over its mask-ROM UART download mode.
+ * @brief   The `wifi flash <sub>` subtree (issue #19): rewriting the RTL8720DN's own
+ *          SPI flash over its mask-ROM UART download mode.
  *
- *   wifi flashread <off> [n]      survey sectors, erased-vs-data (read-only)
- *   wifi flashtest <off> confirm  DESTRUCTIVE erase/write/verify on one unused sector
- *   wifi flashinfo                capacity (address wrap) / status regs / checksum
- *   wifi flashbackup [off] [len]  back the flash up to the PC over YMODEM (read-only)
- *   wifi imgload                  receive an image from the PC into PSRAM (read-only)
- *   wifi imginfo                  show + re-verify the staged image (read-only)
- *   wifi flashwrite <off> confirm DESTRUCTIVE -- program the staged image
+ *   wifi flash info                capacity (address wrap) / status regs / checksum
+ *   wifi flash read <off> [n]      survey sectors, erased-vs-data (read-only)
+ *   wifi flash backup [off] [len]  back the flash up to the PC over YMODEM (read-only)
+ *   wifi flash imgload             receive an image from the PC into PSRAM (read-only)
+ *   wifi flash imginfo             show + re-verify the staged image (read-only)
+ *   wifi flash write <off> confirm DESTRUCTIVE -- program the staged image
+ *
+ * They were seven flat `wifi flashXXX` / `wifi imgXXX` commands until issue #28: the
+ * flat namespace could not keep them together in `help wifi` (prefix order and pipeline
+ * order disagree -- `flashwrite` needs `imgload` to have run first), and the M3
+ * single-sector self-test `wifi flashtest` went with the move, its erase/write/verify
+ * path now proven by every real `wifi flash write` instead.
  *
  * None of this talks eRPC: every session drops the module into its mask-ROM UART
  * download mode (app/rtl8720_flash.c owns the protocol) and ALWAYS power-cycles it
  * back to the normal firmware on the way out -- flash_session_recover() below is that
- * epilogue, shared by every handler.  The registration table stays in cmd_wifi.c; the
- * handlers are exported through cmd_wifi_priv.h.
+ * epilogue, shared by every handler.  The table at the bottom is nested into the `wifi`
+ * table (cmd_wifi.c) through cmd_wifi_priv.h, exactly like `wifi link`.
  *
  * Clean-room design; no third-party code reused.
  */
 #include "cli.h"
 /* cli_instance.h (ThreadX-aware) gives the full struct cli_instance, which
- * `wifi imgload` needs for sh->rx_dropped: the console backend silently drops --
+ * `wifi flash imgload` needs for sh->rx_dropped: the console backend silently drops --
  * and counts -- a byte when its RX ring overruns, and a bulk receive is the first
  * thing in this firmware that can provoke that, so the count has to be reported
  * rather than assumed to be zero. */
@@ -178,9 +183,10 @@ static uint32_t flash_report_size(struct cli_instance *sh, const struct rtl_dl_s
 	          (unsigned long)(sz->size >> 20), (unsigned long)sz->size);
 	return sz->size;
 }
-/* wifi flashread <offset> [nsectors] (issue #19, M3): NON-DESTRUCTIVE flash survey -- read
- * sectors and show whether each looks erased (helps pick an unused sector for flashtest). */
-int cmd_wifi_flashread(struct cli_instance *sh, int argc, char **argv)
+/* wifi flash read <offset> [nsectors] (issue #19, M3): NON-DESTRUCTIVE flash survey --
+ * read sectors and show whether each looks erased.  It is how a range is checked before
+ * and after `wifi flash write`, without needing a PC receiver like `backup` does. */
+static int cmd_flash_read(struct cli_instance *sh, int argc, char **argv)
 {
 	uint32_t offset, nsectors = 1u, s;
 	uint8_t buf[128];
@@ -227,87 +233,17 @@ recover:
 	rtl_link_hw_release(sh);
 	return ok ? 0 : 1;
 }
-/* wifi flashtest <offset> confirm (issue #19, M3): DESTRUCTIVE erase/write/verify self-test
- * on ONE unused (all-0xFF) 4 KB sector, restored to 0xFF afterwards.  Hard-gated in
- * rtl_dl_flash_selftest (range [0x100000,0x200000) + erasable-content check), and requires
- * the literal `confirm` token.  Never touches boot/app.  Always resets the module back. */
-int cmd_wifi_flashtest(struct cli_instance *sh, int argc, char **argv)
-{
-	struct rtl_dl_selftest r;
-	uint32_t offset;
-	int rc, i, ok = 0;
-
-	if (parse_u32(argv[1], &offset) != 0) {
-		cli_error(sh, "wifi: bad offset (hex, e.g. 0x180000)\r\n");
-		return 1;
-	}
-	if (argc < 3 || strcmp(argv[2], "confirm") != 0) {
-		cli_error(sh, "wifi: DESTRUCTIVE (erases+writes a flash sector). "
-		          "Re-run `wifi flashtest 0x%lX confirm` to proceed.\r\n", (unsigned long)offset);
-		return 1;
-	}
-	if (flash_claim(sh) != 0)
-		return 1;
-
-	cli_print(sh, "wifi: flash erase/write/verify self-test @0x%lX "
-	          "(DESTRUCTIVE; power-cycles the module to verify)...\r\n", (unsigned long)offset);
-	rc = rtl_dl_flash_selftest(offset, 30000u, &r, rtl_abort_cb, sh);
-	if (rc == -1) {
-		cli_error(sh, "wifi: offset outside the safe test range "
-		          "[0x100000, 0x200000), 4KB-aligned\r\n");
-		goto recover;
-	}
-	if (rc == -2) {
-		cli_error(sh, "wifi: download / flashloader setup failed (rc %d)\r\n", rc);
-		goto recover;
-	}
-	if (rc == -3) {
-		cli_error(sh, "wifi: refusing -- sector 0x%lX is not erased/unused (foreign data)\r\n",
-		          (unsigned long)offset);
-		cli_print(sh, "  first 16 B:");
-		for (i = 0; i < 16; i++)
-			cli_print(sh, " %02X", r.found[i]);
-		cli_print(sh, "\r\n  pick an all-0xFF sector (use `wifi flashread`)\r\n");
-		goto recover;
-	}
-	cli_print(sh, "  gate:    %s\r\n", r.gate_ok ?
-	          (r.gate_was_ff ? "erasable (all 0xFF)" : "erasable (our leftover pattern)") : "FAIL");
-	cli_print(sh, "  erase:   %s\r\n", r.erase_ok ? "OK (all 0xFF)" : "FAIL");
-	cli_print(sh, "  write:   %s\r\n",
-	          r.write_ok ? "OK (pattern verified after re-enter)" :
-	          (rc == -5) ? "FAIL (block send)" :
-	          (rc == -7) ? "FAIL (verify read after re-enter)" :
-	          (rc == -8) ? "FAIL (verify mismatch)" : "-");
-	if (rc == -7 || rc == -8)
-		cli_print(sh, "           (read rc %d)\r\n", r.rc_detail);
-	cli_print(sh, "  restore: %s\r\n", r.restore_ok ? "OK (re-erased to 0xFF)" :
-	          (r.dirty ? "FAIL -- sector DIRTY" : "-"));
-	if (rc == 0) {
-		cli_print(sh, "wifi: PASSED -- erase/write/verify OK, sector restored to 0xFF\r\n");
-		ok = 1;
-	} else {
-		cli_error(sh, "wifi: FAILED (rc %d)\r\n", rc);
-		if (r.dirty)
-			cli_print(sh, "  note: sector 0x%lX left with data; re-run "
-			          "`wifi flashtest 0x%lX confirm` to heal, or pick another offset\r\n",
-			          (unsigned long)offset, (unsigned long)offset);
-	}
-
-recover:
-	flash_session_recover(sh);
-	rtl_link_hw_release(sh);
-	return ok ? 0 : 1;
-}
-/* wifi flashinfo (issue #19, M4): NON-DESTRUCTIVE flash identification.
+/* wifi flash info (issue #19, M4): NON-DESTRUCTIVE flash identification.
  *
  * Runs in TWO download sessions on purpose.  Two operations each want to be last:
  * the 0x27 checksum (a timeout may still be answered later and would desynchronise
  * whatever follows) and the experimental RDID probe (its command shape is not
  * established by the reference tool, so a mis-framed reply may desynchronise too).
  * Session A therefore ends with the checksum, and the RDID probe gets a fresh session
- * of its own -- the same "power-cycle and re-enter" pattern rtl_dl_flash_selftest uses.
+ * of its own -- the same "power-cycle and re-enter" pattern the programmer uses between
+ * its write and verify phases.
  * Only session A's wrap detection is authoritative; everything else is a diagnostic. */
-int cmd_wifi_flashinfo(struct cli_instance *sh, int argc, char **argv)
+static int cmd_flash_info(struct cli_instance *sh, int argc, char **argv)
 {
 	struct rtl_dl_size sz;
 	struct rtl_dl_jedec jd;
@@ -467,10 +403,10 @@ static void bak_build_name(char *buf, uint32_t off, uint32_t len)
 	*p = '\0';
 }
 
-/* wifi flashbackup [offset] [len] (issue #19, M4): NON-DESTRUCTIVE full-chip backup.
+/* wifi flash backup [offset] [len] (issue #19, M4): NON-DESTRUCTIVE full-chip backup.
  * Streams the flash to the PC over the console with YMODEM (receive with `rz`).
  * Defaults to the whole chip as detected by the address-wrap probe. */
-int cmd_wifi_flashbackup(struct cli_instance *sh, int argc, char **argv)
+static int cmd_flash_backup(struct cli_instance *sh, int argc, char **argv)
 {
 	struct rtl_dl_size sz;
 	struct rtl_bak_src src_ctx;
@@ -510,7 +446,7 @@ int cmd_wifi_flashbackup(struct cli_instance *sh, int argc, char **argv)
 	if (len == 0u) {
 		if (size == 0u) {
 			cli_error(sh, "wifi: capacity unknown -- pass an explicit length, "
-			          "e.g. `wifi flashbackup 0x0 0x200000`\r\n");
+			          "e.g. `wifi flash backup 0x0 0x200000`\r\n");
 			goto recover;
 		}
 		len = size - offset;
@@ -576,7 +512,7 @@ static int img_report(struct cli_instance *sh)
 	int                   i;
 
 	if (!im->valid) {
-		cli_warn(sh, "wifi: no image staged -- run `wifi imgload` first\r\n");
+		cli_warn(sh, "wifi: no image staged -- run `wifi flash imgload` first\r\n");
 		return 0;
 	}
 	cli_print(sh, "  name:    '%s'\r\n", im->name);
@@ -595,7 +531,7 @@ static int img_report(struct cli_instance *sh)
 	now = rtl_img_verify();
 	if (now != im->digest) {
 		cli_error(sh, "  RECHECK: 0x%08lX -- PSRAM was CLOBBERED since the load "
-		          "(another command used it); re-run `wifi imgload`\r\n",
+		          "(another command used it); re-run `wifi flash imgload`\r\n",
 		          (unsigned long)now);
 		return 0;
 	}
@@ -604,7 +540,7 @@ static int img_report(struct cli_instance *sh)
 }
 
 /*
- * wifi imgload (issue #19, M5): receive a firmware image from the PC over YMODEM into
+ * wifi flash imgload (issue #19, M5): receive a firmware image from the PC over YMODEM into
  * the PSRAM staging buffer.  Touches NO RTL8720 hardware at all -- this is purely the
  * host-to-board transfer, and it is what makes the stock backup restorable.
  *
@@ -613,7 +549,7 @@ static int img_report(struct cli_instance *sh)
  * poll cli_cancel_requested() (see cmd_xfer.h) -- here it physically cannot, since
  * rtl_img_sink() has no abort hook to pass.
  */
-int cmd_wifi_imgload(struct cli_instance *sh, int argc, char **argv)
+static int cmd_flash_imgload(struct cli_instance *sh, int argc, char **argv)
 {
 	const struct rtl_img *im;
 	uint32_t              drops0;
@@ -708,8 +644,8 @@ out:
 	return ok ? 0 : 1;
 }
 
-/* wifi imginfo (issue #19, M5): show the staged image and re-verify it against PSRAM. */
-int cmd_wifi_imginfo(struct cli_instance *sh, int argc, char **argv)
+/* wifi flash imginfo (issue #19, M5): show the staged image and re-verify it against PSRAM. */
+static int cmd_flash_imginfo(struct cli_instance *sh, int argc, char **argv)
 {
 	int ok;
 
@@ -724,7 +660,7 @@ int cmd_wifi_imginfo(struct cli_instance *sh, int argc, char **argv)
 	return ok ? 0 : 1;
 }
 /*
- * wifi flashwrite <offset> confirm (issue #19, M5): DESTRUCTIVE.  Erase and program the
+ * wifi flash write <offset> confirm (issue #19, M5): DESTRUCTIVE.  Erase and program the
  * staged image into the RTL8720DN's flash at <offset>, then verify it with the module's
  * own digest.  THIS IS THE COMMAND THAT CAN REWRITE THE MODULE'S BOOT SECTORS.
  *
@@ -734,7 +670,7 @@ int cmd_wifi_imginfo(struct cli_instance *sh, int argc, char **argv)
  * and the detected chip capacity.  Recovery if this ever goes wrong: re-enter download
  * mode (mask ROM -- always possible) and re-run with the full 2 MB stock backup staged.
  */
-int cmd_wifi_flashwrite(struct cli_instance *sh, int argc, char **argv)
+static int cmd_flash_write(struct cli_instance *sh, int argc, char **argv)
 {
 	const struct rtl_img *im = rtl_img_get();
 	struct rtl_dl_program pr;
@@ -746,14 +682,14 @@ int cmd_wifi_flashwrite(struct cli_instance *sh, int argc, char **argv)
 		return 1;
 	}
 	if (!im->valid) {
-		cli_error(sh, "wifi: no image staged -- run `wifi imgload` first\r\n");
+		cli_error(sh, "wifi: no image staged -- run `wifi flash imgload` first\r\n");
 		return 1;
 	}
 	len = im->padded_len;
 	if (argc < 3 || strcmp(argv[2], "confirm") != 0) {
 		cli_error(sh, "wifi: DESTRUCTIVE -- erases and rewrites %lu bytes of RTL8720 "
 		          "flash at 0x%lX.\r\n", (unsigned long)len, (unsigned long)offset);
-		cli_print(sh, "  re-run `wifi flashwrite 0x%lX confirm` to proceed\r\n",
+		cli_print(sh, "  re-run `wifi flash write 0x%lX confirm` to proceed\r\n",
 		          (unsigned long)offset);
 		return 1;
 	}
@@ -774,7 +710,7 @@ int cmd_wifi_flashwrite(struct cli_instance *sh, int argc, char **argv)
 	 * digested at load time. */
 	if (rtl_img_verify() != im->digest) {
 		cli_error(sh, "wifi: staged image no longer matches its digest (PSRAM was "
-		          "clobbered) -- re-run `wifi imgload`\r\n");
+		          "clobbered) -- re-run `wifi flash imgload`\r\n");
 		goto out;
 	}
 
@@ -808,7 +744,7 @@ int cmd_wifi_flashwrite(struct cli_instance *sh, int argc, char **argv)
 		goto recover;
 	case -10:
 		cli_error(sh, "wifi: could not read the flash to size it -- nothing erased. "
-		          "Retry; if it persists, check the link with `wifi flashinfo`\r\n");
+		          "Retry; if it persists, check the link with `wifi flash info`\r\n");
 		goto recover;
 	default:
 		break;
@@ -838,7 +774,7 @@ int cmd_wifi_flashwrite(struct cli_instance *sh, int argc, char **argv)
 	} else {
 		cli_error(sh, "wifi: FAILED (rc %d)\r\n", rc);
 		cli_print(sh, "  the range is now INDETERMINATE. Re-run "
-		          "`wifi flashwrite 0x%lX confirm` (erase+write is idempotent); if it "
+		          "`wifi flash write 0x%lX confirm` (erase+write is idempotent); if it "
 		          "keeps failing, stage the full 2 MB backup and write it at 0x0.\r\n",
 		          (unsigned long)offset);
 	}
@@ -850,3 +786,29 @@ out:
 	rtl_link_hw_release(sh);
 	return ok ? 0 : 1;
 }
+
+/* ---- registration -------------------------------------------------------- */
+
+/*
+ * Registered UNDER `wifi` (cmd_wifi.c holds the root table; cmd_wifi_priv.h is the
+ * seam), so this cannot be CLI_SUBCMD_SET_CREATE -- that macro makes the array static.
+ *
+ * Order is the order the commands are USED, which is what the flat names could not
+ * express: identify the chip, survey it, save it, stage a replacement, check the
+ * staging, then write.  `write` last is deliberate -- it is the only destructive one.
+ */
+const struct cli_cmd wifi_flash_subcmds[] = {
+	CLI_CMD_ARG(info,    NULL, "identify the chip: capacity / status regs / checksum",
+	            cmd_flash_info,    1, 0),
+	CLI_CMD_ARG(read,    NULL, "survey sectors <offset> [nsectors] (non-destructive)",
+	            cmd_flash_read,    2, 1),
+	CLI_CMD_ARG(backup,  NULL, "back the flash up to the PC over YMODEM [offset] [len]",
+	            cmd_flash_backup,  1, 2),
+	CLI_CMD_ARG(imgload, NULL, "receive a firmware image from the PC into PSRAM (YMODEM `sb`)",
+	            cmd_flash_imgload, 1, 0),
+	CLI_CMD_ARG(imginfo, NULL, "show + re-verify the staged firmware image",
+	            cmd_flash_imginfo, 1, 0),
+	CLI_CMD_ARG(write,   NULL, "DESTRUCTIVE program staged image: write <offset> confirm",
+	            cmd_flash_write,   2, 1),
+	CLI_SUBCMD_SET_END
+};
