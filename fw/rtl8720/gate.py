@@ -68,8 +68,8 @@ def device_digest(blob):
 
     This is the `0x27` algorithm identified on hardware in issue #19 and reimplemented
     on the STM32 in `app/rtl8720_flash.c` (`rtl_dl_digest_*`).  Printing it here is what
-    ties this gate report to the bytes that actually get programmed: `wifi imginfo`
-    reports the digest of the staged image and `wifi flashwrite` prints it again as the
+    ties this gate report to the bytes that actually get programmed: `wifi flash imginfo`
+    reports the digest of the staged image and `wifi flash write` prints it again as the
     host digest, so an operator who staged the wrong file sees a mismatch before
     confirming.  The staging buffer pads to 4 KB with 0xFF and digests the padded range,
     so pad the same way here.
@@ -135,7 +135,7 @@ def main():
     ap.add_argument("--km0-boot", required=True, help="core prebuilt km0_boot_all.bin")
     ap.add_argument("--km4-boot", required=True, help="core prebuilt km4_boot_all.bin")
     ap.add_argument("--stock", required=True,
-                    help="full-chip backup of board #2 (2 MB, from `wifi flashbackup`)")
+                    help="full-chip backup of board #2 (2 MB, from `wifi flash backup`)")
     ap.add_argument("--offset", type=lambda s: int(s, 0), default=IMAGE2_OFF,
                     help="flash offset the image will be written to (default 0x6000)")
     args = ap.parse_args()
@@ -202,7 +202,7 @@ def main():
     print("\n\033[1msummary\033[0m")
     info(f"md5    {hashlib.md5(img).hexdigest()}")
     info(f"sha256 {hashlib.sha256(img).hexdigest()}")
-    info(f"device digest 0x{device_digest(img):08X}  <- must match `wifi imginfo`")
+    info(f"device digest 0x{device_digest(img):08X}  <- must match `wifi flash imginfo`")
     if fails:
         print(f"\n\033[1;31m{len(fails)} gate(s) FAILED -- do not flash\033[0m")
         for m in fails:
@@ -216,11 +216,11 @@ def main():
         print(f"\n\033[1;33mall gates passed with {len(warns)} warning(s)\033[0m")
     else:
         print("\n\033[1;32mall gates passed\033[0m")
-    print(f"\nflash with:  wifi imgload   (send {args.image} with `sb -k`)\n"
-          f"             wifi imginfo   (check digest 0x{device_digest(img):08X} "
+    print(f"\nflash with:  wifi flash imgload   (send {args.image} with `sb -k`)\n"
+          f"             wifi flash imginfo   (check digest 0x{device_digest(img):08X} "
           f"and {len(img)} bytes)\n"
-          f"             wifi flashwrite 0x{args.offset:x} confirm")
-    print("\nThe gates above ran on that file only.  `wifi imgload` will stage whatever\n"
+          f"             wifi flash write 0x{args.offset:x} confirm")
+    print("\nThe gates above ran on that file only.  `wifi flash imgload` will stage whatever\n"
           "you send it, so compare the digest before typing `confirm`.")
     return 0
 

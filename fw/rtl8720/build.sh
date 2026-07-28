@@ -5,8 +5,8 @@
 # The STM32 side of this board talks to the WiFi module over eRPC; the module runs
 # Seeed's `seeed-ambd-firmware`.  This script rebuilds that firmware from pinned
 # sources so we can then patch it (N2 bounded handlers, N3 worker dispatch) and flash
-# the result with the on-device flasher from issue #19 (`wifi imgload` +
-# `wifi flashwrite`).  Nothing here touches the STM32 firmware.
+# the result with the on-device flasher from issue #19 (`wifi flash imgload` +
+# `wifi flash write`).  Nothing here touches the STM32 firmware.
 #
 # Everything is pinned and verified before a single byte is compiled, because the
 # artifact ends up in the flash of the only surviving board:

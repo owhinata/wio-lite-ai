@@ -313,6 +313,12 @@ fw/rtl8720/
 - **N6** (built) — a DATA channel on the same wire (`patches/0006`, issue #23 U1): the
   unsolicited, unacknowledged frame type that raw Ethernet needs, plus the pools, queue
   and tasks that U2's L2 bridge will plug into. See *N6 result* below.
+- **N7** (built) — the L2 bridge itself (`patches/0007`, issue #23 U2): received Ethernet
+  frames go to the host instead of the module's lwIP, and frames from the host go out on
+  the air. See *N7 result* below.
+- **N8** (built) — an entry guard on `LwIP_Init` (`patches/0008`, issue #31 = #30 B0), so
+  a second `rpc_tcpip_adapter_init` can no longer unhook the bridge tap. See *N8 result*
+  below.
 
 ### N2 result
 
@@ -748,3 +754,61 @@ Acceptance (beyond the N6 regression set, with `wifi rpc ver` reading `2.1.3+wio
 `link arp <gateway>` shows a `who-has` going out and an **`is-at` reply coming back** — which
 proves the whole path in both directions at once — and after the session `net info`,
 `net dhcp`, `net ping <gateway>` and the telnet console all work again unchanged.
+
+### N8 result
+
+`patches/0008-n8-lwip-init-guard.patch` — three lines of behaviour in
+`src/wifi/wifi_tcpip_adapter.c`, plus the build id becoming `2.1.3+wio-n8`. **The eRPC
+wire format is unchanged for the sixth time**, and the host needs no change at all: it
+parses the generation as a number and every gate is a `>=`.
+
+`LwIP_Init()` sets `lwip_init_done = 1` at its **end** and never reads it on entry, so a
+second `rpc_tcpip_adapter_init` runs the whole thing again: `tcpip_init()` starts a second
+tcpip thread, and `netif_add(&xnetif[0], …, &tcpip_input)` puts `xnetif[0].input` back —
+which **silently unhooks the tap** N7 installed there. Since issue #30 made the bridge
+permanent, that tap is the host's only path to the network, so the failure mode is "the
+network disappears and nothing is logged on either side". `tcpip_adapter_init()` now
+returns early when lwIP is already up.
+
+The guard consults the SDK's own `lwip_init_done` rather than a private flag, because that
+is the real state — it is also 1 when something inside the SDK brought lwIP up without
+coming through here. It is not in `lwip_netconf.h`, but it is a plain 4-byte global in the
+prebuilt library (`nm --print-size lib_arduino.a` → `00000000 00000004 B lwip_init_done`)
+and lives in `.bss`, so a fresh boot still runs the init. The host-side latch
+(`rtl_tcpip_inited`, `app/rtl_link.c`) stays: two independent guards is the point.
+
+Cost: image length unchanged at 888832 B (write range `0x6000..0xdefff`), device digest
+`0x9E74C4C6`.
+
+#### Proving it, and why the normal path cannot
+
+The host latch means a stock build never issues the second call, so the guard is invisible
+to the standard regression. It was verified with a **throwaway host build** (never
+committed) in which `wifi connect`'s `if (!rtl_tcpip_inited())` is forced true, so every
+connect re-issues `rpc_tcpip_adapter_init`, run as an A/B against both firmwares on
+board #2:
+
+- **on N7** the second call never comes back at all. The host gives up on its 5 s timeout —
+  `wifi: tcpip/lwIP init failed (rc -2, result -1)` with `timeout 1` in the diag — and the
+  handler stays stuck inside `LwIP_Init()`. That is *worse* than the silent unhook this
+  patch was written for and it hides it: the tap never gets a chance to die, because the
+  second `netif_add` never completes. Since N3 dispatches handlers to a two-worker pool,
+  each attempt burns a worker, so `wifi connect` cannot succeed again — which is the whole
+  point, since the retry after a refused association is exactly when a second connect
+  happens. `wifi reset` recovers.
+- **on N8** the same sequence is a no-op: `wifi: connected` / `the host stack is already
+  up`, and `net ping` answers 4/4 both before (2/16/59 ms) and after (3/3/3 ms) the second
+  connect. The bridge is untouched.
+
+#### Why the module's own auto-reconnect is NOT part of this
+
+Enabling `wifi_set_autoreconnect()` looks like the obvious companion feature and would
+break the bridge. Disassembling the prebuilt `wifi_conf.o` shows the handler it installs
+(`wifi_autoreconnect_hdl` → `wifi_autoreconnect_thread`) calls `wifi_connect()` and then
+**`LwIP_DHCP(0, START)`**, falling back to `LwIP_AUTOIP` when no lease arrives. With the
+tap installed, the module's lwIP receives nothing, so that DHCP always times out and AutoIP
+puts a `169.254.x.x` address on `xnetif[0]` — and the WLAN driver's `netif_is_valid_IP()`
+returns 1 unconditionally **only while that address is 0** (see *N7 result*), so the host's
+unicast IP would then be dropped before it ever reached the tap. Auto-reconnect therefore
+belongs on the host, which re-issues `rpc_wifi_connect` and never starts a module-side DHCP
+client: issue #32.
