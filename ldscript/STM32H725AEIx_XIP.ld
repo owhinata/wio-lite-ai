@@ -145,6 +145,20 @@ SECTIONS
     *(.text._tx_event_flags_set)
     *(.text._tx_thread_system_resume)
 
+    /* ...and the two tails of that same path (issue #29).  Both are only reached
+     * when a waiting thread is really made ready, which is exactly the request/reply
+     * case (`wifi ver`, `wifi scan`): the eRPC service thread is parked in
+     * tx_event_flags_get() WITH A TIMEOUT, so every wake-up has to unlink its timer
+     * (_tx_timer_system_deactivate) and then re-check preemption.  With only the
+     * heads above resident, those two were still fetched from XIP through veneers and
+     * held the measured worst-case ISR at 3.5 us, versus 0.1 us for an ISR that wakes
+     * nobody.  106 bytes together, and in this Cortex-M7/GNU configuration both link
+     * as leaves, so nothing further follows them: preempt_check's
+     * _tx_thread_system_return() is the inline PENDSVSET store from tx_port.h, not a
+     * call (it would become one again under TX_DISABLE_INLINE). */
+    *(.text._tx_thread_system_preempt_check)
+    *(.text._tx_timer_system_deactivate)
+
     /* Fault handlers (app/fault.c).  This buys the fetch cost of the handler body
      * only -- it does NOT make a wedged OCTOSPI2 survivable, because the vector
      * read itself still comes from 0x70000000 and fault_handler_c calls log_write
@@ -402,4 +416,13 @@ SECTIONS
   ASSERT(DEFINED(_tx_thread_system_resume) ?
          (_tx_thread_system_resume < ORIGIN(ITCM) + LENGTH(ITCM)) : 1,
          "_tx_thread_system_resume (RTL8720 RX wake-up) is not in ITCM")
+  /* The tails of the same path (issue #29) -- these are the branches that only run
+   * when a thread is actually woken, i.e. the ones that dominate request/reply
+   * latency. */
+  ASSERT(DEFINED(_tx_thread_system_preempt_check) ?
+         (_tx_thread_system_preempt_check < ORIGIN(ITCM) + LENGTH(ITCM)) : 1,
+         "_tx_thread_system_preempt_check (RTL8720 RX wake-up) is not in ITCM")
+  ASSERT(DEFINED(_tx_timer_system_deactivate) ?
+         (_tx_timer_system_deactivate < ORIGIN(ITCM) + LENGTH(ITCM)) : 1,
+         "_tx_timer_system_deactivate (RTL8720 RX wake-up) is not in ITCM")
 }
