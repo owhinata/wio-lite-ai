@@ -456,6 +456,10 @@ static int wifi_hold_bridge(struct cli_instance *sh, const char *what)
 #define WIFI_ARM_POLL_MS   100u
 #define WIFI_ARM_WAIT_MS   20000u
 
+/* Firmware generation the L2 bridge needs (2.1.3+wio-n7), mirroring nx_net.c's own gate.
+ * Checked here so the failure lands before the association rather than after it. */
+#define WIFI_BRIDGE_MIN_GEN 7u
+
 static int wifi_arm_bridge(struct cli_instance *sh)
 {
 	const char *why = "";
@@ -566,6 +570,26 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 		return 1;
 	if (rtl_link_begin(sh, true) != RTL_LINK_READY)
 		return 1;
+	/*
+	 * Check the firmware proof BEFORE spending 15 s associating (issue #30 B2b).
+	 *
+	 * Since associating is what brings the interface up, a connect that cannot bridge
+	 * leaves the module joined to an AP with no way to carry a packet -- which is worse
+	 * than not connecting, because it looks like it worked.  The generation is dropped
+	 * by every CHIP_EN move and every flash session (rtl_link_forget_module), so this
+	 * fires exactly when the host genuinely does not know what is on the module.
+	 *
+	 * It cannot be earned automatically: rpc_system_version corrupts the heap of
+	 * pre-N2 firmware, which is why `wifi ver` is a deliberate act (issue #20).
+	 */
+	if (erpc_module_gen() < WIFI_BRIDGE_MIN_GEN) {
+		rtl_link_end(sh);
+		cli_error(sh, "wifi: the host cannot bridge this module -- it does not know "
+		          "which firmware is loaded\r\n");
+		cli_print(sh, "  run `wifi ver` first.  Any `wifi reset` or flash session "
+		          "drops that proof, so it has to be re-earned after one.\r\n");
+		return 1;
+	}
 	if (wifi_hold_bridge(sh, "wifi connect")) {
 		rtl_link_end(sh);
 		return 1;
@@ -1038,7 +1062,7 @@ CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(status,     NULL, "show connection state / RSSI / IP / MAC", cmd_wifi_status, 1, 0),
 	CLI_CMD_ARG(scan,       NULL, "list visible APs (ch/band/rssi/security/bssid/ssid)", cmd_wifi_scan, 1, 0),
 	CLI_CMD_ARG(link, wifi_link_subcmds,
-	            "the RTL8720 UART link itself (info / baud / bench / dbench / arp)", NULL, 1, 0),
+	            "the RTL8720 UART link itself (info / baud / bench / dbench)", NULL, 1, 0),
 	CLI_CMD_ARG(flashread,  NULL, "read flash <offset> [nsectors] (non-destructive survey)", cmd_wifi_flashread, 2, 1),
 	CLI_CMD_ARG(flashtest,  NULL, "DESTRUCTIVE erase/write/verify test <offset> confirm", cmd_wifi_flashtest, 2, 1),
 	CLI_CMD_ARG(flashinfo,  NULL, "identify flash: capacity / status regs / checksum", cmd_wifi_flashinfo, 1, 0),

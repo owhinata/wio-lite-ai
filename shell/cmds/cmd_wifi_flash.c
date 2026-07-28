@@ -134,6 +134,12 @@ static void flash_session_recover(struct cli_instance *sh)
 	rtl8720_reset();
 	rtl_link_forget_module();
 	cli_print(sh, "wifi: RTL8720 reset to normal firmware\r\n");
+	/* The session dropped the firmware proof along with everything else the host
+	 * believed (rtl_link_force_quiesce -> rtl_link_forget_module), and `wifi connect`
+	 * now needs it in order to bridge.  Say so here rather than letting the next
+	 * connect discover it. */
+	cli_print(sh, "  run `wifi ver` before `wifi connect` (this session dropped the "
+	          "firmware proof)\r\n");
 }
 
 /* Open a download session: enter download mode + load the flashloader at 1.5 Mbaud.
