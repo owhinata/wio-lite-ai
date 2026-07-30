@@ -227,20 +227,6 @@ static int nxn_refresh_fails;
 
 /* ---- small helpers ---------------------------------------------------------- */
 
-static uint32_t nxn_u32le(const uint8_t *p)
-{
-	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static void nxn_put_u32le(uint8_t *p, uint32_t v)
-{
-	p[0] = (uint8_t)v;
-	p[1] = (uint8_t)(v >> 8);
-	p[2] = (uint8_t)(v >> 16);
-	p[3] = (uint8_t)(v >> 24);
-}
-
 static void nxn_opts(struct wifi_rpc_opts *o, uint32_t ms)
 {
 	memset(o, 0, sizeof *o);
@@ -261,8 +247,8 @@ static int nxn_data_cfg(uint8_t mode, uint32_t ms)
 	req[1] = 0u;
 	req[2] = 0u;
 	req[3] = 0u;
-	nxn_put_u32le(req + 4, ms);
-	nxn_put_u32le(req + 8, ERPC_CTRL_DATA_MAGIC);
+	erpc_put_u32le(req + 4, ms);
+	erpc_put_u32le(req + 8, ERPC_CTRL_DATA_MAGIC);
 	n = erpc_ctrl_call(ERPC_CTRL_DATA_CFG, req, (uint16_t)sizeof req, nxn_reply,
 	                   (uint16_t)sizeof nxn_reply, NXN_DCFG_TMO_MS, &diag);
 	if (n < 0) {
@@ -284,7 +270,7 @@ static int nxn_data_stats(uint32_t st[NXN_DSTAT_WORDS])
 	if (n < (int)(NXN_DSTAT_WORDS * 4u))
 		return -1;
 	for (i = 0u; i < NXN_DSTAT_WORDS; i++)
-		st[i] = nxn_u32le(nxn_reply + i * 4u);
+		st[i] = erpc_get_u32le(nxn_reply + i * 4u);
 	return 0;
 }
 

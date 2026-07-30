@@ -4,12 +4,13 @@
  */
 /*
  * Wio Lite AI (STM32H725AEI6) -- typed eRPC wrappers for the onboard RTL8720DN
- * WiFi/tcpip API (issue #5, increment 3: WiFi association + DHCP).
+ * WiFi/tcpip API (issue #5, increment 3: WiFi association).
  *
  * Thin, synchronous C wrappers over app/erpc.c's erpc_call_ex().  Each function
  * performs ONE eRPC round-trip on the currently-open RTL8720 UART; a caller holds that
  * UART for its whole flow by referencing it once (rtl_link_begin() for a shell command,
- * or rtl_link_uart_ref(RTL8720_UART_AT, 2000000) directly -- see app/rtl_link.h).  The
+ * or rtl_link_uart_ref(RTL8720_UART_AT, rtl_link_erpc_baud()) directly -- never a
+ * hard-coded rate, the link is re-based at runtime; see app/rtl_link.h).  The
  * frames themselves are sent and routed by the eRPC service thread, so these are safe
  * to call from any thread.  No clock/RCC work here -- XIP-safe.
  * Layering: HAL/CMSIS <- erpc.c <- wifi_rpc.c <- cmd_wifi.c.
@@ -90,8 +91,8 @@ int wifi_rpc_tcpip_init(const struct wifi_rpc_opts *o, int32_t *result);
 /*
  * get_ip_info / set_ip_info / dhcpc_start were here until issue #30 B1.  They drove the
  * MODULE's L3 -- an address the host stack throws away the moment the bridge goes in
- * (`net up` stops the DHCP client and the module zeroes its netif, because the WLAN
- * driver filters received IP against it).  L3 is the host's alone now; what remains of
+ * (arming the bridge stops the DHCP client and the module zeroes its netif, because the
+ * WLAN driver filters received IP against it).  L3 is the host's alone now; what remains of
  * service 15 is the two calls the BRIDGE itself needs.
  */
 int wifi_rpc_dhcpc_stop(const struct wifi_rpc_opts *o, uint32_t itf, int32_t *result);

@@ -83,46 +83,6 @@ static const struct devmem_region devmem_map[] = {
 	{ 0xE0000000u, 0x00100000u, 1, 1, W32,  0, "PPB"       }, /* SCB/NVIC/SysTick/DWT */
 };
 
-/*
- * Parse a 32-bit unsigned value: 0x/0X-prefixed hex or plain decimal.  Strict --
- * an empty string, an invalid digit, trailing garbage, or 32-bit overflow all
- * fail.  No newlib strtoul dependency (this firmware ships its own parsers).
- */
-static int parse_u32(const char *s, uint32_t *out)
-{
-	uint32_t base = 10;
-	uint32_t val = 0;
-	const char *p = s;
-
-	if (p == NULL || *p == '\0')
-		return -1;
-	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
-		base = 16;
-		p += 2;
-		if (*p == '\0')                 /* bare "0x" */
-			return -1;
-	}
-	for (; *p != '\0'; p++) {
-		uint32_t digit;
-		char c = *p;
-
-		if (c >= '0' && c <= '9')
-			digit = (uint32_t)(c - '0');
-		else if (base == 16 && c >= 'a' && c <= 'f')
-			digit = (uint32_t)(c - 'a' + 10);
-		else if (base == 16 && c >= 'A' && c <= 'F')
-			digit = (uint32_t)(c - 'A' + 10);
-		else
-			return -1;              /* invalid / trailing character */
-
-		if (val > (0xFFFFFFFFu - digit) / base)
-			return -1;              /* would overflow 32-bit */
-		val = val * base + digit;
-	}
-	*out = val;
-	return 0;
-}
-
 /* "8"/"16"/"32" -> access width in bytes (1/2/4). */
 static int parse_width(const char *s, uint32_t *bytes)
 {
@@ -221,7 +181,7 @@ static int parse_addr_width(struct cli_instance *sh, const char *addr_s,
                             const char *width_s, uint32_t *addr, uint32_t *width)
 {
 	*width = 4;                                      /* default 32-bit */
-	if (parse_u32(addr_s, addr) != 0) {
+	if (cli_parse_u32(addr_s, addr) != 0) {
 		cli_error(sh, "devmem: bad address '%s'\r\n", addr_s);
 		return -1;
 	}
@@ -289,7 +249,7 @@ static int cmd_devmem_poke(struct cli_instance *sh, int argc, char **argv)
 	uintptr_t a;
 	int plk;
 
-	if (parse_u32(argv[2], &value) != 0) {
+	if (cli_parse_u32(argv[2], &value) != 0) {
 		cli_error(sh, "devmem: bad value '%s'\r\n", argv[2]);
 		return 1;
 	}
@@ -324,11 +284,11 @@ static int cmd_devmem_dump(struct cli_instance *sh, int argc, char **argv)
 {
 	uint32_t addr, len = 64;                        /* default 64 bytes */
 
-	if (parse_u32(argv[1], &addr) != 0) {
+	if (cli_parse_u32(argv[1], &addr) != 0) {
 		cli_error(sh, "devmem: bad address '%s'\r\n", argv[1]);
 		return 1;
 	}
-	if (argc >= 3 && parse_u32(argv[2], &len) != 0) {
+	if (argc >= 3 && cli_parse_u32(argv[2], &len) != 0) {
 		cli_error(sh, "devmem: bad length '%s'\r\n", argv[2]);
 		return 1;
 	}

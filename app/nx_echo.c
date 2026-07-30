@@ -35,16 +35,6 @@
 #define LOG_TAG "nxecho"
 #include "log.h"
 
-/*
- * The transmit budget from app/nx_net.h, checked here because this is a translation unit
- * that already has NX_ARP_MAX_QUEUE_DEPTH.  If a future socket or a deeper queue breaks
- * it, the build stops rather than the console stalling on a TCP retransmit timer.
- */
-_Static_assert(NXN_TCP_SOCKETS_MAX * NXN_TCP_TX_DEPTH + NX_ARP_MAX_QUEUE_DEPTH +
-                       NXN_TX_SPARE <= LINK_DATA_TX_BUFS,
-               "LINK_DATA_TX_BUFS is too shallow for the NetX transmit budget "
-               "(see the transmit budget note in app/nx_net.h)");
-
 /* ---- tunables --------------------------------------------------------------- */
 
 #define NXE_WINDOW        2048u    /* advertised TCP receive window                  */

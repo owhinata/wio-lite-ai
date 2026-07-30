@@ -337,22 +337,6 @@ static void erpc_lock_put(void)  { tx_mutex_put(&erpc_lock); }
 void erpc_link_lock(void)   { if (erpc_ready) erpc_lock_get(); }
 void erpc_link_unlock(void) { if (erpc_ready) erpc_lock_put(); }
 
-/* ------------------------------------------------------------------ *
- *  little-endian helpers / CRC
- * ------------------------------------------------------------------ */
-static void put_u16le(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
-static void put_u32le(uint8_t *p, uint32_t v)
-{
-	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
-	p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
-}
-static uint16_t get_u16le(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-static uint32_t get_u32le(const uint8_t *p)
-{
-	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
 /*
  * CRC-16 (poly 0x1021, MSB-first, no reflection, init 0xEF4A -- erpc_crc16.cpp).
  *
@@ -499,8 +483,8 @@ static void erpc_dispatch(const uint8_t *body, uint16_t len, uint16_t crc)
 		erpc_ctr.crc_fail++;
 		return;
 	}
-	hdr = get_u32le(body + 0);
-	seq = get_u32le(body + 4);
+	hdr = erpc_get_u32le(body + 0);
+	seq = erpc_get_u32le(body + 4);
 	if (((hdr >> 24) & 0xffu) != ERPC_CODEC_VERSION) {
 		erpc_ctr.crc_fail++;             /* wrong version = malformed */
 		return;
@@ -606,7 +590,7 @@ static int erpc_rx_step(void)
 		 * grows from 4 to 6 as soon as they are in -- before the length is
 		 * believed. */
 		if (rx_hdr_got >= 2u && rx_hdr_need == 4u) {
-			uint16_t lead = get_u16le(rx_hdr + 0);
+			uint16_t lead = erpc_get_u16le(rx_hdr + 0);
 
 			if (lead == ERPC_CTRL_MAGIC) {
 				rx_is_ctrl  = 1u;
@@ -621,8 +605,8 @@ static int erpc_rx_step(void)
 
 		rx_body_got = 0u;
 		if (rx_is_data) {
-			rx_size = get_u16le(rx_hdr + 2);
-			rx_crc  = get_u16le(rx_hdr + 4);
+			rx_size = erpc_get_u16le(rx_hdr + 2);
+			rx_crc  = erpc_get_u16le(rx_hdr + 4);
 			/* TWO different failures, and they must not be handled the same way:
 			 *  - a length outside the channel's bounds is not a frame at all (a
 			 *    desynchronised stream that landed on 0xFFFE), so resynchronise --
@@ -643,8 +627,8 @@ static int erpc_rx_step(void)
 				return 1;
 			}
 		} else if (rx_is_ctrl) {
-			rx_size = get_u16le(rx_hdr + 2);
-			rx_crc  = get_u16le(rx_hdr + 4);
+			rx_size = erpc_get_u16le(rx_hdr + 2);
+			rx_crc  = erpc_get_u16le(rx_hdr + 4);
 			/* NEVER drain a CTRL length we do not believe: on a desynchronised
 			 * stream it is attacker-free but arbitrary, and draining it would
 			 * swallow real frames.  Resynchronise instead. */
@@ -654,8 +638,8 @@ static int erpc_rx_step(void)
 				return 1;
 			}
 		} else {
-			rx_size = get_u16le(rx_hdr + 0);
-			rx_crc  = get_u16le(rx_hdr + 2);
+			rx_size = erpc_get_u16le(rx_hdr + 0);
+			rx_crc  = erpc_get_u16le(rx_hdr + 2);
 			if (rx_size > ERPC_RX_SCRATCH) {  /* too big: drain to resync */
 				erpc_ctr.oversize++;
 				rx_drain_left = rx_size;
@@ -754,8 +738,8 @@ static int erpc_send_one(void)
 			erpc_stream_reset_locked();
 		}
 		(void)erpc_debt_add(s->seq, frame_len);
-		put_u16le(frame_hdr + 0, s->body_len);
-		put_u16le(frame_hdr + 2, s->crc);
+		erpc_put_u16le(frame_hdr + 0, s->body_len);
+		erpc_put_u16le(frame_hdr + 2, s->crc);
 		rtl8720_uart_write(frame_hdr, 4u);
 		rtl8720_uart_write(s->body, s->body_len);
 		s->state = ERPC_ST_SENT;
@@ -785,9 +769,9 @@ static int erpc_ctrl_send(void)
 		 * the same exception while DATA is live. */
 		erpc_stream_reset_locked();
 	}
-	put_u16le(hdr + 0, ERPC_CTRL_MAGIC);
-	put_u16le(hdr + 2, s->body_len);
-	put_u16le(hdr + 4, s->crc);
+	erpc_put_u16le(hdr + 0, ERPC_CTRL_MAGIC);
+	erpc_put_u16le(hdr + 2, s->body_len);
+	erpc_put_u16le(hdr + 4, s->crc);
 	rtl8720_uart_write(hdr, sizeof(hdr));
 	rtl8720_uart_write(s->body, s->body_len);
 	s->state = ERPC_ST_SENT;
@@ -827,9 +811,9 @@ static int erpc_data_send_one(void)
 	 */
 	if (rtl8720_uart_tx_space() < (uint32_t)body_len + sizeof(hdr))
 		return 0;
-	put_u16le(hdr + 0, LINK_DATA_MAGIC);
-	put_u16le(hdr + 2, body_len);
-	put_u16le(hdr + 4, crc);
+	erpc_put_u16le(hdr + 0, LINK_DATA_MAGIC);
+	erpc_put_u16le(hdr + 2, body_len);
+	erpc_put_u16le(hdr + 4, crc);
 	rtl8720_uart_write(hdr, sizeof(hdr));
 	rtl8720_uart_write(body, body_len);
 	link_data_tx_pop();
@@ -1207,8 +1191,8 @@ int erpc_begin(uint8_t service, uint8_t request,
 	seq = ++erpc_seq;
 	msg_hdr = ((uint32_t)ERPC_CODEC_VERSION << 24) | ((uint32_t)service << 16) |
 	          ((uint32_t)request << 8) | 0u /* kInvocationMessage */;
-	put_u32le(s->body + 0, msg_hdr);
-	put_u32le(s->body + 4, seq);
+	erpc_put_u32le(s->body + 0, msg_hdr);
+	erpc_put_u32le(s->body + 4, seq);
 	if (req_len != 0u)
 		memcpy(s->body + 8, req, req_len);
 	s->body_len  = (uint16_t)(8u + req_len);
@@ -1475,7 +1459,7 @@ int erpc_system_version(char *out, uint16_t out_cap, struct erpc_diag *diag)
 		return n;                        /* -2 timeout / -4 aborted, forwarded as-is */
 	if (n < 4 || n > (int)sizeof(r))         /* need the u32 length; reject truncation */
 		return -3;
-	slen = get_u32le(r);                     /* BasicCodec writeString: u32 len + bytes */
+	slen = erpc_get_u32le(r);                /* BasicCodec writeString: u32 len + bytes */
 	if (slen > (uint32_t)(n - 4))            /* length word disagrees with the payload */
 		return -3;
 	if (out && out_cap) {

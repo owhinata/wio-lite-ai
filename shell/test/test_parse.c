@@ -320,6 +320,61 @@ static void test_background(void)
 	}
 }
 
+/* ---- argument-value parsers (issue #27) ---------------------------------- */
+
+/*
+ * These had seven private copies before issue #27 -- one per command that took a
+ * number.  Now there is one, with seven callers, so the edge cases are worth
+ * pinning down here rather than on the board.
+ */
+static void test_value_parsers(void)
+{
+	uint32_t v, ip, mask;
+
+	/* decimal / hex, both cases, and the boundaries of the range */
+	assert(cli_parse_u32("0", &v) == 0 && v == 0u);
+	assert(cli_parse_u32("4294967295", &v) == 0 && v == 0xFFFFFFFFu);
+	assert(cli_parse_u32("0xdeadBEEF", &v) == 0 && v == 0xDEADBEEFu);
+	assert(cli_parse_u32("0X10", &v) == 0 && v == 16u);
+
+	/* rejected: empty, bare prefix, wrong digit for the base, trailing junk,
+	 * and 32-bit overflow (decimal and hex) */
+	assert(cli_parse_u32("", &v) != 0);
+	assert(cli_parse_u32(NULL, &v) != 0);
+	assert(cli_parse_u32("0x", &v) != 0);
+	assert(cli_parse_u32("12a", &v) != 0);
+	assert(cli_parse_u32("10 ", &v) != 0);
+	assert(cli_parse_u32("-1", &v) != 0);
+	assert(cli_parse_u32("4294967296", &v) != 0);
+	assert(cli_parse_u32("0x100000000", &v) != 0);
+
+	/* *out is untouched when the parse fails */
+	v = 0x5A5A5A5Au;
+	assert(cli_parse_u32("nope", &v) != 0 && v == 0x5A5A5A5Au);
+
+	/* dotted quad -> host order */
+	assert(cli_parse_ipv4("192.168.1.44", &ip) == 0 && ip == 0xC0A8012Cu);
+	assert(cli_parse_ipv4("0.0.0.0", &ip) == 0 && ip == 0u);
+	assert(cli_parse_ipv4("255.255.255.255", &ip) == 0 && ip == 0xFFFFFFFFu);
+	assert(cli_parse_ipv4("192.168.1", &ip) != 0);          /* too few octets   */
+	assert(cli_parse_ipv4("1.2.3.4.5", &ip) != 0);          /* too many         */
+	assert(cli_parse_ipv4("192.168.1.256", &ip) != 0);      /* octet range      */
+	assert(cli_parse_ipv4("192.168..1", &ip) != 0);         /* empty octet      */
+	assert(cli_parse_ipv4("192.168.1.4x", &ip) != 0);       /* trailing junk    */
+
+	/* CIDR + its inverse */
+	assert(cli_parse_ipv4_cidr("192.168.1.44/24", &ip, &mask) == 0 &&
+	       ip == 0xC0A8012Cu && mask == 0xFFFFFF00u);
+	assert(cli_parse_ipv4_cidr("10.0.0.1/0", &ip, &mask) == 0 && mask == 0u);
+	assert(cli_parse_ipv4_cidr("10.0.0.1/32", &ip, &mask) == 0 && mask == 0xFFFFFFFFu);
+	assert(cli_parse_ipv4_cidr("10.0.0.1/33", &ip, &mask) != 0);
+	assert(cli_parse_ipv4_cidr("10.0.0.1", &ip, &mask) != 0);     /* no prefix   */
+	assert(cli_parse_ipv4_cidr("10.0.0.1/", &ip, &mask) != 0);    /* empty prefix */
+	assert(cli_ipv4_mask_bits(0xFFFFFF00u) == 24u);
+	assert(cli_ipv4_mask_bits(0u) == 0u);
+	assert(cli_ipv4_mask_bits(0xFFFFFFFFu) == 32u);
+}
+
 int main(void)
 {
 	test_tokenizer();
@@ -328,6 +383,8 @@ int main(void)
 	test_raw();
 	test_segment();
 	test_background();
-	printf("OK: tokenizer / tree search / validation / RAW / segment / background all pass\n");
+	test_value_parsers();
+	printf("OK: tokenizer / tree search / validation / RAW / segment / background / "
+	       "value parsers all pass\n");
 	return 0;
 }

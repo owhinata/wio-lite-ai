@@ -406,3 +406,108 @@ enum cli_parse_status cli_parse(char *line, char **argv, int argv_cap,
 
 	return CLI_PARSE_OK;
 }
+
+/* ---- argument-value parsers (issue #27) ---------------------------------- */
+
+/*
+ * These are the deduplicated copies of the per-command parsers that every
+ * numeric/address-taking command carried before issue #27 (7 copies of the
+ * integer one alone).  Kept here, next to the tokenizer, because they are the
+ * same kind of thing: pure functions over a token, no shell instance involved,
+ * and covered by the host tests in shell/test/test_parse.c.
+ */
+
+int cli_parse_u32(const char *s, uint32_t *out)
+{
+	uint32_t base = 10, val = 0;
+	const char *p = s;
+
+	if (p == NULL || *p == '\0')
+		return -1;
+	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+		base = 16;
+		p += 2;
+	}
+	if (*p == '\0')                                  /* bare "0x" */
+		return -1;
+	for (; *p != '\0'; p++) {
+		uint32_t d;
+		char c = *p;
+
+		if (c >= '0' && c <= '9')                    d = (uint32_t)(c - '0');
+		else if (base == 16 && c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
+		else if (base == 16 && c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
+		else return -1;                              /* invalid / trailing char */
+		if (val > (0xFFFFFFFFu - d) / base)
+			return -1;                           /* would overflow 32-bit */
+		val = val * base + d;
+	}
+	*out = val;
+	return 0;
+}
+
+int cli_parse_ipv4(const char *s, uint32_t *out)
+{
+	uint32_t b[4];
+	int i = 0;
+	const char *p = s;
+
+	if (p == NULL)
+		return -1;
+	for (;;) {
+		uint32_t v = 0;
+		int digits = 0;
+
+		while (*p >= '0' && *p <= '9') {
+			v = v * 10u + (uint32_t)(*p - '0');
+			if (v > 255u)
+				return -1;
+			p++;
+			digits++;
+		}
+		if (digits == 0 || i > 3)
+			return -1;
+		b[i++] = v;
+		if (*p == '\0')
+			break;
+		if (*p != '.')
+			return -1;
+		p++;
+	}
+	if (i != 4)
+		return -1;
+	*out = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+	return 0;
+}
+
+int cli_parse_ipv4_cidr(const char *s, uint32_t *ip, uint32_t *mask)
+{
+	char buf[20];
+	const char *slash = NULL;
+	uint32_t bits;
+	size_t n = 0;
+
+	if (s == NULL)
+		return -1;
+	for (const char *p = s; *p != '\0'; p++) {
+		if (*p == '/') { slash = p + 1; break; }
+		if (n >= sizeof buf - 1)
+			return -1;
+		buf[n++] = *p;
+	}
+	buf[n] = '\0';
+	if (slash == NULL || cli_parse_ipv4(buf, ip) != 0)
+		return -1;
+	if (cli_parse_u32(slash, &bits) != 0 || bits > 32u)
+		return -1;
+	*mask = (bits == 0) ? 0u : (0xFFFFFFFFu << (32u - bits));
+	return 0;
+}
+
+unsigned cli_ipv4_mask_bits(uint32_t mask)
+{
+	unsigned n = 0;
+
+	while (mask & 0x80000000u) { n++; mask <<= 1; }
+	return n;
+}

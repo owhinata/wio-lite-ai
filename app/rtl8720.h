@@ -4,7 +4,7 @@
  */
 /*
  * Wio Lite AI (STM32H725AEI6) -- onboard RTL8720DN WiFi/BLE companion driver
- * (issue #17: factory-firmware identification).
+ * (issue #17 originally; the host's whole side of the module now sits on top of it).
  *
  * The RTL8720DN is reached from the STM32 host over (schematic sheets 2/5/8):
  *   - CHIP_EN  : PC3                       (module power/enable; board has NO pull,
@@ -13,11 +13,16 @@
  *   - LOG UART : UART9  PD14(RX)/PD15(TX)  (module UART_LOG, boot log, default 115200)
  *   - AT  UART : USART1 PA10(RX)/PB14(TX)  (module HS/BLE UART, AT default 38400)
  *
- * This is a minimal, safe investigation driver: it powers the module and bridges
- * one of its UARTs to the USB CDC shell so the boot banner identifies the factory
- * firmware (eRPC / AT / raw Realtek).  It touches only GPIO + UART9/USART1 +
- * peripheral clock gates -- never the RCC clock tree (baud is derived from the
- * inherited PCLK2 = 137.5 MHz) -- so it is XIP-safe.
+ * This is the bottom layer: power (CHIP_EN) plus ONE open host UART at a time, with an
+ * interrupt-driven RX ring and a TX ring, and a notify hook so a waiter wakes on arrival
+ * instead of polling.  It started out (issue #17) as an investigation aid that only
+ * bridged a module UART to the USB CDC console for the boot banner -- that bridge is
+ * still here as `wifi log` -- but everything above it now rides the same driver: the
+ * eRPC service thread (app/erpc.c) and its CTRL/DATA channels, and the issue-#19 flash
+ * downloader.  Which of them owns the UART is arbitrated one layer up, in app/rtl_link.h.
+ *
+ * It touches only GPIO + UART9/USART1 + peripheral clock gates -- never the RCC clock
+ * tree (baud is derived from the inherited PCLK2 = 137.5 MHz) -- so it is XIP-safe.
  */
 #ifndef APP_RTL8720_H
 #define APP_RTL8720_H
@@ -26,7 +31,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Which RTL8720DN host UART the sniffer bridges to. */
+/* Which of the two RTL8720DN host UARTs is opened. */
 enum rtl8720_uart {
 	RTL8720_UART_LOG = 0,   /* module LOG UART  -> STM32 UART9  (PD14 RX / PD15 TX) */
 	RTL8720_UART_AT  = 1,   /* module HS/AT UART -> STM32 USART1 (PA10 RX / PB14 TX) */
@@ -57,7 +62,7 @@ void rtl8720_reset(void);
  * ring.  Returns 0 on success, -1 if the UART did not come ready.
  *
  * OWNERSHIP (issue #21 increment 8) -- open/close and the ring have several would-be
- * users: the eRPC service thread (app/erpc.c), the `wifi log`/`probe` console bridge
+ * users: the eRPC service thread (app/erpc.c), the `wifi log` console bridge
  * and the issue-#19 flash downloader.  Because open() closes the current UART and
  * resets the shared SPSC ring, it must only be called from a path that
  *   (a) holds the coarse link mutex (app/rtl_link.h) for the whole session, AND

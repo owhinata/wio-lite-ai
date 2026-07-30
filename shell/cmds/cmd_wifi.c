@@ -13,8 +13,9 @@
  *                                 `reset` power-cycles first, capturing boot from t=0
  *   wifi ver                      prove the eRPC link (rpc_system_ack) + read the FW
  *                                 build id = the capability gate the L2 bridge requires
- *   wifi connect <ssid> [pw] [sec]  associate (STA) + DHCP, print the IP (#5 inc 3)
+ *   wifi connect <ssid> [pw] [sec]  associate (STA) + arm the L2 bridge (#5 inc 3)
  *   wifi disconnect               drop the current association
+ *   wifi autoreconnect [on|off]   re-associate by ourselves when the AP goes away (#32)
  *   wifi status                   connected? + RSSI + IP/mask/gw + MAC
  *   wifi scan                     list visible APs: ch/band/rssi/security/bssid/ssid
  *   wifi link <sub>               the UART link itself -- cmd_wifi_link.c (issue #23)
@@ -60,32 +61,6 @@
 #include <stdio.h>           /* snprintf: naming a scan result's security mode.
                               * Already linked in by cmd_thread.c / cmd_membench.c /
                               * cmd_builtin.c, so this adds no footprint. */
-
-/* Parse a 32-bit unsigned: 0x-hex or decimal.  Returns 0 on success. */
-static int parse_u32(const char *s, uint32_t *out)
-{
-	uint32_t base = 10, val = 0;
-	const char *p = s;
-
-	if (p == NULL || *p == '\0')
-		return -1;
-	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { base = 16; p += 2; }
-	if (*p == '\0')
-		return -1;
-	for (; *p != '\0'; p++) {
-		uint32_t d;
-		char c = *p;
-		if (c >= '0' && c <= '9')            d = (uint32_t)(c - '0');
-		else if (base == 16 && c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
-		else if (base == 16 && c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
-		else return -1;
-		if (val > (0xFFFFFFFFu - d) / base)
-			return -1;
-		val = val * base + d;
-	}
-	*out = val;
-	return 0;
-}
 
 /*
  * The RTL8720DN eRPC session helpers (rtl_link_begin/end), the Ctrl+C abort thunk
@@ -550,11 +525,11 @@ static int wifi_enter_sta(struct cli_instance *sh, struct wifi_rpc_opts *o)
 }
 
 /* wifi connect <ssid> [password] [security_hex] (issue #5 inc 3): put the module in
- * STA mode, associate with the AP, run the DHCP client and print the leased address.
+ * STA mode, associate with the AP, and arm the L2 bridge the host stack rides on
+ * (issue #30 B2b) -- L3 is `net`'s job, see the note at the end of this function.
  * The steps are synchronous eRPC calls on the USART1 link (at whatever rate it runs
- * now); connect blocks on the module up to ~15 s and DHCP up to ~30 s (both abortable
- * with Ctrl+C).  Default security is WPA2-AES with a password / OPEN without; a 3rd
- * hex arg overrides it. */
+ * now); associating blocks on the module up to 22 s (abortable with Ctrl+C).  Default
+ * security is WPA2-AES with a password / OPEN without; a 3rd hex arg overrides it. */
 static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 {
 	const char *ssid = argv[1];
@@ -566,7 +541,7 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 	int rc;
 
 	if (argc >= 4) {
-		if (parse_u32(argv[3], &security) != 0) {
+		if (cli_parse_u32(argv[3], &security) != 0) {
 			cli_error(sh, "wifi: bad security hex (e.g. 0x00400004)\r\n");
 			return 1;
 		}

@@ -78,30 +78,13 @@ uint16_t wifi_rpc_send_chunk(void)
 #define M_LWIP_SOCKET       18u
 #define M_LWIP_ERRNO        24u
 
-
-/* ---- little-endian codec helpers (BasicCodec is a packed LE byte stream) ---- */
-static void put_u32le(uint8_t *p, uint32_t v)
-{
-	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
-	p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
-}
-static uint32_t get_u32le(const uint8_t *p)
-{
-	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-static uint16_t get_u16le(const uint8_t *p)
-{
-	return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-
 /* Append a BasicCodec string (u32 length + raw bytes, no NUL) at @p; returns the
  * new cursor.  The caller pre-validates lengths so the request buffer cannot overflow
  * (wifi_rpc_connect bounds ssid<=32 / password<=64 before building the frame). */
 static uint8_t *put_string(uint8_t *p, const char *s)
 {
 	uint32_t n = (uint32_t)strlen(s);
-	put_u32le(p, n);
+	erpc_put_u32le(p, n);
 	p += 4;
 	memcpy(p, s, n);
 	return p + n;
@@ -127,7 +110,7 @@ static int decode_result(const uint8_t *rep, int plen, int32_t *result)
 {
 	if (plen < 4)
 		return WIFI_RPC_EDECODE;
-	*result = (int32_t)get_u32le(rep);
+	*result = (int32_t)erpc_get_u32le(rep);
 	return 0;
 }
 
@@ -138,7 +121,7 @@ int wifi_rpc_on(const struct wifi_rpc_opts *o, uint32_t mode, int32_t *result)
 	uint8_t req[4], rep[16];
 	int plen, rc;
 
-	put_u32le(req, mode);
+	erpc_put_u32le(req, mode);
 	rc = do_call(o, SVC_WIFI_DRV, M_WIFI_ON, req, 4u, rep, sizeof(rep), &plen);
 	if (rc)
 		return rc;
@@ -175,9 +158,9 @@ int wifi_rpc_connect(const struct wifi_rpc_opts *o, const char *ssid,
 	} else {
 		*p++ = 1u;                       /* null flag: kIsNull */
 	}
-	put_u32le(p, security);   p += 4;
-	put_u32le(p, 0u);         p += 4;    /* key_id = 0 (unused for WPA-PSK) */
-	put_u32le(p, 0u);         p += 4;    /* semaphore = 0 (ignored by the module) */
+	erpc_put_u32le(p, security);   p += 4;
+	erpc_put_u32le(p, 0u);         p += 4;    /* key_id = 0 (unused for WPA-PSK) */
+	erpc_put_u32le(p, 0u);         p += 4;    /* semaphore = 0 (ignored by the module) */
 
 	rc = do_call(o, SVC_WIFI_DRV, M_WIFI_CONNECT, req,
 	             (uint16_t)(p - req), rep, sizeof(rep), &plen);
@@ -218,8 +201,8 @@ int wifi_rpc_get_rssi(const struct wifi_rpc_opts *o, int32_t *rssi, int32_t *res
 		return rc;
 	if (plen < 8)                        /* pRSSI(i32) + result(i32) */
 		return WIFI_RPC_EDECODE;
-	*rssi   = (int32_t)get_u32le(rep + 0);
-	*result = (int32_t)get_u32le(rep + 4);
+	*rssi   = (int32_t)erpc_get_u32le(rep + 0);
+	*result = (int32_t)erpc_get_u32le(rep + 4);
 	return 0;
 }
 
@@ -235,7 +218,7 @@ int wifi_rpc_get_mac(const struct wifi_rpc_opts *o, char mac[18], int32_t *resul
 		return WIFI_RPC_EDECODE;
 	memcpy(mac, rep, 18);
 	mac[17] = '\0';                      /* firmware already NUL-terminates within 18 */
-	*result = (int32_t)get_u32le(rep + 18);
+	*result = (int32_t)erpc_get_u32le(rep + 18);
 	return 0;
 }
 
@@ -257,7 +240,7 @@ int wifi_rpc_dhcpc_stop(const struct wifi_rpc_opts *o, uint32_t itf, int32_t *re
 	uint8_t req[4], rep[16];
 	int plen, rc;
 
-	put_u32le(req, itf);
+	erpc_put_u32le(req, itf);
 	rc = do_call(o, SVC_WIFI_TCPIP, M_TCPIP_DHCPC_STOP, req, 4u, rep, sizeof(rep), &plen);
 	if (rc)
 		return rc;
@@ -302,7 +285,7 @@ int wifi_rpc_scan_get_ap_num(const struct wifi_rpc_opts *o, uint16_t *num)
 		return rc;
 	if (plen < 2)                        /* reply = uint16 count */
 		return WIFI_RPC_EDECODE;
-	*num = get_u16le(rep);
+	*num = erpc_get_u16le(rep);
 	return 0;
 }
 
@@ -332,13 +315,13 @@ int wifi_rpc_scan_get_ap_records(const struct wifi_rpc_opts *o, uint16_t number,
 	 * on the module returns a 1-byte dummy blob, which the length check below catches. */
 	if (plen > (int)buf_cap || plen < 4)
 		return WIFI_RPC_EDECODE;
-	mlen = get_u32le(buf);
+	mlen = erpc_get_u32le(buf);
 	if (mlen != want)                    /* not exactly `number` whole records */
 		return WIFI_RPC_EDECODE;
 	if ((uint32_t)plen < 4u + mlen + 4u) /* need the trailing i32 result too */
 		return WIFI_RPC_EDECODE;
 
-	*result = (int32_t)get_u32le(buf + 4u + mlen);
+	*result = (int32_t)erpc_get_u32le(buf + 4u + mlen);
 	*got    = number;
 	return 0;
 }
@@ -363,11 +346,11 @@ int wifi_rpc_scan_record(const uint8_t *buf, uint16_t got, uint16_t idx,
 	rec->ssid_len  = len;
 
 	memcpy(rec->bssid, r + 34, 6);
-	rec->rssi     = (int16_t)get_u16le(r + 40);   /* signed dBm, LE on both sides */
-	rec->bss_type = get_u32le(r + 42);
-	rec->security = get_u32le(r + 46);
-	rec->wps_type = get_u32le(r + 50);
-	rec->channel  = get_u32le(r + 54);
-	rec->band     = get_u32le(r + 58);
+	rec->rssi     = (int16_t)erpc_get_u16le(r + 40);   /* signed dBm, LE on both sides */
+	rec->bss_type = erpc_get_u32le(r + 42);
+	rec->security = erpc_get_u32le(r + 46);
+	rec->wps_type = erpc_get_u32le(r + 50);
+	rec->channel  = erpc_get_u32le(r + 54);
+	rec->band     = erpc_get_u32le(r + 58);
 	return 0;
 }

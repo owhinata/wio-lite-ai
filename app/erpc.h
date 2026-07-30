@@ -59,6 +59,35 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/*
+ * ---- little-endian wire codec (issue #27) -------------------------------------
+ *
+ * Every byte this link carries is little-endian at its natural width: the eRPC
+ * BasicCodec (app/wifi_rpc.c), the eRPC framing itself (app/erpc.c) and the CTRL /
+ * DATA channels below (shell/cmds/cmd_wifi_link.c, app/nx_net.c).  One definition,
+ * because they are all the SAME wire -- four private copies is how the four ends of
+ * one protocol drift apart.  Byte-at-a-time deliberately: the buffers are packed, so
+ * a cast to uint32_t* would be an unaligned access.
+ */
+static inline void erpc_put_u16le(uint8_t *p, uint16_t v)
+{
+	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+}
+static inline void erpc_put_u32le(uint8_t *p, uint32_t v)
+{
+	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+	p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static inline uint16_t erpc_get_u16le(const uint8_t *p)
+{
+	return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+static inline uint32_t erpc_get_u32le(const uint8_t *p)
+{
+	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
 /* Maximum eRPC requests that may be outstanding at once (erpc_begin without a matching
  * erpc_wait/erpc_cancel yet).  Each live token costs one slot (metadata + a request
  * staging buffer) in AXI-SRAM static BSS. */
@@ -192,7 +221,7 @@ void erpc_link_closed(void);
  *         8 kB ring, so the 127-byte input ring that shaped every request size is gone)
  *   >= 5  the LINK-CTRL channel below exists at all
  *   >= 6  the DATA channel exists (`wifi link dbench`)
- *   >= 7  the L2 bridge exists (`wifi link arp`, `net up`)
+ *   >= 7  the L2 bridge exists (the tap the host stack runs on -- `wifi connect` arms it)
  * The wire budget is DERIVED here rather than latched separately, so the two can never
  * disagree about the same module.
  */
@@ -286,8 +315,9 @@ enum {
  *
  * -3 collapses every module-side refusal into one number, which is not enough once a
  * command can refuse for more than one reason: erpc_ctrl_last_status() returns the byte
- * itself so the caller can say WHY (issue #23 U2 -- `wifi link arp` before `wifi connect` is a
- * different problem from a malformed request, and the first is what a new user hits).
+ * itself so the caller can say WHY (issue #23 U2 -- asking the module to bridge before it
+ * has an lwIP netif to tap is a different problem from a malformed request, and the first
+ * is what a new user hits; see the status decode in cmd_wifi_link.c's link_data_cfg).
  * Valid immediately after a -3 and nowhere else; it is well defined for the same reason
  * the single reply slot is: one CTRL exchange at a time, held by one owner.
  */
@@ -317,11 +347,13 @@ void erpc_data_posted(void);
  * waiting to be delivered, none half-received.
  *
  * Deliberately NOT erpc_link_quiescent() -- that answers "is the whole link idle?", which
- * additionally requires no eRPC request to be outstanding, and the telnet console keeps a
- * blocking accept outstanding by design (issue #21).  Asking the stronger question when
- * tearing the DATA channel down therefore never succeeds while a console is armed, for
- * reasons that have nothing to do with DATA.  This is the half of it that matters: the
- * detach ordering rule in app/link_data.h needs the DATA channel quiet, not the link idle.
+ * additionally requires no eRPC request to be outstanding.  Something normally is: the
+ * interface owner refreshes the association over eRPC on its own schedule, and back when
+ * TCP still ran on the module the telnet console kept a blocking accept outstanding by
+ * design (issue #21).  Asking the stronger question when tearing the DATA channel down
+ * would therefore fail for reasons that have nothing to do with DATA.  This is the half of
+ * it that matters: the detach ordering rule in app/link_data.h needs the DATA channel
+ * quiet, not the link idle.
  */
 int erpc_data_quiescent(void);
 
@@ -432,7 +464,7 @@ int erpc_system_ack(uint8_t c, uint8_t *echoed, struct erpc_diag *diag);
  * erpc_free()s a string literal when version is invoked, which corrupts the module's
  * heap regardless of what the host does with the reply; that is why increment 1 never
  * called it.  N2 (patch 0002) makes the shim's target a heap copy ("2.1.3+wio-n2"), so
- * from N2 on this is safe.  The board runs N3 ("2.1.3+wio-n3"). */
+ * from N2 on this is safe.  Board #2 currently runs n8 ("2.1.3+wio-n8", issue #31). */
 int erpc_system_version(char *out, uint16_t out_cap, struct erpc_diag *diag);
 
 #endif /* APP_ERPC_H */

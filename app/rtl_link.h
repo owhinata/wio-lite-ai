@@ -9,25 +9,26 @@
  * The module is a single physical resource shared by several unrelated users:
  *
  *   - the `wifi` (L2) and `net` (L3) shell commands, which run multi-RPC flows
- *     (`wifi connect` = tcpip_init -> off -> on(STA) -> connect -> dhcp -> get_ip)
+ *     (`wifi connect` = tcpip_init -> off -> on(STA) -> connect -> arm the bridge)
  *     that must not interleave with each other,
  *   - the eRPC link itself (USART1 @2 Mbaud), whose frames are multiplexed by the
  *     resident service thread in app/erpc.c,
- *   - the `wifi log` / `wifi probe` console bridge and the issue-#19 flash download
+ *   - the `wifi log` console bridge and the issue-#19 flash download
  *     path, which re-open the SAME UART peripheral (UART9, other baud rates) and read
  *     the SAME strict-SPSC RX ring themselves.
  *
  * So this file owns two things: a COARSE MUTEX that serialises whole command flows,
- * and a REFERENCE COUNT on the eRPC UART so a resident user (the issue-#21 telnet
- * console service) can hold it open across many commands.  Together with the service
- * thread's "touch nothing while idle" rule they keep the invariant that the RX ring
+ * and a REFERENCE COUNT on the eRPC UART so a resident user (since issue #30 B2b that is
+ * the L2 bridge owner in app/nx_net.c) can hold it open across many commands.  Together
+ * with the service thread's "touch nothing while idle" rule they keep the invariant that
+ * the RX ring
  * has exactly ONE consumer at any instant: the eRPC service thread while the UART is
  * referenced, or the command thread while a bridge / flash session owns it.
  *
  * Two API tiers:
  *   (a) thread-agnostic core -- rtl_link_claim/_unclaim, rtl_link_uart_ref/_unref,
  *       rtl_link_force_quiesce, the module lifecycle state.  Usable from any thread
- *       (the telnet service in increment 9 uses these directly).
+ *       (the bridge owner thread in app/nx_net.c uses these directly).
  *   (b) shell adapters -- rtl_link_begin/_end and rtl_link_hw_claim/_hw_release, which
  *       add the console claim (foreground only, single owner of the console RX) and
  *       print the reason on failure.
@@ -92,8 +93,8 @@ bool rtl_link_uart_busy(void);
 /*
  * How many references are outstanding.  rtl_link_uart_busy() cannot answer "is anybody
  * ELSE holding it?", because a command that took its own reference (rtl_link_begin) always
- * sees true -- so `wifi link baud`, which must exclude the RESIDENT holder (the telnet console
- * service) and only itself, tests for exactly 1 while holding the coarse mutex.  That is
+ * sees true -- so `wifi link baud`, which must exclude the RESIDENT holder (the L2 bridge
+ * owner) and only itself, tests for exactly 1 while holding the coarse mutex.  That is
  * race-free because every reference is taken and dropped under that same mutex.
  */
 unsigned rtl_link_uart_refs(void);
@@ -180,7 +181,9 @@ bool rtl_link_rate_supported(uint32_t baud);
  * ---- generation counters, for a RESIDENT reference holder (issue #21 increment 9) ------
  *
  * An ordinary command takes and drops its reference inside one coarse-mutex section, so its
- * reference can never be revoked underneath it.  The telnet console service is different:
+ * reference can never be revoked underneath it.  A RESIDENT holder is different (issue #21
+ * increment 9 introduced one; since issue #30 B2b it is the L2 bridge owner in
+ * app/nx_net.c):
  * it holds a reference across many commands, and rtl_link_force_quiesce() (`wifi on/off/
  * reset`) deliberately drops the count to zero while it is holding one.  A plain
  * rtl_link_uart_unref() afterwards would decrement SOMEBODY ELSE'S reference -- the next
@@ -262,7 +265,7 @@ void rtl_link_end(struct cli_instance *sh);
 
 /*
  * Claim the module for a command that drives the hardware WITHOUT the eRPC link: the
- * power/reset commands and the log/probe bridge + flash download paths, which open the
+ * power/reset commands and the `wifi log` bridge + flash download paths, which open the
  * UART themselves.  Console claim + coarse mutex; no UART reference is taken.
  *   @allow_busy false: refuse (with a message) while an eRPC session holds the UART --
  *                      a bridge/flasher must not re-open the peripheral under it.

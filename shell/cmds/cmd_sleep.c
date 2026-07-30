@@ -21,32 +21,12 @@
 #include "cli.h"
 #include "timebase.h"   /* udelay (DWT cycle-counter busy-wait) */
 
-/* Parse a plain decimal uint32 (no 0x, no sign).  Empty, non-digit, or 32-bit
- * overflow all fail.  No newlib strtoul (this firmware ships its own parsers). */
-static int parse_uint(const char *s, uint32_t *out)
-{
-	uint32_t val = 0;
-
-	if (s == NULL || *s == '\0')
-		return -1;
-	for (const char *p = s; *p != '\0'; p++) {
-		if (*p < '0' || *p > '9')
-			return -1;
-		uint32_t d = (uint32_t)(*p - '0');
-		if (val > (0xFFFFFFFFu - d) / 10u)      /* overflow */
-			return -1;
-		val = val * 10u + d;
-	}
-	*out = val;
-	return 0;
-}
-
 static int cmd_sleep(struct cli_instance *sh, int argc, char **argv)
 {
 	uint32_t sec;
 
 	(void)argc;
-	if (parse_uint(argv[1], &sec) != 0 || sec > CLI_SLEEP_MAX_SEC) {
+	if (cli_parse_u32(argv[1], &sec) != 0 || sec > CLI_SLEEP_MAX_SEC) {
 		cli_error(sh, "sleep: bad seconds '%s' (0..%u)\r\n",
 		          argv[1], (unsigned)CLI_SLEEP_MAX_SEC);
 		return 1;
@@ -61,7 +41,7 @@ static int cmd_usleep(struct cli_instance *sh, int argc, char **argv)
 	uint32_t us;
 
 	(void)argc;
-	if (parse_uint(argv[1], &us) != 0 || us > CLI_USLEEP_MAX_US) {
+	if (cli_parse_u32(argv[1], &us) != 0 || us > CLI_USLEEP_MAX_US) {
 		cli_error(sh, "usleep: bad microseconds '%s' (0..%u)\r\n",
 		          argv[1], (unsigned)CLI_USLEEP_MAX_US);
 		return 1;

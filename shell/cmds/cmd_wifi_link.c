@@ -10,13 +10,12 @@
  *   wifi link baud <bps>               change the rate of the link (2M / 3M / 4M / 6M)
  *   wifi link bench [bytes] [secs] [dir]   measured traffic; dir = rx | tx | both | all
  *   wifi link dbench [bytes] [secs] [dir]  the same, free-running on the DATA channel (U1)
- *   wifi link arp <ip> [secs] [spa]    L2 bridge + an ARP request once a second (U2)
  *
  * Where `wifi` is L2 and `net` is L3, this is L1/L2 of the wire between the STM32 and
  * the companion chip: the maintenance and diagnostics face of the link that issue #23
- * built (the numbers here are what proved the "L2 bypass" road before `net up` shipped,
- * and they remain the link's health monitors -- `ore`/drops must stay 0 -- and its
- * regression witnesses: `dbench` for the DATA channel, `arp` for the bridge).
+ * built (the numbers here are what proved the "L2 bypass" road the host stack now runs
+ * on, and they remain the link's health monitors -- `ore`/drops must stay 0 -- and the
+ * DATA channel's regression witness, `dbench`).
  *
  * It talks the LINK-CTRL channel (app/erpc.h), NOT eRPC -- a second frame type that the
  * link layer owns at both ends, so none of it required touching the generated eRPC server
@@ -24,11 +23,10 @@
  * `wifi ver` command teaches the host which firmware is loaded, hence the
  * erpc_module_gen() gate on every subcommand below.
  *
- * PRECONDITION, uniformly: CTRL is only issued on a QUIESCENT link (the U0 simplification
- * -- see erpc.h).  So every subcommand that talks to the module requires that nothing
- * else holds the eRPC UART, which in practice means the telnet console must be stopped:
- * app/net_shell.c keeps a resident reference AND issues receives without the coarse mutex,
- * so its frames would interleave with ours.
+ * PRECONDITION, for everything except the read-only `info`: THE L2 BRIDGE MUST BE DOWN,
+ * i.e. this runs after a power-on and before `wifi connect`.  The reason is time and the
+ * DATA channel, not ownership -- see link_ctrl_ready_ex() below, which is where issue #30
+ * B2c narrowed it down.
  *
  * TIMING.  Per-frame latency is measured with TIM2->CNT (free-running, 32-bit at
  * 2*PCLK1 = 275 MHz, started unconditionally by port/threadx/tx_glue.c for the execution
@@ -131,45 +129,6 @@ _Static_assert(sizeof(link_reply) >= LINK_STATS_WORDS * 4u, "LINK_STATS reply mu
 static struct link_run link_run;
 
 /* ---- helpers ------------------------------------------------------------- */
-
-/* Parse a 32-bit unsigned: 0x-hex or decimal.  Returns 0 on success. */
-static int parse_u32(const char *s, uint32_t *out)
-{
-	uint32_t base = 10, val = 0;
-	const char *p = s;
-
-	if (p == NULL || *p == '\0')
-		return -1;
-	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { base = 16; p += 2; }
-	if (*p == '\0')
-		return -1;
-	for (; *p != '\0'; p++) {
-		uint32_t d;
-		char c = *p;
-
-		if (c >= '0' && c <= '9')                    d = (uint32_t)(c - '0');
-		else if (base == 16 && c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
-		else if (base == 16 && c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
-		else return -1;
-		if (val > (0xFFFFFFFFu - d) / base)
-			return -1;
-		val = val * base + d;
-	}
-	*out = val;
-	return 0;
-}
-
-static void put_u32le(uint8_t *p, uint32_t v)
-{
-	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
-	p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
-}
-
-static uint32_t get_u32le(const uint8_t *p)
-{
-	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
 
 /* The same generator the module runs, so both ends produce identical bytes from a seed.
  * Its only job is to put real bit transitions on the wire -- integrity is checked by the
@@ -286,7 +245,7 @@ static int link_get_stats(struct cli_instance *sh, uint32_t st[LINK_STATS_WORDS]
 		return -1;
 	}
 	for (i = 0u; i < LINK_STATS_WORDS; i++)
-		st[i] = get_u32le(link_reply + i * 4u);
+		st[i] = erpc_get_u32le(link_reply + i * 4u);
 	return 0;
 }
 
@@ -395,7 +354,7 @@ static int cmd_link_baud(struct cli_instance *sh, int argc, char **argv)
 	uint32_t baud, old;
 	int rc;
 
-	if (parse_u32(argv[1], &baud) != 0) {
+	if (cli_parse_u32(argv[1], &baud) != 0) {
 		cli_error(sh, "usage: wifi link baud <2000000|3000000|4000000|6000000>\r\n");
 		return 1;
 	}
@@ -541,7 +500,7 @@ static int link_bench_run(struct cli_instance *sh, uint32_t bytes, uint32_t secs
 		if (cli_cancel_requested(sh))
 			break;
 
-		put_u32le(link_req + 0, want_rx);
+		erpc_put_u32le(link_req + 0, want_rx);
 		link_req[4] = seed++;
 		link_req[5] = 0u;
 		link_req[6] = 0u;
@@ -563,9 +522,9 @@ static int link_bench_run(struct cli_instance *sh, uint32_t bytes, uint32_t secs
 		}
 		/* The module echoes how many bytes it received; a mismatch means the request
 		 * lost its tail, which is precisely the failure this link had before U0-2. */
-		if (n >= 4 && get_u32le(link_reply) != want_tx) {
+		if (n >= 4 && erpc_get_u32le(link_reply) != want_tx) {
 			cli_error(sh, "  bench: module saw %lu of %lu request bytes\r\n",
-			          (unsigned long)get_u32le(link_reply), (unsigned long)want_tx);
+			          (unsigned long)erpc_get_u32le(link_reply), (unsigned long)want_tx);
 			rc = -1;
 			break;
 		}
@@ -591,13 +550,13 @@ static int cmd_link_bench(struct cli_instance *sh, int argc, char **argv)
 	const char *dir = "both";
 	int all;
 
-	if (argc > 1 && (parse_u32(argv[1], &bytes) != 0 || bytes == 0u ||
-	                 bytes > LINK_BENCH_MAX)) {
+	if (argc > 1 && (cli_parse_u32(argv[1], &bytes) != 0 || bytes == 0u ||
+	                     bytes > LINK_BENCH_MAX)) {
 		cli_error(sh, "link: bad size (1..%u)\r\n", (unsigned)LINK_BENCH_MAX);
 		return 1;
 	}
-	if (argc > 2 && (parse_u32(argv[2], &secs) != 0 || secs == 0u ||
-	                 secs > LINK_BENCH_MAX_S)) {
+	if (argc > 2 && (cli_parse_u32(argv[2], &secs) != 0 || secs == 0u ||
+	                     secs > LINK_BENCH_MAX_S)) {
 		cli_error(sh, "link: bad duration (1..%u s)\r\n", (unsigned)LINK_BENCH_MAX_S);
 		return 1;
 	}
@@ -724,7 +683,7 @@ static int link_dbench_rx(void *ctx, uint8_t chan, uint8_t *p, uint16_t n)
 		d->rx_badlen++;
 		return 0;
 	}
-	seq = get_u32le(p);
+	seq = erpc_get_u32le(p);
 	if (!d->started) {
 		d->started = 1u;                 /* first frame defines the origin */
 	} else if (seq != d->next_seq) {
@@ -751,8 +710,8 @@ static int link_data_cfg(struct cli_instance *sh, uint8_t mode, uint16_t bytes,
 	req[1] = seed;
 	req[2] = (uint8_t)bytes;
 	req[3] = (uint8_t)(bytes >> 8);
-	put_u32le(req + 4, ms);
-	put_u32le(req + 8, ERPC_CTRL_DATA_MAGIC);
+	erpc_put_u32le(req + 4, ms);
+	erpc_put_u32le(req + 8, ERPC_CTRL_DATA_MAGIC);
 	n = erpc_ctrl_call(ERPC_CTRL_DATA_CFG, req, (uint16_t)sizeof(req), link_reply,
 	                   (uint16_t)sizeof(link_reply), LINK_DCFG_TMO_MS, &diag);
 	if (n < 0) {
@@ -801,7 +760,7 @@ static int link_get_dstats(struct cli_instance *sh, uint32_t st[LINK_DSTAT_WORDS
 		return -1;
 	}
 	for (i = 0u; i < LINK_DSTAT_WORDS; i++)
-		st[i] = get_u32le(link_reply + i * 4u);
+		st[i] = erpc_get_u32le(link_reply + i * 4u);
 	return 0;
 }
 
@@ -893,14 +852,14 @@ static int cmd_link_dbench(struct cli_instance *sh, int argc, char **argv)
 	uint8_t mode;
 	int rc = 0;
 
-	if (argc > 1 && (parse_u32(argv[1], &bytes) != 0 || bytes < LINK_DBENCH_MIN ||
-	                 bytes > LINK_DATA_PAYLOAD_MAX)) {
+	if (argc > 1 && (cli_parse_u32(argv[1], &bytes) != 0 || bytes < LINK_DBENCH_MIN ||
+	                     bytes > LINK_DATA_PAYLOAD_MAX)) {
 		cli_error(sh, "link: bad size (%u..%u)\r\n", (unsigned)LINK_DBENCH_MIN,
 		          (unsigned)LINK_DATA_PAYLOAD_MAX);
 		return 1;
 	}
-	if (argc > 2 && (parse_u32(argv[2], &secs) != 0 || secs == 0u ||
-	                 secs > LINK_BENCH_MAX_S)) {
+	if (argc > 2 && (cli_parse_u32(argv[2], &secs) != 0 || secs == 0u ||
+	                     secs > LINK_BENCH_MAX_S)) {
 		cli_error(sh, "link: bad duration (1..%u s)\r\n", (unsigned)LINK_BENCH_MAX_S);
 		return 1;
 	}
@@ -955,7 +914,7 @@ static int cmd_link_dbench(struct cli_instance *sh, int argc, char **argv)
 			cli_sleep(sh, 10u);      /* receive-only: just let the run elapse */
 			continue;
 		}
-		put_u32le(link_dtx, link_db.tx_frames);
+		erpc_put_u32le(link_dtx, link_db.tx_frames);
 		if (link_data_send(LINK_DATA_CHAN_BENCH, link_dtx, (uint16_t)tx) == 0) {
 			link_db.tx_frames++;
 			link_db.tx_bytes += tx;

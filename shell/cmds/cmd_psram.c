@@ -24,32 +24,6 @@
 #include <stdint.h>
 #include <string.h>
 
-/* Parse a 32-bit unsigned: 0x-hex or decimal.  Returns 0 on success. */
-static int parse_u32(const char *s, uint32_t *out)
-{
-	uint32_t base = 10, val = 0;
-	const char *p = s;
-
-	if (p == NULL || *p == '\0')
-		return -1;
-	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { base = 16; p += 2; }
-	if (*p == '\0')
-		return -1;
-	for (; *p != '\0'; p++) {
-		uint32_t d;
-		char c = *p;
-		if (c >= '0' && c <= '9')            d = (uint32_t)(c - '0');
-		else if (base == 16 && c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
-		else if (base == 16 && c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
-		else return -1;
-		if (val > (0xFFFFFFFFu - d) / base)
-			return -1;
-		val = val * base + d;
-	}
-	*out = val;
-	return 0;
-}
-
 /* Take the OCTOSPI1 concurrency guard for a hardware subcommand; on contention
  * (a backgrounded `psram`/`membench` command still holds it) print and bail so
  * two commands never drive OCTOSPI1 at once.  Pair every success with
@@ -116,7 +90,7 @@ static int cmd_psram_clk(struct cli_instance *sh, int argc, char **argv)
 	uint32_t p;
 
 	(void)argc;
-	if (parse_u32(argv[1], &p) != 0 || p > 255u) {
+	if (cli_parse_u32(argv[1], &p) != 0 || p > 255u) {
 		cli_error(sh, "psram: bad prescaler (0..255)\r\n");
 		return 1;
 	}
@@ -142,8 +116,8 @@ static int cmd_psram_phase(struct cli_instance *sh, int argc, char **argv)
 
 	psram_get_phase(&cur_sel, &cur_unit);
 	unit = cur_unit;
-	if (parse_u32(argv[1], &sel) != 0 || sel > 12u ||
-	    (argc >= 3 && (parse_u32(argv[2], &unit) != 0 || unit > 127u))) {
+	if (cli_parse_u32(argv[1], &sel) != 0 || sel > 12u ||
+	    (argc >= 3 && (cli_parse_u32(argv[2], &unit) != 0 || unit > 127u))) {
 		cli_error(sh, "psram: bad phase (sel 0..12, units 0..127)\r\n");
 		return 1;
 	}
@@ -168,7 +142,7 @@ static int cmd_psram_mr0(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "psram: not ready\r\n");
 		return 1;
 	}
-	if (parse_u32(argv[1], &v) != 0 || v > 0xFFu) {
+	if (cli_parse_u32(argv[1], &v) != 0 || v > 0xFFu) {
 		cli_error(sh, "psram: bad MR0 value (0..0xFF)\r\n");
 		return 1;
 	}
@@ -189,7 +163,7 @@ static int cmd_psram_set(struct cli_instance *sh, int argc, char **argv)
 	uint32_t rd, wr;
 
 	(void)argc;
-	if (parse_u32(argv[1], &rd) != 0 || parse_u32(argv[2], &wr) != 0 ||
+	if (cli_parse_u32(argv[1], &rd) != 0 || cli_parse_u32(argv[2], &wr) != 0 ||
 	    rd > 31u || wr > 31u) {
 		cli_error(sh, "psram: bad dummy-cycle count (0..31)\r\n");
 		return 1;
@@ -248,7 +222,7 @@ static int cmd_psram_test(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "psram: not ready (bring-up failed; see `psram info`)\r\n");
 		return 1;
 	}
-	if (argc >= 2 && parse_u32(argv[1], &len) != 0) {
+	if (argc >= 2 && cli_parse_u32(argv[1], &len) != 0) {
 		cli_error(sh, "psram: bad length '%s'\r\n", argv[1]);
 		return 1;
 	}
@@ -339,7 +313,7 @@ static int cmd_psram_mmapscan(struct cli_instance *sh, int argc, char **argv)
 			cli_error(sh, "psram: not ready\r\n");
 			return 1;
 		}
-		if (argc >= 3 && (parse_u32(argv[2], &phase) != 0 ||
+		if (argc >= 3 && (cli_parse_u32(argv[2], &phase) != 0 ||
 		    phase < 1u || phase > 12u)) {
 			cli_error(sh, "psram: bad phase (1..12)\r\n");
 			return 1;
@@ -372,7 +346,7 @@ static int cmd_psram_wtune(struct cli_instance *sh, int argc, char **argv)
 	uint32_t addr = PSRAM_BASE_ADDR + 0x200u;
 	uint32_t mask, d;
 
-	if (argc >= 2 && parse_u32(argv[1], &addr) != 0) {
+	if (argc >= 2 && cli_parse_u32(argv[1], &addr) != 0) {
 		cli_error(sh, "psram: bad address '%s'\r\n", argv[1]);
 		return 1;
 	}

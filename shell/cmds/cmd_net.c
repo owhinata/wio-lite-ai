@@ -43,89 +43,7 @@
 #include <stdint.h>
 #include <string.h>
 
-
 #define PING_TIMEOUT_MS    1000u     /* per-probe reply wait */
-
-/* ---- number / address parsing (ported from f746 cmd_net.c) --------------- */
-
-static int parse_uint(const char *s, uint32_t *out)
-{
-	uint32_t v = 0;
-
-	if (s == NULL || *s == '\0')
-		return -1;
-	for (const char *p = s; *p != '\0'; p++) {
-		if (*p < '0' || *p > '9')
-			return -1;
-		v = v * 10u + (uint32_t)(*p - '0');
-	}
-	*out = v;
-	return 0;
-}
-
-/* Parse "a.b.c.d" into a host-order u32 ((a<<24)|(b<<16)|(c<<8)|d). */
-static int parse_ipv4(const char *s, uint32_t *out)
-{
-	uint32_t b[4];
-	int i = 0;
-	const char *p = s;
-
-	for (;;) {
-		uint32_t v = 0;
-		int digits = 0;
-
-		while (*p >= '0' && *p <= '9') {
-			v = v * 10u + (uint32_t)(*p - '0');
-			if (v > 255u)
-				return -1;
-			p++;
-			digits++;
-		}
-		if (digits == 0 || i > 3)
-			return -1;
-		b[i++] = v;
-		if (*p == '\0')
-			break;
-		if (*p != '.')
-			return -1;
-		p++;
-	}
-	if (i != 4)
-		return -1;
-	*out = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
-	return 0;
-}
-
-/* Parse "a.b.c.d/mask" into address + netmask (host order). */
-static int parse_ipv4_cidr(const char *s, uint32_t *ip, uint32_t *mask)
-{
-	char buf[20];
-	const char *slash = NULL;
-	uint32_t bits;
-	size_t n = 0;
-
-	for (const char *p = s; *p != '\0'; p++) {
-		if (*p == '/') { slash = p + 1; break; }
-		if (n >= sizeof buf - 1)
-			return -1;
-		buf[n++] = *p;
-	}
-	buf[n] = '\0';
-	if (slash == NULL || parse_ipv4(buf, ip) != 0)
-		return -1;
-	if (parse_uint(slash, &bits) != 0 || bits > 32u)
-		return -1;
-	*mask = (bits == 0) ? 0u : (0xFFFFFFFFu << (32u - bits));
-	return 0;
-}
-
-static unsigned mask_bits(uint32_t mask)
-{
-	unsigned n = 0;
-
-	while (mask & 0x80000000u) { n++; mask <<= 1; }
-	return n;
-}
 
 /* ---- eRPC option helper -------------------------------------------------- */
 
@@ -161,7 +79,7 @@ static void net_print_nx_ip(struct cli_instance *sh, const struct nx_net_info *n
 	cli_print(sh, "ip:    %u.%u.%u.%u/%u\r\n",
 	          (unsigned)((ni->ip >> 24) & 0xFFu), (unsigned)((ni->ip >> 16) & 0xFFu),
 	          (unsigned)((ni->ip >> 8) & 0xFFu),  (unsigned)(ni->ip & 0xFFu),
-	          mask_bits(ni->mask));
+	          cli_ipv4_mask_bits(ni->mask));
 	cli_print(sh, "gw:    %u.%u.%u.%u (%s)%s\r\n",
 	          (unsigned)((ni->gw >> 24) & 0xFFu), (unsigned)((ni->gw >> 16) & 0xFFu),
 	          (unsigned)((ni->gw >> 8) & 0xFFu),  (unsigned)(ni->gw & 0xFFu),
@@ -269,11 +187,11 @@ static int cmd_net_ip(struct cli_instance *sh, int argc, char **argv)
 	struct nx_net_info ni;
 	uint32_t a, mask, gw = 0;
 
-	if (parse_ipv4_cidr(argv[1], &a, &mask) != 0) {
+	if (cli_parse_ipv4_cidr(argv[1], &a, &mask) != 0) {
 		cli_error(sh, "net: bad address '%s' (use a.b.c.d/mask)\r\n", argv[1]);
 		return 1;
 	}
-	if (argc >= 3 && parse_ipv4(argv[2], &gw) != 0) {
+	if (argc >= 3 && cli_parse_ipv4(argv[2], &gw) != 0) {
 		cli_error(sh, "net: bad gateway '%s'\r\n", argv[2]);
 		return 1;
 	}
@@ -334,12 +252,12 @@ static int cmd_net_ping(struct cli_instance *sh, int argc, char **argv)
 	int count = 4, ok = 0, i;
 	unsigned rmin = 0xFFFFFFFFu, rmax = 0, rsum = 0;
 
-	if (parse_ipv4(argv[1], &dst) != 0) {
+	if (cli_parse_ipv4(argv[1], &dst) != 0) {
 		cli_error(sh, "net: bad address '%s'\r\n", argv[1]);
 		return 1;
 	}
 	if (argc >= 3) {                            /* explicit count must be valid */
-		if (parse_uint(argv[2], &c) != 0 || c == 0 || c > 100) {
+		if (cli_parse_u32(argv[2], &c) != 0 || c == 0 || c > 100) {
 			cli_error(sh, "net: bad count '%s' (1..100)\r\n", argv[2]);
 			return 1;
 		}
@@ -424,7 +342,7 @@ static int cmd_net_echo(struct cli_instance *sh, int argc, char **argv)
 		return 1;
 	}
 	if (argc >= 2) {
-		if (parse_uint(argv[1], &v) != 0 || v == 0u || v > 65535u) {
+		if (cli_parse_u32(argv[1], &v) != 0 || v == 0u || v > 65535u) {
 			cli_error(sh, "net: bad port '%s' (1..65535)\r\n", argv[1]);
 			return 1;
 		}
@@ -456,7 +374,7 @@ static int cmd_net_shell_start(struct cli_instance *sh, int argc, char **argv)
 	uint16_t port = (uint16_t)NET_SHELL_PORT_DEFAULT;
 
 	if (argc >= 2) {
-		if (parse_uint(argv[1], &v) != 0 || v == 0u || v > 65535u) {
+		if (cli_parse_u32(argv[1], &v) != 0 || v == 0u || v > 65535u) {
 			cli_error(sh, "net: bad port '%s' (1..65535)\r\n", argv[1]);
 			return 1;
 		}

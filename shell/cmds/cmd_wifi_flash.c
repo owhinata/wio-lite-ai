@@ -50,32 +50,6 @@
 #include <stdbool.h>
 #include <string.h>
 
-/* Parse a 32-bit unsigned: 0x-hex or decimal.  Returns 0 on success. */
-static int parse_u32(const char *s, uint32_t *out)
-{
-	uint32_t base = 10, val = 0;
-	const char *p = s;
-
-	if (p == NULL || *p == '\0')
-		return -1;
-	if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { base = 16; p += 2; }
-	if (*p == '\0')
-		return -1;
-	for (; *p != '\0'; p++) {
-		uint32_t d;
-		char c = *p;
-		if (c >= '0' && c <= '9')            d = (uint32_t)(c - '0');
-		else if (base == 16 && c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
-		else if (base == 16 && c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
-		else return -1;
-		if (val > (0xFFFFFFFFu - d) / base)
-			return -1;
-		val = val * base + d;
-	}
-	*out = val;
-	return 0;
-}
-
 /*
  * Take the link for a download session (issue #30 B2b).
  *
@@ -201,11 +175,11 @@ static int cmd_flash_read(struct cli_instance *sh, int argc, char **argv)
 	uint8_t buf[128];
 	int rc, ok = 0;
 
-	if (parse_u32(argv[1], &offset) != 0 || (offset & 0xFFFu) != 0u) {
+	if (cli_parse_u32(argv[1], &offset) != 0 || (offset & 0xFFFu) != 0u) {
 		cli_error(sh, "wifi: bad offset (4KB-aligned hex, e.g. 0x180000)\r\n");
 		return 1;
 	}
-	if (argc >= 3 && (parse_u32(argv[2], &nsectors) != 0 || nsectors == 0u || nsectors > 64u)) {
+	if (argc >= 3 && (cli_parse_u32(argv[2], &nsectors) != 0 || nsectors == 0u || nsectors > 64u)) {
 		cli_error(sh, "wifi: bad nsectors (1..64)\r\n");
 		return 1;
 	}
@@ -424,11 +398,11 @@ static int cmd_flash_backup(struct cli_instance *sh, int argc, char **argv)
 	uint32_t offset = 0u, len = 0u, size, devsum = 0u;
 	int rc, ok = 0;
 
-	if (argc >= 2 && (parse_u32(argv[1], &offset) != 0 || (offset & 0xFFFu) != 0u)) {
+	if (argc >= 2 && (cli_parse_u32(argv[1], &offset) != 0 || (offset & 0xFFFu) != 0u)) {
 		cli_error(sh, "wifi: bad offset (4KB-aligned, e.g. 0x0)\r\n");
 		return 1;
 	}
-	if (argc >= 3 && (parse_u32(argv[2], &len) != 0 || len == 0u || (len & 0xFFFu) != 0u)) {
+	if (argc >= 3 && (cli_parse_u32(argv[2], &len) != 0 || len == 0u || (len & 0xFFFu) != 0u)) {
 		cli_error(sh, "wifi: bad length (4KB-aligned, non-zero, e.g. 0x1000)\r\n");
 		return 1;
 	}
@@ -686,7 +660,7 @@ static int cmd_flash_write(struct cli_instance *sh, int argc, char **argv)
 	uint32_t              offset, len;
 	int                   rc, ok = 0;
 
-	if (parse_u32(argv[1], &offset) != 0) {
+	if (cli_parse_u32(argv[1], &offset) != 0) {
 		cli_error(sh, "wifi: bad offset (hex, e.g. 0x0)\r\n");
 		return 1;
 	}

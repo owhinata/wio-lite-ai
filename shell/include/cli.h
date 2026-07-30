@@ -207,6 +207,29 @@ void cli_console_release(struct cli_instance *sh);
 int  cli_read_byte(struct cli_instance *sh, unsigned timeout_ms);
 void cli_rx_flush(struct cli_instance *sh);
 
+/*
+ * Argument-value parsers (issue #27).  Every command that takes a number or an
+ * address used to carry its own copy of these; they live here so there is one
+ * definition and one set of edge cases.  All are strict and side-effect-free:
+ * *out is written only on success, and anything the caller then range-checks it
+ * still has to range-check.  No newlib strtoul -- this firmware ships its own
+ * parsers (and libc's would drag in errno/locale for nothing).
+ *
+ * cli_parse_u32():  "0x"/"0X"-prefixed hex or plain decimal.  NULL, empty, a
+ *   bare "0x", an invalid digit, trailing garbage, or 32-bit overflow all fail.
+ * cli_parse_ipv4(): "a.b.c.d" into a HOST-order u32 ((a<<24)|(b<<16)|(c<<8)|d).
+ *   Each octet must be 0..255 and present; no shorthand forms.
+ * cli_parse_ipv4_cidr(): "a.b.c.d/bits" into address + netmask (both host order),
+ *   bits 0..32.
+ * cli_ipv4_mask_bits(): the inverse -- prefix length of a contiguous netmask.
+ *
+ * Return 0 on success, -1 on any malformed input.
+ */
+int cli_parse_u32(const char *s, uint32_t *out);
+int cli_parse_ipv4(const char *s, uint32_t *out);
+int cli_parse_ipv4_cidr(const char *s, uint32_t *ip, uint32_t *mask);
+unsigned cli_ipv4_mask_bits(uint32_t mask);
+
 /** Iterate every registered root command in .shell_root_cmds order. */
 #define CLI_ROOT_CMD_FOREACH(it) \
 	for (const struct cli_cmd *it = __cli_root_cmds_start; \

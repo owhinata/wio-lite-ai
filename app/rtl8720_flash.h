@@ -24,8 +24,8 @@
  * REQUIRED CALLER DISCIPLINE (issue #21 increment 8).  Every entry point here drives
  * CHIP_EN and opens/closes UART9 at several baud rates internally, and reads the shared
  * SPSC RX ring itself.  The RTL8720 link now has other users (the resident eRPC service
- * thread, and from increment 9 a telnet console service), so a caller MUST hold the
- * coarse link mutex with no eRPC session live for the WHOLE session --
+ * thread, and the L2 bridge owner that holds the UART while the host stack is up), so a
+ * caller MUST hold the coarse link mutex with no eRPC session live for the WHOLE session --
  * rtl_link_hw_claim(sh, false) .. rtl_link_hw_release(sh) (app/rtl_link.h), which
  * rejects the command outright while the eRPC UART is referenced.  Nothing here takes
  * that lock for you.
