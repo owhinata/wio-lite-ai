@@ -31,12 +31,18 @@
  *
  * ---- the credentials -----------------------------------------------------------
  *
- * Re-associating needs the SSID and the passphrase, so they are kept in host RAM -- but
- * only as an OPT-IN: `wifi autoreconnect on` first, and even then they are captured by the
- * next successful `wifi connect` rather than dug out of anything.  `devmem` and the telnet
- * console can read RAM, so this is a deliberate trade the operator makes, not a default.
- * They are zeroed on every path that ends the association or changes the module underneath
- * us (see wifi_auto_disarm() and the forget-generation backstop below).
+ * Re-associating needs the SSID and the passphrase, so they are kept in host RAM.
+ *
+ * THIS IS ON BY DEFAULT, so an ordinary `wifi connect` leaves its passphrase there.  That
+ * is a real exposure -- `devmem` and the telnet console can both read RAM -- and it was an
+ * opt-in when the feature landed for exactly that reason.  It is a default now because the
+ * preference could only ever be set BEFORE the outage it protects against, so requiring it
+ * meant the feature was off in most of the cases it exists for.  `wifi autoreconnect off`
+ * opts out and wipes what is held; nothing is persisted, so a reset comes back on.
+ *
+ * The credentials are captured by a successful `wifi connect` rather than dug out of the
+ * module, and they are zeroed on every path that ends the association or changes the
+ * module underneath us (see wifi_auto_disarm() and the forget-generation backstop below).
  *
  * ---- threading -----------------------------------------------------------------
  *

@@ -120,10 +120,12 @@ time as the USB console. 22 commands:
   answer is a transport failure, not a lost AP — and it fires *before* link-down is
   declared (that needs two consecutive samples), so a re-association inside one refresh
   means NetX never sees the link drop and no socket, telnet console included, is torn
-  down. Credentials are opt-in: `on` only permits the **next** successful `wifi connect`
-  to keep its SSID and passphrase in RAM, and they are wiped by `off`, by
-  `wifi on|off|reset`, by `wifi disconnect` and by any flash session. Failures back off
-  8 → 60 s. The address is not re-acquired automatically — `net info` flags the lease as
+  down. It is **on by default**, which means an ordinary `wifi connect` leaves its SSID and
+  passphrase in host RAM — a real exposure, since `devmem` and the telnet console can read
+  it. That was an opt-in when the feature landed, and is a default now because the
+  preference could only ever be set *before* the outage it protects against. `off` opts out
+  and wipes what is held; so do `wifi on|off|reset`, `wifi disconnect` and any flash
+  session. Nothing is persisted, so a reset comes back on. Failures back off 8 → 60 s. The address is not re-acquired automatically — `net info` flags the lease as
   possibly stale and `net dhcp` is still the operator's call.
   `wifi scan` lists the visible APs — channel, band, RSSI, security mode, BSSID and SSID
   (the module is dual-band). The **band is derived from the channel number**, because the

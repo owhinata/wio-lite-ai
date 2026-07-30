@@ -36,7 +36,15 @@ static volatile bool wa_armed;
  */
 static volatile bool wa_in_flight;
 
-static bool     wa_enabled;
+/*
+ * ON at boot.  Re-associating is what the operator wants in almost every case, and having
+ * to remember a preference before the outage -- which is the only time it can be set,
+ * since arming happens at `wifi connect` -- made the feature miss precisely the situation
+ * it exists for.  The cost is stated at wifi_auto.h: with this on, every successful
+ * `wifi connect` leaves its passphrase in host RAM.  `wifi autoreconnect off` opts out for
+ * the session; there is no persistent setting, so a reset comes back on.
+ */
+static bool     wa_enabled = true;
 static char     wa_ssid[WIFI_AUTO_SSID_MAX + 1u];
 static char     wa_pass[WIFI_AUTO_PASS_MAX + 1u];
 static bool     wa_open;                 /* no passphrase (open network) */
@@ -57,7 +65,7 @@ static ULONG    wa_last_try;
 static bool     wa_last_try_valid;
 static int      wa_last_rc;
 static int32_t  wa_last_result;
-static const char *wa_why = "never armed";
+static const char *wa_why = "waiting for the next `wifi connect`";
 
 /* ---- the critical section ---------------------------------------------------- */
 
