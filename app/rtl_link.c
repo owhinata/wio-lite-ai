@@ -34,6 +34,7 @@ static uint32_t          g_uart_baud;
  * touched under erpc_link_lock(), the same section that mutates g_uart_refs. */
 static uint32_t g_uart_gen = 1u;     /* ++ on every 0->1 open and on force-quiesce */
 static uint32_t g_quiesce_gen;       /* ++ on force-quiesce only (= CHIP_EN moved)  */
+static uint32_t g_forget_gen;        /* ++ on every forget_module (see rtl_link.h)  */
 
 /* The rate the eRPC link currently runs at.  MODULE state, not link state -- see
  * rtl_link_erpc_baud() in rtl_link.h for why, and for the four places that reset it. */
@@ -54,6 +55,10 @@ void rtl_link_forget_module(void)
 	g_erpc_baud = RTL_ERPC_BAUD_DEFAULT;   /* the module always boots at 2 Mbaud */
 	erpc_set_module_gen(0u);               /* ... and its firmware must be re-proved */
 	g_tcpip_inited = false;
+	/* Published rather than acted on: state that belongs to ONE module but lives in a
+	 * layer above this one (issue #32's WiFi credentials) watches this counter instead
+	 * of being reached down to from here.  See rtl_link_forget_gen() in rtl_link.h. */
+	g_forget_gen++;
 }
 
 /* ------------------------------------------------------------------ *
@@ -192,6 +197,11 @@ void rtl_link_uart_unref_gen(uint32_t gen)
 uint32_t rtl_link_quiesce_gen(void)
 {
 	return g_quiesce_gen;
+}
+
+uint32_t rtl_link_forget_gen(void)
+{
+	return g_forget_gen;
 }
 
 void rtl_link_force_quiesce(void)

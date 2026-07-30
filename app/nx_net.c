@@ -25,6 +25,7 @@
 #include "nx_link_driver.h"
 #include "rtl_link.h"
 #include "rtl8720.h"
+#include "wifi_auto.h"
 #include "wifi_rpc.h"
 
 /* ---- tunables --------------------------------------------------------------- */
@@ -57,7 +58,19 @@
 #define NXN_ARP_CACHE      1040u      /* ~20 entries                                 */
 
 #define NXN_OWNER_PRIORITY 13u
-#define NXN_OWNER_STACK    2048u
+/*
+ * 3072, not 2048: issue #32 puts a new call chain on this thread -- nxn_refresh() ->
+ * nxn_auto_reconnect() -> wifi_auto_attempt() -> wifi_rpc_connect() (which builds its
+ * request in a 160-byte local) -> erpc_call_ex().
+ *
+ * Measured on board #2 after 13 re-association attempts: `thread` reports a peak of
+ * 860 B, so 2048 would have been ample and would have returned 1 kB of AXI-SRAM.  It is
+ * NOT taken back, for the same reason the packet pool above was not shrunk: the region is
+ * 41 % free and nothing is asking for that kilobyte, while the high-water mark is a
+ * best-effort measurement of the paths that HAPPENED to run, and the thread it protects
+ * is the one that owns the network.
+ */
+#define NXN_OWNER_STACK    3072u
 
 /*
  * The module takes its own tap out this long after the last DATA_CFG (cap 60 s,
@@ -75,6 +88,13 @@
 #define NXN_DCFG_TMO_MS    2500u      /* CFG(off) delays its ack until the module's
                                        * DATA writer is idle -- as `link` does        */
 #define NXN_RPC_TMO_MS     5000u
+/*
+ * How long an issue-#32 re-association may block.  It must EXCEED the module's own join
+ * timeout, which is 20 s (rtw_down_timeout_sema(join_sema, 20000) in lib_arduino.a's
+ * wifi_connect): give up first and the module is still holding its serial mutex when the
+ * next call goes out, and its answer arrives as a stale frame we have to drop.
+ */
+#define NXN_CONNECT_TMO_MS 22000u
 #define NXN_CLAIM_MS       RTL_LINK_CLAIM_WAIT_MS
 #define NXN_ARM_CLAIM_MS   20000u     /* how long ARM waits for the coarse mutex      */
 
@@ -728,6 +748,88 @@ static void nxn_publish_link(int assoc)
 }
 
 /*
+ * Abort hook for an issue-#32 re-association.  Polled by erpc_call_ex() about once a
+ * millisecond on this thread.
+ *
+ * Disarming IS the abort -- see app/wifi_auto.h -- so there is no separate cancel flag and
+ * therefore no window in which a command has asked us to stop and an attempt starts anyway.
+ * The other two terms are the reasons the owner itself must stop: a `net down` waiting to
+ * be acted on, and the link having been taken away from under us.
+ */
+static int nxn_auto_abort(void *ctx)
+{
+	(void)ctx;
+	return (!wifi_auto_armed() || nxn_req_stop ||
+	        rtl_link_uart_gen() != nxn_uart_gen) ? 1 : 0;
+}
+
+/*
+ * Re-associate after the module has told us it is not associated (issue #32).  Called from
+ * nxn_refresh() with the coarse mutex held; returns a fresh association sample for
+ * nxn_publish_link(): 1 associated, 0 not, -1 no answer.
+ *
+ * THE ABORT PATH IS THE DELICATE PART.  erpc_call_ex()'s abort releases the HOST's slot and
+ * nothing else -- rpc_wifi_connect is outside the module firmware's concurrent allow-list
+ * (fw/rtl8720 patch 0003), so the module stays inside wifi_connect() holding its serial
+ * mutex for up to its own 20 s timeout.  An aborted attempt therefore issues NO further
+ * eRPC and returns immediately, because the whole point of being abortable is to hand the
+ * coarse mutex back to the `wifi off` / `wifi reset` that asked for it.  Leaving the hold
+ * at its 60 s ceiling on the way out is safe: it is a watchdog bound, so a wider one only
+ * means the module waits longer before dropping a tap that the next refresh re-arms anyway.
+ */
+static int nxn_auto_reconnect(void)
+{
+	struct wifi_rpc_opts o;
+	uint32_t st[NXN_DSTAT_WORDS];
+	int32_t connected = -1;
+	int rc;
+
+	/*
+	 * EVERY non-OFF DATA_CFG zeroes the module's DATA counters, and this function issues
+	 * two of them -- so each one has to be preceded by taking the ledger, exactly as
+	 * nxn_refresh() does before its own re-arm.  Without this, an attempt would destroy
+	 * the loss evidence for the window it spans, which is the one window where knowing
+	 * whether frames were lost matters most.
+	 */
+	if (nxn_data_stats(st) == 0)
+		nxn_mod_accumulate(st);
+	/* Hold the module's tap open across the attempt: we are the thread that would
+	 * otherwise be refreshing it, and we are about to block for up to 22 s. */
+	if (nxn_data_cfg(ERPC_DATA_MODE_BRIDGE, NXN_HOLD_MAX_MS) != 0)
+		return 0;                    /* no hold, no attempt -- and still not associated */
+
+	nxn_opts(&o, NXN_CONNECT_TMO_MS);
+	o.should_abort = nxn_auto_abort;
+	rc = wifi_auto_attempt(&o);
+	if (rc == -4)
+		return 0;                    /* aborted: touch nothing, let the caller unclaim */
+
+	/* Back to the ordinary hold (ledger first, as above).  A failure here is the same
+	 * event nxn_refresh_fails exists for -- the module no longer acknowledging the
+	 * bridge -- so it counts, unlike the extension above, which we merely chose to ask
+	 * for and whose failure only costs us this attempt. */
+	if (nxn_data_stats(st) == 0)
+		nxn_mod_accumulate(st);
+	if (nxn_data_cfg(ERPC_DATA_MODE_BRIDGE, NXN_HOLD_MS) != 0)
+		nxn_refresh_fails++;
+
+	if (rc != 0)
+		return 0;                    /* a failed join needs no second opinion */
+
+	/* Only a reported success is worth another round trip, and by now the module is
+	 * idle: our 22 s exceeds the 20 s it gives itself. */
+	nxn_opts(&o, NXN_RPC_TMO_MS);
+	if (wifi_rpc_is_connected(&o, &connected) != 0)
+		return -1;
+	if (connected != WIFI_RPC_OK)
+		return 0;
+	/* The address outlived an association, so it may belong to a network we are no
+	 * longer on.  `net info` turns this into "run `net dhcp`". */
+	nxn_lease_stale = true;
+	return 1;
+}
+
+/*
  * Feed the module's watchdog, and take its loss ledger before doing so: every non-OFF
  * DATA_CFG zeroes the module's DATA counters.
  */
@@ -766,6 +868,19 @@ static void nxn_refresh(void)
 		nxn_opts(&o, NXN_RPC_TMO_MS);
 		if (wifi_rpc_is_connected(&o, &connected) == 0)
 			assoc = (connected == WIFI_RPC_OK) ? 1 : 0;
+
+		/*
+		 * Automatic re-association (issue #32), on a DEFINITE "not associated" only.
+		 * assoc < 0 is a transport failure -- the module did not answer -- which is
+		 * not the network's fault and must never make us re-join.
+		 *
+		 * This runs BEFORE the link state is published, and that is the point: the
+		 * declaration of link-down needs NXN_LINK_DOWN_SAMPLES consecutive samples,
+		 * so a re-association that lands inside one refresh means NetX never sees the
+		 * link drop at all and no socket -- telnet console included -- is torn down.
+		 */
+		if (assoc == 0 && wifi_auto_should_try())
+			assoc = nxn_auto_reconnect();
 	}
 	rtl_link_unclaim();
 

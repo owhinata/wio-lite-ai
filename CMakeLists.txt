@@ -347,6 +347,7 @@ add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/erpc.c"
     "${CMAKE_SOURCE_DIR}/app/link_data.c"
     "${CMAKE_SOURCE_DIR}/app/wifi_rpc.c"
+    "${CMAKE_SOURCE_DIR}/app/wifi_auto.c"
     "${CMAKE_SOURCE_DIR}/app/rtl_link.c"
     "${CMAKE_SOURCE_DIR}/app/net_shell.c"
     "${CMAKE_SOURCE_DIR}/app/nx_echo.c"

@@ -43,6 +43,7 @@
 #include "psram.h"           /* #19 M5: PSRAM_BASE_ADDR + the OCTOSPI1 guard */
 #include "log.h"             /* #19 M5: transfer post-mortem into the dmesg ring */
 #include "rtl_link.h"
+#include "wifi_auto.h"       /* #32: a flash session disarms the host's re-association */
 #include "nx_net.h"        /* the bridge has to be given back before we take the link */
 
 #include <stdint.h>
@@ -100,6 +101,14 @@ static int parse_u32(const char *s, uint32_t *out)
 static int flash_claim(struct cli_instance *sh)
 {
 	unsigned waited = 0u;
+
+	/*
+	 * First line, before the teardown below (issue #32): an automatic re-association can
+	 * be holding the coarse mutex for up to 22 s, and nx_net_down()'s unwind needs that
+	 * same mutex -- so disarming here is what stops step 1 from waiting out an attempt.
+	 * The credentials go with it, which is right: this session rewrites the module.
+	 */
+	wifi_auto_disarm("flash session");
 
 	if (nx_net_state() != NX_NET_OFF) {
 		cli_print(sh, "wifi: taking the host stack down first (flashing needs the "

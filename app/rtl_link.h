@@ -202,6 +202,19 @@ void     rtl_link_uart_unref_gen(uint32_t gen);
 uint32_t rtl_link_quiesce_gen(void);
 
 /*
+ * rtl_link_forget_gen() advances on every rtl_link_forget_module(), which is the strictly
+ * wider set: force-quiesce AND the flash session's own recovery AND rtl_link_begin()'s
+ * fresh power-on path, which drives CHIP_EN without going through force_quiesce and so
+ * does not move rtl_link_quiesce_gen().
+ *
+ * It exists for a holder of state that is only meaningful for ONE module -- issue #32's
+ * stored WiFi credentials (app/wifi_auto.c) -- to notice, on its own, that the module in
+ * front of us has changed.  Having the holder latch and watch this counter is what keeps
+ * rtl_link_forget_module() free of calls up into the layers that own such state.
+ */
+uint32_t rtl_link_forget_gen(void);
+
+/*
  * Take the link away from whoever holds it, unconditionally: abandon every in-flight
  * eRPC token (their waiters wake up with -2), drop the reference count to zero and
  * close the UART.  This is the recovery primitive behind `wifi off` / `wifi reset` --

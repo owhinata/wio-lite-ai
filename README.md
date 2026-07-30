@@ -109,6 +109,22 @@ time as the USB console. 22 commands:
   DHCP and prints no address, because L3 belongs entirely to `net` on the host stack.
   `wifi status` reports connected state, RSSI and MAC; `wifi disconnect` drops the
   association.
+  `wifi autoreconnect [on|off]` (issue #32) makes the **host** re-associate by itself when
+  the AP goes away — the module's own `wifi_set_autoreconnect()` cannot be used, because
+  the handler it installs runs the module's DHCP and then AutoIP, and any non-zero address
+  on that netif makes the WLAN driver drop host-bound unicast IP before it reaches
+  `netif_rx()` (issue #31's failure mode, confirmed by disassembling `lib_arduino.a`).
+  Instead the resident owner's 8-second association poll re-issues `rpc_wifi_connect`
+  itself: the module's DHCP never runs, its netif address stays zero and the bridge is
+  untouched. It fires on a **definite** "not associated" only — a module that did not
+  answer is a transport failure, not a lost AP — and it fires *before* link-down is
+  declared (that needs two consecutive samples), so a re-association inside one refresh
+  means NetX never sees the link drop and no socket, telnet console included, is torn
+  down. Credentials are opt-in: `on` only permits the **next** successful `wifi connect`
+  to keep its SSID and passphrase in RAM, and they are wiped by `off`, by
+  `wifi on|off|reset`, by `wifi disconnect` and by any flash session. Failures back off
+  8 → 60 s. The address is not re-acquired automatically — `net info` flags the lease as
+  possibly stale and `net dhcp` is still the operator's call.
   `wifi scan` lists the visible APs — channel, band, RSSI, security mode, BSSID and SSID
   (the module is dual-band). The **band is derived from the channel number**, because the
   scan record's own `band` field came back 0 (`RTW_802_11_BAND_5GHZ`) for every result on
@@ -179,7 +195,12 @@ time as the USB console. 22 commands:
   touch) plus the host stack's IP/mask/gw and dhcp-vs-static; `net ip <a.b.c.d/mask> [gw]`
   sets a static address; `net dhcp` (re)acquires a lease; `net ping <a.b.c.d> [count]`
   sends **real ICMP echoes** built by NetX Duo — no eRPC round trip in the measured RTT.
-  All of them need the interface up, which `wifi connect` does.
+  All of them need the interface up, which `wifi connect` does. Recovering from an air
+  outage is an **L2** act (`wifi autoreconnect`, issue #32): it restores the association,
+  not the address. A lease taken before the outage may belong to a network we are no
+  longer on, so `net info` marks it stale and leaves the re-acquisition to `net dhcp` —
+  running a DHCP client from the owner thread would close the lock-order cycle documented
+  at `nxn_link_status_cb()`.
   `net echo [port]` (default 2323, Ctrl+C stops) runs a **TCP echo server on the host
   stack** (issue #23 U4-1, `app/nx_echo.c`) — it needs the interface up, and it is the bring-up
   rehearsal the telnet console follows. There is no RPC in its data path: bytes arrive as

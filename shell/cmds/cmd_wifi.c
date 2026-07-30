@@ -48,6 +48,7 @@
 #include "erpc.h"
 #include "wifi_rpc.h"
 #include "rtl_link.h"
+#include "wifi_auto.h" /* issue #32: the host's own re-association policy */
 #include "net_shell.h"
 #include "nx_net.h"    /* the host stack owns the module while it is up (issue #23 U3) */
 #include "stm32h7xx_hal.h"   /* #5 inc 6: HAL_GetTick (1 ms SysTick, fed via tx_glue.c)
@@ -191,6 +192,15 @@ static int wifi_power_claim(struct cli_instance *sh, const char *what)
 	 * very session running this command -- away.  Run it from the USB CDC console. */
 	if (net_shell_guard(sh, what))
 		return 1;
+	/*
+	 * BEFORE the claim, not after (issue #32).  An automatic re-association holds the
+	 * coarse mutex for up to 22 s, and these are the recovery commands -- the ones that
+	 * must work exactly when something is stuck.  Disarming is what aborts an attempt in
+	 * flight, so doing it here makes the claim below succeed in milliseconds instead of
+	 * timing out at RTL_LINK_CLAIM_WAIT_MS.  The credentials go too, which is right: all
+	 * three of these move CHIP_EN, so they change the module the credentials were for.
+	 */
+	wifi_auto_disarm(what);
 	return rtl_link_hw_claim(sh, true) != 0 ? 1 : 0;
 }
 
@@ -568,6 +578,14 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 	 * running this command away.  Run it from USB CDC. */
 	if (net_shell_guard(sh, "wifi connect"))
 		return 1;
+	/*
+	 * Disarm before claiming (issue #32).  An operator typing `wifi connect` during an
+	 * outage is the very moment an automatic attempt is likely to be holding the coarse
+	 * mutex, and rtl_link_begin() below would give up on it after RTL_LINK_CLAIM_WAIT_MS
+	 * and report a busy link.  The credentials are about to be replaced by this command
+	 * anyway, so cutting the attempt short costs nothing: success re-arms below.
+	 */
+	wifi_auto_disarm("superseded by `wifi connect`");
 	if (rtl_link_begin(sh, true) != RTL_LINK_READY)
 		return 1;
 	/*
@@ -616,9 +634,17 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 	if (wifi_enter_sta(sh, &o) != 0)
 		goto fail;
 
-	/* 2) associate (module blocks until connected or it gives up). */
+	/*
+	 * 2) associate (module blocks until connected or it gives up).
+	 *
+	 * 22 s, because the module gives ITSELF 20 (rtw_down_timeout_sema(join_sema, 20000)
+	 * inside lib_arduino.a's wifi_connect).  The 15 s this used to wait expired while the
+	 * module was still trying, so its answer came back as a stale frame and its serial
+	 * mutex stayed held for another five seconds -- long enough for the next command to
+	 * queue behind a call that had already been given up on (issue #32).
+	 */
 	cli_print(sh, "wifi: connecting to \"%s\"%s...\r\n", ssid, pass ? "" : " (open)");
-	o.timeout_ms = 15000u;
+	o.timeout_ms = 22000u;
 	rc = wifi_rpc_connect(&o, ssid, pass, security, &result);
 	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto fail; }
 	if (rc || result != WIFI_RPC_OK) {
@@ -640,6 +666,14 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 	 */
 	rtl_link_end(sh);
 	cli_print(sh, "wifi: connected\r\n");
+	/*
+	 * Capture the credentials for issue #32.  A no-op unless `wifi autoreconnect on` has
+	 * been run, which is what keeps holding a passphrase in RAM an opt-in rather than
+	 * something every association does behind the operator's back.
+	 */
+	wifi_auto_arm(ssid, pass, security);
+	if (wifi_auto_enabled())
+		cli_print(sh, "  autoreconnect armed for \"%s\"\r\n", ssid);
 	/*
 	 * Bring the bridge up as part of associating (issue #30 B2b), so there is no
 	 * user-visible "which stack owns the network" mode left.
@@ -670,6 +704,12 @@ static int cmd_wifi_disconnect(struct cli_instance *sh, int argc, char **argv)
 	 * (issue #30 B2b treats an operator disconnect exactly like the AP going away). */
 	if (net_shell_guard(sh, "wifi disconnect"))
 		return 1;
+	/*
+	 * Disarm BEFORE the claim (issue #32).  An operator disconnect has to win: leaving
+	 * autoreconnect armed would have the owner thread re-join within 8 s, and holding the
+	 * coarse mutex in an attempt would make the claim below time out first.
+	 */
+	wifi_auto_disarm("wifi disconnect");
 	link = rtl_link_begin(sh, false);
 	if (link == RTL_LINK_OFF) {
 		cli_print(sh, "wifi: powered off (nothing to disconnect)\r\n");
@@ -679,7 +719,17 @@ static int cmd_wifi_disconnect(struct cli_instance *sh, int argc, char **argv)
 		return 1;
 
 	wifi_opts(&o, sh, &diag);
-	o.timeout_ms   = 5000u;
+	/*
+	 * 25 s, not 5 (issue #32).  The disarm above aborts a re-association on the HOST
+	 * side only -- rpc_wifi_connect is outside the module firmware's concurrent
+	 * allow-list, so the module can still be inside wifi_connect() holding its serial
+	 * mutex for the rest of its own 20 s timeout, and this request queues behind it.
+	 * Giving up at 5 s would report a failed disconnect and then let the module finish
+	 * associating: the operator would be left connected having asked not to be.  The
+	 * margin over 22 s covers the disconnect's own work and the queueing on top.
+	 * Ctrl+C still cuts the wait short (wifi_opts wires rtl_abort_cb).
+	 */
+	o.timeout_ms   = 25000u;
 	rc = wifi_rpc_disconnect(&o, &result);
 	rtl_link_end(sh);
 
@@ -691,6 +741,49 @@ static int cmd_wifi_disconnect(struct cli_instance *sh, int argc, char **argv)
 	}
 	cli_print(sh, "wifi: disconnected\r\n");
 	return 0;
+}
+
+/*
+ * wifi autoreconnect [on|off] (issue #32): whether the HOST re-associates by itself when
+ * the AP goes away.  No argument reports the state and the tally.
+ *
+ * Turning it on does not go near the module -- it only says that the next successful
+ * `wifi connect` may keep its credentials, which is what makes holding a passphrase in RAM
+ * a decision rather than a default.  Turning it off wipes them and aborts any attempt
+ * already running.
+ */
+static int cmd_wifi_autoreconnect(struct cli_instance *sh, int argc, char **argv)
+{
+	bool in_flight;
+
+	if (argc < 2) {
+		wifi_auto_print(sh);
+		return 0;
+	}
+	if (strcmp(argv[1], "on") == 0) {
+		wifi_auto_set_enabled(true);
+		cli_print(sh, "wifi: autoreconnect on\r\n");
+		if (!wifi_auto_armed())
+			cli_print(sh, "  arms at the next successful `wifi connect` (the "
+			          "credentials come from there)\r\n");
+		return 0;
+	}
+	if (strcmp(argv[1], "off") == 0) {
+		/* Sampled BEFORE disarming, which is what ends the attempt. */
+		in_flight = wifi_auto_attempt_in_flight();
+		wifi_auto_set_enabled(false);
+		cli_print(sh, "wifi: autoreconnect off (credentials cleared)\r\n");
+		if (in_flight)
+			/* The host stops waiting; the module does not stop trying.  Its
+			 * wifi_connect() runs to its own 20 s timeout, so it may still come
+			 * back associated -- the next refresh will simply report that as link
+			 * up, and nothing will re-join after it. */
+			cli_print(sh, "  an attempt was in flight and was cut short -- the "
+			          "module may still finish associating (`wifi status`)\r\n");
+		return 0;
+	}
+	cli_error(sh, "usage: wifi autoreconnect [on|off]\r\n");
+	return 1;
 }
 
 /* wifi status: report association state, RSSI, IP config and MAC (pure query). */
@@ -1059,6 +1152,8 @@ CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	            cmd_wifi_ver, 1, 0),
 	CLI_CMD_ARG(connect,    NULL, "associate with an AP: connect <ssid> [pw] [sec_hex]", cmd_wifi_connect,    2, 2),
 	CLI_CMD_ARG(disconnect, NULL, "drop the current WiFi association",     cmd_wifi_disconnect, 1, 0),
+	CLI_CMD_ARG(autoreconnect, NULL, "re-associate by ourselves when the AP goes away: autoreconnect [on|off]",
+	            cmd_wifi_autoreconnect, 1, 1),
 	CLI_CMD_ARG(status,     NULL, "show connection state / RSSI / IP / MAC", cmd_wifi_status, 1, 0),
 	CLI_CMD_ARG(scan,       NULL, "list visible APs (ch/band/rssi/security/bssid/ssid)", cmd_wifi_scan, 1, 0),
 	CLI_CMD_ARG(link, wifi_link_subcmds,
