@@ -31,7 +31,7 @@ time as the USB console. 23 commands:
 | system | `version` · `uptime` · `reboot` · `free` · `thread` |
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
-| storage | `sd` (info/read) |
+| storage | `sd` (card: info/read/format · FAT: ls/cat/write/rm/mkdir/df/umount) |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
 | wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench · **flash** info/read/backup/imgload/imginfo/write) · `net` (L3 = **host NetX Duo only**: info/ip/dhcp/ping/echo/shell) |
 | benchmarks | `coremark` · `membench` |
@@ -60,15 +60,26 @@ time as the USB console. 23 commands:
   subcommands (`clk`/`set`/`mr0`/`phase`/`wtune`/`mmapscan`) re-derive an operating
   point at a different clock without a reflash. `mmapscan` maps the true
   memory-mapped read eye across IWDG-recovered auto-reboots (issue #16).
-- **`sd`** — the on-board **microSD slot** (J4) on **SDMMC1**, 4-bit bus at 18.33 MHz
-  (issue #6). `sd info` identifies the card and prints type/capacity/geometry/bus
-  width/clock/CID/CSD; `sd read <lba>` hexdumps one 512 B block. The card is probed
-  **lazily** — the first command that needs it identifies it — so a boot with no card
-  costs nothing. There is **no card-detect line on this board** (the socket's CD is
-  tied to DAT3 and the f746 reference design's CD pin is the red LED here), so
-  presence is inferred from the bus: anything that ends in a command-response timeout
-  is reported as `no card in slot` and re-probes on the next call. A FileX filesystem
-  on top is the rest of issue #6.
+- **`sd`** — the on-board **microSD slot** (J4) on **SDMMC1**, 4-bit bus at 18.33 MHz,
+  with an **Eclipse FileX** FAT filesystem on top (issue #6). Two layers, and the
+  command reflects both:
+  - *card*: `sd info` identifies the card and prints type/capacity/geometry/bus
+    width/clock/CID/CSD, `sd read <lba>` hexdumps one 512 B block, and
+    `sd format yes` writes a fresh whole-card FAT32 superfloppy (destructive; the
+    literal `yes` is the latch).
+  - *filesystem*: `sd ls [path]` · `cat` · `write` · `rm` · `mkdir` · `df` · `umount`,
+    mounted **on first use** and left mounted. Both MBR-partitioned and superfloppy
+    cards work: FileX only ever reads logical sector 0, so the media driver detects
+    the layout at mount and adds the partition offset to every access itself.
+  - The card is probed **lazily** throughout, so a boot with no card costs nothing.
+    `info`/`read`/`format` may re-identify the card, which would corrupt a live
+    filesystem underneath them, so they take an exclusive slot and are refused while
+    the filesystem is mounted (`sd umount` first).
+  - There is **no card-detect line on this board** (the socket's CD is tied to DAT3,
+    and the f746 reference design's CD pin is the red LED here), so presence is
+    inferred from the bus: anything ending in a command-response timeout is reported
+    as `no card in slot`, and a card removed while mounted is noticed by the next
+    command, which evicts the stale media and re-probes.
 - **`wifi`** — the on-board **RTL8720DN** Wi-Fi/BLE companion (issues #17/#5/#23).
   The host reaches it over `CHIP_EN` (PC3), a **LOG UART** (UART9 PD14/PD15) and an
   **AT/HS UART** (USART1 PA10/PB14); the module is held powered-off (PC3 low) at boot.
@@ -448,9 +459,20 @@ time as the USB console. 23 commands:
   `hsd.ErrorCode` (the H7 HAL's `HAL_SD_GetCardState()` returns a state of 0 rather than
   an error), and one `classify_err()` turns that into `no card` on every path —
   identification, bus-width setup, both DMA submissions and the completion callback.
-  Build `-DBSP_ENABLE_SD=OFF` to compile the driver and its command out entirely, which
-  also removes the only DMA engine the app enables — useful when bisecting a suspected
-  D-cache coherency problem.
+  Build `-DBSP_ENABLE_SD=OFF` to compile the driver, FileX and the command out
+  entirely, which also removes the only DMA engine the app enables — useful when
+  bisecting a suspected D-cache coherency problem.
+
+  Having no card-detect pin also reshapes the **mount** path, and not in the obvious
+  way. The f746 code this was ported from checks its CD pin immediately before
+  `fx_media_open()` and returns "no card" early. The nearest thing this board has is
+  a *cached* "have we successfully talked to a card" flag — and gating the mount on it
+  would deadlock by construction, because the probe that would set the flag happens
+  inside the driver's `FX_DRIVER_INIT`, which only that same `fx_media_open()` reaches.
+  A cold boot with a perfectly good card would report "no card" forever. So there is
+  no pre-check: the probe decides. Since `fx_media_open()` flattens every INIT failure
+  into `FX_IO_ERROR`, the driver records its probe result and the glue reads it back
+  afterwards to tell an empty slot from a card with no FAT on it.
 - **PSRAM (issues #3 / #16)**: `app/psram.c` brings up the **APS6408L Octal DDR PSRAM
   on OCTOSPI1** (memory-mapped 8 MB @ `0x90000000`) without touching OCTOSPI2/OCTOSPIM/
   the RCC, so it cannot disturb the inherited clock tree. Shipped operating point: **133 MHz Fixed Latency** (kernel
@@ -518,6 +540,8 @@ shell/      core/    HW-independent CLI engine (parse/edit/history/complete/...)
             test/    host unit tests (run with host gcc; see below)
 port/       threadx/ ThreadX low-level init + shared SysTick glue
             sd/      microSD block driver over SDMMC1 + its internal IDMA (issue #6)
+            filex/   FileX media driver on that block API + the lazy-mount
+                     singleton and its ownership gates (issue #6)
             coremark/ EEMBC CoreMark port (core_portme.*)
             netxduo/ nx_user.h (NetX Duo build configuration; the driver is in app/,
                      because what it sits on is the RTL8720 link, not a MAC)
@@ -527,7 +551,7 @@ ldscript/   STM32H725AEIx_IROM.ld (FLASH @ 0x08020000, RAM = AXI-SRAM, DTCM log,
             STM32H725AEIx_ROM.ld  (the bootloader's own script: FLASH @ 0x08000000, 128 KB)
 cmake/      ARM GNU toolchain file (auto-downloads gcc into tools/)
 lib/        git submodules: cmsis_core/device_h7, stm32h7xx_hal_driver, tinyusb,
-            threadx, netxduo, coremark
+            threadx, netxduo, filex, coremark
 boot/       standalone USB DFU bootloader (internal 0x08000000) — see boot/README.md
 fw/rtl8720/ reproducible build of the RTL8720DN's own firmware (the eRPC server that
             wifi/net drive) — host-side only, flashed by `wifi flash write`; see its README

@@ -25,7 +25,8 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/stm32h7xx_hal_driver/Src/stm32h7x
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/cmsis_device_h7/Include/stm32h725xx.h"
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/tinyusb/src/tusb.h"
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/coremark/core_main.c"
-   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/netxduo/common/src/nx_ip_create.c")
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/netxduo/common/src/nx_ip_create.c"
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/filex/common/src/fx_media_open.c")
     message(STATUS "Initializing git submodules ...")
     execute_process(
         COMMAND git submodule update --init
@@ -339,15 +340,27 @@ option(BSP_PSRAM_INIT_IN_APP "Bring up OCTOSPI1 PSRAM app-side (app-first valida
 # suspicion, since SDMMC1's IDMA is the only DMA engine this app enables.
 option(BSP_ENABLE_SD "Enable the microSD card (SDMMC1) and the sd command" ON)
 
-# The block driver and its command are one unit -- cmd_sd.c is the only caller of
-# port/sd, so they are added or omitted together.  This append must stay BELOW the
-# option() above: SHELL_SOURCES is set earlier in the file, when BSP_ENABLE_SD is
-# still undefined, so appending there silently drops the driver and the link fails
-# on sd_card_init().
+# The block driver, the FileX media stack and the command are one unit -- cmd_sd.c
+# is the only caller of port/sd and port/filex, so they are added or omitted
+# together.  This append must stay BELOW the option() above: SHELL_SOURCES is set
+# earlier in the file, when BSP_ENABLE_SD is still undefined, so appending there
+# silently drops the driver and the link fails on sd_card_init().
+#
+# FileX (eclipse-threadx/filex, MIT, pinned to v6.5.1.202602_rel) is GLOB'd whole
+# and configured through port/filex/fx_user.h, the same pattern as ThreadX and NetX
+# Duo -- one executable compiled uniformly so every translation unit agrees on the
+# FX_MEDIA / FX_FILE layout.  --gc-sections drops the feature paths nothing calls.
 if(BSP_ENABLE_SD)
+    set(FX_DIR "${CMAKE_SOURCE_DIR}/lib/filex")
+    file(GLOB FX_CORE "${FX_DIR}/common/src/*.c")
+    list(FILTER FX_CORE EXCLUDE REGEX "simulat")     # RAM-disk demo drivers
     list(APPEND SHELL_SOURCES
         "${CMAKE_SOURCE_DIR}/port/sd/sd_card.c"
-        "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_sd.c")
+        "${CMAKE_SOURCE_DIR}/port/filex/fx_sd_driver.c"
+        "${CMAKE_SOURCE_DIR}/port/filex/sd_fs_glue.c"
+        "${CMAKE_SOURCE_DIR}/shell/cmds/fs_cmd_core.c"
+        "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_sd.c"
+        ${FX_CORE})
 endif()
 
 add_executable(shell
@@ -389,6 +402,9 @@ target_include_directories(shell PRIVATE
     "${CMAKE_SOURCE_DIR}/app"
     "${CMAKE_SOURCE_DIR}/port/threadx"
     "${CMAKE_SOURCE_DIR}/port/sd"                # issue #6: sd_card.h
+    "${CMAKE_SOURCE_DIR}/port/filex"             # issue #6: fx_user.h + the SD glue
+    "${CMAKE_SOURCE_DIR}/lib/filex/common/inc"
+    "${CMAKE_SOURCE_DIR}/lib/filex/ports/cortex_m7/gnu/inc"
     "${CMAKE_SOURCE_DIR}/shell/include"
     "${CMAKE_SOURCE_DIR}/shell/core"
     "${CMAKE_SOURCE_DIR}/shell/backend"
@@ -423,6 +439,7 @@ target_compile_definitions(shell PRIVATE
     BSP_ENABLE_WFI=$<BOOL:${BSP_ENABLE_WFI}>      # issue #2: gates TX_ENABLE_WFI (tx_user.h)
     BSP_ENABLE_PSRAM=$<BOOL:${BSP_ENABLE_PSRAM}>          # issue #3: PSRAM window + psram cmd
     BSP_PSRAM_INIT_IN_APP=$<BOOL:${BSP_PSRAM_INIT_IN_APP}>  # issue #3: app-side OCTOSPI1 bring-up
+    FX_INCLUDE_USER_DEFINE_FILE             # issue #6: port/filex/fx_user.h
     BSP_ENABLE_SD=$<BOOL:${BSP_ENABLE_SD}>)                 # issue #6: SDMMC1 microSD + sd cmd
 target_compile_options(shell PRIVATE -O2)
 

@@ -33,6 +33,7 @@
 #endif
 #if BSP_ENABLE_SD
 #include "sd_card.h"    /* microSD block driver over SDMMC1 + IDMA (issue #6) */
+#include "sd_fs_glue.h" /* FileX lazy-mount singleton for the card (issue #6) */
 #endif
 
 /* --- interactive shell over USB CDC ------------------------------------- */
@@ -133,6 +134,11 @@ void tx_application_define(void *first_unused_memory)
    * HAL_GetTick and it is safe pre-scheduler (issue #12), like rtl8720_init() above.
    * Fail-soft: on failure the `sd` commands report "driver not initialized". */
   (void) sd_card_init();
+  /* FileX mount singleton: creates its mutexes and runs fx_system_initialize().
+   * Object creation only -- the media is mounted lazily by the first `sd` command
+   * that needs a filesystem, so a boot with no card (or no FAT on it) costs
+   * nothing and cannot fail here. */
+  sd_fs_glue_init();
 #endif
 
   /* Telnet console service (issue #21 increment 9): owns the module's listening/session
