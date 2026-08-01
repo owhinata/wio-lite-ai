@@ -27,7 +27,7 @@
  * being attempted.  This keeps a typo off the Reserved holes in the H725 memory
  * map (RM0468 §2.3.1) -- a read/write there faults to the weak Default_Handler,
  * whose infinite loop would hang the shell.  The default map permits the real
- * on-chip RAM, the internal + external XIP flash (read-only) and the PPB; the
+ * on-chip RAM, the internal flash (read-only) and the PPB; the
  * general peripheral windows are omitted until a fault handler lands (Phase 3b).
  * The PPB is word-access only (many registers fault or misbehave on sub-word
  * access), so dump -- which is byte-granular -- is allowed on RAM/Flash only.
@@ -64,8 +64,8 @@ struct devmem_region {
 
 /*
  * Default region allow-list for the Wio Lite AI (STM32H725) memory map (RM0468
- * §2.3.1).  Only real on-chip RAM, the internal + external XIP flash (read-only),
- * and the PPB are listed; reserved holes and the general peripheral bus windows
+ * §2.3.1).  Only real on-chip RAM, the internal flash (read-only) and the PPB are
+ * listed; reserved holes and the general peripheral bus windows
  * are absent, so a typo there is rejected instead of faulting.  This matters
  * because this build has no fault handler yet (Phase 3b), so a stray access would
  * spin in the weak Default_Handler and hang the shell.  The PPB is word-only.
@@ -73,10 +73,9 @@ struct devmem_region {
  */
 static const struct devmem_region devmem_map[] = {
 	{ 0x00000000u, 0x00010000u, 1, 1, WALL, 0, "ITCM"      }, /* 64 KB               */
-	{ 0x08000000u, 0x00080000u, 1, 0, WALL, 0, "IntFlash"  }, /* 512 KB int, RO (boot) */
+	{ 0x08000000u, 0x00080000u, 1, 0, WALL, 0, "IntFlash"  }, /* 512 KB: sector 0 boot, 1-3 app */
 	{ 0x20000000u, 0x00020000u, 1, 1, WALL, 0, "DTCM"      }, /* 128 KB              */
 	{ 0x24000000u, 0x00050000u, 1, 1, WALL, 0, "AXI-SRAM"  }, /* 320 KB (D1)         */
-	{ 0x70000000u, 0x00800000u, 1, 0, WALL, 0, "XIP-Flash" }, /* ext OCTOSPI2 XIP, RO */
 #if BSP_ENABLE_PSRAM
 	{ 0x90000000u, 0x00800000u, 1, 1, WALL, 1, "PSRAM"     }, /* ext OCTOSPI1 APS6408 (#3); gated on psram_ready() */
 #endif

@@ -19,12 +19,12 @@
  * flips from cacheable-default to non-cacheable.
  *
  * PRIVDEFENA=1 keeps the ARMv7-M background default map for everything the table
- * does not cover, so XIP code at 0x70000000 (Normal WBWA cacheable, executable),
- * AXI-SRAM at 0x24000000 (cacheable), the DTCM log ring (TCM, bypasses the
- * D-cache) and the peripheral/PPB windows all keep their default attributes --
- * only the listed regions override.  Unused regions are explicitly cleared
- * (PM0253 sec 4.6.9: a stale region left from a prior configuration can otherwise
- * take effect).
+ * does not cover, so app code in the internal flash at 0x08020000 (Normal
+ * cacheable, executable), AXI-SRAM at 0x24000000 (cacheable), the DTCM log ring
+ * (TCM, bypasses the D-cache) and the peripheral/PPB windows all keep their
+ * default attributes -- only the listed regions override.  Unused regions are
+ * explicitly cleared (PM0253 sec 4.6.9: a stale region left from a prior
+ * configuration can otherwise take effect).
  */
 #include "stm32h7xx_hal.h"   /* CMSIS core (ARM_MPU_*, __MPU_PRESENT) + device */
 #include "app.h"
@@ -37,7 +37,7 @@ struct mpu_region {
 };
 
 /*
- * v1 region table.  Region 0: the whole 8 MB OCTOSPI1 PSRAM window at 0x90000000
+ * Region table.  Region 0: the whole 8 MB OCTOSPI1 PSRAM window at 0x90000000
  * as Normal, Non-cacheable, Shareable, full RW, execute-never (DMA/data buffers,
  * not code) -- TEX=001, C=0, B=0, S=1, AP=full, XN=1.  8 MB is a power of two and
  * naturally aligned, so it needs no sub-region masking.  Future DMA carve-outs
@@ -74,6 +74,33 @@ static const struct mpu_region mpu_regions[] = {
 		                     /*IsCacheable*/ 0u, /*IsBufferable*/ 0u,
 		                     /*SubRegionDisable*/ 0u,
 		                     ARM_MPU_REGION_SIZE_64KB),
+	},
+	/*
+	 * Region 2: the external OCTOSPI2 window at 0x70000000, fenced off (issue #25).
+	 *
+	 * The app used to execute in place from here; it now runs from the internal
+	 * flash and the bootloader no longer brings OCTOSPI2 up at all, so this window
+	 * is backed by nothing.  In the ARMv7-M background map 0x60000000-0x7FFFFFFF is
+	 * Normal memory, which the core is allowed to access speculatively -- and an
+	 * access to a disabled memory-mapped OCTOSPI either stalls the AXI read
+	 * indefinitely or returns a slave error (RM0468 sec 25.4.16).  An indefinite
+	 * stall is the bad one: it looks like a lockup with no evidence, and only the
+	 * IWDG gets the board back.
+	 *
+	 * No-access + execute-never turns any such access -- speculative or a stale
+	 * pointer someone forgot to update -- into an immediate MemManage fault, which
+	 * app/fault.c records to the reset-persistent log so `dmesg` names the faulting
+	 * PC.  256 MB is the whole 0x70000000-0x7FFFFFFF quarter and is naturally
+	 * aligned, so it needs no sub-region masking.  Remove this row if OCTOSPI2 is
+	 * ever brought up app-side (issue #10).
+	 */
+	{
+		.rbar = ARM_MPU_RBAR(2u, 0x70000000u),
+		.rasr = ARM_MPU_RASR(/*DisableExec*/ 1u, ARM_MPU_AP_NONE,
+		                     /*TEX*/ 1u, /*IsShareable*/ 0u,
+		                     /*IsCacheable*/ 0u, /*IsBufferable*/ 0u,
+		                     /*SubRegionDisable*/ 0u,
+		                     ARM_MPU_REGION_SIZE_256MB),
 	},
 };
 

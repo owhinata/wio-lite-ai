@@ -1,30 +1,40 @@
 # Wio Lite AI プロジェクト
 
 Seeed **Wio Lite AI**（STM32H725AEI6 / Cortex-M7 @ 550 MHz）向けファームウェア。
-内蔵フラッシュ `0x08000000` に**スタンドアロン USB DFU ブートローダ**（`boot/`）が常駐し、
-アプリ本体は**外部 OCTOSPI2 フラッシュ `0x70000000` から XIP 実行**される。ST 公式 HAL、
+内蔵フラッシュ **セクタ0 `0x08000000`（128KB）** に**スタンドアロン USB DFU ブートローダ**
+（`boot/`）が常駐し、アプリ本体は**内蔵フラッシュ セクタ1-3 `0x08020000`（384KB）から
+実行**される（#25 で外部 OCTOSPI2 XIP `0x70000000` から移行。54 → 905 MB/s）。ST 公式 HAL、
 ビルドは CMake + Ninja。HAL/CMSIS/ThreadX/TinyUSB のソースと ARM GNU ツールチェーンは
 初回 configure で自動取得。
 
 現行の作業目標: **`../stm32f746g-disco` の Eclipse ThreadX Shell を app 層に移植する。**
-DFU ブートローダ（`boot/`）は**不変**。shell はブートローダが残したクロック/OCTOSPI2 XIP
-マップの上で動く app として載せる。
+DFU ブートローダ（`boot/`）は**不変**。shell はブートローダが残したクロックツリーの上で
+動く app として載せる。
 
 ## 🔴 最重要: 2 つの不変条件（読み飛ばし厳禁）
 
 ### 1. `boot/`（DFU ブートローダ）は不変
 
 `boot/` と `ldscript/STM32H725AEIx_ROM.ld` は**触らない**。内蔵 `0x08000000` を焼き直す
-操作は**ブリック本番**であり、現存する唯一の実機（board #2）を失う。app 移植で boot 側を
+操作は**ブリック本番**であり、現存する唯一の実機（board #2）を失う。app 開発で boot 側を
 変更する必要は原則ない。もし触る必要が生じたら **必ず** codex-review（3 面）+ objdump 監査
 + バックアップを経てからユーザーに実機書込を依頼する（手順は `boot/README.md`）。
 
+> **#25 は例外的にここへ触った**（app を内蔵実行へ移すため、内蔵フラッシュ書込経路の追加と
+> OCTOSPI2 の撤去）。その際の作法がこのルールの実例: plan を codex-review 3 面 → app 先行で
+> ドライバを実機検証 → objdump 監査（セクタ範囲チェックがバイナリに残っていることまで確認）
+> → バックアップ → 良品 ST-Link(mode=UR) 接続下でユーザーが書込。**boot が内蔵フラッシュを
+> 消去/書込するようになった今、`boot/iflash.c` の範囲チェックはセクタ0 を守る唯一の砦**
+> なので、ここを緩める変更は絶対にしない。
+
 ### 2. app はクロックツリーを再設定しない
 
-DFU ブートローダが `reset → clock.c → OCTOSPI2 mmap → app へ jump` を済ませて渡す。app が
-RCC を再設定（stock CMSIS `SystemInit` / `HAL_Init` / `SystemClock_Config` が行う）すると、
-**OCTOSPI2 の XIP 命令フェッチが止まりハングする**。app の `SystemInit` はクロックを一切
-触らないカスタム版（FPU + VTOR のみ）にする（`src/system_stm32h7xx.c` 参照）。
+DFU ブートローダが `reset → clock.c → app へ jump` を済ませて渡す。app が RCC を再設定
+（stock CMSIS `SystemInit` / `HAL_Init` / `SystemClock_Config` が行う）すると、**継承した
+550 MHz / PLL3Q 48 MHz USB / FLASH_ACR latency 3 が全部壊れる**（HSI 64 MHz に落ちるのに
+フラッシュ latency は 550 MHz 用のまま）。app の `SystemInit` はクロックを一切触らない
+カスタム版（FPU + VTOR + ITCM ロードのみ）にする（`src/system_stm32h7xx.c` 参照）。
+VTOR はリンカの `g_pfnVectors` から取る（アドレスをハードコードしない）。
 
 > ThreadX は SysTick tick と PendSV を必要とする。SysTick の reload は**継承した
 > `SystemCoreClock`（550 MHz）から計算する**が、その過程で **RCC は触らない**。詳細は
@@ -40,8 +50,9 @@ RCC を再設定（stock CMSIS `SystemInit` / `HAL_Init` / `SystemClock_Config` 
 2. **ビルド** — `cmake --build build`
 3. **フラッシュ（DFU）** — **PF1（USER ボタン）を保持したままリセット**で DFU モードに入り
    （赤 LED 点灯 / `dfu-util -l` で列挙）、`dfu-util -d 0483:df11 -a 0 -D build/<app>.bin`。
-   manifest 後に自動 reboot して新 app 起動。（ST-Link の `flash` ターゲットは使わない。
-   それは boot を内蔵に焼く用で、app は DFU 経由。）
+   書込先は内蔵 `0x08020000`（セクタ1-3）。manifest 後に自動 reboot して新 app 起動。
+   （ST-Link 書込は boot をセクタ0 に焼く用だけ。app は DFU 経由。）
+   ⚠ **内蔵の書換え耐久は ~10k サイクル**（外部は 100k だった）。自動ループで焼き直さない。
 4. **動作確認** — ユーザーが実機で確認（**USB CDC シェルコンソール** = `/dev/ttyACM0` /
    LED / 必要なら SWD で観測）
 5. **ドキュメント更新** — 変更に対応する `README.md` / 該当モジュールの README を更新。
@@ -53,14 +64,14 @@ RCC を再設定（stock CMSIS `SystemInit` / `HAL_Init` / `SystemClock_Config` 
 ### Plan + Codex review ワークフロー
 
 **Phase 系 / architecture を変える plan は、plan 確定前と実装後の両方で codex-review を
-実施する。** 本プロジェクトはブリック・XIP ハングのリスクが高いので、以下は特に厳格に扱う:
+実施する。** 本プロジェクトはブリックのリスクが高いので、以下は特に厳格に扱う:
 
 対象となる plan:
 - app のクロック継承／`SystemInit`／VTOR／起動フローに関わる変更
 - ThreadX 統合方針（`_tx_initialize_low_level`、SysTick、PendSV、tick 供給、スタック）
 - 新規ペリフェラル採用、割込み優先度・DMA・キャッシュ構成の変更
 - USB CDC コンソール backend など複数レイヤ（HW + HAL + TinyUSB/ThreadX + shell）に跨る変更
-- リンカスクリプト／メモリ配置（XIP `0x70000000` / AXI-SRAM）の変更
+- リンカスクリプト／メモリ配置（内蔵 `0x08020000` / AXI-SRAM）の変更
 - `boot/` に触れる一切の変更（原則やらないが、やるなら最優先で厳格 review）
 
 ゲートのタイミング:
@@ -167,14 +178,18 @@ dfu-util -d 0483:df11 -a 0 -D build/<app>.bin
 - MCU: STM32H725AEI6 / Cortex-M7、**550 MHz**。DFU ブートローダが構成する
   クロックを継承する（HSE 25 MHz → PLL1 M2 N44 → VCO 550、P/1 = sysclk 550 CPU、
   VOS0 + SMPS 直結供給、FLASH ACR=0x33 latency 3）。**app は RCC を再設定しない**。
-- FPU on。I-Cache / D-Cache は用途に応じて（XIP + OCTOSPI2 / DMA コヒーレンシに注意）。
-- **メモリ配置**（`ldscript/STM32H725AEIx_XIP.ld`）:
-  - FLASH: 外部 OCTOSPI2 XIP 窓 `0x70000000`（W25Q128 16 MB、リンク上は 8 MB）。app の
-    ベクタ table 先頭に MSP / Reset。
+- FPU on。I-Cache / D-Cache は両方 ON（DMA マスタ不在なので自己コヒーレント）。
+- **メモリ配置**（`ldscript/STM32H725AEIx_IROM.ld`）:
+  - 内蔵 Flash 512 KB = **1 バンク・128 KB セクタ × 4**（RM0468 Table 15）。
+    **セクタ0 `0x08000000` = DFU ブートローダ専用**、**セクタ1-3 `0x08020000` 384 KB = app**。
+    消去単位がセクタ境界と一致するので、app 書込経路はセクタ0 に物理的に到達できない。
+    app のベクタ table 先頭に MSP / Reset。
   - RAM: **AXI-SRAM (D1) 320 KB @ 0x24000000**、`_estack = 0x24050000`（ブートローダが
     vector[0] からロードする MSP と一致）。
   - DTCM: 128 KB @ 0x20000000。ITCM 64 KB @ 0x00000000。
-  - 内蔵 Flash `0x08000000`（512 KB）は **DFU ブートローダ専用**。app は所有しない。
+  - 外部 OCTOSPI2 `0x70000000`（W25Q128 16 MB）は **#25 以降どこからも mmap されない**。
+    `app/mpu.c` が 256 MB を no-access + XN で塞いでいる（未初期化 mmap read は AXI 無期限
+    ストールになるため）。ストレージとして使うなら app 側 bring-up から＝ #10 の範疇。
 - **コンソール = USB CDC**: 単一 USB = **USB1_OTG_HS を FS（内蔵 PHY）動作**。CMSIS に
   `USB2_OTG_FS` / `OTG_FS_IRQn` は**無い** → TinyUSB(dwc2) は rhport0 を OTG_HS base +
   `OTG_HS_IRQHandler` にエイリアス（`tud_int_handler(0)`）。GPIO = PA11/PA12
@@ -227,5 +242,6 @@ dfu-util -d 0483:df11 -a 0 -D build/<app>.bin
   良品 ST-Link mode=UR 安全ゲート（`boot/README.md`）。
 - **オプションバイト / RDP / DBGMCU / SWD 端子（PA13/14）は絶対に触らない**。悪い config でも
   SWD で再書込できる状態を必ず保つ。
-- app は DFU フォールバックで常に再ロード可能（erased/invalid app は必ず DFU モードに入る）
+- app は DFU フォールバックで常に再ロード可能（erased/invalid app は必ず DFU モードに入る。
+  中断した DFU 転送も、先頭 32B を最後に書く vector-last commit により必ずここに落ちる）
   ——この安全網を壊す変更（boot の DFU 判定条件など）を app 側から入れない。

@@ -1,22 +1,32 @@
 /*
- * Linker script for the Wio Lite AI (STM32H725AEI6) blink, running XIP from the
- * external OCTOSPI2 NOR flash (W25Q128, 16 MB) that the TinyUF2 bootloader
- * memory-maps and boots.
+ * Linker script for Wio Lite AI (STM32H725AEI6) applications, running from the
+ * INTERNAL flash app partition that the DFU bootloader programs and boots.
  *
- *   FLASH : 8 MB  @ 0x70000000  -- external OCTOSPI2 XIP window (the bootloader
- *                                  validates .uf2 writes against 0x70000000+8 MB
- *                                  and jumps to the vector table it finds here).
+ *   FLASH : 384 KB @ 0x08020000 -- internal flash sectors 1-3 (issue #25).  The
+ *                                  bootloader owns sector 0 (0x08000000, 128 KB)
+ *                                  and jumps to the vector table it finds here.
  *   RAM   : 320 KB @ 0x24000000 -- AXI-SRAM (D1).  _estack = 0x24050000, exactly
  *                                  the MSP the bootloader loads from vector[0].
- *   DTCM  : 128 KB @ 0x20000000 -- tightly-coupled RAM (unused by the blink).
+ *   DTCM  : 128 KB @ 0x20000000 -- tightly-coupled RAM (reset-persistent log).
  *   ITCM  :  64 KB @ 0x00000000 -- tightly-coupled instruction RAM; holds the ISR
- *                                  paths (.itcm, issue #24) so they are not fetched
- *                                  from OCTOSPI2 through a 16 KB I-cache.
+ *                                  paths (.itcm, issue #24), which are zero-wait
+ *                                  and outside both caches.
  *
- * The app does NOT own the internal 0x08000000 flash (that is the TinyUF2
- * bootloader) and must NOT reconfigure the clock tree: it executes straight out
- * of OCTOSPI2, whose kernel clock is PLL2R -- resetting the RCC (as the stock
- * CMSIS SystemInit does) would stall the instruction fetch.  See src/system_stm32h7xx.c.
+ * WHY 0x08020000 AND NOT 0x70000000 (issue #25): the app used to execute in place
+ * from the external OCTOSPI2 NOR flash mapped at 0x70000000.  That window reads at
+ * ~54 MB/s (88.7 MHz Quad, membench) against ~905 MB/s for the internal flash, and
+ * every cold path, every interrupt that had fallen out of the 16 KB I-cache, and
+ * the whole of startup paid for it.  The bootloader no longer brings OCTOSPI2 up at
+ * all, so 0x70000000 is not mapped while this app runs -- app/mpu.c fences it off.
+ *
+ * The app must NOT reconfigure the clock tree.  That rule outlived the move: the
+ * bootloader hands over HSE 25 MHz -> PLL1 550 MHz CPU, PLL3Q 48 MHz for USB and
+ * FLASH_ACR latency 3 / WRHIGHFREQ 3 for exactly this frequency.  The stock CMSIS
+ * SystemInit resets the RCC to HSI and would take all of that away.
+ * See src/system_stm32h7xx.c.
+ *
+ * The 128 KB sector size is also the erase granule, so the bootloader's own sector
+ * is not reachable from anything that programs this partition (RM0468 Table 15).
  *
  * Symbols (_estack, _sdata, _edata, _sidata, _sbss, _ebss) match the CMSIS gcc
  * startup file startup_stm32h725xx.s.
@@ -38,14 +48,25 @@ MEMORY
    * 192 KB of the shared block assigned to AXI-SRAM -- which is why RAM above is
    * 320 KB, not 128 KB).  We never touch option bytes (CLAUDE.md), so 64 KB is fixed. */
   ITCM  (rx)  : ORIGIN = 0x00000000, LENGTH = 64K
-  FLASH (rx)  : ORIGIN = 0x70000000, LENGTH = 8M     /* external OCTOSPI2 XIP */
+  /* Internal flash sectors 1-3.  Sector 0 (0x08000000) is the DFU bootloader and
+   * is deliberately outside this region: overflowing the app cannot reach it, it
+   * is a link error (issue #25). */
+  FLASH (rx)  : ORIGIN = 0x08020000, LENGTH = 384K
   PSRAM (xrw) : ORIGIN = 0x90000000, LENGTH = 8M     /* external OCTOSPI1 APS6408 (issue #3) */
 }
 
+/* Published so the app can report its own partition instead of hard-coding it
+ * (shell `free` / `version`): a second copy of these numbers in C would be one
+ * more thing to forget when the map changes. */
+PROVIDE(__app_flash_start = ORIGIN(FLASH));
+PROVIDE(__app_flash_size  = LENGTH(FLASH));
+
 SECTIONS
 {
-  /* Interrupt vector table at the very start of the XIP flash -- the bootloader
-   * reads vector[0] (MSP) / vector[1] (Reset_Handler) from here. */
+  /* Interrupt vector table at the very start of the partition -- the bootloader
+   * reads vector[0] (MSP) / vector[1] (Reset_Handler) from here, and refuses to
+   * boot an image whose reset vector is outside this window.  The region origin
+   * is 128 KB aligned, which more than covers the VTOR alignment requirement. */
   .isr_vector :
   {
     . = ALIGN(4);
@@ -58,14 +79,23 @@ SECTIONS
   } >FLASH
 
   /* ---- ITCM-resident interrupt paths (issue #24) --------------------------
-   * Every ISR in this app used to be fetched from the external OCTOSPI2 flash.
-   * The M7 I-cache is only 16 KB, so once coremark / USB / shell / telnet run, the
-   * ISR lines are evicted and each burst pays a cold XIP fetch again: measured on
-   * board #2, rtl_uart_isr() took 8.7 us cold vs 3.3 us warm (#23 U0-1).  ITCM is
-   * zero-wait-state and outside both caches, so residents here have a fixed cost.
+   * When this app executed XIP from the external OCTOSPI2 flash, every ISR was
+   * fetched through a 16 KB I-cache at ~54 MB/s: once coremark / USB / shell /
+   * telnet had evicted the ISR lines, each burst paid the cold fetch again --
+   * rtl_uart_isr() measured 8.7 us cold vs 3.3 us warm on board #2 (#23 U0-1), and
+   * moving it here made it a flat 0.7 us.
    *
-   * VMA in ITCM, LMA in the XIP flash; src/system_stm32h7xx.c copies the image in
-   * SystemInit() before anything can take an interrupt (the CMSIS startup only
+   * Issue #25 moved execution to the internal flash (~905 MB/s, roughly the AXI-SRAM
+   * refill rate), which shrinks that gap enormously -- but does not close it.  ITCM
+   * is still strictly better for an interrupt path: zero wait states, outside both
+   * caches, and never evicted by whatever the threads are doing.  So this section
+   * stays, with its win now measured in hundreds of nanoseconds rather than
+   * microseconds.  (The historical numbers in the comments below were taken on the
+   * external-XIP build; they document why each entry was chosen, not what it costs
+   * today.)
+   *
+   * VMA in ITCM, LMA in the app partition; src/system_stm32h7xx.c copies the image
+   * in SystemInit() before anything can take an interrupt (the CMSIS startup only
    * copies .data, so this section needs its own copy loop).
    *
    * TWO PLACEMENT RULES, both learned the hard way:
@@ -85,12 +115,13 @@ SECTIONS
    *
    * The ASSERTs at the end of this file catch a pattern that silently stops
    * matching (e.g. after a submodule bump renames a file) -- otherwise the code
-   * just quietly moves back to XIP and the win disappears with no build error.
+   * just quietly moves back to the flash and the win disappears with no build
+   * error.
    *
    * NOT here, deliberately: the vector table itself (the bootloader reads MSP from
-   * 0x70000000, so VTOR stays there and the vector fetch is still an OCTOSPI2
-   * read) and the dwc2 USB ISR (~1.5 KB with a wide call closure -- separate
-   * increment).  Empty for firmwares with no ISRs of their own (blink). */
+   * the partition base, so VTOR stays there) and the dwc2 USB ISR (~1.5 KB with a
+   * wide call closure -- separate increment).  Empty for firmwares with no ISRs of
+   * their own (blink). */
   .itcm :
   {
     . = ALIGN(8);
@@ -105,13 +136,13 @@ SECTIONS
 
     /* The two C functions the timer ISR tail-calls when a timer actually expires
      * or a time slice runs out.  Their own callees (timer thread wakeup, thread
-     * resume) stay in XIP: this closes the tick path, not the whole scheduler. */
+     * resume) stay in the flash: this closes the tick path, not the whole scheduler. */
     *(.text._tx_timer_expiration_process)
     *(.text._tx_thread_time_slice)
 
     /* Execution Profile Kit (issue #2, `thread` cpu%): called from every ISR entry
      * and every context switch, so it is on both hot paths above.  The setup and
-     * *_time_get query helpers stay in XIP -- they run from thread context. */
+     * *_time_get query helpers stay in the flash -- they run from thread context. */
     *(.text._tx_execution_isr_enter)
     *(.text._tx_execution_isr_exit)
     *(.text._tx_execution_thread_enter)
@@ -133,7 +164,7 @@ SECTIONS
     /* ...and the wake-up it performs (issue #23 U0-3).  The RX ISR signals the eRPC
      * service thread so it starts reading a frame immediately instead of waiting out
      * its 1 ms poll.  Measured on board #2, adding that call took the ISR from 0.7 us
-     * to 4.3 us warm and 12.9 us cold -- all of it XIP fetch, at ~24 k interrupts/s at
+     * to 4.3 us warm and 12.9 us cold -- all of it external-flash fetch, at ~24 k interrupts/s at
      * 6 Mbaud, i.e. around a tenth of the CPU spent fetching instructions.
      *
      * _tx_thread_system_resume is the tail of that path (the service thread is
@@ -150,7 +181,7 @@ SECTIONS
      * case (`wifi ver`, `wifi scan`): the eRPC service thread is parked in
      * tx_event_flags_get() WITH A TIMEOUT, so every wake-up has to unlink its timer
      * (_tx_timer_system_deactivate) and then re-check preemption.  With only the
-     * heads above resident, those two were still fetched from XIP through veneers and
+     * heads above resident, those two were still fetched from the flash through veneers and
      * held the measured worst-case ISR at 3.5 us, versus 0.1 us for an ISR that wakes
      * nobody.  106 bytes together, and in this Cortex-M7/GNU configuration both link
      * as leaves, so nothing further follows them: preempt_check's
@@ -160,9 +191,9 @@ SECTIONS
     *(.text._tx_timer_system_deactivate)
 
     /* Fault handlers (app/fault.c).  This buys the fetch cost of the handler body
-     * only -- it does NOT make a wedged OCTOSPI2 survivable, because the vector
-     * read itself still comes from 0x70000000 and fault_handler_c calls log_write
-     * in XIP (the linker emits a veneer for it).  See the file header. */
+     * only: the vector read itself still comes from the flash and fault_handler_c
+     * calls log_write there too (the linker emits a veneer for it).  See the file
+     * header. */
     *(.text.HardFault_Handler)
     *(.text.fault_handler_c)
     *(.text.fault_rest*)
@@ -236,17 +267,19 @@ SECTIONS
     PROVIDE_HIDDEN (__fini_array_end = .);
   } >FLASH
 
-  /* Initialized data: LMA in XIP flash (_sidata), copied to AXI-SRAM at reset. */
+  /* Initialized data: LMA in the app partition (_sidata), copied to AXI-SRAM at
+   * reset. */
   _sidata = LOADADDR(.data);
   .data :
   {
     . = ALIGN(4);
     _sdata = .;
-    /* Code that must execute from RAM, not XIP: the OCTOSPI2 self-programming
-     * driver runs while the flash is switched out of memory-mapped mode, so it
-     * (and anything it calls) cannot be fetched from 0x70000000.  Placed at the
-     * head of .data so the CMSIS startup's _sidata->_sdata.._edata copy loads it
-     * into AXI-SRAM before main().  (Empty for firmwares that use no .RamFunc.) */
+    /* Code that must execute from RAM rather than from the flash it is operating
+     * on.  Kept as a placement facility -- nothing in the app uses it today, and
+     * the internal flash does not need it (a program/erase stalls the fetch and
+     * then resumes, RM0468 sec 4.3.8; the bootloader relies on exactly that).
+     * Placed at the head of .data so the CMSIS startup's _sidata->_sdata.._edata
+     * copy loads it into AXI-SRAM before main(). */
     *(.RamFunc)
     *(.RamFunc*)
     . = ALIGN(4);
@@ -380,7 +413,7 @@ SECTIONS
 
   /* ---- .itcm residency guards (issue #24) ---------------------------------
    * An input-section pattern that stops matching does NOT fail the link -- the
-   * code just silently reverts to XIP and the interrupt-latency win vanishes
+   * code just silently reverts to the flash and the interrupt-latency win vanishes
    * unnoticed.  Assert that the named entry points really did land in ITCM.
    *
    * DEFINED(...) guards each one because both app firmwares share this script and
@@ -390,7 +423,7 @@ SECTIONS
    * The two vector-table entry points are gated on a STRONG companion symbol from
    * the same module, not on themselves: the CMSIS startup declares every vector
    * .weak and aliases it to Default_Handler, so DEFINED(SysTick_Handler) is true
-   * even in blink -- where it correctly lives in XIP -- and asserting on it
+   * even in blink -- where it correctly lives in the flash -- and asserting on it
    * directly breaks the blink link. */
   ASSERT(DEFINED(_tx_thread_schedule) ?
          (_tx_thread_schedule < ORIGIN(ITCM) + LENGTH(ITCM)) : 1,

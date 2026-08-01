@@ -38,11 +38,10 @@ struct psram_diag {
 /*
  * Bring up OCTOSPI1 + the APS6408 Octal DDR PSRAM in memory-mapped mode.
  *
- * Bare-register, bounded poll-loops, fail-soft.  Touches ONLY OCTOSPI1 and GPIO
- * banks B/D/E -- never OCTOSPI2, the OCTOSPIM I/O manager, or the RCC
- * clock tree -- so it is safe to call while the app executes XIP from OCTOSPI2 at
- * 0x70000000 (OCTOSPI1 is a separate port + register block sharing only the
- * already-running PLL2R kernel clock).  Uses no HAL_GetTick or libc.
+ * Bare-register, bounded poll-loops, fail-soft.  Touches ONLY OCTOSPI1 and its
+ * Port-1 pins (GPIO banks B/D/E/F/G, per-pin RMW) -- never OCTOSPI2, the OCTOSPIM
+ * routing registers, or the RCC clock tree; it runs on the PLL2R kernel clock the
+ * bootloader already started.  Uses no HAL_GetTick or libc.
  *
  * Call after HAL_Init(), before tx_kernel_enter().  Returns 1 if the device
  * answered and memory-mapped mode was entered, 0 on failure (the shell still

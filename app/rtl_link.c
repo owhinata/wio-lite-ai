@@ -6,7 +6,7 @@
  * Ownership of the onboard RTL8720DN link (issue #5; promoted from shell/cmds/ and
  * given the coarse mutex + UART reference count in issue #21 increment 8).
  * See rtl_link.h for the model and the lock order.  No clock/RCC/register access of
- * its own (XIP-safe).
+ * its own (clock-safe).
  */
 #include "rtl_link.h"
 

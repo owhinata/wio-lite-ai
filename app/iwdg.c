@@ -8,7 +8,7 @@
  *
  * The IWDG1 is clocked by the LSI (~32 kHz typ, 17-47 kHz over tolerance),
  * independent of the inherited HSE+PLL 550 MHz tree, so it keeps counting even if
- * the main clock, the OCTOSPI2 XIP instruction fetch or the ThreadX scheduler
+ * the main clock, the instruction fetch or the ThreadX scheduler
  * stalls.  Prescaler /64 + reload 1499 gives T = 64 * (1499 + 1) / f_LSI: ~3.0 s at
  * the typical LSI and 2.04 s at the 47 kHz fast corner.  The priority-5 petter
  * thread (app/main.c) refreshes every ~1 s (<= T/2 at every LSI corner), so it

@@ -1,22 +1,24 @@
 /*
- * SPDX-License-Identifier: MIT
- * Copyright (c) 2026 ThreadX Shell Project
- */
-/**
- * @file    iflash.h
- * @brief   Internal-flash (sector 1-3) erase/program driver -- issue #25.
+ * Internal-flash (sector 1-3) erase/program driver for the Wio Lite AI standalone
+ * DFU bootloader -- issue #25.
  *
- * The app is moving from XIP out of the external OCTOSPI2 window (0x70000000,
- * ~44 MB/s) to execution from the internal flash at 0x08020000 (~905 MB/s).  The
- * DFU bootloader is what will actually program that region, but the driver is
- * validated HERE FIRST, app-side, while the app still runs XIP from the external
- * flash: the instruction fetch then comes from OCTOSPI2, so it is completely
- * unaffected by the internal bank being busy, and sector 0 (the bootloader) is
- * never a candidate.  Same "app-first validation" pattern as the PSRAM bring-up
- * (BSP_PSRAM_INIT_IN_APP) and the DFU bootloader's own phase 1.
+ * This is what a DFU download writes to: the app lives at 0x08020000 and executes
+ * from there, so the bootloader owns the erase/program path for sectors 1-3.
  *
- * The file is deliberately dependency-free (HAL only, no libc, no ThreadX, no
- * shell) so it can be copied verbatim into boot/ once validated.
+ * The driver was validated app-side first (a temporary `iflash` shell command in
+ * the last external-XIP build) so that this file, which ends up in the internal
+ * flash where a bad image cannot be debugged, was already proven on board #2
+ * before being flashed.
+ *
+ * PROGRAMMING WHILE EXECUTING FROM THE SAME BANK: the part has ONE flash bank, so
+ * the bootloader erases/programs the same bank it is running from.  That is
+ * supported: reads are queued and served once the outstanding operation completes
+ * (RM0468 sec 4.3.8), so an instruction fetch during an erase stalls and then
+ * resumes -- it does not fault.  ST's own single-bank example does the same thing
+ * from flash-resident code (STM32Cube_FW_H7 NUCLEO-H723ZG FLASH_EraseProgram).
+ * The visible consequence is that no interrupt runs for the duration of an erase,
+ * which is why the DFU layer hands the host a bwPollTimeout that covers it BEFORE
+ * starting one.
  *
  * MEMORY MAP (RM0468 sec 4.3.4 Table 15 -- STM32H723/733 and H725/735):
  *   one bank, 128 KB sectors.
@@ -39,10 +41,9 @@
  * word plus 10 ECC bits; a non-virgin word may not be overwritten.  Hence
  * erase-then-program, 32-byte-aligned, with short tails padded to 0xFF.
  *
- * Clean-room design; no third-party code reused.
  */
-#ifndef APP_IFLASH_H
-#define APP_IFLASH_H
+#ifndef BOOT_IFLASH_H
+#define BOOT_IFLASH_H
 
 #include <stdint.h>
 
@@ -95,11 +96,22 @@ uint32_t iflash_device_kb(void);
  *
  * Sector 0 and any non-existent sector (4-7, which the HAL's IS_FLASH_SECTOR
  * would happily accept on this 512 KB part) are rejected before the HAL is
- * called.  Blocking: on this single-bank part the CPU stalls on any fetch from
- * the internal flash until the erase completes (RM0468 sec 4.3.8) -- harmless
- * here, where the caller executes from the external XIP window.
+ * called.  Blocking, and it blocks HARD: the bootloader itself runs from this
+ * bank, so nothing executes -- interrupts included -- until the erase completes
+ * (RM0468 sec 4.3.8).  Callers must have told the USB host to wait first.
  */
 int iflash_erase_sector(uint32_t sector);
+
+/**
+ * @brief  Cycles the last erase took, measured on the DWT cycle counter.
+ *
+ * The number the DFU bwPollTimeout is sized from.  HAL_GetTick cannot measure it
+ * here: SysTick does not fire while the core is stalled on the flash, so the tick
+ * barely advances across an erase.  DWT/DEMCR are Cortex-M core debug registers,
+ * NOT the STM32 DBGMCU peripheral -- neither the SWD interface nor any option byte
+ * is affected.  Wraps if an erase were ever to exceed ~7.8 s at 550 MHz.
+ */
+uint32_t iflash_last_erase_cycles(void);
 
 /**
  * @brief  Program @p len bytes at @p off bytes into the app partition.
@@ -135,4 +147,4 @@ uint32_t iflash_last_hal_error(void);
 }
 #endif
 
-#endif /* APP_IFLASH_H */
+#endif /* BOOT_IFLASH_H */

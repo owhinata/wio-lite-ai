@@ -8,7 +8,9 @@
  *
  *   HSE 25 MHz crystal
  *   PLL1: /M2 (12.5) xN44 -> VCO 550; P/1 -> SYSCLK 550 (CPU); Q/5 110; R/2 275
- *   PLL2: /M25 (1) xN266 -> VCO 266; R/1 -> 266 -> OCTOSPI2 (DCR2 /3 ~89 MHz)
+ *   PLL2: /M25 (1) xN266 -> VCO 266; R/1 -> 266 -> OCTOSPI kernel clock (the app
+ *         runs the OCTOSPI1 PSRAM off it at /2 = 133 MHz; issue #25 removed the
+ *         OCTOSPI2 user, but the PLL is left configured -- see the note below)
  *   PLL3: /M5 (5) xN48 -> VCO 240; Q/5 -> 48 MHz -> USB
  *   HPRE /2 (AXI/AHB 275), APBx /2; FLASH latency 3; VOS0; SMPS direct supply.
  *   OCTOSPI kernel <- PLL2R; USB <- PLL3Q.
@@ -57,7 +59,9 @@ void SystemClock_Config(void)
   clk.APB4CLKDivider = RCC_APB4_DIV2;
   if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_3) != HAL_OK) { while (1) {} }
 
-  // PLL2 -> OCTOSPI2 kernel (PLL2R 266), PLL3 -> USB (PLL3Q 48).
+  // PLL2 -> OCTOSPI kernel (PLL2R 266), PLL3 -> USB (PLL3Q 48).  PLL2 stays even
+  // though this bootloader no longer uses OCTOSPI2 (issue #25): the app's PSRAM
+  // bring-up inherits it, and changing this file buys nothing but risk.
   pclk.PeriphClockSelection = RCC_PERIPHCLK_OSPI | RCC_PERIPHCLK_USB;
   pclk.PLL2.PLL2M = 25; pclk.PLL2.PLL2N = 266; pclk.PLL2.PLL2P = 2;
   pclk.PLL2.PLL2Q = 2;  pclk.PLL2.PLL2R = 1;

@@ -22,7 +22,7 @@
  * queue-depth callbacks wake it.  That is the mechanism the packet pool and the link's
  * DATA transmit pool were sized around (see the transmit budget note in app/nx_net.h).
  *
- * No clock/RCC/register work of its own (XIP-safe).  Clean-room design.
+ * No clock/RCC/register work of its own (clock-safe).  Clean-room design.
  */
 #include "net_shell.h"
 

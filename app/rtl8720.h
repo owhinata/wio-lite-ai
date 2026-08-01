@@ -22,7 +22,7 @@
  * downloader.  Which of them owns the UART is arbitrated one layer up, in app/rtl_link.h.
  *
  * It touches only GPIO + UART9/USART1 + peripheral clock gates -- never the RCC clock
- * tree (baud is derived from the inherited PCLK2 = 137.5 MHz) -- so it is XIP-safe.
+ * tree (baud is derived from the inherited PCLK2 = 137.5 MHz) -- so it is clock-safe.
  */
 #ifndef APP_RTL8720_H
 #define APP_RTL8720_H

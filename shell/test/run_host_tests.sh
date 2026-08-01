@@ -8,7 +8,7 @@
 # verbatim port from stm32f746g-disco, so these HW-independent tests run
 # unchanged.  Each test links shell/test/host_sections.ld, which supplies the
 # .shell_root_cmds section + boundary symbols that the target ldscript
-# (ldscript/STM32H725AEIx_XIP.ld) provides on hardware.  No firmware build is
+# (ldscript/STM32H725AEIx_IROM.ld) provides on hardware.  No firmware build is
 # involved -- this runs on the build host, not the board.
 #
 # svc/ymodem.c came over with issue #19 M4 (the RTL8720DN flash backup streams

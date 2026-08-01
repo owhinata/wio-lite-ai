@@ -1,5 +1,6 @@
 /*
- * Wio Lite AI (STM32H725AEI6) -- LED blink, XIP from external OCTOSPI2 flash.
+ * Wio Lite AI (STM32H725AEI6) -- LED blink, running from the internal flash app
+ * partition (0x08020000).
  *
  * Board wiring (from _ref/...Schematic.pdf, sheet 8 "LED & Button"):
  *   LED2 (red,   "LED0") <- PC13 -> NPN digital transistor (DDC114VU) -> LED to 3V3.
@@ -10,7 +11,8 @@
  *
  * Clocking: we run entirely on the clock tree the TinyUF2 bootloader left us
  * (CPU 550 MHz).  We do NOT call HAL_Init()/SystemClock_Config() -- reprogramming
- * the clocks would kill the OCTOSPI2 XIP fetch (see src/system_stm32h7xx.c).  The
+ * the clocks would take away the 550 MHz / USB / flash-latency setup the
+ * bootloader established (see src/system_stm32h7xx.c).  The
  * delay is a self-contained DWT cycle-counter busy-wait (CPU-clock based), so it
  * needs no SysTick interrupt and no tick configuration.
  */

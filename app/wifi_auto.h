@@ -53,7 +53,7 @@
  * exception is wifi_auto_armed(), which is polled roughly every millisecond from
  * erpc_call_ex()'s abort hook and therefore only ever reads a single volatile bool.
  *
- * No clock/RCC/register work of its own (XIP-safe).  Clean-room design.
+ * No clock/RCC/register work of its own (clock-safe).  Clean-room design.
  */
 #ifndef APP_WIFI_AUTO_H
 #define APP_WIFI_AUTO_H

@@ -6,7 +6,7 @@
  * The link's DATA channel (issue #23 U1).  See link_data.h for the wire format, the
  * ownership rules and the detach ordering rule.
  *
- * Register-agnostic and clock-agnostic (XIP-safe): pools and queues only.  The UART is
+ * Register-agnostic and clock-agnostic (clock-safe): pools and queues only.  The UART is
  * never touched here -- app/erpc.c's service thread remains the single owner of it, and
  * this file only hands it frames to write and takes frames it has read.
  *

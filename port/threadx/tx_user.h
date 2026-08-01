@@ -54,8 +54,9 @@
  * SWD-debug build can be made with -DBSP_ENABLE_WFI=OFF (a WFI-sleeping core is hard
  * to attach without connect-under-reset).  Safe: Cortex-M7 CSleep keeps HCLK/APB
  * running (only the CPU stops), so SysTick(14) still ticks, OTG_HS(6) RX wakes the
- * core (WFI wakes on any enabled IRQ regardless of PRIMASK), and TIM2/OCTOSPI2 keep
- * their clocks (TIM2LPEN / OCTO2LPEN) -- the app XIP-executes from OCTOSPI2. */
+ * core (WFI wakes on any enabled IRQ regardless of PRIMASK), TIM2 keeps counting
+ * (TIM2LPEN) and the internal flash the CPU wakes back up into keeps its clock
+ * (AHB3LPENR.FLASHLPEN, set out of reset and never cleared here). */
 #if defined(BSP_ENABLE_WFI) && (BSP_ENABLE_WFI)
 #define TX_ENABLE_WFI
 #endif

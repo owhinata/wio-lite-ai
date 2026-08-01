@@ -1,10 +1,6 @@
 /*
- * SPDX-License-Identifier: MIT
- * Copyright (c) 2026 ThreadX Shell Project
- */
-/**
- * @file    iflash.c
- * @brief   Internal-flash (sector 1-3) erase/program driver -- issue #25.
+ * Internal-flash (sector 1-3) erase/program driver for the Wio Lite AI standalone
+ * DFU bootloader -- issue #25.
  *
  * See iflash.h for the memory map, the safety argument and the reference-manual
  * citations.  Two properties are worth restating where the code lives:
@@ -20,14 +16,34 @@
  *      unlock (HAL_FLASH_OB_Unlock, FLASH_OPTKEYR) and OPTCR are never touched,
  *      so RDP / BOOT / SWD configuration cannot be altered by this code -- the
  *      objdump audit before flashing the bootloader checks exactly this.
- *
- * Clean-room design; no third-party code reused.
  */
 #include "iflash.h"
 
 #include "stm32h7xx_hal.h"
 
 static uint32_t iflash_hal_err;
+static uint32_t iflash_erase_cycles;
+
+/*
+ * Start the DWT cycle counter, the only clock that survives an erase: the core
+ * stalls on every instruction fetch from the flash while one is running, so
+ * SysTick does not tick, but DWT->CYCCNT is hardware and keeps counting.  Only
+ * CoreDebug->DEMCR and DWT are written -- these are ARM core registers, not the
+ * STM32 DBGMCU peripheral that the project rules forbid touching.
+ */
+static void iflash_cyccnt_init(void)
+{
+	if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) != 0u)
+		return;
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+	DWT->CYCCNT = 0u;
+	DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
+uint32_t iflash_last_erase_cycles(void)
+{
+	return iflash_erase_cycles;
+}
 
 uint32_t iflash_device_kb(void)
 {
@@ -70,6 +86,7 @@ int iflash_erase_sector(uint32_t sector)
 {
 	FLASH_EraseInitTypeDef erase = {0};
 	uint32_t bad_sector = 0xFFFFFFFFu;
+	uint32_t t0;
 	HAL_StatusTypeDef st;
 
 	if (!iflash_available())
@@ -88,11 +105,15 @@ int iflash_erase_sector(uint32_t sector)
 	erase.NbSectors    = 1u;
 	erase.VoltageRange = FLASH_VOLTAGE_RANGE_4; /* 64-bit parallelism at 3.3 V */
 
+	iflash_cyccnt_init();
+
 	if (HAL_FLASH_Unlock() != HAL_OK) {
 		iflash_hal_err = HAL_FLASH_GetError();
 		return IFLASH_ERR_HAL;
 	}
+	t0 = DWT->CYCCNT;
 	st = HAL_FLASHEx_Erase(&erase, &bad_sector);
+	iflash_erase_cycles = DWT->CYCCNT - t0;
 	(void)HAL_FLASH_Lock();
 
 	if (st != HAL_OK) {

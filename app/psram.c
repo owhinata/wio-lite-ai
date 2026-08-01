@@ -6,20 +6,24 @@
  * validated on board #2 with a full-8MB test pass; the operating-point table and
  * the two-stage bring-up are documented at the PSRAM_* defines below.
  *
- * WHY THIS IS SAFE TO RUN FROM XIP: OCTOSPI1 and OCTOSPI2 sit on separate
- * OCTOSPIM ports (P1 vs P2, un-muxed) and separate register blocks, sharing only
- * the already-running PLL2R 266 MHz kernel clock.  This file writes ONLY OCTOSPI1,
- * GPIO B/D/E and the OCTOSPI1 delay block -- never OCTOSPI2, OCTOSPIM
- * (CR/P1CR/P2CR), or the RCC -- so it never disturbs the code memory the CPU is
- * fetching.  HAL_OSPIM_Config() is deliberately NOT used: it clears CR.EN on BOTH
- * OCTOSPIs, which would kill the XIP fetch.  OCTOSPIM is left fully at reset --
- * its P1CR reset value (0x03010111) already enables the octal IO[7:0] + DQS + CLK
- * + NCS on Port 1 (RM0468 sec 26.5.2).
+ * OWNERSHIP: this file owns OCTOSPI1 end to end -- its registers, its Port-1 pins
+ * (GPIO B/D/E/F/G, per-pin RMW) and its delay block.  It does not touch OCTOSPI2,
+ * the OCTOSPIM routing registers (CR/P1CR/P2CR) or the RCC clock tree; the kernel
+ * clock is the PLL2R 266 MHz the bootloader already started.  HAL_OSPIM_Config()
+ * is deliberately NOT used: it clears CR.EN on BOTH OCTOSPIs.  OCTOSPIM is left at
+ * reset -- its P1CR reset value (0x03010111) already enables the octal IO[7:0] +
+ * DQS + CLK + NCS on Port 1 (RM0468 sec 26.5.2) -- but its bus clock is enabled
+ * here.
+ *
+ * Before issue #25 the app executed XIP from OCTOSPI2 and the bootloader had put
+ * the Port-1 pins in AF while bringing that flash up, so this file only configured
+ * the octal-extension pins.  Both of those are gone: the app runs from the internal
+ * flash and the bootloader never touches OCTOSPI2, so psram_gpio_init() now
+ * configures the full pin set.
  *
  * PIN MAP (schematic sheet 5/6 "OSPI1_*" nets; AF from the H735-DK BSP, same
  * silicon/pins, cross-checked vs the STM32H725 datasheet Table 8/9):
- *   IO0..3 PF8/PF9/PF7/PF6 AF10, CLK PF10 AF9, NCS PG6 AF10  -- already in AF from
- *          the bootloader (boot/octospi.c); this file leaves them alone.
+ *   IO0..3 PF8/PF9/PF7/PF6 AF10, CLK PF10 AF9, NCS PG6 AF10  (note the split AF).
  *   IO4 PD4, IO5 PD5, IO7 PD7, DQS PB2 -- all AF10 (H735-DK confirmed).
  *   IO6 PE9 AF10.  NB: IO7 is PD7, NOT PD6 (PD6 = LCD_B2, a different net).
  *   RESET# is not connected: schematic R13 (0 ohm) is DNP.  Initialization must
@@ -404,7 +408,7 @@ static int ospi1_mem_read_ind(uint32_t off, uint8_t *d, uint32_t n)
 }
 
 /* ------------------------------------------------------------------ *
- *  GPIO (octal-extension pins only; RMW-safe, never a whole-bank write)
+ *  GPIO (RMW-safe, never a whole-bank write)
  * ------------------------------------------------------------------ */
 static void psram_gpio_init(void)
 {
@@ -413,18 +417,44 @@ static void psram_gpio_init(void)
 	__HAL_RCC_GPIOB_CLK_ENABLE();
 	__HAL_RCC_GPIOD_CLK_ENABLE();
 	__HAL_RCC_GPIOE_CLK_ENABLE();
-	__HAL_RCC_OSPI1_CLK_ENABLE();          /* idempotent (boot enabled it)  */
+	__HAL_RCC_GPIOF_CLK_ENABLE();
+	__HAL_RCC_GPIOG_CLK_ENABLE();
+	__HAL_RCC_OSPI1_CLK_ENABLE();
+	/* The OCTOSPI I/O manager gates the Port-1 pin routing; its reset defaults
+	 * are what we want (P1CR = 0x03010111, RM0468 sec 26.5.2), but the block
+	 * still needs its bus clock. */
+	__HAL_RCC_OCTOSPIM_CLK_ENABLE();
 
-	/* Octal high nibble + DQS, all AF10 (PE9 IO6 = candidate).  HAL_GPIO_Init
-	 * is per-pin RMW, so it never disturbs the OCTOSPI2 pins on these banks. */
 	io.Mode  = GPIO_MODE_AF_PP;
 	io.Pull  = GPIO_NOPULL;
 	io.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
 
+	/*
+	 * The quad low nibble, clock and chip select (issue #25).  These used to be
+	 * left alone here because the bootloader replayed the whole GPIOF/GPIOG banks
+	 * while bringing up the OCTOSPI2 XIP flash, which put them in AF as a side
+	 * effect.  The bootloader no longer touches OCTOSPI2 at all, so they come out
+	 * of reset as analog inputs and this driver has to configure them itself --
+	 * otherwise the PSRAM simply never answers.
+	 *
+	 * NOTE THE SPLIT AF: IO0-3 and NCS are AF10, but the clock on PF10 is AF9
+	 * (the values the bootloader's replay wrote: GPIOF AFRL 0xAA090000 / AFRH
+	 * 0x000009AA, GPIOG AFRL 0x0A000099).  HAL_GPIO_Init is per-pin RMW, so none
+	 * of this disturbs the neighbouring pins.
+	 */
+	io.Alternate = GPIO_AF10_OCTOSPIM_P1;
+	io.Pin = GPIO_PIN_6 | GPIO_PIN_7 | GPIO_PIN_8 | GPIO_PIN_9;
+	HAL_GPIO_Init(GPIOF, &io);                                 /* IO0-IO3 */
+	io.Pin = GPIO_PIN_6;  HAL_GPIO_Init(GPIOG, &io);            /* NCS */
+	io.Alternate = GPIO_AF9_OCTOSPIM_P1;
+	io.Pin = GPIO_PIN_10; HAL_GPIO_Init(GPIOF, &io);            /* CLK */
+
+	/* Octal high nibble + DQS, all AF10 (PE9 IO6 = candidate). */
+	io.Alternate = GPIO_AF10_OCTOSPIM_P1;
+
 	/* DQS (PB2) with a weak pulldown: the APS6408 shares DQS with DM (write
 	 * data mask); a floating DM when the controller is not driving it could
 	 * mask write bytes.  Pulldown keeps DM=0 (unmasked) when idle. */
-	io.Alternate = GPIO_AF10_OCTOSPIM_P1;
 	io.Pull = GPIO_PULLDOWN;
 	io.Pin = GPIO_PIN_2;  HAL_GPIO_Init(GPIOB, &io);            /* DQS */
 	io.Pull = GPIO_NOPULL;
@@ -432,7 +462,6 @@ static void psram_gpio_init(void)
 	HAL_GPIO_Init(GPIOD, &io);                                 /* IO4/IO5/IO7 */
 	io.Alternate = PSRAM_IO6_AF;
 	io.Pin = GPIO_PIN_9;  HAL_GPIO_Init(GPIOE, &io);            /* IO6 */
-
 }
 
 /* ------------------------------------------------------------------ *
@@ -468,7 +497,7 @@ static void dlyb_apply(uint32_t sel, uint32_t unit)
 /* Leave any active memory-mapped mode, then (re)program the memory-mapped read
  * (CCR/IR/TCR) and write (WCCR/WIR/WTCR) configs with the given dummy-cycle
  * counts and re-enter mmap.  Safe to call while running (OCTOSPI1 is independent
- * of the OCTOSPI2 XIP the CPU fetches from); used both at bring-up and by the
+ * of the flash the CPU fetches from); used both at bring-up and by the
  * runtime `psram set` sweep.  Both directions are 8-line DTR data with DQS
  * (RM0468 sec 25.4.16: mmap write needs WCCR.DQSE=1). */
 static void psram_mmap_enter(uint32_t rd_dcyc, uint32_t wr_dcyc)

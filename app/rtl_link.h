@@ -38,7 +38,7 @@
  * the latter, so the order cannot cycle.
  *
  * No clock/RCC/register work of its own -- it only claims the console, powers the
- * module via app/rtl8720.c and opens the eRPC UART (XIP-safe).  Clean-room design.
+ * module via app/rtl8720.c and opens the eRPC UART (clock-safe).  Clean-room design.
  */
 #ifndef APP_RTL_LINK_H
 #define APP_RTL_LINK_H

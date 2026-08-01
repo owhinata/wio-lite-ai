@@ -23,14 +23,18 @@
  *    exactly 512 lines and still fits, so 64 KB (1024 lines) is used.  Sequential
  *    *bandwidth* stays high even out-of-cache (burst line-refills), so the cache
  *    step shows mainly in the dependent-load *latency* rows.  DTCM is TCM (bypasses
- *    the D-cache, always the raw rate) and Flash is the read-only XIP window.
+ *    the D-cache, always the raw rate) and Flash is read-only.
  *  - Regions: DTCM (4 KB, .dtcm_bench), ITCM (4 KB, .itcm_bench -- READ ONLY, and no
  *    latency column: the ISR paths live in ITCM since issue #24 and app/mpu.c marks
  *    the region read-only, so the write/copy legs and the chain-building
  *    pointer-chase would fault), AXI-SRAM (64 KB, malloc'd on demand),
- *    Flash int = embedded flash via AXIM 0x08000000, Flash ext = OCTOSPI2 XIP window
- *    0x70000000 (both read-only: measure the flash read rate; a read of the boot
- *    region is harmless -- no write/erase, so no brick risk), PSRAM = OCTOSPI1
+ *    Flash = the embedded flash via AXIM at 0x08000000 (read-only, and the region
+ *    the app itself executes from since issue #25; a read is harmless -- no
+ *    write/erase, so no brick risk even though sector 0 is the bootloader).  The
+ *    former "Flash ext" row measured the OCTOSPI2 XIP window at 0x70000000; the
+ *    bootloader no longer maps it and app/mpu.c fences it off, so the row is gone
+ *    (it read 54 MB/s against 905 for the internal flash -- the reason for #25).
+ *    PSRAM = OCTOSPI1
  *    APS6408 mmap window 0x90000000 (writable scratch, MPU non-cacheable ->
  *    raw octal-DTR rate; skipped when the bring-up failed).
  *
@@ -75,11 +79,9 @@
 #define SRAM_CACHED_BYTES  ( 4u * 1024u)   /* fits in the 16 KB L1 D-cache */
 #define FLASH_BENCH_BYTES  (64u * 1024u)
 #define PSRAM_BENCH_BYTES  (64u * 1024u)   /* scratch at PSRAM base (non-cacheable mmap) */
-#define EFLASH_BENCH_BASE  0x70000000u   /* external: OCTOSPI2 XIP window (read-only) */
-#define IFLASH_BENCH_BASE  0x08000000u   /* internal: embedded flash via AXIM (read-only).
-                                          * This is the DFU bootloader's region, but a READ
-                                          * is harmless -- no write/erase, so no brick risk;
-                                          * measured only for the int-vs-ext comparison. */
+#define IFLASH_BENCH_BASE  0x08000000u   /* embedded flash via AXIM (read-only).  Starts in
+                                          * the bootloader's sector, but a READ is harmless
+                                          * -- no write/erase, so no brick risk. */
 
 static uint32_t dtcm_bench_buf[DTCM_BENCH_BYTES / 4]
 	__attribute__((aligned(32), section(".dtcm_bench")));
@@ -439,8 +441,8 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 	}
 
 	cli_print(sh, "DWT CYCCNT @%luMHz; warm-up + tick-guarded min; I-cache + D-cache on "
-	          "(DTCM=TCM uncached; SRAM via 16KB L1 D$; Flash int=embedded/AXIM, "
-	          "ext=OCTOSPI2/XIP).\r\n\r\n", (unsigned long)(clk / 1000000u));
+	          "(DTCM=TCM uncached; SRAM via 16KB L1 D$; Flash=embedded/AXIM).\r\n\r\n",
+	          (unsigned long)(clk / 1000000u));
 
 	/* bandwidth table */
 	cli_print(sh, "%-24s %8s %8s %8s\r\n", "bandwidth (MB/s)", "read", "write", "copy");
@@ -480,10 +482,7 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 #endif
 	if (do_flash) {
 		if (cli_cancel_requested(sh)) goto done;
-		bw_row(sh, "Flash  int (64KB)", (uint32_t *)IFLASH_BENCH_BASE,
-		       FLASH_BENCH_BYTES / 4u, clk, 0);
-		if (cli_cancel_requested(sh)) goto done;
-		bw_row(sh, "Flash  ext (64KB)", (uint32_t *)EFLASH_BENCH_BASE,
+		bw_row(sh, "Flash  (64KB)", (uint32_t *)IFLASH_BENCH_BASE,
 		       FLASH_BENCH_BYTES / 4u, clk, 0);
 	}
 

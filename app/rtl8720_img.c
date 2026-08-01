@@ -10,7 +10,7 @@
  * Deliberately dumb: it is a bounded byte buffer plus the module's own checksum
  * algorithm.  Nothing here talks to the RTL8720 -- rtl8720_flash.c does that -- and
  * nothing here touches the RCC (the PSRAM controller was configured at boot by
- * psram.c), so it is XIP-safe like the rest of the app.
+ * psram.c), so it is clock-safe like the rest of the app.
  */
 #include "rtl8720_img.h"
 

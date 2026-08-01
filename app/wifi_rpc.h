@@ -12,7 +12,7 @@
  * or rtl_link_uart_ref(RTL8720_UART_AT, rtl_link_erpc_baud()) directly -- never a
  * hard-coded rate, the link is re-based at runtime; see app/rtl_link.h).  The
  * frames themselves are sent and routed by the eRPC service thread, so these are safe
- * to call from any thread.  No clock/RCC work here -- XIP-safe.
+ * to call from any thread.  No clock/RCC work here -- clock-safe.
  * Layering: HAL/CMSIS <- erpc.c <- wifi_rpc.c <- cmd_wifi.c.
  *
  * Service / method IDs and wire layout come from the factory firmware's generated

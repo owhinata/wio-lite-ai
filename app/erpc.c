@@ -6,7 +6,7 @@
  * Minimal clean-room eRPC client for the onboard RTL8720DN (issue #5).
  * See erpc.h for the wire format and the public contract.
  *
- * Register-agnostic (no RCC / peripheral setup here) -- XIP-safe.  It only uses
+ * Register-agnostic (no RCC / peripheral setup here) -- clock-safe.  It only uses
  * ThreadX time/sync and the #17 rtl8720 UART driver for the raw bytes.
  *
  * Concurrency model (issue #21 increment 8).  ONE resident service thread owns the

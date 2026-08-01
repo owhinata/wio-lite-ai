@@ -5,7 +5,7 @@
  * Host-only linker augmentation for the Shell registration smoke test.
  *
  * The target firmware defines `.shell_root_cmds` and its boundary symbols in
- * ldscript/STM32H725AEIx_XIP.ld.  On the host we need the same section and
+ * ldscript/STM32H725AEIx_IROM.ld.  On the host we need the same section and
  * symbols, but the GNU ld default script does not provide auto __start_/__stop_
  * symbols for a section whose name contains a dot, so we supply them here.
  *

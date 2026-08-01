@@ -5,9 +5,10 @@
 #    boot  -- standalone USB DFU bootloader (see boot/README.md).  Runs from
 #             internal flash 0x08000000 (replaces TinyUF2); flashed via ST-Link
 #             (mode=UR).  Produces build/boot.{elf,bin,hex} (no UF2).
-#    blink -- LED blink reference app.  XIP from external OCTOSPI2 0x70000000;
-#             load it with `dfu-util -d 0483:df11 -a 0 -D build/blink.bin` while
-#             `boot` is in DFU mode (convenience target: `dfu-blink`).
+#    blink -- LED blink reference app.  Runs from the internal flash app
+#             partition 0x08020000; load it with
+#             `dfu-util -d 0483:df11 -a 0 -D build/blink.bin` while `boot` is in
+#             DFU mode (convenience target: `dfu-blink`).
 #
 #  Configure (downloads the ARM toolchain into ./tools on first run):
 #    cmake -B build -G Ninja \
@@ -50,7 +51,7 @@ set(MCU_OPTS
 set(HAL_DIR    "${CMAKE_SOURCE_DIR}/lib/stm32h7xx_hal_driver")
 set(CMSIS_DEV  "${CMAKE_SOURCE_DIR}/lib/cmsis_device_h7")
 set(CMSIS_CORE "${CMAKE_SOURCE_DIR}/lib/cmsis_core")
-set(LDSCRIPT_XIP "${CMAKE_SOURCE_DIR}/ldscript/STM32H725AEIx_XIP.ld")  # app-first (0x70000000)
+set(LDSCRIPT_APP "${CMAKE_SOURCE_DIR}/ldscript/STM32H725AEIx_IROM.ld") # app (internal 0x08020000)
 set(LDSCRIPT_ROM "${CMAKE_SOURCE_DIR}/ldscript/STM32H725AEIx_ROM.ld")  # standalone (0x08000000)
 
 # stm32h7xx_hal_conf.h from the upstream template (its default HSE_VALUE of
@@ -95,11 +96,12 @@ function(rom_finalize tgt)
 endfunction()
 
 # Replaces the stock TinyUF2 at internal flash 0x08000000 (LDSCRIPT_ROM): it
-# configures the clock tree / OCTOSPI2 itself (stock CMSIS system file resets to
-# HSI, then SystemClock_Config), enumerates as a composite DFU + CDC device, and
-# programs downloads to the app base 0x70000000.  Flashed with the ST-Link
-# (mode=UR), not via UF2.  TinyUSB and its config/descriptors are compiled into
-# ONLY this target (blink stays a pure bare-metal app).
+# configures the clock tree itself (stock CMSIS system file resets to HSI, then
+# SystemClock_Config), enumerates as a composite DFU + CDC device, and programs
+# downloads into the internal app partition at 0x08020000 (sectors 1-3, issue
+# #25).  Flashed with the ST-Link (mode=UR), not via UF2.  TinyUSB and its
+# config/descriptors are compiled into ONLY this target (blink stays a pure
+# bare-metal app).
 set(TUSB_DIR "${CMAKE_SOURCE_DIR}/lib/tinyusb/src")
 
 # Device-mode subset of TinyUSB: core + FIFO + device stack + DFU + CDC classes +
@@ -116,7 +118,7 @@ set(TINYUSB_SOURCES
 add_executable(boot
     "${CMAKE_SOURCE_DIR}/boot/main.c"
     "${CMAKE_SOURCE_DIR}/boot/clock.c"
-    "${CMAKE_SOURCE_DIR}/boot/octospi.c"
+    "${CMAKE_SOURCE_DIR}/boot/iflash.c"
     "${CMAKE_SOURCE_DIR}/boot/usb_descriptors.c"
     "${CMAKE_SOURCE_DIR}/boot/dfu_callbacks.c"
     "${CMSIS_DEV}/Source/Templates/system_stm32h7xx.c"
@@ -135,15 +137,17 @@ target_compile_options(boot PRIVATE -O2)
 rom_finalize(boot)
 
 # ============================================================================
-#  Apps: blink (and the future ThreadX shell)
-#  XIP from external OCTOSPI2 0x70000000; flashed over DFU (dfu-util / dfu-<tgt>)
+#  Apps: blink and the ThreadX shell
+#  Internal flash app partition 0x08020000 (sectors 1-3, issue #25); flashed over
+#  DFU (dfu-util / dfu-<tgt>)
 # ============================================================================
 # --- Post-build artifacts + DFU flash target -------------------------------
-# App XIP firmwares (blink, and the future ThreadX shell): linked at 0x70000000,
-# emitted as raw .bin (what the DFU bootloader programs over dfu-util) + .hex.
+# App firmwares (blink, shell): linked at 0x08020000, emitted as raw .bin (what the
+# DFU bootloader programs over dfu-util) + .hex.  Overflowing the 384 KB partition
+# is a link error -- it cannot silently grow into the bootloader's sector.
 function(firmware_finalize tgt)
-    target_link_options(${tgt} PRIVATE "-T${LDSCRIPT_XIP}" -Wl,-Map=${tgt}.map,--cref)
-    set_target_properties(${tgt} PROPERTIES LINK_DEPENDS "${LDSCRIPT_XIP}")
+    target_link_options(${tgt} PRIVATE "-T${LDSCRIPT_APP}" -Wl,-Map=${tgt}.map,--cref)
+    set_target_properties(${tgt} PROPERTIES LINK_DEPENDS "${LDSCRIPT_APP}")
     add_custom_command(TARGET ${tgt} POST_BUILD
         COMMAND "${CMAKE_OBJCOPY}" -O binary -S $<TARGET_FILE:${tgt}> ${tgt}.bin
         COMMAND "${CMAKE_OBJCOPY}" -O ihex   $<TARGET_FILE:${tgt}> ${tgt}.hex
@@ -151,7 +155,7 @@ function(firmware_finalize tgt)
         BYPRODUCTS ${tgt}.bin ${tgt}.hex
         COMMENT "objcopy -> ${tgt}.bin/.hex")
 
-    # `dfu-<tgt>`: program the app to OCTOSPI2 0x70000000 over the custom DFU
+    # `dfu-<tgt>`: program the app to the internal partition over the custom DFU
     # bootloader.  Put the board in DFU mode first (hold USER/PF1 at reset -- the
     # red LED stays on).  Named per firmware so app targets never collide on one
     # `dfu` target.  (TinyUF2 and its .uf2 drive are gone: the bootloader that
@@ -160,7 +164,7 @@ function(firmware_finalize tgt)
         COMMAND dfu-util -d 0483:df11 -a 0 -D ${tgt}.bin
         DEPENDS ${tgt}
         USES_TERMINAL
-        COMMENT "dfu-util -> ${tgt}.bin to OCTOSPI2 0x70000000 (hold PF1 at reset for DFU mode)")
+        COMMENT "dfu-util -> ${tgt}.bin to internal flash 0x08020000 (hold PF1 at reset for DFU mode)")
 endfunction()
 
 add_executable(blink
@@ -174,9 +178,9 @@ target_compile_options(blink PRIVATE -O2)
 firmware_finalize(blink)
 
 # --- shell: interactive Eclipse ThreadX CLI console -------------------------
-# XIP app at 0x70000000 (firmware_finalize -> dfu-shell): ThreadX + an interactive
+# App at 0x08020000 (firmware_finalize -> dfu-shell): ThreadX + an interactive
 # CLI over USB CDC.  Reuses src/system_stm32h7xx.c (clock-free SystemInit) so the
-# app inherits the bootloader's 550 MHz clock + OCTOSPI2 XIP.  ThreadX core
+# app inherits the bootloader's 550 MHz clock tree.  ThreadX core
 # (common/src) + Cortex-M7/GNU port asm; the app supplies its own
 # _tx_initialize_low_level + shared SysTick handler in port/threadx/tx_glue.c.
 # ONE executable compiled uniformly (TX_INCLUDE_USER_DEFINE_FILE + port/threadx on
@@ -236,7 +240,6 @@ set(SHELL_SOURCES
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_watch.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_jobs.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_devmem.c"
-    "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_iflash.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_psram.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_dmesg.c"
     "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_crash.c"
@@ -339,7 +342,6 @@ add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/fault.c"
     "${CMAKE_SOURCE_DIR}/app/iwdg.c"
     "${CMAKE_SOURCE_DIR}/app/malloc_lock.c"
-    "${CMAKE_SOURCE_DIR}/app/iflash.c"
     "${CMAKE_SOURCE_DIR}/app/mpu.c"
     "${CMAKE_SOURCE_DIR}/app/psram.c"
     "${CMAKE_SOURCE_DIR}/app/rtl8720.c"

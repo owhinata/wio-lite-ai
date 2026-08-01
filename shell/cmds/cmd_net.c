@@ -26,7 +26,7 @@
  * that claims the console, takes the coarse link mutex and references the eRPC UART.
  * Every other subcommand talks to NetX only.
  *
- * No clock/RCC/register work -- pure marshalling + orchestration (XIP-safe).
+ * No clock/RCC/register work -- pure marshalling + orchestration (clock-safe).
  * Clean-room design; no third-party code reused.
  */
 #include "cli.h"

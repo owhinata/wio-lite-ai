@@ -18,7 +18,7 @@
  *
  * Layering: HAL/CMSIS <- rtl8720.c (basic UART/power) <- rtl8720_flash.c (download
  * protocol) <- cmd_wifi.c (shell).  It never touches the RCC clock tree -- only GPIO
- * reconfig + the #17 rtl8720 UART/power primitives -- so it is XIP-safe.  cli-agnostic:
+ * reconfig + the #17 rtl8720 UART/power primitives -- so it is clock-safe.  cli-agnostic:
  * timing via ThreadX, cancellation via an optional abort hook (like app/erpc.c).
  *
  * REQUIRED CALLER DISCIPLINE (issue #21 increment 8).  Every entry point here drives

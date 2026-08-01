@@ -1,36 +1,42 @@
 /*
  * Wio Lite AI (STM32H725AEI6) -- standalone USB DFU bootloader.
  *
- * Runs from internal flash at 0x08000000 (it replaces the stock TinyUF2).  On
- * reset it brings up its own clock tree (SystemClock_Config) and the external
- * OCTOSPI2 flash in memory-mapped mode (octospi2_init), then decides:
+ * Runs from internal flash sector 0 (0x08000000; it replaced the stock TinyUF2).
+ * On reset it brings up its own clock tree (SystemClock_Config), then decides:
  *
  *   - Enter DFU mode if the USER button (PF1, active-low) is held, OR there is
- *     no valid app in the external flash, OR OCTOSPI2 failed to come up.  It
- *     enumerates as a composite DFU + CDC device; a download
- *     (dfu-util -a 0 -D app.bin) is written straight to the app base
- *     (OCTOSPI2 offset 0 = 0x70000000) via octospi.c.  After the download
- *     manifests, the board reboots into the new app.  The red LED (PC13) is
- *     held on while in DFU mode.
- *   - Otherwise jump to the app at 0x70000000 (set VTOR + MSP, branch to its
+ *     no valid app in the internal flash.  It enumerates as a composite DFU +
+ *     CDC device; a download (dfu-util -a 0 -D app.bin) is programmed into the
+ *     app partition, sectors 1-3 at 0x08020000, via iflash.c.  After the
+ *     download manifests, the board reboots into the new app.  The red LED
+ *     (PC13) is held on while in DFU mode.
+ *   - Otherwise jump to the app at 0x08020000 (set VTOR + MSP, branch to its
  *     reset vector) -- with SysTick stopped first so a stray tick cannot
  *     vector into the app.
  *
- * DFU mode is the safe fallback: an erased / invalid app always lands here, so
- * the board can always be re-loaded over DFU.  It touches NO option bytes /
- * RDP / DBGMCU / SWD pins, so a bad config leaves the board re-flashable over
- * SWD.
+ * SINCE ISSUE #25 the app executes from the internal flash rather than XIP from
+ * the external OCTOSPI2 window (905 vs 54 MB/s measured), so this bootloader no
+ * longer touches OCTOSPI2 at all: no memory-mapped bring-up, no external
+ * programming path, no external app to jump to.  The external flash is simply
+ * not mapped while the app runs; bringing it back up, if it is ever wanted for
+ * storage, belongs to the app now (issue #10).  The clock tree still programs
+ * PLL2R, which is that flash's kernel clock, because clock.c is deliberately
+ * left untouched.
  *
- * Caches stay OFF the whole time (reset default): this keeps the OCTOSPI2
- * register / memory-mapped accesses coherent and avoids speculative reads of
- * 0x70000000 while the flash is briefly out of memory-mapped mode during a
- * program.
+ * DFU mode is the safe fallback: an erased / invalid app always lands here, so
+ * the board can always be re-loaded over DFU.  Reading a never-programmed app
+ * vector is safe -- erased flash reads back as all-ones with no ECC error
+ * (RM0468 sec 4.3.10).  It touches NO option bytes / RDP / DBGMCU / SWD pins,
+ * so a bad config leaves the board re-flashable over SWD.
+ *
+ * Caches stay OFF the whole time (reset default), which keeps every read of the
+ * flash the DFU path just programmed coherent with no maintenance.
  */
 
 #include <stdio.h>
 #include "stm32h7xx_hal.h"
 #include "tusb.h"
-#include "octospi.h"
+#include "iflash.h"
 
 void SystemClock_Config(void);   /* boot/clock.c */
 
@@ -72,12 +78,11 @@ int _write(int fd, char *buf, int len)
 #define LED_PORT   GPIOC
 #define LED_PIN    GPIO_PIN_13
 
-/* --- OCTOSPI2 status (published: DFU alt-0 name + CDC banner) ------------ */
-static uint8_t      g_jedec[3];
-static volatile int g_ospi_ok;       /* octospi2_init() verdict (mfr seen) */
-static volatile int g_app_present;   /* app MSP lands in an on-chip RAM */
+/* --- internal-flash status (published: DFU alt-0 name + CDC banner) ------ */
+static volatile int g_iflash_ok;     /* device flash size matches the map */
+static volatile int g_app_present;   /* app vector table looks like an app */
 
-char g_dfu_alt0_str[48] = "Wio Lite AI app @0x70000000";  /* dfu-util -l */
+char g_dfu_alt0_str[48] = "Wio Lite AI app @0x08020000";  /* dfu-util -l */
 
 /*
  * Deferred reboot: the DFU manifest callback requests one so the freshly
@@ -127,57 +132,59 @@ static void led_on(void)
   HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET);   /* PC13 high = on */
 }
 
-static void hex2(char *o, uint8_t b)
-{
-  static const char h[] = "0123456789ABCDEF";
-  o[0] = h[b >> 4];
-  o[1] = h[b & 0xF];
-}
-
 /*
- * Compose the DFU alt-0 name shown by `dfu-util -l`.  A clean label for the app
- * partition when OCTOSPI2 is up; on failure, show the raw JEDEC id to help
- * diagnose (the CDC banner also reports the id / status).
+ * Compose the DFU alt-0 name shown by `dfu-util -l`.  Names the internal app
+ * partition, or says so loudly when the device's own flash-size register does
+ * not match the sector map this bootloader was built for -- in which case the
+ * programming path stays disabled rather than erasing an unknown layout.
  */
 static void build_alt0_str(void)
 {
   char *p = g_dfu_alt0_str;
-  if (g_ospi_ok)
-  {
-    const char *s = "Wio Lite AI app @0x70000000";
-    while (*s) *p++ = *s++;
-  }
-  else
-  {
-    const char *s = "OCTOSPI2 FAIL id=";
-    while (*s) *p++ = *s++;
-    hex2(p, g_jedec[0]); p += 2;
-    hex2(p, g_jedec[1]); p += 2;
-    hex2(p, g_jedec[2]); p += 2;
-  }
+  const char *s = g_iflash_ok ? "Wio Lite AI app @0x08020000"
+                              : "UNSUPPORTED flash size";
+  while (*s) *p++ = *s++;
   *p = '\0';
 }
 
-/* USB CDC console: banner on connect + periodic heartbeat. */
+/* USB CDC console: banner on connect + periodic heartbeat, plus the measured
+ * cost of the last sector erase -- the number the DFU bwPollTimeout is sized
+ * from, reported from the environment that actually pays it. */
 static void console_task(void)
 {
   static bool was_connected = false;
   static uint32_t last_ms = 0;
+  static uint32_t last_erase_cyc = 0;
   bool connected = tud_cdc_connected();
 
   if (connected && !was_connected)
   {
+    const volatile uint32_t *vec = (const volatile uint32_t *) IFLASH_APP_BASE;
+
     printf("\r\n=== Wio Lite AI standalone DFU bootloader ===\r\n");
-    printf("flash JEDEC id     : %02X %02X %02X (%s)\r\n",
-           g_jedec[0], g_jedec[1], g_jedec[2],
-           g_ospi_ok ? "OCTOSPI2 up" : "OCTOSPI2 FAIL");
-    printf("app vector[0] (MSP): %08lX (%s)\r\n",
-           (unsigned long) *(volatile uint32_t *)0x70000000u,
+    printf("internal flash     : %lu KB (%s)\r\n",
+           (unsigned long) iflash_device_kb(),
+           g_iflash_ok ? "sectors 1-3 = app partition"
+                       : "UNSUPPORTED -- programming disabled");
+    printf("app vector (MSP/PC): %08lX %08lX (%s)\r\n",
+           (unsigned long) vec[0], (unsigned long) vec[1],
            g_app_present ? "app present" : "no valid app");
-    printf("DFU alt 0 -> app base 0x70000000.  "
-           "dfu-util -d 0483:df11 -a 0 -D app.bin\r\n");
+    printf("DFU -> app partition 0x%08lX + %lu KB.  "
+           "dfu-util -d 0483:df11 -a 0 -D app.bin\r\n",
+           (unsigned long) IFLASH_APP_BASE,
+           (unsigned long) (IFLASH_APP_SIZE / 1024u));
   }
   was_connected = connected;
+
+  uint32_t erase_cyc = iflash_last_erase_cycles();
+  if (connected && erase_cyc && erase_cyc != last_erase_cyc)
+  {
+    last_erase_cyc = erase_cyc;
+    /* SystemCoreClock is 550 MHz here, so cycles/550000 is milliseconds. */
+    printf("[erase] 128 KB sector in %lu ms (%lu cycles)\r\n",
+           (unsigned long) (erase_cyc / (SystemCoreClock / 1000u)),
+           (unsigned long) erase_cyc);
+  }
 
   uint32_t now = HAL_GetTick();
   if (connected && (now - last_ms >= 2000u))
@@ -192,12 +199,13 @@ static void console_task(void)
 #define BTN_PIN    GPIO_PIN_1    /* USER button, active-low (10K pull-up) */
 
 /*
- * Force DFU if the USER button (PF1) is held at reset.  PF1 is not an OCTOSPI2
- * pin, so reconfiguring it as an input does not disturb the flash bus.
+ * Force DFU if the USER button (PF1) is held at reset.  This is the escape hatch
+ * that survives any bad app image, so it is checked before the app is even
+ * looked at.
  */
 static int dfu_button_held(void)
 {
-  __HAL_RCC_GPIOF_CLK_ENABLE();     /* already on from octospi2_init */
+  __HAL_RCC_GPIOF_CLK_ENABLE();     /* nothing else enables GPIOF now */
   GPIO_InitTypeDef btn = {0};
   btn.Pin  = BTN_PIN;
   btn.Mode = GPIO_MODE_INPUT;
@@ -208,27 +216,33 @@ static int dfu_button_held(void)
 }
 
 /*
- * A valid app image (read through the OCTOSPI2 mmap window) has its initial MSP
- * in an on-chip RAM region and its reset vector inside the XIP window (thumb
- * bit set).  This rejects blank (0xFFFFFFFF) / unprogrammed (0) flash.
+ * A valid app image has its initial MSP in an on-chip RAM region and its reset
+ * vector inside the app partition (thumb bit set).  This rejects blank
+ * (0xFFFFFFFF) / unprogrammed (0) flash -- and equally an image built for the
+ * old external XIP window, whose reset vector points at 0x70000000.
+ *
+ * Reading the partition before anything has ever been programmed there is safe:
+ * an erased flash word reads back as all-ones with no ECC error (RM0468
+ * sec 4.3.10), so this cannot fault on a virgin board.
  */
 static int app_valid(void)
 {
-  uint32_t msp = *(volatile uint32_t *)0x70000000u;
-  uint32_t rst = *(volatile uint32_t *)0x70000004u;
+  uint32_t msp = *(volatile uint32_t *)(IFLASH_APP_BASE + 0u);
+  uint32_t rst = *(volatile uint32_t *)(IFLASH_APP_BASE + 4u);
   uint32_t msp_hi = msp & 0xFF000000u;
   int msp_ok = (msp_hi == 0x24000000u) ||   /* AXI-SRAM (D1) */
                (msp_hi == 0x20000000u) ||   /* DTCM / ITCM */
                (msp_hi == 0x30000000u) ||   /* D2 SRAM */
                (msp_hi == 0x38000000u);     /* D3 SRAM */
-  int rst_ok = ((rst & 0xFF000000u) == 0x70000000u) && (rst & 1u);
+  int rst_ok = (rst >= IFLASH_APP_BASE) &&
+               (rst < IFLASH_APP_BASE + IFLASH_APP_SIZE) && (rst & 1u);
   return msp_ok && rst_ok;
 }
 
-/* Hand off to the application in the OCTOSPI2 XIP flash.  Never returns. */
+/* Hand off to the application in the internal flash.  Never returns. */
 static void jump_to_app(void)
 {
-  volatile uint32_t const *vec = (volatile uint32_t const *)0x70000000u;
+  volatile uint32_t const *vec = (volatile uint32_t const *) IFLASH_APP_BASE;
   uint32_t app_msp   = vec[0];
   uint32_t app_reset = vec[1];
 
@@ -267,19 +281,23 @@ int main(void)
   HAL_Init();               /* NVIC grouping + SysTick at the reset clock */
   SystemClock_Config();     /* HSE -> PLL1 550, PLL2 266, PLL3 48 (USB) */
 
-  /* Bring up the external OCTOSPI2 flash in memory-mapped mode. */
-  g_ospi_ok = octospi2_init(g_jedec);
+  g_iflash_ok = iflash_available();
   build_alt0_str();
 
   int forced    = dfu_button_held();
   g_app_present = app_valid();
 
   /*
-   * Boot the app unless DFU is forced, the app is missing/invalid, or OCTOSPI2
-   * (needed to reach the app) failed to come up.  DFU mode is the safe
-   * fallback everywhere else, so the board can always be re-loaded.
+   * Boot the app unless DFU is forced, the device's flash map is not the one
+   * this bootloader was built for, or the app is missing/invalid.  DFU mode is
+   * the safe fallback everywhere else, so the board can always be re-loaded.
+   *
+   * g_iflash_ok gates the JUMP as well as the programming path on purpose: if
+   * the flash-size register does not report the expected 512 KB then the sector
+   * map underneath 0x08020000 is not the one assumed here, and staying in DFU is
+   * the recoverable answer.
    */
-  if (!forced && g_ospi_ok && g_app_present)
+  if (!forced && g_iflash_ok && g_app_present)
     jump_to_app();          /* never returns */
 
   /* ---- DFU mode ---- */

@@ -1,15 +1,20 @@
-# Wio Lite AI — Eclipse ThreadX CLI shell (XIP from external flash)
+# Wio Lite AI — Eclipse ThreadX CLI shell
 
 An interactive **command-line shell over USB CDC** for the **Seeed Wio Lite AI**
-(STM32H725AEI6, Cortex-M7 @ 550 MHz), running on **Eclipse ThreadX** and executing
-**in-place (XIP) from the external OCTOSPI2 NOR flash (W25Q128, 16 MB) at
-`0x70000000`**. Built with the ST HAL + CMake/Ninja; the ARM toolchain, HAL/CMSIS,
-ThreadX, TinyUSB and CoreMark are fetched automatically on first configure.
+(STM32H725AEI6, Cortex-M7 @ 550 MHz), running on **Eclipse ThreadX** from the
+**internal flash app partition at `0x08020000`** (sectors 1-3, 384 KB). Built with
+the ST HAL + CMake/Ninja; the ARM toolchain, HAL/CMSIS, ThreadX, TinyUSB and
+CoreMark are fetched automatically on first configure.
 
 The app is loaded over DFU by a **standalone USB DFU bootloader** in
-[`boot/`](boot/README.md) (internal flash `0x08000000`), which configures the
-clocks + OCTOSPI2 memory-mapped mode and jumps here. The bootloader is **invariant**
-and the app **inherits its clock tree** — see *Key design points*.
+[`boot/`](boot/README.md) (internal flash sector 0, `0x08000000`), which configures
+the clocks and jumps here. The bootloader is **invariant** and the app **inherits
+its clock tree** — see *Key design points*.
+
+> Until issue #25 the app executed in place (XIP) from the external OCTOSPI2 NOR
+> flash at `0x70000000`. That window reads at ~54 MB/s against ~905 MB/s for the
+> internal flash, so execution moved; the bootloader no longer brings OCTOSPI2 up
+> at all and the app fences the window off in the MPU.
 
 > Ported from the sibling [`stm32f746g-disco`](https://github.com/owhinata/stm32f746g-disco)
 > ThreadX shell; the HW-independent core is a verbatim port.
@@ -38,7 +43,7 @@ time as the USB console. 22 commands:
   (HardFault/MemManage/BusFault/UsageFault) before a reset; `dmesg` replays them
   after the board comes back. `crash` deliberately triggers a fault to test it.
 - **`wdt`** — the IWDG1 independent watchdog (LSI-clocked, ~3 s) auto-recovers from a
-  *non-faulting* hang (scheduler/tick stall, IRQ-off lockup, OCTOSPI2 XIP fetch stall);
+  *non-faulting* hang (scheduler/tick stall, IRQ-off lockup, a stalled external-memory access);
   a priority-5 petter thread feeds it every ~1 s. `wdt info` shows state / timeout /
   last reset cause; `wdt starve` stops feeding to prove the reset (afterwards `dmesg`
   and `wdt info` report `reset cause: IWDG`). Build `-DBSP_ENABLE_IWDG=OFF` to compile
@@ -400,10 +405,13 @@ time as the USB console. 22 commands:
 ## Key design points
 
 - **Never reprograms the clock tree.** The DFU bootloader sets HSE 25 MHz → PLL1
-  → 550 MHz CPU, PLL2R → OCTOSPI2 XIP (~89 MHz), and OCTOSPI2 memory-mapped mode
-  before jumping here. Reprogramming the RCC (as stock CMSIS `SystemInit` /
-  `HAL_Init` / `SystemClock_Config` do) stalls the XIP instruction fetch and hangs.
-  `src/system_stm32h7xx.c` is a custom clock-free `SystemInit` (FPU + VTOR only);
+  → 550 MHz CPU, PLL2R 266 MHz (the OCTOSPI kernel clock the PSRAM runs on), PLL3Q
+  → 48 MHz USB and `FLASH_ACR` latency 3 / WRHIGHFREQ 3 before jumping here.
+  Reprogramming the RCC (as stock CMSIS `SystemInit` / `HAL_Init` /
+  `SystemClock_Config` do) would drop the core to HSI while the flash latency stays
+  configured for 550 MHz and kill the USB clock.
+  `src/system_stm32h7xx.c` is a custom clock-free `SystemInit` (FPU + VTOR + the
+  ITCM load only, with VTOR taken from the linker's `g_pfnVectors`);
   the ThreadX SysTick reload is computed from the inherited `SystemCoreClock`.
 - **Both L1 caches on** (`SCB_EnableICache` + `SCB_EnableDCache` in `app/main.c`).
   Safe because the app is single-CPU with **no DMA master** (USB dwc2 is slave/FIFO
@@ -415,7 +423,7 @@ time as the USB console. 22 commands:
   `mpu_regions[]` rather than per-transfer cache maintenance.
 - **PSRAM (issues #3 / #16)**: `app/psram.c` brings up the **APS6408L Octal DDR PSRAM
   on OCTOSPI1** (memory-mapped 8 MB @ `0x90000000`) without touching OCTOSPI2/OCTOSPIM/
-  RCC, so it is XIP-safe. Shipped operating point: **133 MHz Fixed Latency** (kernel
+  the RCC, so it cannot disturb the inherited clock tree. Shipped operating point: **133 MHz Fixed Latency** (kernel
   266 MHz / 2), MR0 = 0x24 (Fixed LC8), read dummy 8, write dummy 4, DLYB phase 3 /
   unit 8 — ≈2.4× the 53.2 MHz point (113 read / 154 write MB/s). High clocks *require*
   Fixed Latency: the power-up variable latency's refresh push-out jitter collapses the
@@ -440,8 +448,9 @@ time as the USB console. 22 commands:
   started clock-tree-untouched in `_tx_initialize_low_level`, `TIM2LPEN` keeps it
   counting through sleep) — **not** DWT/CYCCNT, which *freezes* while the core clock
   is gated in WFI. DWT stays the `udelay`/`membench` timebase (those busy-wait in the
-  foreground and never run while asleep). The app **XIP-executes from OCTOSPI2**, which
-  keeps its clock in CSleep (`OCTO2LPEN`), so wake-path fetches resume normally. Build
+  foreground and never run while asleep). The internal flash the core wakes back up
+  into keeps its clock in CSleep (`AHB3LPENR.FLASHLPEN`, set out of reset and never
+  cleared), so wake-path fetches resume normally. Build
   `-DBSP_ENABLE_WFI=OFF` for a busy-idle variant — a WFI-sleeping core needs
   connect-under-reset to attach over SWD (the app does not touch DBGMCU), so a no-sleep
   build is handy for SWD debugging.
@@ -483,7 +492,8 @@ port/       threadx/ ThreadX low-level init + shared SysTick glue
                      because what it sits on is the RTL8720 link, not a MAC)
 svc/        freestanding services: fmt (printf), log (DTCM ring), timebase (DWT)
 src/        custom clock-free SystemInit  (also the minimal `blink` example's main)
-ldscript/   STM32H725AEIx_XIP.ld  (FLASH @ 0x70000000, RAM = AXI-SRAM, DTCM log, ITCM ISRs)
+ldscript/   STM32H725AEIx_IROM.ld (FLASH @ 0x08020000, RAM = AXI-SRAM, DTCM log, ITCM ISRs)
+            STM32H725AEIx_ROM.ld  (the bootloader's own script: FLASH @ 0x08000000, 128 KB)
 cmake/      ARM GNU toolchain file (auto-downloads gcc into tools/)
 lib/        git submodules: cmsis_core/device_h7, stm32h7xx_hal_driver, tinyusb,
             threadx, netxduo, coremark
@@ -492,15 +502,16 @@ fw/rtl8720/ reproducible build of the RTL8720DN's own firmware (the eRPC server 
             wifi/net drive) — host-side only, flashed by `wifi flash write`; see its README
 ```
 
-## Memory map (`ldscript/STM32H725AEIx_XIP.ld`)
+## Memory map (`ldscript/STM32H725AEIx_IROM.ld`)
 
 | Region | Address | Notes |
 |---|---|---|
-| FLASH (XIP) | `0x70000000` | external OCTOSPI2. Chip is 16 MB; the **app owns the first 8 MB** (boot validates writes there), the upper 8 MB is reserved for a future filesystem. |
+| FLASH | `0x08020000` | internal flash **sectors 1-3 = 384 KB** (issue #25). Sector 0 (`0x08000000`, 128 KB) is the DFU bootloader; the 128 KB erase granule is what keeps the two apart, so no programming path can reach it. ~905 MB/s read (`membench`). |
+| *(external flash)* | `0x70000000` | the 16 MB W25Q128 the app used to execute from. **Not mapped**: the bootloader no longer brings OCTOSPI2 up, and `app/mpu.c` marks the 256 MB window no-access + execute-never so a stray or speculative access raises MemManage (recorded in `dmesg`) instead of stalling the AXI bus. Bringing it back up as storage is issue #10. |
 | PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). |
 | AXI-SRAM (D1) | `0x24000000` | 320 KB; `_estack = 0x24050000` (the MSP the bootloader loads). |
 | DTCM | `0x20000000` | 128 KB; holds the reset-persistent `.log_noinit` crash-log ring, the **32 KB NetX Duo packet pool** (`.nx_pool`, issue #23 U3 — no DMA touches a frame, so DTCM costs nothing from AXI-SRAM and evicts nothing from the D-cache) and `membench` scratch. All of it bypasses the D-cache. |
-| ITCM | `0x00000000` | 64 KB; holds the **interrupt paths** (`.itcm`, 3,272 B): ThreadX PendSV + SysTick, the RTL8720 UART RX ISR **and the whole wake-up it signals** (`tx_event_flags_set` + `_tx_thread_system_resume`, issue #23 U0-3 — that call alone had put the ISR back to 4.3 µs warm / 12.9 µs cold — plus their two tails `_tx_thread_system_preempt_check` + `_tx_timer_system_deactivate`, issue #29), and the fault handlers, plus the 4 KB `.itcm_bench` scratch. Zero-wait-state and outside both caches, so an ISR no longer pays a cold OCTOSPI2 fetch through the 16 KB I-cache: the same UART ISR went from **8.7 µs cold / 3.3 µs warm to a flat 0.7 µs** (issue #24). The tails matter because they only run when a thread is *really* woken — with them still in XIP, request/reply commands (`wifi ver`, `wifi scan`) measured 3.5 µs against 0.1 µs for an ISR that wakes nobody; 106 bytes of ITCM took that to **1.5 µs**, and `wifi link bench` improved 2.1 → 1.5 µs too. Loaded from its XIP load image by `SystemInit()`, which also zero-fills all 64 KB to initialise the TCM ECC; kept read-only by the MPU so a NULL write raises MemManage instead of corrupting ISR code. |
+| ITCM | `0x00000000` | 64 KB; holds the **interrupt paths** (`.itcm`, 3,272 B): ThreadX PendSV + SysTick, the RTL8720 UART RX ISR **and the whole wake-up it signals** (`tx_event_flags_set` + `_tx_thread_system_resume`, issue #23 U0-3 — that call alone had put the ISR back to 4.3 µs warm / 12.9 µs cold — plus their two tails `_tx_thread_system_preempt_check` + `_tx_timer_system_deactivate`, issue #29), and the fault handlers, plus the 4 KB `.itcm_bench` scratch. Zero-wait-state and outside both caches, so an ISR never pays a cold fetch through the 16 KB I-cache: measured against the external-XIP build the same UART ISR went from **8.7 µs cold / 3.3 µs warm to a flat 0.7 µs** (issue #24). The tails matter because they only run when a thread is *really* woken — with them still in the flash, request/reply commands (`wifi ver`, `wifi scan`) measured 3.5 µs against 0.1 µs for an ISR that wakes nobody; 106 bytes of ITCM took that to **1.5 µs**, and `wifi link bench` improved 2.1 → 1.5 µs too. Those figures were taken while the app ran from the external flash; issue #25 shrank the gap without closing it (ITCM is still zero-wait and never evicted). Loaded from its load image by `SystemInit()`, which also zero-fills all 64 KB to initialise the TCM ECC; kept read-only by the MPU so a NULL write raises MemManage instead of corrupting ISR code. |
 | internal Flash | `0x08000000` | 512 KB — **DFU bootloader only**; the app does not own it. |
 
 ## Build
@@ -521,9 +532,13 @@ picocom -b 115200 /dev/ttyACM0     # (any 8N1 terminal; baud is nominal for USB 
 ```
 
 `cmake --build build --target dfu-shell` runs the `dfu-util` step. Flashing the app
-is **not** a brick risk — it writes external OCTOSPI2, never the internal
-bootloader. (Re-flashing the internal `0x08000000` bootloader is a separate,
-higher-risk procedure documented in [`boot/README.md`](boot/README.md).)
+is **not** a brick risk: it writes sectors 1-3 only, and the bootloader's erase path
+rejects any sector outside 1-3 before the HAL is called, so `0x08000000` is
+unreachable from DFU. A download that is interrupted leaves the app's first flash
+word erased (the bootloader writes it last, only after the whole image has arrived
+and verified), so the board comes back up in DFU mode ready for another attempt.
+(Re-flashing the `0x08000000` bootloader itself is a separate, higher-risk procedure
+documented in [`boot/README.md`](boot/README.md).)
 
 ## Host tests
 
@@ -541,6 +556,6 @@ ring, the byte ring, and Tab completion.
 ## `blink` — minimal example
 
 The repo also builds a bare-metal LED blink (`src/main.c` → `build/blink.bin`) that
-shares the clock-free `SystemInit` and XIP linker script — a minimal reference for
-XIP-from-external-flash bring-up. Flash it the same way
+shares the clock-free `SystemInit` and the app linker script — a minimal reference
+for clock-inheriting bring-up. Flash it the same way
 (`dfu-util … -D build/blink.bin`).

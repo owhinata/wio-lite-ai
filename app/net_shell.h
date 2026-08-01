@@ -42,7 +42,7 @@
  * holding the coarse mutex without creating a lock-order cycle.  Do not add a link call
  * to this thread.
  *
- * No clock/RCC/register work of its own (XIP-safe).  Layering:
+ * No clock/RCC/register work of its own (clock-safe).  Layering:
  * HAL/CMSIS/ThreadX <- NetX <- nx_net/link_data <- shell <- here.
  */
 #ifndef APP_NET_SHELL_H

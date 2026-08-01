@@ -254,7 +254,7 @@ static int cmd_wifi_log(struct cli_instance *sh, int argc, char **argv)
  *
  * `isr` is the per-interrupt drain cost in tenths of a microsecond -- it is NOT part of
  * the grace budget (the drain loop absorbs bytes that land while it runs), it just has
- * to stay well under one byte time on the wire.  NOTE the ISR runs from OCTOSPI2 XIP,
+ * to stay well under one byte time on the wire.  NOTE the ISR path is ITCM-resident,
  * so the FIRST invocation after a cold I-cache pays an external-flash fetch: on board
  * #2 the maximum was 8.7 us over 7 interrupts (`wifi ver`) but 3.3 us over 133
  * (`wifi scan`), i.e. the short-exchange figure is the cold entry, not the real cost.

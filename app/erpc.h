@@ -11,7 +11,7 @@
  * USART1 / BLE_UART, PA10/PB14).  This is a hand-written C client that speaks the
  * exact wire format of that firmware -- no C++ eRPC runtime is pulled in.  It sits
  * on top of the #17 rtl8720 UART driver (app/rtl8720.c) and never touches the RCC
- * clock tree, so it is XIP-safe.
+ * clock tree, so it is clock-safe.
  *
  * Wire format (reference: https://github.com/Seeed-Studio/seeed-ambd-firmware,
  * branch Wio-Lite-AI):

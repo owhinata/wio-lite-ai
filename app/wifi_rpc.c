@@ -7,7 +7,7 @@
  * See wifi_rpc.h for the service/method IDs, the wire layout and the return
  * convention.  Each function encodes the request body per BasicCodec, calls
  * erpc_call_ex() once, then decodes the reply (out params in order, return value
- * last).  Pure data marshalling -- no register/RCC access, XIP-safe.
+ * last).  Pure data marshalling -- no register/RCC access, clock-safe.
  */
 #include "wifi_rpc.h"
 

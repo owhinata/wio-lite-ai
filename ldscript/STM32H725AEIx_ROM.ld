@@ -9,13 +9,17 @@
  *   RAM   : 320 KB @ 0x24000000 -- AXI-SRAM (D1).  _estack = 0x24050000.
  *   DTCM  : 128 KB @ 0x20000000 -- tightly-coupled RAM (unused).
  *
- * Unlike the XIP (app-first) script, the vector table and code live in the internal
- * flash; this bootloader configures the clock tree and OCTOSPI2 memory-mapped mode
- * itself (see bootrom/), then jumps to the application in the external OCTOSPI2 flash
- * at 0x70000000.
+ * The bootloader configures the clock tree itself (see boot/), programs downloads
+ * into the app partition at 0x08020000 (sectors 1-3) and jumps there.  Since issue
+ * #25 it does not touch the external OCTOSPI2 flash at all.
  *
- * A .RamFunc region (loaded into AXI-SRAM at reset) is kept for the OCTOSPI2
- * self-programming driver shared with the app-first firmware.
+ * NOTE this file describes SECTOR 0 ONLY (128 KB of the 512 KB device).  Sectors
+ * 1-3 belong to the app (ldscript/STM32H725AEIx_IROM.ld); the 128 KB erase granule
+ * is what keeps the two apart.
+ *
+ * A .RamFunc region (loaded into AXI-SRAM at reset) is kept as a placement
+ * facility; the internal-flash programming path does not need it (a program or
+ * erase stalls the fetch and then resumes, RM0468 sec 4.3.8).
  */
 
 ENTRY(Reset_Handler)

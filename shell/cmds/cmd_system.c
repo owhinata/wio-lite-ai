@@ -29,6 +29,17 @@
 
 #include <stdint.h>
 
+/* ORIGIN(FLASH) / LENGTH(FLASH) of the app partition, PROVIDEd by
+ * ldscript/STM32H725AEIx_IROM.ld.  These are ABSOLUTE symbols: the symbol's
+ * ADDRESS is the value, so they are declared as arrays and read with sym()
+ * (same idiom as cmd_free.c). */
+extern uint8_t __app_flash_start[], __app_flash_size[];
+
+static uint32_t sym(const uint8_t s[])
+{
+	return (uint32_t)(uintptr_t)s;
+}
+
 /*
  * version: firmware identity + build + ThreadX + this STM32H725's silicon id.
  * IDCODE fields and the UID / flash-size register bases come from CMSIS macros
@@ -53,14 +64,15 @@ static int cmd_version(struct cli_instance *sh, int argc, char **argv)
 	          THREADX_MAJOR_VERSION, THREADX_MINOR_VERSION, THREADX_PATCH_VERSION);
 	cli_print(sh, "MCU:      STM32H725 (devid 0x%03lx rev 0x%04lx)\r\n",
 	          (unsigned long)devid, (unsigned long)rev);
-	/* Two distinct flashes on this board: the internal die (FLASHSIZE_BASE = 512 KB
-	 * on the H725AE) holds only the DFU bootloader, while the app runs XIP from the
-	 * 8 MB external OCTOSPI2 window (0x70000000; mirrors the linker XIP region and
-	 * `free`).  Print both with sizes aligned so they are not read as one flash. */
-	cli_print(sh, "Flash:    %lu KB (die; holds the DFU bootloader)\r\n",
+	/* The internal die (FLASHSIZE_BASE = 512 KB on the H725AE) holds both: sector 0
+	 * is the DFU bootloader, sectors 1-3 are the app partition this firmware runs
+	 * from (issue #25).  The partition bounds come from the linker script so this
+	 * line, `free` and the actual link can never disagree. */
+	cli_print(sh, "Flash:    %lu KB (die; sector 0 = DFU bootloader)\r\n",
 	          (unsigned long)flash_kb);
-	cli_print(sh, "App:      %u KB (XIP from external OCTOSPI2 flash @0x70000000)\r\n",
-	          8u * 1024u);
+	cli_print(sh, "App:      %lu KB @0x%08lx (internal flash, sectors 1-3)\r\n",
+	          (unsigned long)(sym(__app_flash_size) / 1024u),
+	          (unsigned long)sym(__app_flash_start));
 	cli_print(sh, "UID:      0x%08lx 0x%08lx 0x%08lx\r\n",
 	          (unsigned long)uid[0], (unsigned long)uid[1], (unsigned long)uid[2]);
 	return 0;

@@ -16,7 +16,7 @@
  * owning the stack -- there is no far end still running a call we abandoned, so there is
  * nothing to leak and no "link dirty" state to latch.
  *
- * No clock/RCC/register work of its own (XIP-safe).  Clean-room design.
+ * No clock/RCC/register work of its own (clock-safe).  Clean-room design.
  */
 #include "nx_echo.h"
 

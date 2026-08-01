@@ -25,7 +25,7 @@
  * or (issue #21) the telnet instance's transport -- i.e. the same console as cli_print (the
  * CDC TX ring is sized to hold the whole report; the timed region itself does no
  * I/O, so TX back-pressure cannot perturb the score).  With the I-cache enabled
- * (app/main.c) the score reflects cached XIP execution rather than raw flash
+ * (app/main.c) the score reflects cached execution rather than raw flash
  * fetch stalls.
  *
  * A singleton guard rejects a second concurrent run (e.g. `coremark &` twice):

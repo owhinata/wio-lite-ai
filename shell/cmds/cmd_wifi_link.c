@@ -35,7 +35,7 @@
  * used only for individual round trips; whole-run elapsed time comes from HAL_GetTick.
  *
  * No clock/RCC/register work of its own: it READS TIM2->CNT and computes BRR arithmetic,
- * nothing more (XIP-safe).  Clean-room design.
+ * nothing more (clock-safe).  Clean-room design.
  */
 #include "cli.h"
 #include "cmd_wifi_priv.h"

@@ -2,8 +2,10 @@
  * USB descriptors for the Wio Lite AI standalone DFU bootloader.
  *
  * Composite DFU + CDC (serial console).  A single DFU-mode interface with one
- * alternate (alt 0) mapped to the external OCTOSPI2 flash at 0x70000000 -- the
- * app base the bootloader boots from.  Target usage:
+ * alternate (alt 0) mapped to the internal-flash app partition at 0x08020000
+ * (sectors 1-3) -- the app base the bootloader boots from since issue #25.
+ * There is exactly one download target, so no alt-setting can be picked by
+ * mistake.  Target usage (unchanged):
  *     dfu-util -d 0483:df11 -a 0 -D app.bin
  *
  * Adapted from lib/tinyusb .../examples/device/dfu, made self-contained (no
@@ -57,7 +59,7 @@ uint8_t const *tud_descriptor_device_cb(void)
 
 /* --- Configuration Descriptor ------------------------------------------- */
 
-/* One alternate per flash partition.  We expose a single one (OCTOSPI2). */
+/* One alternate per flash partition.  We expose a single one (internal app). */
 #define ALT_COUNT   1
 
 /* Interfaces: CDC (control + data, grouped by an IAD) then DFU. */
@@ -96,7 +98,7 @@ enum {
   STRID_PRODUCT,
   STRID_SERIAL,
   STRID_CDC,        /* 4: CDC interface name */
-  STRID_DFU_ALT0,   /* 5: DFU alt 0 (runtime: JEDEC + self-test verdict) */
+  STRID_DFU_ALT0,   /* 5: DFU alt 0 (runtime: app partition / device verdict) */
 };
 
 uint8_t const desc_configuration[] =
@@ -119,7 +121,7 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
 
 /* --- String Descriptors ------------------------------------------------- */
 
-/* The alt-0 name is filled in at runtime (JEDEC id + OCTOSPI2 verdict). */
+/* The alt-0 name is filled in at runtime (app partition / device verdict). */
 extern char g_dfu_alt0_str[];
 
 static char const *string_desc_arr[] =
@@ -171,7 +173,7 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
     default:
       if (index >= TU_ARRAY_SIZE(string_desc_arr)) return NULL;
 
-      /* alt-0 name is a runtime buffer (JEDEC id + OCTOSPI2 verdict). */
+      /* alt-0 name is a runtime buffer (app partition / device verdict). */
       const char *str = (index == STRID_DFU_ALT0) ? g_dfu_alt0_str
                                                   : string_desc_arr[index];
       if (str == NULL) return NULL;

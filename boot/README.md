@@ -1,8 +1,17 @@
 # Wio Lite AI — スタンドアロン USB DFU ブートローダ
 
 STM32H725AEI6 用の **TinyUSB標準DFUブートローダ**。内蔵フラッシュ `0x08000000`
-の TinyUF2 を置換し、`dfu-util` で **外部OCTOSPI2フラッシュ (`0x70000000`)** に
-アプリを焼けるようにする。ソースは `boot/`、ビルド成果物は `build/boot.{elf,bin,hex}`。
+（セクタ0, 128KB）に常駐し、`dfu-util` で **内蔵フラッシュのappパーティション
+（`0x08020000`, セクタ1-3 = 384KB）** にアプリを焼く。ソースは `boot/`、成果物は
+`build/boot.{elf,bin,hex}`。
+
+> **2026-08-01 更新 (issue #25)**: app の実行元を外部OCTOSPI2 XIP (`0x70000000`,
+> 54 MB/s) から**内蔵フラッシュ (`0x08020000`, 905 MB/s)** へ移した。これに伴い
+> ブートローダから **OCTOSPI2 を完全撤去**（`octospi.c` 削除、mmap立ち上げ無し、
+> 外部appへのjump無し）。ブートローダは「内蔵フラッシュ用DFU + 内蔵appへのjump」
+> だけになった。DFU の alt は 1 つのまま（alt 0 = 内蔵）なので
+> `dfu-util -a 0 -D app.bin` のコマンドラインは不変、書込先だけが変わる。
+> 以下「ステータス」節の記述は移行前の実機検証ログ（＝当時の事実）。
 
 ## ステータス: 実機で全経路動作確認済 (2026-07-12)
 
@@ -15,7 +24,7 @@ STM32H725AEI6 用の **TinyUSB標準DFUブートローダ**。内蔵フラッシ
 board #2 の内蔵 `0x08000000` に焼いて全経路を実機検証:
 
 - 書込後も SWD/UR 健在・RDP 0xAA（文鎮化せず）。読み戻しバイト一致。
-- **boot flow**: reset → clock/OCTOSPI2 mmap → app検証 → jump。jump先アプリの
+- **boot flow**（当時）: reset → clock/OCTOSPI2 mmap → app検証 → jump。jump先アプリの
   CDCダンプが元TinyUF2のクロックとほぼ完全一致（差はPLLCFGRのPLL3VCOSEL 1bit
   のみ＝MEDIUM vs WIDE、240MHz VCOで両範囲有効・無害）。
 - **DFUモード**（PF1保持リセット）: `dfu-util -l` で
@@ -26,20 +35,43 @@ board #2 の内蔵 `0x08000000` に焼いて全経路を実機検証:
 
 ## どう動くか
 
-リセット後、`main()` は自前でクロックツリー（`clock.c`）と OCTOSPI2 メモリ
-マップ（`octospi.c`）を立ち上げ、次を判定する:
+リセット後、`main()` は自前でクロックツリー（`clock.c`）を立ち上げ、次を判定する:
 
-- **DFUモードに入る条件**: USERボタン (PF1, active-low) 保持 **または** 外部
-  フラッシュに有効appが無い **または** OCTOSPI2 の立ち上げ失敗。→ 複合
-  DFU+CDC デバイスとして列挙。ダウンロードは app base（OCTOSPI2 offset 0 =
-  `0x70000000`）へ直接書込。manifest後に新appへreboot。DFUモード中は赤LED点灯。
-- **それ以外**: `0x70000000` のアプリへ jump（VTOR+MSP設定 → reset vectorへ
-  分岐）。jump前に SysTick を停止（blink等は SysTick をデフォルト無限ループ
-  ハンドラのまま残すため、stray tick で app がハングするのを防ぐ）。
+```
+PF1 保持?      --yes--> DFU
+内蔵 app 有効? --yes--> jump 0x08020000
+                 no  --> DFU
+```
+
+- **DFUモード**: 複合 DFU+CDC デバイスとして列挙。ダウンロードは app パーティ
+  ション（`0x08020000`, セクタ1-3）へ `iflash.c` 経由で書込。manifest後に新app
+  へreboot。DFUモード中は赤LED点灯。
+- **jump**: VTOR+MSP設定 → reset vector へ分岐。jump前に SysTick を停止
+  （blink等は SysTick をデフォルト無限ループハンドラのまま残すため、stray tick
+  で app がハングするのを防ぐ）。
+
+**app が「有効」の条件**: vector[0] (MSP) がオンチップRAM、vector[1] (Reset) が
+`0x08020000..0x0807FFFF` 内で thumb ビット付き。未書込（消去済み）フラッシュを
+読んでも**全ビット1が返り ECC エラーにならない**（RM0468 §4.3.10）ので、app を
+一度も焼いていない基板でも安全に判定できる。古い外部XIP版 `.bin`（Reset が
+`0x700xxxxx`）もここで弾かれる。
 
 DFUモードは安全なフォールバック: erased/invalid app は必ずここに来るので、
 基板は常に再ロードできる。**option byte / RDP / DBGMCU / SWD端子は一切触らない**
 ので、悪いconfigでも SWD で再書込可能。
+
+### 内蔵フラッシュ書込の設計（issue #25）
+
+| | |
+|---|---|
+| セクタ構成 | 1バンク・128KB × 4（RM0468 Table 15）。セクタ0=boot、1-3=app |
+| セクタ0の保護 | `iflash_erase_sector()` が **1..3 以外を HAL 呼び出し前に拒否**。書込オフセットは `0x08020000` 相対なので、どんな引数でもセクタ0に到達できない。HAL の `IS_FLASH_SECTOR` は `FLASH_SECTOR_TOTAL=8`（1MB品前提）まで通してしまうので自前で縛る |
+| デバイス判定 | `FLASHSIZE_BASE` が 512KB を返す場合のみ内蔵経路を有効化。違えば DFU download を拒否し jump もしない |
+| 書込粒度 | 32B (256bit) flash word + 10bit ECC。非virgin word の上書き不可（RM0468 §4.3.9）→ 消去 → 32B整列書込、端数は 0xFF パディング |
+| **vector-last commit** | 先頭32B（MSP/Reset）は最後まで書かない。転送が中断すると MSP は消去済み `0xFFFFFFFF` のままなので、次の起動は必ず DFU に入る。**外部フォールバックが無い今、これが「中断した転送でハングしない」唯一の担保** |
+| セッション検査 | `block 0` で始まった連続転送でなければ commit しない（`off == next_off` を強制）。abort/エラー時は state 破棄 |
+| 同一バンク書込 | boot自身がセクタ0から実行中にセクタ1-3を消去する。read は queue に積まれ完了後に serve されるので命令フェッチは **stall して再開**（RM0468 §4.3.8, ST公式 H723 例と同じ）。**消去中は割込みも含めて何も走らない** |
+| DFU poll timeout | 消去を伴うブロックだけ 2500ms、通常は 10ms。board #2 実測: 128KB消去 = **888ms**、1KB書込 = 2.685ms |
 
 ## ビルド
 
@@ -74,7 +106,7 @@ CLI=/home/ouwa/work/STM32CubeProgrammer/bin/STM32_Programmer_CLI
 ## アプリを DFU で焼く
 
 1. **PF1 (USERボタン) を保持したままリセット** → ブートローダが DFUモードに留まる
-   （赤LED点灯 / `dfu-util -l` に `name="Wio Lite AI app @0x70000000"`）。
+   （赤LED点灯 / `dfu-util -l` に `name="Wio Lite AI app @0x08020000"`）。
    - SWD経由でリセットするなら PF1 保持中に
      `STM32_Programmer_CLI -c port=SWD mode=UR --start`。
 2. `dfu-util -d 0483:df11 -a 0 -D <app>.bin`
@@ -89,15 +121,28 @@ CubeProgrammer が認識）。descriptor は manifestation-**intolerant**（自�
 
 - **board #1 = 恒久文鎮化**（RDP2/debug恒久無効。`0x08000000` に不良ブートを
   焼いて死亡。復旧不能）。
-- **board #2 = 開発ターゲット**（現在: boot@0x08000000, blink@0x70000000 XIP）。
+- **board #2 = 開発ターゲット**（現在: boot@0x08000000 セクタ0, app@0x08020000 セクタ1-3）。
 - 文鎮化の鉄則: 内蔵ブートで **PA13/14(SWD)不変更・DBGMCU非改変・低電力なし・
   オプションバイト/RDP絶対触らない**。焼く前に objdump 監査:
   ```bash
-  arm-none-eabi-objdump -d build/boot.elf | \
-    grep -iE '5c001000|52002008|5200201c|52002020'   # 何も出なければ OK
+  TC=tools/arm-gnu-toolchain-*/bin
+  # 1. option byte / DBGMCU に触れる定数が無いこと（何も出なければ OK）
+  $TC/arm-none-eabi-objdump -d build/boot.elf | \
+    grep -iE '5c001000|52002008|52002018|5200201c|52002020'
+  # 2. option byte 系 API がリンクされていないこと（何も出なければ OK）
+  $TC/arm-none-eabi-nm -C build/boot.elf | grep -iE 'OB_|OPTCR|OBProgram|MassErase'
+  # 3. フラッシュ消去/書込の呼び出し元が iflash 経由だけであること
+  $TC/arm-none-eabi-objdump -d build/boot.elf | \
+    awk '/^[0-9a-f]+ <.*>:/{fn=$2} /bl.*<(HAL_FLASHEx_Erase|HAL_FLASH_Program)>/{print fn, $NF}' | sort -u
+  #   期待: <iflash_erase_sector>: <HAL_FLASHEx_Erase> / <iflash_program>: <HAL_FLASH_Program>
+  # 4. セクタ範囲チェックがコードに残っていること（issue #25）
+  $TC/arm-none-eabi-objdump -d build/boot.elf --start-address=<iflash_erase_sector>
+  #   期待: `cmp.w r2, #512`（デバイス容量判定）と sector-1 <= 2 の符号なし範囲判定
   ```
-  （唯一の AIRCR 書込は `NVIC_SystemReset` の `0x05FA0004`。FLASH書込は
-  `FLASH->ACR` latency のみ = リセット値 0x37 → 0x33。）
+  （唯一の AIRCR 書込は `NVIC_SystemReset` の `0x05FA0004`。**issue #25 以降、
+  boot は内蔵フラッシュを消去/書込する**が、経路は `iflash.c` の 1 本だけで、
+  セクタ0 には構造的に到達できない。option byte 解錠 `HAL_FLASH_OB_Unlock`
+  (`FLASH_OPTKEYR`) と `OPTCR` は一切使わない。）
 - **TinyUF2復元**: バックアップ `_ref/wio_flash_backup_20260710_225512.bin`
   (512KB, md5 615ac2df..) を `0x08000000` へ書けば元に戻る。
 
@@ -224,7 +269,10 @@ GPIOバンク F/G を丸ごと再現するので両端子群をカバー**して
 
 ## 参照コード
 
-- TinyUF2: `_ref/tinyuf2/ports/stm32h7/boards.c`（jump/valid の参考。QUADSPI →
-  OCTOSPI2 へ移植）。
-- OCTOSPI2 雛形: `_ref/.../STM32H735G-DK/stm32h735g_discovery_ospi.c`。
+- TinyUF2: `_ref/tinyuf2/ports/stm32h7/boards.c`（jump/valid の参考）。
+- 内蔵フラッシュ消去/書込: `_ref/STM32Cube_FW_H7_V1.13.0/Projects/NUCLEO-H723ZG/
+  Examples/FLASH/FLASH_EraseProgram/`（同じ1バンク品で、flash常駐 HAL が同一
+  バンクのセクタを消去している ST 公式例）。
+- OCTOSPI2 の実装は issue #25 で削除。復活させるなら `git show <#25以前>:boot/octospi.c`
+  （app 側で使うなら `app/psram.c` と同じ流儀で、issue #10 の範疇）。
 - TinyUSB DFUクラス: `lib/tinyusb/src/class/dfu/dfu_device.{c,h}`（直 submodule, 0.21.0）。

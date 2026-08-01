@@ -20,7 +20,7 @@
  * to UART9_RX) and issues the download read-word command, checking for the framed
  * reply.  NO erase / NO write -- fully reversible, cannot brick (mask-ROM download is
  * re-enterable).  Register-agnostic beyond GPIO + the #17 rtl8720 primitives (never
- * touches the RCC clock tree) -> XIP-safe.  cli-agnostic (ThreadX timing + abort hook).
+ * touches the RCC clock tree) -> clock-safe.  cli-agnostic (ThreadX timing + abort hook).
  */
 #include "stm32h7xx_hal.h"   /* GPIO reconfig (PD14 strap: AF11 UART9_RX <-> output low) */
 #include "tx_api.h"          /* tx_time_get / tx_thread_sleep (1 tick = 1 ms here) */

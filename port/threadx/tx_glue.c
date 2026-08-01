@@ -7,7 +7,8 @@
  *    increments the HAL tick and, once ThreadX is initialized, calls
  *    _tx_timer_interrupt().  So HAL_GetTick() and ThreadX both work.  The app
  *    does NOT reprogram the RCC -- it inherits the bootloader's 550 MHz clock and
- *    OCTOSPI2 XIP map (reprogramming would stall the XIP instruction fetch).
+ *    flash timing (reprogramming would break every inherited clock and the flash
+ *    latency the app is executing under).
  *  - PendSV (context switch) runs at the lowest priority; SysTick one step higher.
  *    SysTick MUST outrank PendSV: when no thread is ready ThreadX idles by spinning
  *    inside PendSV with interrupts enabled, and SysTick must be able to preempt that
@@ -48,7 +49,7 @@ static volatile UINT profile_active = 0u;
    275 MHz, PSC = 0 (full resolution).  __HAL_RCC_TIM2_CLK_ENABLE touches only
    APB1LENR.TIM2EN (the peripheral gate) and _SLEEP_ENABLE only APB1LLPENR.TIM2LPEN
    (keep counting in CSleep/WFI) -- neither reprograms the clock tree, so the
-   OCTOSPI2 XIP clock inheritance is untouched.  No interrupt is used; the kit just
+   inherited clock configuration is untouched.  No interrupt is used; the kit just
    reads TIM2->CNT. */
 static void tx_glue_epk_timer_init(void)
 {

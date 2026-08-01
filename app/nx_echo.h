@@ -19,7 +19,7 @@
  * It lives in app/ rather than shell/cmds/ for one reason: nothing above app/nx_net.h is
  * supposed to include nx_api.h (see that header), and this needs NX_TCP_SOCKET.
  *
- * No clock/RCC/register work of its own (XIP-safe).
+ * No clock/RCC/register work of its own (clock-safe).
  */
 #ifndef APP_NX_ECHO_H
 #define APP_NX_ECHO_H

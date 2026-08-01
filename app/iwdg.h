@@ -24,7 +24,7 @@ _Static_assert(BSP_ENABLE_IWDG == 0 || BSP_ENABLE_IWDG == 1,
 /* Petter thread knobs.  Priority 5 sits above usb(8) / cli(16) / bg(17) so the
  * petter preempts every app thread: it keeps feeding through a ~12 s CoreMark run
  * and only stops when the whole system is stuck (scheduler/tick death, IRQ-off
- * lockup, OCTOSPI2 XIP fetch stall).  Feed every 1000 ms (1 tick == 1 ms); the
+ * lockup, a stalled external-memory access).  Feed every 1000 ms (1 tick == 1 ms); the
  * nominal timeout is ~3.0 s (2.04 s at the 47 kHz LSI fast corner), so a 1 s feed
  * keeps margin at every LSI corner.  This assumes normal code never masks IRQs for
  * > ~1 s nor adds a non-blocking CPU hog at priority <= 5. */

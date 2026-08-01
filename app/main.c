@@ -1,10 +1,10 @@
 /*
  * Wio Lite AI (STM32H725AEI6) -- ThreadX shell app entry (Phase 2).
  *
- * Runs XIP from the external OCTOSPI2 flash at 0x70000000, launched by the DFU
- * bootloader.  It INHERITS the bootloader's 550 MHz clock tree + OCTOSPI2
- * memory-mapped mode and must NOT reprogram the RCC: src/system_stm32h7xx.c gives
- * a clock-free SystemInit (FPU + VTOR=0x70000000 only).  HAL_Init() only sets the
+ * Runs from the internal flash app partition at 0x08020000 (issue #25), launched
+ * by the DFU bootloader.  It INHERITS the bootloader's 550 MHz clock tree and must
+ * NOT reprogram the RCC: src/system_stm32h7xx.c gives a clock-free SystemInit (FPU
+ * + VTOR + the ITCM load only).  HAL_Init() only sets the
  * NVIC priority grouping and SysTick (reload = SystemCoreClock/1000 = 550000 for a
  * 1 ms tick); it does not touch the PLLs.
  *
@@ -64,7 +64,7 @@ static UCHAR     usb_stack[4096] __attribute__((aligned(8)));  /* tud_task + pri
  * interrupts enabled (no __disable_irq) and SysTick_Handler calls HAL_IncTick()
  * unconditionally.  Priority 5 preempts usb(8)/cli(16)/bg(17), so the petter keeps
  * feeding through a ~12 s CoreMark run and only stops on a whole-system stall
- * (scheduler/tick death, IRQ-off lockup, OCTOSPI2 XIP fetch stall) -> the IWDG then
+ * (scheduler/tick death, IRQ-off lockup, a stalled external-memory access) -> the IWDG then
  * resets the board. */
 static TX_THREAD iwdg_thread;
 static UCHAR     iwdg_stack[IWDG_PETTER_STACK_SIZE] __attribute__((aligned(8)));
@@ -169,8 +169,8 @@ static void led_init_off(void)
 
 int main(void)
 {
-  /* Caches on: the app executes XIP from OCTOSPI2 and keeps its working data in
-   * AXI-SRAM, both slow uncached.  Enable I-cache (read-only instruction memory ->
+  /* Caches on: the app executes from the internal flash and keeps its working data
+   * in AXI-SRAM, both slow uncached.  Enable I-cache (read-only instruction memory ->
    * no coherency concern) then D-cache.  Neither touches the RCC/clock.
    *
    * D-cache is safe here because the app is single-CPU with NO DMA master: USB
@@ -210,11 +210,10 @@ int main(void)
                     * no interrupt is armed before its ThreadX objects exist (#12). */
 
 #if BSP_PSRAM_INIT_IN_APP
-  /* App-first OCTOSPI1 APS6408 PSRAM bring-up (issue #3): register-only, touches
-   * neither OCTOSPI2/OCTOSPIM nor the RCC, so it is XIP-safe.  Fail-soft -- a
-   * failed bring-up just leaves `psram` reporting "not ready".  Once the register
-   * values are validated on hardware this moves into the bootloader (Phase B) and
-   * this call is disabled (-DBSP_PSRAM_INIT_IN_APP=OFF). */
+  /* OCTOSPI1 APS6408 PSRAM bring-up (issue #3): register-only, touches neither the
+   * OCTOSPIM routing nor the RCC.  Fail-soft -- a failed bring-up just leaves
+   * `psram` reporting "not ready".  This stays app-side: since issue #25 the
+   * bootloader owns no external memory at all, so the app is the natural owner. */
   psram_hw_init();
   /* mmapscan (issue #16): if a DLYB sweep is in progress, test the next unit
    * against real mmap access and either record + reset, or (on a hang) let the

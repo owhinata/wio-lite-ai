@@ -9,7 +9,7 @@
  * Design (plan codex-review LGTM):
  *  - Bare-register UART bring-up; GPIO/clock via HAL macros (house style, cf.
  *    app/psram.c, app/usb_cdc.c).  NEVER touches the RCC clock tree -- only the
- *    peripheral clock GATES -- so it is safe while the CPU runs XIP from OCTOSPI2.
+ *    peripheral clock GATES -- so it never disturbs the inherited clock tree.
  *  - Baud is derived from the inherited PCLK2 = 137.5 MHz (UART9/USART1 are on APB2;
  *    the bootloader leaves RCC_D2CCIP2R USART clock-select = 0 = PCLK2, and
  *    HCLK=SYSCLK/2=275 MHz, APB2 /2 -> PCLK2 = 137.5 MHz).
@@ -98,15 +98,14 @@
  * rtl8720_uart_flush() and its single call site at the top of rtl8720_uart_close()
  * (every baud change in the tree goes through a close).
  *
- * BUT that measurement cannot clear a HIGHER baud, and issue #24 tracks why: this whole
- * path is fetched from OCTOSPI2 XIP, and the drain cost measured 8.7 us cold (7
- * interrupts) against 3.3 us warm (133) -- so the external-flash fetch is worth
- * microseconds.  At 2 Mbaud one byte time is 5 us, which is coarse enough to hide all
- * of it; at 6 Mbaud it is 1.67 us and it would show.  The entry path (vector read,
- * exception prologue, tx_glue_isr_enter) is XIP too and is not measured here at all.
- * Before raising the baud, move this path into ITCM / .RamFunc (issue #24) so the
- * argument becomes structural -- no XIP fetch in the RX path -- rather than a
- * workload-dependent measurement.
+ * BUT that measurement cannot clear a HIGHER baud, and issue #24 tracks why: back when
+ * this whole path was fetched from the external OCTOSPI2 flash, the drain cost measured
+ * 8.7 us cold (7 interrupts) against 3.3 us warm (133) -- the flash fetch alone was
+ * worth microseconds.  At 2 Mbaud one byte time is 5 us, coarse enough to hide all of
+ * it; at 6 Mbaud it is 1.67 us and it would show.  That is why the path was moved into
+ * ITCM (issue #24/#29): the argument is now structural -- no flash fetch in the RX path
+ * -- rather than a workload-dependent measurement.  Issue #25 shrank the remaining
+ * exposure further by moving execution to the internal flash.
  */
 #include "stm32h7xx_hal.h"
 #include "tx_api.h"       /* tx_thread_sleep / tx_time_get: yield while the TX ring is full */
