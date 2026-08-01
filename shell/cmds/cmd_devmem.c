@@ -211,7 +211,8 @@ static int devmem_psram_lock(struct cli_instance *sh, uint32_t addr, uint32_t sp
 	    (uint64_t)addr + span > (uint64_t)PSRAM_BASE_ADDR + PSRAM_SIZE_BYTES)
 		return 0;                               /* not the PSRAM window */
 	if (!psram_acquire()) {
-		cli_error(sh, "devmem: PSRAM busy (a psram command holds OCTOSPI1)\r\n");
+		cli_error(sh, "devmem: OCTOSPI1 busy (a psram command holds it, or "
+		              "the LCD is scanning out of it -- run `lcd off`)\r\n");
 		return -1;
 	}
 	return 1;

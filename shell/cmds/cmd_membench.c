@@ -485,7 +485,9 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 		if (!psram_ready())
 			cli_warn(sh, "membench: PSRAM not ready; skipping\r\n");
 		else if (!psram_acquire())
-			cli_warn(sh, "membench: PSRAM busy (a psram command holds it); skipping\r\n");
+			cli_warn(sh, "membench: OCTOSPI1 busy (a psram command holds it, "
+			             "or the LCD is scanning out of it -- run `lcd off`); "
+			             "skipping\r\n");
 		else {
 			bw_row(sh, "PSRAM  (64KB)", (uint32_t *)PSRAM_BASE_ADDR,
 			       PSRAM_BENCH_BYTES / 4u, clk, 1);

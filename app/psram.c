@@ -35,6 +35,9 @@
  */
 #include "stm32h7xx_hal.h"
 #include "psram.h"
+#if BSP_ENABLE_LCD
+#include "ltdc_display.h"   /* ltdc_scanout_active(): see psram_acquire() (issue #7) */
+#endif
 
 /* ------------------------------------------------------------------ *
  *  Tunable bring-up parameters (validate / adjust on board #2)
@@ -633,11 +636,29 @@ int psram_ready(void) { return psram_up; }
  * AXI bus until the IWDG resets the board.  A non-blocking test-and-set (LDREXB/
  * STREXB, no IRQ disable, thread-context only) lets the shell reject the second
  * user instead.  Held at the shell-command boundary: cmd_psram.c hardware
- * subcommands, cmd_membench.c PSRAM rows, and cmd_devmem.c PSRAM accesses. */
+ * subcommands, cmd_membench.c PSRAM rows, and cmd_devmem.c PSRAM accesses.
+ *
+ * Issue #7 added a second, non-shell contender that no test-and-set can arbitrate
+ * after the fact: the LTDC. Its frame buffers live in this window, so while
+ * scanout runs the display controller reads OCTOSPI1 *continuously* and entirely
+ * outside the shell. Retuning the bus underneath it (prescaler, latency, MR0,
+ * DLYB phase, an mmap->indirect switch) starves the LTDC FIFO at best and, with a
+ * DQS-gated read on a half-configured controller, stalls the AXI until the IWDG
+ * fires. So scanout takes precedence: the guard simply refuses while the display
+ * is live and the caller tells the user to run `lcd off` first.
+ *
+ * The dependency is one-way on purpose -- app/psram.c calls into port/ltdc, and
+ * port/ltdc never includes psram.h (its caller checks psram_ready() instead).
+ * ltdc_scanout_active() is false whenever the LTDC never came up, so a build or a
+ * boot without a display behaves exactly as before. */
 static volatile uint8_t psram_busy;
 
 int psram_acquire(void)
 {
+#if BSP_ENABLE_LCD
+	if (ltdc_scanout_active())
+		return 0;               /* LTDC is reading this bus right now */
+#endif
 	do {
 		if (__LDREXB(&psram_busy) != 0u) {
 			__CLREX();

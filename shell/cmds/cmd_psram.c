@@ -31,8 +31,9 @@
 static int psram_guard(struct cli_instance *sh)
 {
 	if (!psram_acquire()) {
-		cli_error(sh, "psram: busy (another psram/membench command holds "
-		          "OCTOSPI1)\r\n");
+		cli_error(sh, "psram: OCTOSPI1 busy (another psram/membench command "
+		          "holds it, or the LCD is scanning out of it -- "
+		          "run `lcd off`)\r\n");
 		return -1;
 	}
 	return 0;

@@ -1,0 +1,127 @@
+/*
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Wio Lite AI ThreadX Shell Project
+ */
+/**
+ * @file    st7789_rgb.c
+ * @brief   ST7789 bring-up over the bit-banged 3-wire SPI multiplexed onto the
+ *          LTDC red data lines (issue #7).  See st7789_rgb.h for why this exists
+ *          and where the numbers came from.
+ */
+#include "st7789_rgb.h"
+
+#include "stm32h7xx_hal.h"
+#include "timebase.h"   /* udelay: DWT-based, no scheduler needed */
+
+/* Serial pins, multiplexed with LTDC_R2 / R0 / R1 (see the header). */
+#define ST_CS_PORT    GPIOA
+#define ST_CS_PIN     GPIO_PIN_1     /* LTDC_R2 */
+#define ST_SDA_PORT   GPIOH
+#define ST_SDA_PIN    GPIO_PIN_2     /* LTDC_R0 */
+#define ST_SCL_PORT   GPIOH
+#define ST_SCL_PIN    GPIO_PIN_3     /* LTDC_R1 */
+/* The factory firmware also parks the pixel clock low as a GPIO across the
+   sequence; mirrored here so the panel sees exactly what it saw at the factory. */
+#define ST_PCLK_PORT  GPIOG
+#define ST_PCLK_PIN   GPIO_PIN_7     /* LTDC_CLK */
+
+/* Half-bit time.  The factory image inserts a short software delay between edges
+   and the ST7789 has no minimum clock rate, so this is generous rather than
+   tuned: ~1 us per edge puts the bus around 300 kHz, and the whole 68-frame
+   sequence still costs well under a millisecond of clocking. */
+#define ST_HALF_BIT_US  1u
+
+static void st_write(uint32_t dc, uint8_t val)
+{
+	/* 9 bits, MSB first: the data/command flag, then the byte.  Data is
+	   presented while SCL is high, then SCL goes low and back high -- the
+	   controller latches on the rising edge. */
+	HAL_GPIO_WritePin(ST_CS_PORT, ST_CS_PIN, GPIO_PIN_RESET);
+	for (uint32_t i = 0; i < 9u; i++) {
+		uint32_t bit = (i == 0u) ? dc : ((uint32_t)val >> (8u - i)) & 1u;
+
+		HAL_GPIO_WritePin(ST_SDA_PORT, ST_SDA_PIN,
+		                  bit ? GPIO_PIN_SET : GPIO_PIN_RESET);
+		udelay(ST_HALF_BIT_US);
+		HAL_GPIO_WritePin(ST_SCL_PORT, ST_SCL_PIN, GPIO_PIN_RESET);
+		udelay(ST_HALF_BIT_US);
+		HAL_GPIO_WritePin(ST_SCL_PORT, ST_SCL_PIN, GPIO_PIN_SET);
+	}
+	HAL_GPIO_WritePin(ST_SDA_PORT, ST_SDA_PIN, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(ST_PCLK_PORT, ST_PCLK_PIN, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(ST_CS_PORT, ST_CS_PIN, GPIO_PIN_SET);
+}
+
+static void st_cmd(uint8_t c)  { st_write(0u, c); }
+static void st_data(uint8_t d) { st_write(1u, d); }
+
+/*
+ * The power-on sequence, transcribed one-for-one from the factory image.  The
+ * command bytes are ST7789 register names; the parameter bytes are panel-
+ * specific tuning (gamma, power rails, porches) that only the module vendor
+ * knows, so they are reproduced verbatim rather than derived.
+ */
+static void st_send_sequence(void)
+{
+	static const uint8_t seq[] = {
+		/* count, command, params... ; count = number of parameter bytes */
+		0, 0x11,                                     /* SLPOUT (needs 120 ms) */
+		2, 0xB0, 0x11, 0xF0,                         /* RAMCTRL: RGB interface */
+		3, 0xB1, 0xC0, 0x02, 0x14,                   /* RGBCTRL: DE mode       */
+		5, 0xB2, 0x0C, 0x0C, 0x00, 0x33, 0x33,       /* PORCTRL                */
+		1, 0xB7, 0x35,                               /* GCTRL                  */
+		1, 0xBB, 0x28,                               /* VCOMS                  */
+		1, 0xC0, 0x2C,                               /* LCMCTRL                */
+		1, 0xC2, 0x01,                               /* VDVVRHEN               */
+		1, 0xC3, 0x0B,                               /* VRHS                   */
+		1, 0xC4, 0x20,                               /* VDVS                   */
+		1, 0xC6, 0x0F,                               /* FRCTRL2                */
+		2, 0xD0, 0xA4, 0xA1,                         /* PWCTRL1                */
+		14, 0xE0, 0xD0, 0x01, 0x08, 0x0F, 0x11, 0x2A, 0x36, 0x55, 0x44, 0x3A,
+		           0x0B, 0x06, 0x11, 0x20,           /* PVGAMCTRL             */
+		14, 0xE1, 0xD0, 0x02, 0x07, 0x0A, 0x0B, 0x18, 0x34, 0x43, 0x4A, 0x2B,
+		           0x1B, 0x1C, 0x22, 0x1F,           /* NVGAMCTRL             */
+		1, 0x3A, 0x55,                               /* COLMOD: 16 bit/pixel   */
+		1, 0x36, 0x00,                               /* MADCTL: default scan   */
+		0, 0x29,                                     /* DISPON                 */
+	};
+	uint32_t i = 0;
+
+	while (i < sizeof seq) {
+		uint8_t n   = seq[i++];
+		uint8_t cmd = seq[i++];
+
+		st_cmd(cmd);
+		if (cmd == 0x11u)
+			HAL_Delay(120);   /* sleep-out settle, per the factory image */
+		while (n-- > 0u)
+			st_data(seq[i++]);
+	}
+}
+
+void st7789_rgb_init(void)
+{
+	GPIO_InitTypeDef g = {0};
+
+	/* Idle levels before the pins are driven, so the first CS edge is clean. */
+	HAL_GPIO_WritePin(ST_CS_PORT, ST_CS_PIN, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(ST_SCL_PORT, ST_SCL_PIN, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(ST_SDA_PORT, ST_SDA_PIN, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(ST_PCLK_PORT, ST_PCLK_PIN, GPIO_PIN_RESET);
+
+	g.Mode  = GPIO_MODE_OUTPUT_PP;
+	g.Pull  = GPIO_NOPULL;
+	g.Speed = GPIO_SPEED_FREQ_LOW;
+
+	g.Pin = ST_CS_PIN;
+	HAL_GPIO_Init(ST_CS_PORT, &g);
+	g.Pin = ST_SDA_PIN | ST_SCL_PIN;
+	HAL_GPIO_Init(ST_SDA_PORT, &g);
+	g.Pin = ST_PCLK_PIN;
+	HAL_GPIO_Init(ST_PCLK_PORT, &g);
+
+	HAL_Delay(1);
+	st_send_sequence();
+	/* Pins are left as GPIO: the caller re-arms the LTDC alternate function once
+	   it is ready to start scanning (see st7789_rgb.h). */
+}

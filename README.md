@@ -24,7 +24,7 @@ its clock tree** — see *Key design points*.
 Presents a `wio> ` prompt on **`/dev/ttyACM0`** (USB CDC, `0483:5740`, "CDC in FS
 Mode") with line editing, history, and Tab completion — and, once the board is on WiFi,
 the same shell over **telnet** (`wio-net> `, see `net shell` below), usable at the same
-time as the USB console. 23 commands:
+time as the USB console. 24 commands:
 
 | Group | Commands |
 |---|---|
@@ -32,6 +32,7 @@ time as the USB console. 23 commands:
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | storage | `sd` (card: info/read/format · FAT: ls/cat/write/rm/mkdir/df/umount) |
+| display | `lcd` (info/on/off · fill/bar/grad/clear/anim/blit) |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
 | wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench · **flash** info/read/backup/imgload/imginfo/write) · `net` (L3 = **host NetX Duo only**: info/ip/dhcp/ping/echo/shell) |
 | benchmarks | `coremark` · `membench` |
@@ -80,6 +81,30 @@ time as the USB console. 23 commands:
     inferred from the bus: anything ending in a command-response timeout is reported
     as `no card in slot`, and a card removed while mounted is noticed by the next
     command, which evicts the stale media and re-probes.
+- **`lcd`** — the **RGB panel on the 40-pin FPC connector**, driven by the **LTDC**
+  with **DMA2D** (Chrom-ART) acceleration and a tear-free double buffer (issue #7).
+  Intended use is camera preview plus overlays, so there is no GUI toolkit — just a
+  frame buffer and blits.
+  - *patterns*: `lcd bar` (eight colour bars — the one image that proves the RGB
+    channel wiring and the RGB565 bit order), `grad`, `fill <colour>`, `clear`,
+    `anim` (bouncing rectangle, paced by the flip), `blit` (a strided DMA2D M2M copy).
+  - *state*: `lcd info` reports geometry, blanking, the real PLL3R pixel clock, the
+    resulting refresh rate, the frame-buffer address and the sticky **FIFO-underrun /
+    transfer-error** flags. `lcd off` stops scanout **and frees OCTOSPI1** (see below);
+    `lcd on` restarts it.
+  - *the panel*: BL28005-B / JS28019H, 2.8" 240x320, **ST7789** controller. It has
+    no datasheet in circulation, so its timing, polarity, pixel clock and — the
+    part that actually mattered — its **serial power-on sequence** were recovered
+    by disassembling the board's factory Arduino firmware (see *Key design
+    points*). 6.00 MHz pixel clock, 298x336 total frame, 59.9 Hz.
+  - The two RGB565 frame buffers (2 × 76800 px = 300 KB) live in the **PSRAM**, which
+    the MPU already maps non-cacheable — so the CPU, the DMA2D and the LTDC's read DMA
+    are coherent with no cache maintenance. AXI-SRAM has no room for them.
+  - Because scanout reads OCTOSPI1 *continuously*, the `psram`/`membench`/`devmem`/
+    `wifi flash` paths that retune or re-enter that bus are **refused while the display
+    is on** — they tell you to run `lcd off` first. Retuning the octal bus under a live
+    scanout starves the LTDC FIFO, and a memory-mapped read of a half-configured
+    OCTOSPI stalls the AXI until the IWDG fires.
 - **`wifi`** — the on-board **RTL8720DN** Wi-Fi/BLE companion (issues #17/#5/#23).
   The host reaches it over `CHIP_EN` (PC3), a **LOG UART** (UART9 PD14/PD15) and an
   **AT/HS UART** (USART1 PA10/PB14); the module is held powered-off (PC3 low) at boot.
@@ -434,6 +459,28 @@ time as the USB console. 23 commands:
   `src/system_stm32h7xx.c` is a custom clock-free `SystemInit` (FPU + VTOR + the
   ITCM load only, with VTOR taken from the linker's `g_pfnVectors`);
   the ThreadX SysTick reload is computed from the inherited `SystemCoreClock`.
+- **The one exception: the LTDC pixel clock** (issue #7, `port/ltdc/ltdc_display.c`).
+  RM0468 Figure 55 wires `ltdc_ker_ck` straight to `pll3_r_ck` — no kernel-clock mux —
+  and sec 8.7.16 makes `DIVR3` writable **only with PLL3 stopped** (`PLL3ON = 0 &&
+  PLL3RDY = 0`). PLL3 is also the 48 MHz behind the USB console, so retuning the
+  display clock necessarily stops the console's clock for the duration. Two rules make
+  that safe, and both are load-bearing:
+  - `ltdc_clock_init()` runs in `main()` **before `usb_hw_init()`**, while nothing has
+    enumerated and OTG_HS is not even clocked, so the few-tens-of-µs outage is
+    unobservable. (Note `usb_hw_init()` comes *before* `psram_hw_init()`, so "next to
+    the PSRAM bring-up" would already be too late.)
+  - It does **not** use `HAL_RCCEx_PeriphCLKConfig(RCC_PERIPHCLK_LTDC)`. That HAL path
+    stops PLL3 and then rewrites M/N/P/Q/R *from the caller's struct*, which would mean
+    hardcoding the bootloader's values here — and any divergence breaks USB for good.
+    Instead it is a bare read-modify-write that touches the `DIVR3` field and `DIVR3EN`
+    only; every other bit of `RCC_PLL3DIVR` is written back exactly as read, so
+    `DIVQ3EN` and the VCO cannot drift from whatever the bootloader chose. The register
+    field is the divide ratio **minus one** (`DIVR3 = 0` means /1), which the API hides:
+    everything above speaks the ratio, default 40 → 240/40 = **6.00 MHz**.
+
+  It follows that the pixel clock cannot be retuned at run time at all — there is no
+  safe moment to stop PLL3 once the console is up — so the divide ratio is a build-time
+  constant (40 → 6.00 MHz, the rate the factory firmware used).
 - **Both L1 caches on** (`SCB_EnableICache` + `SCB_EnableDCache` in `app/main.c`).
   Ordinary app memory needs no mitigation: the app is single-CPU, so one D-cache is
   self-coherent across threads and ISRs, and USB dwc2 is slave/FIFO (CPU ↔ FIFO by
@@ -490,6 +537,40 @@ time as the USB console. 23 commands:
   indirect path, and `psram mmapscan` maps the true mmap eye across IWDG-recovered
   auto-reboots). Two lower points (88.7 MHz, 53.2 MHz) are documented at the `PSRAM_*`
   defines for a wider-margin rebuild.
+- **LCD (issue #7)**: `port/ltdc/ltdc_display.c` drives the FPC-40 RGB panel. All 28
+  LTDC signals are **AF14 except `LTDC_R3` on PA15, which is AF9** — a detail taken
+  from ST's own machine-readable pin data (`_ref/stm32_open_pin_data/`, cross-checked
+  ball-by-ball against the schematic), not guessed: on this package LTDC appears on
+  seven different alternate functions. PA15 is JTDI, which costs nothing because debug
+  here is SWD (PA13/PA14) only.
+- **The panel is not a dumb RGB panel** (`port/ltdc/st7789_rgb.c`). It carries an
+  **ST7789** that boots asleep with its RGB interface disabled, and whose CS/SDA/SCL
+  are **multiplexed onto LTDC_R2/R0/R1** (PA1/PH2/PH3) — which is why the FPC appears
+  to have no serial pins at all. Until a 9-bit bit-banged serial sequence wakes it
+  (`SLPOUT` → `RAMCTRL` = RGB interface → `RGBCTRL` = DE mode → gamma/power → `COLMOD`
+  16 bpp → `DISPON`), the panel ignores every pixel and sits backlit and blank **while
+  the LTDC reports a healthy scanout with zero FIFO underruns**. That combination is a
+  near-perfect disguise: every register readback says the display controller is fine,
+  because it is — it is driving a panel that is not listening.
+  `ltdc_init()` therefore runs the sequence *between* the reset pulse and the
+  alternate-function handover, while R0/R1/R2 are still plain GPIO.
+  There is no datasheet for this panel. The sequence, the pin multiplexing, the
+  timing (298x336 frame) and the 6.00 MHz pixel clock were all recovered by
+  disassembling the board's **factory Arduino image** (`_ref/wio_APP_0x70000000_*.bin`,
+  which links Seeed's `RGBLCD.cpp`) and mapping its Arduino pin numbers through Seeed's
+  `ArduinoCore-stm32` variant table. When a board ships with working firmware, that
+  binary *is* the missing datasheet.
+  Presentation is tear-free: stage the back buffer with `HAL_LTDC_SetAddress_NoReload`,
+  request a vertical-blanking reload, and commit the swap only once **`SRCR.VBR` reads
+  back 0** — the reload-ready IRQ is a wake-up hint, the register is the truth. A reload
+  that never lands latches the display down rather than tearing.
+  One HAL behaviour had to be undone: `HAL_LTDC_Init()` enables the transfer-error and
+  FIFO-underrun interrupts, and `HAL_LTDC_IRQHandler()` *clears* those flags. Left
+  alone, a bandwidth-starved scanout would both storm the NVIC every line and wipe the
+  very flags `lcd info` exists to report — so both are masked after init and the sticky
+  ISR bits are polled instead (hardware sets them regardless of the enables).
+  Build `-DBSP_ENABLE_LCD=OFF` to compile the driver, the command and the OCTOSPI1
+  interlock out — useful when bisecting a suspected PLL3/USB or PSRAM-bandwidth problem.
 - **ThreadX**: SysTick priority **>** PendSV (PendSV lowest) so the tick can preempt
   the idle PendSV spin; PRIMASK-based critical sections. The shared SysTick feeds
   both `HAL_IncTick` and `_tx_timer_interrupt` (`port/threadx/tx_glue.c`).
@@ -542,6 +623,9 @@ port/       threadx/ ThreadX low-level init + shared SysTick glue
             sd/      microSD block driver over SDMMC1 + its internal IDMA (issue #6)
             filex/   FileX media driver on that block API + the lazy-mount
                      singleton and its ownership gates (issue #6)
+            ltdc/    LTDC + DMA2D display driver: PLL3R pixel clock, double buffer
+                     in PSRAM, tear-free flip, draw primitives, and the ST7789
+                     serial wake-up the panel needs first (issue #7)
             coremark/ EEMBC CoreMark port (core_portme.*)
             netxduo/ nx_user.h (NetX Duo build configuration; the driver is in app/,
                      because what it sits on is the RTL8720 link, not a MAC)
@@ -568,7 +652,7 @@ Listed in memory-hierarchy order — the same order `free` and `membench` print
 | DTCM | `0x20000000` | 128 KB; holds the reset-persistent `.log_noinit` crash-log ring, the **32 KB NetX Duo packet pool** (`.nx_pool`, issue #23 U3 — no DMA touches a frame, so DTCM costs nothing from AXI-SRAM and evicts nothing from the D-cache) and `membench` scratch. All of it bypasses the D-cache. |
 | AXI-SRAM (D1) | `0x24000000` | 320 KB; `_estack = 0x24050000` (the MSP the bootloader loads). Also holds `.axi_dma`, the 4 KB SDMMC1 bounce buffer (issue #6) — in its **own output section, 32 B-aligned at both ends**, so the driver's per-transfer clean/invalidate cannot disturb a neighbouring variable's cache line. AXI-SRAM and not DTCM because the SDMMC's IDMA is an AHB master and the TCMs are reachable only by the core (RM0468 sec 2.4). |
 | FLASH | `0x08020000` | internal flash **sectors 1-3 = 384 KB** (issue #25). Sector 0 (`0x08000000`, 128 KB) is the DFU bootloader; the 128 KB erase granule is what keeps the two apart, so no programming path can reach it. ~905 MB/s read (`membench`). |
-| PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). |
+| PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). Since issue #7 the first 300 KB are the **LTDC double frame buffer**, which the display controller reads continuously while scanout is on — hence the `lcd off` interlock on every path that retunes OCTOSPI1. |
 | *(bootloader)* | `0x08000000` | internal flash **sector 0, 128 KB** — the DFU bootloader. The app does not own it and no app-side path can erase it (the 128 KB erase granule is the sector granule). |
 | *(external flash)* | `0x70000000` | the 16 MB W25Q128 the app used to execute from. **Not mapped**: the bootloader no longer brings OCTOSPI2 up, and `app/mpu.c` marks the 256 MB window no-access + execute-never so a stray or speculative access raises MemManage (recorded in `dmesg`) instead of stalling the AXI bus. Bringing it back up as storage is issue #10. |
 

@@ -552,7 +552,8 @@ static int cmd_flash_imgload(struct cli_instance *sh, int argc, char **argv)
 	 * job cannot overwrite the staging area while it fills. */
 	if (!psram_acquire()) {
 		cli_console_release(sh);
-		cli_error(sh, "wifi: PSRAM is busy (another command holds it)\r\n");
+		cli_error(sh, "wifi: PSRAM is busy (another command holds it, or the "
+		              "LCD is scanning out of it -- run `lcd off`)\r\n");
 		return 1;
 	}
 
@@ -635,7 +636,8 @@ static int cmd_flash_imginfo(struct cli_instance *sh, int argc, char **argv)
 	(void)argc; (void)argv;
 
 	if (!psram_acquire()) {
-		cli_error(sh, "wifi: PSRAM is busy (another command holds it)\r\n");
+		cli_error(sh, "wifi: PSRAM is busy (another command holds it, or the "
+		              "LCD is scanning out of it -- run `lcd off`)\r\n");
 		return 1;
 	}
 	ok = img_report(sh);
@@ -686,7 +688,8 @@ static int cmd_flash_write(struct cli_instance *sh, int argc, char **argv)
 		return 1;
 	if (!psram_acquire()) {                 /* the image is read straight out of PSRAM */
 		rtl_link_hw_release(sh);
-		cli_error(sh, "wifi: PSRAM is busy (another command holds it)\r\n");
+		cli_error(sh, "wifi: PSRAM is busy (another command holds it, or the "
+		              "LCD is scanning out of it -- run `lcd off`)\r\n");
 		return 1;
 	}
 	/* Last gate before any hardware moves: the staged bytes must still be the ones we

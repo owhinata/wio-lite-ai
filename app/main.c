@@ -35,6 +35,9 @@
 #include "sd_card.h"    /* microSD block driver over SDMMC1 + IDMA (issue #6) */
 #include "sd_fs_glue.h" /* FileX lazy-mount singleton for the card (issue #6) */
 #endif
+#if BSP_ENABLE_LCD
+#include "ltdc_display.h" /* FPC-40 RGB panel over LTDC + DMA2D (issue #7) */
+#endif
 
 /* --- interactive shell over USB CDC ------------------------------------- */
 CLI_BACKEND_USBCDC_DEFINE(cdc_tr);
@@ -141,6 +144,27 @@ void tx_application_define(void *first_unused_memory)
   sd_fs_glue_init();
 #endif
 
+#if BSP_ENABLE_LCD
+  /* LCD over LTDC + DMA2D (issue #7).  Creates its ThreadX objects, pulses the
+   * panel reset, wakes the ST7789 over its serial link and configures the
+   * controller.  It waits on no ThreadX object and runs no DMA2D transfer (the
+   * frame buffers are cleared by a CPU loop), which is what makes it safe here;
+   * it does spend ~135 ms in HAL_Delay for the reset pulse and the ST7789's
+   * mandatory sleep-out settle, which is fine because SysTick is already feeding
+   * HAL_IncTick and the IWDG is not armed until further down.
+   * The frame buffers live in the OCTOSPI1 PSRAM, so the
+   * bring-up is gated on psram_ready() HERE rather than inside the driver --
+   * port/ltdc must not depend on app/psram, because app/psram.c depends on it
+   * (it refuses to retune OCTOSPI1 while scanout is live).  Fail-soft: without a
+   * display the `lcd` commands report it down. */
+#if BSP_PSRAM_INIT_IN_APP
+  if (psram_ready())
+    (void) ltdc_init();   /* ~135 ms: reset pulse + the ST7789 sleep-out settle */
+  else
+    LOG_WRN("PSRAM down -- LCD not started (frame buffers live there)");
+#endif
+#endif
+
   /* Telnet console service (issue #21 increment 9): owns the module's listening/session
    * sockets and feeds the net_sh instance above.  Object creation only -- the thread parks
    * on its event flags until an IP address comes up (`wifi connect` / `net dhcp` arm it, or
@@ -231,6 +255,18 @@ int main(void)
 
   HAL_Init();   /* NVIC grouping + SysTick from SystemCoreClock (550 MHz); no PLL touch */
   timebase_init();   /* DWT cycle counter for usleep's udelay (CoreDebug/DWT only, no RCC) */
+
+#if BSP_ENABLE_LCD
+  /* LTDC pixel clock (issue #7).  MUST run here: it briefly stops PLL3 to retune
+   * DIVR3 (RM0468 sec 8.7.16 -- the field is writable only with PLL3 off), and
+   * PLL3Q is the 48 MHz that clocks the USB CDC console.  Before usb_hw_init()
+   * nothing has enumerated and OTG_HS is not even clocked, so the outage is
+   * invisible; anywhere later it would take the console down.  This is the one
+   * place the app touches the clock tree, and it writes back every field it did
+   * not mean to change bit-for-bit as read.  Fail-soft: on failure the shell
+   * still comes up and `lcd` reports the display down. */
+  (void) ltdc_clock_init();
+#endif
 
   usb_hw_init();   /* OTG_HS pins/clock only; the device stack (tusb_init, which
                     * enables OTG_HS_IRQn) comes up later in the usb thread entry so

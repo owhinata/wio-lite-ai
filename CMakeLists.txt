@@ -363,6 +363,24 @@ if(BSP_ENABLE_SD)
         ${FX_CORE})
 endif()
 
+# issue #7: the FPC-40 RGB LCD over LTDC + DMA2D.  ON builds the display driver
+# and the `lcd` command; the two frame buffers land in the OCTOSPI1 PSRAM, so this
+# only does anything useful with BSP_ENABLE_PSRAM.  Turn OFF to build a firmware
+# whose LTDC never touches the clock tree (ltdc_clock_init briefly stops PLL3,
+# which is also the USB console's clock) or never reads OCTOSPI1 -- useful when
+# bisecting a PLL3/USB or a PSRAM-bandwidth suspicion.  Also drops the LTDC
+# interlock inside psram_acquire().
+option(BSP_ENABLE_LCD "Enable the FPC-40 RGB LCD (LTDC) and the lcd command" ON)
+
+# Driver and command move together -- cmd_lcd.c is the only caller of port/ltdc --
+# and, like the SD block above, this append must stay BELOW the option().
+if(BSP_ENABLE_LCD)
+    list(APPEND SHELL_SOURCES
+        "${CMAKE_SOURCE_DIR}/port/ltdc/ltdc_display.c"
+        "${CMAKE_SOURCE_DIR}/port/ltdc/st7789_rgb.c"
+        "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_lcd.c")
+endif()
+
 add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/main.c"
     "${CMAKE_SOURCE_DIR}/app/usb_cdc.c"
@@ -403,6 +421,7 @@ target_include_directories(shell PRIVATE
     "${CMAKE_SOURCE_DIR}/port/threadx"
     "${CMAKE_SOURCE_DIR}/port/sd"                # issue #6: sd_card.h
     "${CMAKE_SOURCE_DIR}/port/filex"             # issue #6: fx_user.h + the SD glue
+    "${CMAKE_SOURCE_DIR}/port/ltdc"              # issue #7: ltdc_display.h
     "${CMAKE_SOURCE_DIR}/lib/filex/common/inc"
     "${CMAKE_SOURCE_DIR}/lib/filex/ports/cortex_m7/gnu/inc"
     "${CMAKE_SOURCE_DIR}/shell/include"
@@ -440,7 +459,8 @@ target_compile_definitions(shell PRIVATE
     BSP_ENABLE_PSRAM=$<BOOL:${BSP_ENABLE_PSRAM}>          # issue #3: PSRAM window + psram cmd
     BSP_PSRAM_INIT_IN_APP=$<BOOL:${BSP_PSRAM_INIT_IN_APP}>  # issue #3: app-side OCTOSPI1 bring-up
     FX_INCLUDE_USER_DEFINE_FILE             # issue #6: port/filex/fx_user.h
-    BSP_ENABLE_SD=$<BOOL:${BSP_ENABLE_SD}>)                 # issue #6: SDMMC1 microSD + sd cmd
+    BSP_ENABLE_SD=$<BOOL:${BSP_ENABLE_SD}>                  # issue #6: SDMMC1 microSD + sd cmd
+    BSP_ENABLE_LCD=$<BOOL:${BSP_ENABLE_LCD}>)               # issue #7: LTDC LCD + lcd cmd
 target_compile_options(shell PRIVATE -O2)
 
 firmware_finalize(shell)
