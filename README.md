@@ -105,6 +105,33 @@ time as the USB console. 24 commands:
     is on** — they tell you to run `lcd off` first. Retuning the octal bus under a live
     scanout starves the LTDC FIFO, and a memory-mapped read of a half-configured
     OCTOSPI stalls the AXI until the IWDG fires.
+- **`camera`** — the **DVP camera on the 24-pin FPC connector** (J7), feeding the
+  **DCMI** (issue #8). **Phase 1 only so far**: everything the sensor needs before a
+  pixel can move — the master clock, the SCCB control bus and the PWDN/RESETB lines
+  — plus the chip-ID read that says which sensor is actually plugged in. DCMI, DMA
+  and the frame pipeline come in phases 2/3.
+  - *the host must generate XCLK*. Schematic sheet 7 leaves the 24 MHz oscillator
+    OSC1 and its series R15 **DNP**; the only populated path to the module's clock
+    pin is R11 (0R) from `DCMI_XCLK` = **PA2**, driven by **TIM5_CH3** (AF2) at
+    275 MHz / 12 = **22.92 MHz** with an exact 50 % duty. TIM2, the other candidate
+    on PA2, is already the ThreadX execution-profile time source. An OmniVision
+    sensor clocks its SCCB off XVCLK, so **the I2C bus stays dead until XCLK runs**
+    — the single most confusing failure mode here.
+  - *the camera supply cannot be switched off*. U8 (ME6216A28M3G) feeds VDD_2V8
+    straight from SYS_5V with no enable pin, so `camera off` can only assert PWDN
+    (PE7), hold RESETB (PH12) low and stop XCLK. The f746 firmware this port comes
+    from cuts a GPIO-controlled rail; this board has none.
+  - *identification*: `camera probe` power-cycles the module and tries OV2640
+    (SCCB 0x30, 8-bit banked registers, PID/MID) then OV5640 (0x3C, 16-bit
+    registers, ID 0x5640). If neither matches it reports **which address ACKed**
+    and leaves the sensor powered so `camera scan` / `camera reg <addr> <reg>` can
+    keep digging. SCCB is I2C4 on **PF14/PF15** (AF4, 4.7k board pull-ups), kernel
+    clock `rcc_pclk4` = 137.5 MHz at 100 kHz nominal.
+  - *bring-up knobs*: `camera xclk <hz>` and `camera tune {pwdn|rst|pull|i2c|sccb}`
+    make every unproven board assumption switchable at run time — the internal
+    flash is rated for only ~10k erase cycles, so sweeping an unknown by reflashing
+    is exactly what these replace (the lesson from the LCD bring-up above). They are
+    instruments, not a permanent command surface.
 - **`wifi`** — the on-board **RTL8720DN** Wi-Fi/BLE companion (issues #17/#5/#23).
   The host reaches it over `CHIP_EN` (PC3), a **LOG UART** (UART9 PD14/PD15) and an
   **AT/HS UART** (USART1 PA10/PB14); the module is held powered-off (PC3 low) at boot.
@@ -626,6 +653,8 @@ port/       threadx/ ThreadX low-level init + shared SysTick glue
             ltdc/    LTDC + DMA2D display driver: PLL3R pixel clock, double buffer
                      in PSRAM, tear-free flip, draw primitives, and the ST7789
                      serial wake-up the panel needs first (issue #7)
+            camera/  DVP camera bring-up: XCLK on TIM5_CH3, SCCB on I2C4,
+                     PWDN/RESETB and sensor identification (issue #8 phase 1)
             coremark/ EEMBC CoreMark port (core_portme.*)
             netxduo/ nx_user.h (NetX Duo build configuration; the driver is in app/,
                      because what it sits on is the RTL8720 link, not a MAC)

@@ -38,6 +38,9 @@
 #if BSP_ENABLE_LCD
 #include "ltdc_display.h" /* FPC-40 RGB panel over LTDC + DMA2D (issue #7) */
 #endif
+#if BSP_ENABLE_CAMERA
+#include "camera.h"     /* FPC-24 DVP camera: XCLK + SCCB bring-up (issue #8) */
+#endif
 
 /* --- interactive shell over USB CDC ------------------------------------- */
 CLI_BACKEND_USBCDC_DEFINE(cdc_tr);
@@ -163,6 +166,17 @@ void tx_application_define(void *first_unused_memory)
   else
     LOG_WRN("PSRAM down -- LCD not started (frame buffers live there)");
 #endif
+#endif
+
+#if BSP_ENABLE_CAMERA
+  /* DVP camera bring-up (issue #8 phase 1).  Creates its mutex, gates the clocks
+   * and configures PA2 (XCLK, parked low), PE7/PH12 (PWDN/RESETB, both asserted)
+   * and I2C4.  It runs NO sensor traffic, waits on nothing, spends no time in
+   * HAL_Delay and enables no interrupt -- the module stays exactly as its own
+   * power-on reset left it until `camera on` / `camera probe`.  That is what
+   * makes it safe here; anything that had to sleep would have to move to a
+   * thread entry.  Fail-soft: without it the `camera` commands report it down. */
+  (void) camera_init();
 #endif
 
   /* Telnet console service (issue #21 increment 9): owns the module's listening/session
