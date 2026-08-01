@@ -504,15 +504,18 @@ fw/rtl8720/ reproducible build of the RTL8720DN's own firmware (the eRPC server 
 
 ## Memory map (`ldscript/STM32H725AEIx_IROM.ld`)
 
+Listed in memory-hierarchy order — the same order `free` and `membench` print
+(issue #33), which is not address order.
+
 | Region | Address | Notes |
 |---|---|---|
-| FLASH | `0x08020000` | internal flash **sectors 1-3 = 384 KB** (issue #25). Sector 0 (`0x08000000`, 128 KB) is the DFU bootloader; the 128 KB erase granule is what keeps the two apart, so no programming path can reach it. ~905 MB/s read (`membench`). |
-| *(external flash)* | `0x70000000` | the 16 MB W25Q128 the app used to execute from. **Not mapped**: the bootloader no longer brings OCTOSPI2 up, and `app/mpu.c` marks the 256 MB window no-access + execute-never so a stray or speculative access raises MemManage (recorded in `dmesg`) instead of stalling the AXI bus. Bringing it back up as storage is issue #10. |
-| PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). |
-| AXI-SRAM (D1) | `0x24000000` | 320 KB; `_estack = 0x24050000` (the MSP the bootloader loads). |
-| DTCM | `0x20000000` | 128 KB; holds the reset-persistent `.log_noinit` crash-log ring, the **32 KB NetX Duo packet pool** (`.nx_pool`, issue #23 U3 — no DMA touches a frame, so DTCM costs nothing from AXI-SRAM and evicts nothing from the D-cache) and `membench` scratch. All of it bypasses the D-cache. |
 | ITCM | `0x00000000` | 64 KB; holds the **interrupt paths** (`.itcm`, 3,272 B): ThreadX PendSV + SysTick, the RTL8720 UART RX ISR **and the whole wake-up it signals** (`tx_event_flags_set` + `_tx_thread_system_resume`, issue #23 U0-3 — that call alone had put the ISR back to 4.3 µs warm / 12.9 µs cold — plus their two tails `_tx_thread_system_preempt_check` + `_tx_timer_system_deactivate`, issue #29), and the fault handlers, plus the 4 KB `.itcm_bench` scratch. Zero-wait-state and outside both caches, so an ISR never pays a cold fetch through the 16 KB I-cache: measured against the external-XIP build the same UART ISR went from **8.7 µs cold / 3.3 µs warm to a flat 0.7 µs** (issue #24). The tails matter because they only run when a thread is *really* woken — with them still in the flash, request/reply commands (`wifi ver`, `wifi scan`) measured 3.5 µs against 0.1 µs for an ISR that wakes nobody; 106 bytes of ITCM took that to **1.5 µs**, and `wifi link bench` improved 2.1 → 1.5 µs too. Those figures were taken while the app ran from the external flash; issue #25 shrank the gap without closing it (ITCM is still zero-wait and never evicted). Loaded from its load image by `SystemInit()`, which also zero-fills all 64 KB to initialise the TCM ECC; kept read-only by the MPU so a NULL write raises MemManage instead of corrupting ISR code. |
-| internal Flash | `0x08000000` | 512 KB — **DFU bootloader only**; the app does not own it. |
+| DTCM | `0x20000000` | 128 KB; holds the reset-persistent `.log_noinit` crash-log ring, the **32 KB NetX Duo packet pool** (`.nx_pool`, issue #23 U3 — no DMA touches a frame, so DTCM costs nothing from AXI-SRAM and evicts nothing from the D-cache) and `membench` scratch. All of it bypasses the D-cache. |
+| AXI-SRAM (D1) | `0x24000000` | 320 KB; `_estack = 0x24050000` (the MSP the bootloader loads). |
+| FLASH | `0x08020000` | internal flash **sectors 1-3 = 384 KB** (issue #25). Sector 0 (`0x08000000`, 128 KB) is the DFU bootloader; the 128 KB erase granule is what keeps the two apart, so no programming path can reach it. ~905 MB/s read (`membench`). |
+| PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). |
+| *(bootloader)* | `0x08000000` | internal flash **sector 0, 128 KB** — the DFU bootloader. The app does not own it and no app-side path can erase it (the 128 KB erase granule is the sector granule). |
+| *(external flash)* | `0x70000000` | the 16 MB W25Q128 the app used to execute from. **Not mapped**: the bootloader no longer brings OCTOSPI2 up, and `app/mpu.c` marks the 256 MB window no-access + execute-never so a stray or speculative access raises MemManage (recorded in `dmesg`) instead of stalling the AXI bus. Bringing it back up as storage is issue #10. |
 
 ## Build
 

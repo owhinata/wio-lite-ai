@@ -24,19 +24,24 @@
  *    *bandwidth* stays high even out-of-cache (burst line-refills), so the cache
  *    step shows mainly in the dependent-load *latency* rows.  DTCM is TCM (bypasses
  *    the D-cache, always the raw rate) and Flash is read-only.
- *  - Regions: DTCM (4 KB, .dtcm_bench), ITCM (4 KB, .itcm_bench -- READ ONLY, and no
- *    latency column: the ISR paths live in ITCM since issue #24 and app/mpu.c marks
- *    the region read-only, so the write/copy legs and the chain-building
- *    pointer-chase would fault), AXI-SRAM (64 KB, malloc'd on demand),
- *    Flash = the embedded flash via AXIM at 0x08000000 (read-only, and the region
- *    the app itself executes from since issue #25; a read is harmless -- no
- *    write/erase, so no brick risk even though sector 0 is the bootloader).  The
- *    former "Flash ext" row measured the OCTOSPI2 XIP window at 0x70000000; the
- *    bootloader no longer maps it and app/mpu.c fences it off, so the row is gone
- *    (it read 54 MB/s against 905 for the internal flash -- the reason for #25).
- *    PSRAM = OCTOSPI1
- *    APS6408 mmap window 0x90000000 (writable scratch, MPU non-cacheable ->
- *    raw octal-DTR rate; skipped when the bring-up failed).
+ *  - Regions, listed in MEMORY-HIERARCHY order (issue #33) -- tightly-coupled RAMs,
+ *    then on-chip AXI-SRAM, then the internal flash the code runs from, then the
+ *    external window.  Not address order, and `free` uses the same sequence so the
+ *    two outputs line up:
+ *      ITCM  (4 KB, .itcm_bench) -- READ ONLY, and no latency column: the ISR paths
+ *            live in ITCM since issue #24 and app/mpu.c marks the region read-only,
+ *            so the write/copy legs and the chain-building pointer-chase would fault.
+ *      DTCM  (4 KB, .dtcm_bench)
+ *      SRAM  AXI-SRAM (64 KB, malloc'd on demand)
+ *      Flash the embedded flash via AXIM at 0x08000000 (read-only, and the region the
+ *            app itself executes from since issue #25; a read is harmless -- no
+ *            write/erase, so no brick risk even though sector 0 is the bootloader).
+ *            The former "Flash ext" row measured the OCTOSPI2 XIP window at
+ *            0x70000000; the bootloader no longer maps it and app/mpu.c fences it
+ *            off, so the row is gone (it read 54 MB/s against 905 for the internal
+ *            flash -- the reason for #25).
+ *      PSRAM OCTOSPI1 APS6408 mmap window 0x90000000 (writable scratch, MPU
+ *            non-cacheable -> raw octal-DTR rate; skipped when the bring-up failed).
  *
  * Timing: DWT CYCCNT.  Each timed run is sized to ~0.3 ms (< one 1 kHz SysTick
  * period) via a calibration pass, run up to MEMBENCH_TRIALS times; runs during
@@ -402,13 +407,13 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 
 		do_dtcm = do_itcm = do_sram = do_flash = do_psram = 0;
 		if (!strcmp(r, "all"))        do_dtcm = do_itcm = do_sram = do_flash = do_psram = 1;
-		else if (!strcmp(r, "dtcm"))  do_dtcm = 1;
 		else if (!strcmp(r, "itcm"))  do_itcm = 1;
+		else if (!strcmp(r, "dtcm"))  do_dtcm = 1;
 		else if (!strcmp(r, "sram"))  do_sram = 1;
 		else if (!strcmp(r, "flash")) do_flash = 1;
 		else if (!strcmp(r, "psram")) do_psram = 1;
 		else {
-			cli_error(sh, "membench: unknown region '%s' (dtcm|itcm|sram|flash|psram|all)\r\n", r);
+			cli_error(sh, "membench: unknown region '%s' (itcm|dtcm|sram|flash|psram|all)\r\n", r);
 			return 1;
 		}
 	}
@@ -444,22 +449,30 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 	          "(DTCM=TCM uncached; SRAM via 16KB L1 D$; Flash=embedded/AXIM).\r\n\r\n",
 	          (unsigned long)(clk / 1000000u));
 
-	/* bandwidth table */
+	/* Bandwidth table, in memory-hierarchy order rather than address order: the
+	 * tightly-coupled RAMs first, then on-chip AXI-SRAM, then the internal flash
+	 * the code runs from, then the external window.  `free` lists its regions the
+	 * same way so the two can be read side by side (issue #33). */
 	cli_print(sh, "%-24s %8s %8s %8s\r\n", "bandwidth (MB/s)", "read", "write", "copy");
-	if (do_dtcm) {
-		if (cli_cancel_requested(sh)) goto done;
-		bw_row(sh, "DTCM   ( 4KB)", dtcm_bench_buf, DTCM_BENCH_BYTES / 4u, clk, 1);
-	}
 	if (do_itcm) {
 		if (cli_cancel_requested(sh)) goto done;
 		/* Read-only: the MPU protects the resident ISR code (see itcm_bench_buf). */
 		bw_row(sh, "ITCM   ( 4KB, RO)", (uint32_t *)(uintptr_t)itcm_bench_buf,
 		       ITCM_BENCH_BYTES / 4u, clk, 0);
 	}
+	if (do_dtcm) {
+		if (cli_cancel_requested(sh)) goto done;
+		bw_row(sh, "DTCM   ( 4KB)", dtcm_bench_buf, DTCM_BENCH_BYTES / 4u, clk, 1);
+	}
 	if (do_sram) {
 		if (cli_cancel_requested(sh)) goto done;
 		bw_row(sh, "SRAM   ( 4KB, cached)", sram_bench_buf, SRAM_CACHED_BYTES / 4u, clk, 1);
 		bw_row(sh, "SRAM   (64KB, refill)", sram_bench_buf, SRAM_BENCH_BYTES / 4u, clk, 1);
+	}
+	if (do_flash) {
+		if (cli_cancel_requested(sh)) goto done;
+		bw_row(sh, "Flash  (64KB)", (uint32_t *)IFLASH_BENCH_BASE,
+		       FLASH_BENCH_BYTES / 4u, clk, 0);
 	}
 #if BSP_ENABLE_PSRAM
 	/* PSRAM is scratch RAM (writable) behind the MPU non-cacheable window, so
@@ -480,11 +493,6 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 		}
 	}
 #endif
-	if (do_flash) {
-		if (cli_cancel_requested(sh)) goto done;
-		bw_row(sh, "Flash  (64KB)", (uint32_t *)IFLASH_BENCH_BASE,
-		       FLASH_BENCH_BYTES / 4u, clk, 0);
-	}
 
 	/* latency vs. working-set size (pointer-chase; Flash is read-only, no row).
 	 * One row per size, one column per region -- the cache cliff shows as the

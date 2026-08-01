@@ -124,14 +124,18 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 
 	cli_print(sh, "%-6s %-10s %9s %9s %9s %4s\r\n",
 	          "region", "start", "total", "used", "free", "use%");
-	print_region(sh, "Flash", flash_origin, flash_length, flash_used,
-	             ".isr/.text/.rodata/.data (internal)");
-	print_region(sh, "RAM",   RAM_ORIGIN,   RAM_LENGTH,   ram_used,
-	             ".data/.bss + ThreadX stacks + heap");
-	print_region(sh, "DTCM",  DTCM_ORIGIN,  DTCM_LENGTH,  dtcm_used,
-	             ".log_noinit (dmesg) + .dtcm_bench (membench)");
+	/* Memory-hierarchy order, not address order: the tightly-coupled RAMs first,
+	 * then on-chip AXI-SRAM, then the internal flash the code runs from, then the
+	 * external window.  `membench` prints its rows in the same order so the two
+	 * can be read side by side (issue #33). */
 	print_region(sh, "ITCM",  ITCM_ORIGIN,  ITCM_LENGTH,  itcm_used,
 	             ".itcm ISR paths + .itcm_bench (membench)");
+	print_region(sh, "DTCM",  DTCM_ORIGIN,  DTCM_LENGTH,  dtcm_used,
+	             ".log_noinit (dmesg) + .dtcm_bench (membench)");
+	print_region(sh, "RAM",   RAM_ORIGIN,   RAM_LENGTH,   ram_used,
+	             ".data/.bss + ThreadX stacks + heap");
+	print_region(sh, "Flash", flash_origin, flash_length, flash_used,
+	             ".isr/.text/.rodata/.data (internal)");
 	print_region(sh, "PSRAM", PSRAM_ORIGIN, PSRAM_LENGTH,
 	             sym(_psram_end) - PSRAM_ORIGIN,          /* .psram_noinit residents */
 	             "ext OCTOSPI1 APS6408 (free scratch pool)");
