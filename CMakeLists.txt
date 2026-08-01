@@ -255,6 +255,11 @@ set(SHELL_SOURCES
     "${CMAKE_SOURCE_DIR}/svc/fmt.c"
     "${CMAKE_SOURCE_DIR}/svc/timebase.c"
     "${CMAKE_SOURCE_DIR}/svc/ymodem.c"
+    # issue #8 phase 3a: the camera frame ring + sink dispatch.  Nothing calls it
+    # yet (phase 3b wires the DCMI producer to it); it is here so the engine and
+    # its host tests land before the hardware work that depends on them.
+    # --gc-sections drops it from the image until it has a caller.
+    "${CMAKE_SOURCE_DIR}/svc/frame_pipeline.c"
     "${CMAKE_SOURCE_DIR}/svc/log.c")
 
 # --- CoreMark object library (run as the shell `coremark` command) ----------
@@ -371,6 +376,7 @@ endif()
 # bisecting a PLL3/USB or a PSRAM-bandwidth suspicion.  Also drops the LTDC
 # interlock inside psram_acquire().
 option(BSP_ENABLE_LCD "Enable the FPC-40 RGB LCD (LTDC) and the lcd command" ON)
+
 
 # Driver and command move together -- cmd_lcd.c is the only caller of port/ltdc --
 # and, like the SD block above, this append must stay BELOW the option().

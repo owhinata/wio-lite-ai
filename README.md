@@ -153,6 +153,15 @@ time as the USB console. 24 commands:
     invisible to it; `port/camera/camera.c` walks the table with error-checked
     writes and stops at the row that failed. It runs lazily on the first capture
     (~350 ms) and again after any power cycle.
+  - *orientation, and why there is no free rotation*: the camera is 320x240
+    landscape, the panel is 240x320 portrait, and the H725 has **no rotation
+    engine** — no GFXMMU, no GPU2D; DMA2D and MDMA *can* transpose, but only by
+    turning one side of the copy into ~77k scattered 2-byte accesses, the worst
+    possible shape for a serial PSRAM. The ST7789's MADCTL bit 5 (MV, row/column
+    exchange) looked like a free way out, so it was **measured on the board and it
+    does not work** — see the comment above `st_send_sequence()` in
+    `port/ltdc/st7789_rgb.c` for exactly what was tried and what the panel did.
+    Rotation therefore has to happen host-side (issue #8 phase 3c).
   - *OCTOSPI1 interlock*: the frame buffer is in the PSRAM, so `camera
     capture`/`save`/`send` take the same `psram_acquire()` guard as `lcd on` —
     they need `lcd off` first, exactly like `psram`/`membench`/`devmem`. Retuning
@@ -708,7 +717,11 @@ port/       threadx/ ThreadX low-level init + shared SysTick glue
             coremark/ EEMBC CoreMark port (core_portme.*)
             netxduo/ nx_user.h (NetX Duo build configuration; the driver is in app/,
                      because what it sits on is the RTL8720 link, not a MAC)
-svc/        freestanding services: fmt (printf), log (DTCM ring), timebase (DWT)
+svc/        freestanding services: fmt (printf), log (DTCM ring), timebase (DWT),
+            ymodem, frame_pipeline (camera frame ring + sink dispatch, issue #8
+            phase 3a — ported byte-identical from the f746 firmware and covered by
+            shell/test, so it is verified without the board; phase 3b wires the
+            DCMI producer to it)
 src/        custom clock-free SystemInit  (also the minimal `blink` example's main)
 ldscript/   STM32H725AEIx_IROM.ld (FLASH @ 0x08020000, RAM = AXI-SRAM, DTCM log, ITCM ISRs)
             STM32H725AEIx_ROM.ld  (the bootloader's own script: FLASH @ 0x08000000, 128 KB)

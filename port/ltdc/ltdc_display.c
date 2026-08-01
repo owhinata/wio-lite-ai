@@ -92,18 +92,23 @@ static const struct ltdc_panel ltdc_cfg = {
  * constant: the buffer must back the active area; HSW/VSH are encoded as
  * width-1 and the total must exceed the accumulated active area, so a zero sync
  * width or front porch is not representable; and the LTDC_TWCR/AWCR counters are
- * 12-bit (RM0468 sec 38.7).  LTDC_CLK_DIV likewise has to fit DIVR3's /1../128
- * (sec 8.7.16). */
+ * bounded (12-bit horizontally, 11-bit vertically -- RM0468 sec 38.7.1-38.7.4).
+ * LTDC_CLK_DIV likewise has to fit DIVR3's /1../128 (sec 8.7.16). */
 _Static_assert((uint32_t)LTDC_DEF_W * LTDC_DEF_H <= LTDC_FB_PIXELS,
                "panel active area exceeds the frame buffer");
 _Static_assert(LTDC_DEF_HS > 0u && LTDC_DEF_VS > 0u &&
                LTDC_DEF_HFP > 0u && LTDC_DEF_VFP > 0u,
                "sync widths and front porches must be >= 1");
+/* The two axes do NOT share a counter width: RM0468 sec 38.7.1-38.7.4 make every
+   horizontal field 12-bit and every vertical field 11-bit, so the vertical bound
+   is 2048, not 4096.  (Both current geometries are far under either; this is the
+   guard being right rather than lucky.) */
 _Static_assert((uint32_t)LTDC_DEF_W + LTDC_DEF_HS + LTDC_DEF_HBP + LTDC_DEF_HFP
-                       <= 4096u &&
-               (uint32_t)LTDC_DEF_H + LTDC_DEF_VS + LTDC_DEF_VBP + LTDC_DEF_VFP
                        <= 4096u,
-               "total frame exceeds the LTDC's 12-bit counters");
+               "total frame width exceeds the LTDC's 12-bit horizontal counters");
+_Static_assert((uint32_t)LTDC_DEF_H + LTDC_DEF_VS + LTDC_DEF_VBP + LTDC_DEF_VFP
+                       <= 2048u,
+               "total frame height exceeds the LTDC's 11-bit vertical counters");
 _Static_assert(LTDC_CLK_DIV >= 1u && LTDC_CLK_DIV <= 128u,
                "LTDC_CLK_DIV outside the DIVR3 range");
 

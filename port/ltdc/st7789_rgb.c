@@ -60,6 +60,36 @@ static void st_data(uint8_t d) { st_write(1u, d); }
  * command bytes are ST7789 register names; the parameter bytes are panel-
  * specific tuning (gamma, power rails, porches) that only the module vendor
  * knows, so they are reproduced verbatim rather than derived.
+ *
+ * MADCTL = 0x00 IS NOT A FREE CHOICE, AND ROTATION IS NOT AVAILABLE HERE.
+ *
+ * Bit 5 of MADCTL (MV, row/column exchange) looks like it should let the panel
+ * be driven landscape for free -- which would matter a lot, because the camera
+ * is 320x240 and this panel is 240x320, the H725 has no rotation engine (no
+ * GFXMMU, no GPU2D), and transposing with DMA2D or MDMA costs ~77k scattered
+ * 2-byte accesses on a serial PSRAM.  It was measured on the board (issue #8
+ * phase 3a) and it does not work:
+ *
+ *   LTDC driven at 320x240 (378x256 total, 62.00 Hz), MADCTL = 0x20:
+ *     RGBCTRL[0] = 0xC0 -> the panel keeps its 240-pixel line length, so the
+ *                          image wraps: a single diagonal comes out as two, 1-px
+ *                          lines widen into dithered bands, and the border is no
+ *                          longer a rectangle.  LTDC reports no underrun and no
+ *                          transfer error throughout -- the controller is fine,
+ *                          the panel simply maps the pixels elsewhere.
+ *     RGBCTRL[0] = 0x40 -> worse: flat blue with a band of noise, no pattern at
+ *                          all.  Clearing that bit breaks the RGB data path.
+ *
+ * So on THIS module MADCTL/MV does not reposition RGB-interface pixels on either
+ * of the two RGBCTRL data paths.  That is the scope of the result -- it is not a
+ * statement about MV in general, and one knob was left untried (RAMCTRL 0xB0's
+ * RM bit, which also selects how RGB input reaches frame memory); the spike was
+ * stopped because two flashes had already answered the question the preview
+ * design needed, not because the space was exhausted.
+ *
+ * Landscape preview therefore has to rotate on the host side.  See the issue #8
+ * phase 3c notes for the design that replaced it (DCMI into AXI-SRAM bands, then
+ * MDMA transposing with the contiguous side on the PSRAM).
  */
 static void st_send_sequence(void)
 {

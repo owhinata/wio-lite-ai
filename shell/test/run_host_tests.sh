@@ -173,4 +173,16 @@ gcc $CFLAGS -I "$svc" \
     $LDFLAGS -pthread -o "$out/test_ymodem_recv"
 "$out/test_ymodem_recv"
 
+# issue #8 phase 3a -- camera frame pipeline core (svc/frame_pipeline.c): ring slot
+# acquire/publish, refcount pin/put, DROP/LATEST policy + pending transfer, detach
+# in-flight count, read_latest generation, and an N=4 ring cycling under a counting
+# sink.  Pure svc layer -- HAL/ThreadX/shell-free, and the mutual exclusion it needs
+# is injected (struct frame_os), so the whole engine runs on the host with a no-op
+# lock.  This is the only part of the camera work that can be verified without the
+# board, which is exactly why it is ported byte-identical from the f746 firmware.
+gcc $CFLAGS -I "$svc" \
+    "$here/test_frame_pipeline.c" "$svc/frame_pipeline.c" \
+    $LDFLAGS -o "$out/test_frame_pipeline"
+"$out/test_frame_pipeline"
+
 echo "host tests passed"
