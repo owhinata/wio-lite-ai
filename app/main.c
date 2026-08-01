@@ -31,6 +31,9 @@
 #if BSP_PSRAM_INIT_IN_APP
 #include "psram.h"      /* app-first OCTOSPI1 APS6408 bring-up (issue #3) */
 #endif
+#if BSP_ENABLE_SD
+#include "sd_card.h"    /* microSD block driver over SDMMC1 + IDMA (issue #6) */
+#endif
 
 /* --- interactive shell over USB CDC ------------------------------------- */
 CLI_BACKEND_USBCDC_DEFINE(cdc_tr);
@@ -123,6 +126,15 @@ void tx_application_define(void *first_unused_memory)
   (void) rtl_link_core_init();
   (void) erpc_service_init();
 
+#if BSP_ENABLE_SD
+  /* microSD block driver (issue #6): creates its mutex/semaphore and configures the
+   * SDMMC1 pins, kernel-clock mux and NVIC.  It performs NO card I/O -- the card is
+   * identified lazily by the first `sd` command -- so nothing here waits on
+   * HAL_GetTick and it is safe pre-scheduler (issue #12), like rtl8720_init() above.
+   * Fail-soft: on failure the `sd` commands report "driver not initialized". */
+  (void) sd_card_init();
+#endif
+
   /* Telnet console service (issue #21 increment 9): owns the module's listening/session
    * sockets and feeds the net_sh instance above.  Object creation only -- the thread parks
    * on its event flags until an IP address comes up (`wifi connect` / `net dhcp` arm it, or
@@ -173,22 +185,31 @@ int main(void)
    * in AXI-SRAM, both slow uncached.  Enable I-cache (read-only instruction memory ->
    * no coherency concern) then D-cache.  Neither touches the RCC/clock.
    *
-   * D-cache is safe here because the app is single-CPU with NO DMA master: USB
-   * dwc2 runs slave/FIFO (the CPU copies buffer<->FIFO by MMIO; app/tusb_config.h
-   * pins CFG_TUD_DWC2_DMA_ENABLE=0), and there is no camera/SD/eth in v1.  One CPU
-   * behind one D-cache is self-coherent across threads/ISRs, so no MPU / clean /
-   * invalidate is needed.  The reset-persistent crash log lives in DTCM, which
+   * D-cache needs no blanket mitigation for ordinary app memory: the app is
+   * single-CPU, and one CPU behind one D-cache is self-coherent across threads and
+   * ISRs.  USB dwc2 runs slave/FIFO (the CPU copies buffer<->FIFO by MMIO;
+   * app/tusb_config.h pins CFG_TUD_DWC2_DMA_ENABLE=0), so it is not an exception.
+   * The one real bus master (SDMMC1 IDMA) is handled per-buffer -- see the DMA
+   * coherency note below.  The reset-persistent crash log lives in DTCM, which
    * bypasses the D-cache, so it stays coherent and survives a reset.  CMSIS
    * invalidates each cache before enabling; .data/.bss were written to SRAM with
    * the caches off, so there are no stale lines.  A reset (DFU reboot / crash)
    * disables the caches in HW, and the app persists no cacheable-SRAM state across
    * a reset, so the boot handoff is unchanged.
    *
-   * DMA coherency (issue #3): mpu_config() (below, between the two cache enables)
-   * marks the OCTOSPI1 PSRAM window at 0x90000000 Normal non-cacheable, so DMA
-   * buffers placed there stay coherent under the D-cache.  Future DMA peripherals
-   * (DCMI camera, SDMMC, Ethernet, USB in DMA mode) add their buffer regions to
-   * mpu_regions[] in app/mpu.c rather than clean/invalidating around each transfer. */
+   * DMA coherency: there IS a bus master now (issue #6) -- the SDMMC1 IDMA, once a
+   * card is probed -- so the "one CPU behind one D-cache, self-coherent" reading of
+   * the paragraph above stops holding for the memory that master touches.  Two
+   * mechanisms cover it, and new DMA peripherals should pick one deliberately:
+   *   - mpu_config() (below, between the two cache enables) marks the OCTOSPI1 PSRAM
+   *     window at 0x90000000 Normal non-cacheable, so buffers placed there are
+   *     coherent with no per-transfer maintenance.  Bulk buffers (a camera
+   *     framebuffer) belong here.
+   *   - port/sd/sd_card.c instead keeps one small bounce buffer in ordinary cacheable
+   *     AXI-SRAM (its own .axi_dma section, so no neighbour shares a cache line) and
+   *     cleans/invalidates around each transfer.  A 4 KB scratch does not justify
+   *     spending an MPU region, and the caller's buffer never reaches the DMA.
+   * USB stays outside both: dwc2 is slave/FIFO here (CFG_TUD_DWC2_DMA_ENABLE=0). */
   SCB_EnableICache();
   mpu_config();       /* PSRAM non-cacheable region; MUST sit between I- and D-cache
                        * enable (PM0253 sec 4.6.8 barriers).  See app/mpu.c. */

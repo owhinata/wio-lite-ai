@@ -24,13 +24,14 @@ its clock tree** — see *Key design points*.
 Presents a `wio> ` prompt on **`/dev/ttyACM0`** (USB CDC, `0483:5740`, "CDC in FS
 Mode") with line editing, history, and Tab completion — and, once the board is on WiFi,
 the same shell over **telnet** (`wio-net> `, see `net shell` below), usable at the same
-time as the USB console. 22 commands:
+time as the USB console. 23 commands:
 
 | Group | Commands |
 |---|---|
 | system | `version` · `uptime` · `reboot` · `free` · `thread` |
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
+| storage | `sd` (info/read) |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
 | wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench · **flash** info/read/backup/imgload/imginfo/write) · `net` (L3 = **host NetX Duo only**: info/ip/dhcp/ping/echo/shell) |
 | benchmarks | `coremark` · `membench` |
@@ -59,6 +60,15 @@ time as the USB console. 22 commands:
   subcommands (`clk`/`set`/`mr0`/`phase`/`wtune`/`mmapscan`) re-derive an operating
   point at a different clock without a reflash. `mmapscan` maps the true
   memory-mapped read eye across IWDG-recovered auto-reboots (issue #16).
+- **`sd`** — the on-board **microSD slot** (J4) on **SDMMC1**, 4-bit bus at 18.33 MHz
+  (issue #6). `sd info` identifies the card and prints type/capacity/geometry/bus
+  width/clock/CID/CSD; `sd read <lba>` hexdumps one 512 B block. The card is probed
+  **lazily** — the first command that needs it identifies it — so a boot with no card
+  costs nothing. There is **no card-detect line on this board** (the socket's CD is
+  tied to DAT3 and the f746 reference design's CD pin is the red LED here), so
+  presence is inferred from the bus: anything that ends in a command-response timeout
+  is reported as `no card in slot` and re-probes on the next call. A FileX filesystem
+  on top is the rest of issue #6.
 - **`wifi`** — the on-board **RTL8720DN** Wi-Fi/BLE companion (issues #17/#5/#23).
   The host reaches it over `CHIP_EN` (PC3), a **LOG UART** (UART9 PD14/PD15) and an
   **AT/HS UART** (USART1 PA10/PB14); the module is held powered-off (PC3 low) at boot.
@@ -414,13 +424,33 @@ time as the USB console. 22 commands:
   ITCM load only, with VTOR taken from the linker's `g_pfnVectors`);
   the ThreadX SysTick reload is computed from the inherited `SystemCoreClock`.
 - **Both L1 caches on** (`SCB_EnableICache` + `SCB_EnableDCache` in `app/main.c`).
-  Safe because the app is single-CPU with **no DMA master** (USB dwc2 is slave/FIFO
-  — CPU ↔ FIFO by MMIO, no system-memory DMA), so one D-cache is self-coherent and
-  needs no MPU/maintenance. The reset-persistent log is in **DTCM, which bypasses
-  the D-cache**. The **PSRAM window is MPU Normal non-cacheable** (`app/mpu.c`,
-  configured between I- and D-cache enable), so future DMA peripherals
-  (camera/SD/eth) can place their buffers there coherently — new regions go in
-  `mpu_regions[]` rather than per-transfer cache maintenance.
+  Ordinary app memory needs no mitigation: the app is single-CPU, so one D-cache is
+  self-coherent across threads and ISRs, and USB dwc2 is slave/FIFO (CPU ↔ FIFO by
+  MMIO, no system-memory DMA). The reset-persistent log is in **DTCM, which bypasses
+  the D-cache**. Since issue #6 there *is* one bus master — the **SDMMC1 IDMA** — and
+  the two mitigations are chosen per buffer rather than globally:
+  - the **PSRAM window is MPU Normal non-cacheable** (`app/mpu.c`, configured between
+    I- and D-cache enable), so a large or long-lived DMA buffer (a camera framebuffer)
+    placed there is coherent with no per-transfer work;
+  - the SD driver instead keeps a **4 KB bounce buffer in ordinary cacheable AXI-SRAM**
+    (`.axi_dma`) and cleans/invalidates around each transfer — a small scratch buffer
+    does not justify one of the 16 MPU regions, and the caller's buffer never reaches
+    the DMA, so callers need no alignment discipline.
+- **microSD (issue #6)**: `port/sd/sd_card.c` drives the slot on **SDMMC1** through the
+  controller's **own IDMA** — there is no DMA stream and no `__HAL_LINKDMA`, so a single
+  `SDMMC1_IRQHandler` carries every completion. The kernel clock is muxed to the
+  inherited **PLL1Q 110 MHz** (`RCC_D1CCIPR.SDMMCSEL = 0`, which is the register's reset
+  value — this asserts the default rather than reconfiguring anything; PLL2R 266 MHz is
+  both over the mux's 250 MHz ceiling and the PSRAM's clock), giving
+  `SDMMC_CK = 110/(2×3) = 18.33 MHz`, inside the 25 MHz Default Speed limit. High Speed
+  via CMD6 is a separate, measured change. **No card-detect line exists on this board**,
+  so removal is detected from the bus: a command-response timeout surfaces *only* in
+  `hsd.ErrorCode` (the H7 HAL's `HAL_SD_GetCardState()` returns a state of 0 rather than
+  an error), and one `classify_err()` turns that into `no card` on every path —
+  identification, bus-width setup, both DMA submissions and the completion callback.
+  Build `-DBSP_ENABLE_SD=OFF` to compile the driver and its command out entirely, which
+  also removes the only DMA engine the app enables — useful when bisecting a suspected
+  D-cache coherency problem.
 - **PSRAM (issues #3 / #16)**: `app/psram.c` brings up the **APS6408L Octal DDR PSRAM
   on OCTOSPI1** (memory-mapped 8 MB @ `0x90000000`) without touching OCTOSPI2/OCTOSPIM/
   the RCC, so it cannot disturb the inherited clock tree. Shipped operating point: **133 MHz Fixed Latency** (kernel
@@ -487,6 +517,7 @@ shell/      core/    HW-independent CLI engine (parse/edit/history/complete/...)
             cmds/    command implementations
             test/    host unit tests (run with host gcc; see below)
 port/       threadx/ ThreadX low-level init + shared SysTick glue
+            sd/      microSD block driver over SDMMC1 + its internal IDMA (issue #6)
             coremark/ EEMBC CoreMark port (core_portme.*)
             netxduo/ nx_user.h (NetX Duo build configuration; the driver is in app/,
                      because what it sits on is the RTL8720 link, not a MAC)
@@ -511,7 +542,7 @@ Listed in memory-hierarchy order — the same order `free` and `membench` print
 |---|---|---|
 | ITCM | `0x00000000` | 64 KB; holds the **interrupt paths** (`.itcm`, 3,272 B): ThreadX PendSV + SysTick, the RTL8720 UART RX ISR **and the whole wake-up it signals** (`tx_event_flags_set` + `_tx_thread_system_resume`, issue #23 U0-3 — that call alone had put the ISR back to 4.3 µs warm / 12.9 µs cold — plus their two tails `_tx_thread_system_preempt_check` + `_tx_timer_system_deactivate`, issue #29), and the fault handlers, plus the 4 KB `.itcm_bench` scratch. Zero-wait-state and outside both caches, so an ISR never pays a cold fetch through the 16 KB I-cache: measured against the external-XIP build the same UART ISR went from **8.7 µs cold / 3.3 µs warm to a flat 0.7 µs** (issue #24). The tails matter because they only run when a thread is *really* woken — with them still in the flash, request/reply commands (`wifi ver`, `wifi scan`) measured 3.5 µs against 0.1 µs for an ISR that wakes nobody; 106 bytes of ITCM took that to **1.5 µs**, and `wifi link bench` improved 2.1 → 1.5 µs too. Those figures were taken while the app ran from the external flash; issue #25 shrank the gap without closing it (ITCM is still zero-wait and never evicted). Loaded from its load image by `SystemInit()`, which also zero-fills all 64 KB to initialise the TCM ECC; kept read-only by the MPU so a NULL write raises MemManage instead of corrupting ISR code. |
 | DTCM | `0x20000000` | 128 KB; holds the reset-persistent `.log_noinit` crash-log ring, the **32 KB NetX Duo packet pool** (`.nx_pool`, issue #23 U3 — no DMA touches a frame, so DTCM costs nothing from AXI-SRAM and evicts nothing from the D-cache) and `membench` scratch. All of it bypasses the D-cache. |
-| AXI-SRAM (D1) | `0x24000000` | 320 KB; `_estack = 0x24050000` (the MSP the bootloader loads). |
+| AXI-SRAM (D1) | `0x24000000` | 320 KB; `_estack = 0x24050000` (the MSP the bootloader loads). Also holds `.axi_dma`, the 4 KB SDMMC1 bounce buffer (issue #6) — in its **own output section, 32 B-aligned at both ends**, so the driver's per-transfer clean/invalidate cannot disturb a neighbouring variable's cache line. AXI-SRAM and not DTCM because the SDMMC's IDMA is an AHB master and the TCMs are reachable only by the core (RM0468 sec 2.4). |
 | FLASH | `0x08020000` | internal flash **sectors 1-3 = 384 KB** (issue #25). Sector 0 (`0x08000000`, 128 KB) is the DFU bootloader; the 128 KB erase granule is what keeps the two apart, so no programming path can reach it. ~905 MB/s read (`membench`). |
 | PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). |
 | *(bootloader)* | `0x08000000` | internal flash **sector 0, 128 KB** — the DFU bootloader. The app does not own it and no app-side path can erase it (the 128 KB erase granule is the sector granule). |

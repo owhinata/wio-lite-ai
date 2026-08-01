@@ -303,6 +303,25 @@ SECTIONS
     __bss_end__ = _ebss;
   } >RAM
 
+  /* Bus-master DMA scratch, in AXI-SRAM (issue #6).  The SDMMC1 IDMA is the first
+   * bus master this firmware enables, so its buffer is the first memory the CPU and
+   * something else both write.  It stays plain cacheable AXI-SRAM and the driver
+   * does the clean/invalidate (port/sd/sd_card.c) -- but that only works if no OTHER
+   * variable shares a 32-byte cache line with it, or maintaining this buffer would
+   * silently discard or flush a neighbour.  Hence its own output section with
+   * ALIGN(32) at BOTH ends, rather than an aligned array inside .bss.
+   *
+   * AXI-SRAM and not DTCM: the IDMA is an AHB master and the TCMs are reachable only
+   * by the core and by MDMA through AHBS (RM0468 sec 2.4), so a DTCM bounce buffer
+   * would fail silently.  NOLOAD: transfer scratch, never loaded or zeroed at boot. */
+  .axi_dma (NOLOAD) :
+  {
+    . = ALIGN(32);
+    *(.axi_dma)
+    *(.axi_dma*)
+    . = ALIGN(32);
+  } >RAM
+
   ._user_heap_stack :
   {
     . = ALIGN(8);

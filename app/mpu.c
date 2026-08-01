@@ -3,14 +3,19 @@
  *
  * The app enables the Cortex-M7 D-cache (app/main.c).  By the ARMv7-M default
  * memory map the external OCTOSPI1 PSRAM window at 0x90000000 (0x80000000-
- * 0x9FFFFFFF = "RAM", Normal, Write-Through cacheable) would be cached, so a
- * future bus master (SDMMC / DCMI camera / OCTOSPI DMA) writing PSRAM behind the
- * CPU's back would leave stale D-cache lines -- the coherency hole flagged in the
- * D-cache-enable comment in app/main.c.  This module carves the PSRAM window out
- * as Normal, non-cacheable, shareable so DMA buffers placed there stay coherent
- * with no per-transfer clean/invalidate.  It is the reusable foundation the SD /
- * LCD / camera work (issues #5-#7) builds their DMA buffers on: add a region to
- * mpu_regions[] rather than sprinkling cache maintenance through each driver.
+ * 0x9FFFFFFF = "RAM", Normal, Write-Through cacheable) would be cached, so a bus
+ * master (DCMI camera / OCTOSPI DMA) writing PSRAM behind the CPU's back would
+ * leave stale D-cache lines.  This module carves the PSRAM window out as Normal,
+ * non-cacheable, shareable so DMA buffers placed there stay coherent with no
+ * per-transfer clean/invalidate.
+ *
+ * That premise is no longer hypothetical: issue #6 enabled the SDMMC1 IDMA, the
+ * first bus master in this firmware.  It deliberately does NOT use a region here --
+ * its 4 KB bounce buffer sits in ordinary cacheable AXI-SRAM and port/sd/sd_card.c
+ * cleans/invalidates around each transfer, because a small scratch buffer does not
+ * justify one of the 16 MPU regions.  Use this table for buffers that are large,
+ * long-lived, or touched at a rate where per-transfer maintenance would hurt (an
+ * LCD/camera framebuffer); use explicit maintenance for small scratch.
  *
  * Ordering (hard invariant, PM0253 sec 4.6.8 -- a barrier is required after every
  * MPU update): mpu_config() MUST run *between* SCB_EnableICache() and

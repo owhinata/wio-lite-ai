@@ -333,6 +333,22 @@ option(BSP_ENABLE_WFI "Enable ThreadX idle WFI power saving" ON)
 # the bring-up moves into the bootloader and BSP_PSRAM_INIT_IN_APP is turned OFF.
 option(BSP_ENABLE_PSRAM "Enable OCTOSPI1 APS6408 PSRAM (MPU window + psram command)" ON)
 option(BSP_PSRAM_INIT_IN_APP "Bring up OCTOSPI1 PSRAM app-side (app-first validation)" ON)
+# issue #6: on-board microSD over SDMMC1 + IDMA.  ON builds the block driver
+# (port/sd), its .axi_dma bounce buffer and the `sd` command.  Turn OFF to build a
+# firmware with no bus master at all -- useful when bisecting a D-cache coherency
+# suspicion, since SDMMC1's IDMA is the only DMA engine this app enables.
+option(BSP_ENABLE_SD "Enable the microSD card (SDMMC1) and the sd command" ON)
+
+# The block driver and its command are one unit -- cmd_sd.c is the only caller of
+# port/sd, so they are added or omitted together.  This append must stay BELOW the
+# option() above: SHELL_SOURCES is set earlier in the file, when BSP_ENABLE_SD is
+# still undefined, so appending there silently drops the driver and the link fails
+# on sd_card_init().
+if(BSP_ENABLE_SD)
+    list(APPEND SHELL_SOURCES
+        "${CMAKE_SOURCE_DIR}/port/sd/sd_card.c"
+        "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_sd.c")
+endif()
 
 add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/main.c"
@@ -372,6 +388,7 @@ target_link_options(shell PRIVATE -u _printf_float)
 target_include_directories(shell PRIVATE
     "${CMAKE_SOURCE_DIR}/app"
     "${CMAKE_SOURCE_DIR}/port/threadx"
+    "${CMAKE_SOURCE_DIR}/port/sd"                # issue #6: sd_card.h
     "${CMAKE_SOURCE_DIR}/shell/include"
     "${CMAKE_SOURCE_DIR}/shell/core"
     "${CMAKE_SOURCE_DIR}/shell/backend"
@@ -405,7 +422,8 @@ target_compile_definitions(shell PRIVATE
     BSP_ENABLE_IWDG=$<BOOL:${BSP_ENABLE_IWDG}>   # issue #4: IWDG1 arm + petter + wdt
     BSP_ENABLE_WFI=$<BOOL:${BSP_ENABLE_WFI}>      # issue #2: gates TX_ENABLE_WFI (tx_user.h)
     BSP_ENABLE_PSRAM=$<BOOL:${BSP_ENABLE_PSRAM}>          # issue #3: PSRAM window + psram cmd
-    BSP_PSRAM_INIT_IN_APP=$<BOOL:${BSP_PSRAM_INIT_IN_APP}>) # issue #3: app-side OCTOSPI1 bring-up
+    BSP_PSRAM_INIT_IN_APP=$<BOOL:${BSP_PSRAM_INIT_IN_APP}>  # issue #3: app-side OCTOSPI1 bring-up
+    BSP_ENABLE_SD=$<BOOL:${BSP_ENABLE_SD}>)                 # issue #6: SDMMC1 microSD + sd cmd
 target_compile_options(shell PRIVATE -O2)
 
 firmware_finalize(shell)
