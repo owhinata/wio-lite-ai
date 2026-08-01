@@ -4,20 +4,32 @@
  */
 /**
  * @file    cmd_camera.c
- * @brief   `camera` shell command: DVP camera bring-up (issue #8 phase 1).
+ * @brief   `camera` shell command: OV2640 bring-up and snapshot (issue #8
+ *          phases 1-2).
  *
  *   camera probe          power-cycle the module and identify the sensor
  *   camera on | off       run / undo the power-up sequence (no ID read)
- *   camera info           driver, sensor, XCLK and SCCB state
+ *   camera info           driver, sensor, XCLK, SCCB and frame state
+ *   camera capture [test] snapshot one frame; 'test' = the sensor's colour bars
+ *   camera save <path>    write the frame raw to the microSD
+ *   camera send [name]    stream the frame to the PC over YMODEM
  *   camera scan           list every 7-bit SCCB address that ACKs
  *   camera reg <a> <r> .. raw SCCB register read / write
  *   camera xclk [hz]      show or retune the master clock
- *   camera tune ...       polarity / pull-up / bit-rate / read-style overrides
+ *   camera tune ...       polarity / pull-up / bit-rate / read-style /
+ *                         byte-swap / warm-up frames
  *
- * `camera probe` is the one command this phase exists for: if it prints a chip
- * ID, then XCLK is at a frequency the sensor accepts, PWDN and RESETB have the
- * polarity assumed, and I2C4 is talking at the right bit rate -- all four proven
- * at once.  Until then, `scan` narrows it down to "does anything answer at all".
+ * `camera probe` proves the sensor-control side: a chip ID means XCLK is at a
+ * frequency the sensor accepts, PWDN and RESETB have the polarity assumed, and
+ * I2C4 is talking at the right bit rate -- four things at once.  `camera capture`
+ * proves the pixel side; read its channel statistics, not just its exit status.
+ * Its `seam:` line reports the largest step between adjacent rows' channel means:
+ * a settled frame is well under 1, and anything in the tens is a gain landing
+ * mid-readout (see camera_capture_locked() for the one unexplained sighting).
+ *
+ * The frame lives in the PSRAM, so `capture`, `save` and `send` all hold the
+ * OCTOSPI1 guard for their whole duration -- see cam_psram_take() for why that
+ * is not optional.
  *
  * `xclk` and `tune` exist because none of those four can be proven from the
  * schematic alone, and the internal flash is only rated for ~10k erase cycles:
@@ -34,11 +46,59 @@
  */
 #include "camera.h"
 #include "cli.h"
+#if BSP_ENABLE_PSRAM
+#include "psram.h"        /* psram_acquire(): OCTOSPI1 interlock, see cam_psram_* */
+#endif
+#if BSP_ENABLE_SD
+#include "fs_cmd_core.h"  /* fs_sd_device(): the microSD media + its ownership gates */
+#endif
+#include "cmd_xfer.h"     /* xfer_send_source(): YMODEM over the console */
 
 #include <stdint.h>
 #include <string.h>
 
 #define CAM_SCAN_MAX 16u
+/* Frame I/O chunk.  Exactly one 320-pixel RGB565 row, so `capture` can compute
+   per-row statistics without buffering more of the frame than that. */
+#define CAM_IO_CHUNK (CAMERA_FRAME_WIDTH * 2u)
+
+/*
+ * OCTOSPI1 interlock for every command that touches the frame buffer.
+ *
+ * The frame lives in the PSRAM, and `psram`/`membench`/`devmem`/`wifi flash`
+ * can RETUNE that bus.  Doing so while the DCMI's DMA is writing it -- or while
+ * `save`/`send` is reading it -- is not a spoiled image: a memory-mapped access
+ * to a half-configured OCTOSPI stalls the AXI indefinitely (issue #3).  There
+ * are two consoles, so "the user would not do that" is not an argument.
+ *
+ * psram_acquire() is the existing try-lock and it also refuses while the LTDC is
+ * scanning out, so taking it here buys mutual exclusion in both directions with
+ * no new mechanism -- at the cost of needing `lcd off` first, exactly like every
+ * other OCTOSPI1 consumer in this firmware.  Simultaneous scanout and capture is
+ * a phase 3 design problem, not something to discover by accident on the only
+ * surviving board.
+ */
+static int cam_psram_take(struct cli_instance *sh)
+{
+#if BSP_ENABLE_PSRAM
+	if (!psram_acquire()) {
+		cli_error(sh, "camera: OCTOSPI1 busy (run 'lcd off', or wait for "
+		              "psram/membench/devmem/wifi flash)\r\n");
+		return 0;
+	}
+	return 1;
+#else
+	(void)sh;
+	return 1;
+#endif
+}
+
+static void cam_psram_give(void)
+{
+#if BSP_ENABLE_PSRAM
+	psram_release();
+#endif
+}
 
 static void report(struct cli_instance *sh, int rc)
 {
@@ -115,6 +175,7 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 {
 	struct camera_tuning t;
 	struct camera_info ci;
+	struct camera_mode m;
 	int rc;
 
 	(void)argc;
@@ -156,7 +217,15 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 	          t.pwdn_active_high ? "high" : "low",
 	          t.rst_active_low ? "low" : "high",
 	          t.i2c_pullup ? "board + internal" : "board only");
-	cli_print(sh, "dcmi:    not configured (issue #8 phase 2)\r\n");
+	cli_print(sh, "dcmi:    8-bit, PCK rising, VS/HS low, DMA2_Stream1 -> PSRAM\r\n");
+	cli_print(sh, "sensor cfg: %s, DVP byte swap %s\r\n",
+	          ci.configured ? "QVGA RGB565 loaded" : "not loaded (lazy)",
+	          t.dvp_swap ? "on" : "off");
+	if (camera_get_mode(&m) == CAM_OK)
+		cli_print(sh, "frame:   %ux%u %s (%lu bytes) -- %s\r\n",
+		          (unsigned)m.width, (unsigned)m.height, m.format,
+		          (unsigned long)m.frame_bytes,
+		          ci.frame_valid ? "captured" : "none yet");
 	return 0;
 }
 
@@ -291,6 +360,332 @@ static int cmd_camera_xclk(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
+/* ---- capture ------------------------------------------------------------- */
+
+/*
+ * Per-channel min/max/mean over the whole frame.
+ *
+ * This is the instrument phase 2 exists to read.  A frame that never arrived is
+ * all zeros; a saturated one pins every channel at max; a DCMI that is latching
+ * on the wrong edge or losing sync gives min 0 / max full on all three with a
+ * mid-grey mean.  Covering the lens and pointing at a light must move the means
+ * in opposite directions -- that, and nothing cheaper, is what proves the pixels
+ * are real.
+ */
+struct rgb_stats {
+	uint32_t min[3], max[3], sum[3];
+	uint32_t npx;
+};
+
+static void stats_init(struct rgb_stats *s)
+{
+	for (int i = 0; i < 3; i++) {
+		s->min[i] = 0xFFFFFFFFu;
+		s->max[i] = 0u;
+		s->sum[i] = 0u;
+	}
+	s->npx = 0u;
+}
+
+static void stats_add_rgb565(struct rgb_stats *s, const uint8_t *buf, uint32_t n)
+{
+	for (uint32_t i = 0; i + 1u < n; i += 2u) {
+		uint32_t p = (uint32_t)buf[i] | ((uint32_t)buf[i + 1u] << 8);
+		uint32_t ch[3] = { (p >> 11) & 0x1Fu, (p >> 5) & 0x3Fu, p & 0x1Fu };
+
+		for (int k = 0; k < 3; k++) {
+			if (ch[k] < s->min[k]) s->min[k] = ch[k];
+			if (ch[k] > s->max[k]) s->max[k] = ch[k];
+			s->sum[k] += ch[k];
+		}
+		s->npx++;
+	}
+}
+
+/* Per-row channel means, x100 so the seam metric keeps two decimals in integers. */
+static void row_means_x100(const uint8_t *buf, uint32_t n, uint32_t out[3])
+{
+	uint32_t sum[3] = { 0u, 0u, 0u };
+	uint32_t npx = 0u;
+
+	for (uint32_t i = 0; i + 1u < n; i += 2u) {
+		uint32_t p = (uint32_t)buf[i] | ((uint32_t)buf[i + 1u] << 8);
+
+		sum[0] += (p >> 11) & 0x1Fu;
+		sum[1] += (p >> 5) & 0x3Fu;
+		sum[2] += p & 0x1Fu;
+		npx++;
+	}
+	for (int k = 0; k < 3; k++)
+		out[k] = npx ? (sum[k] * 100u) / npx : 0u;
+}
+
+/* Largest adjacent-row step, and where.  Ranked on the summed channel delta so
+   one row is reported rather than three unrelated ones. */
+struct seam_max {
+	uint32_t row;
+	uint32_t d[3];
+	uint32_t total;
+};
+
+static void seam_track(struct seam_max *s, uint32_t row,
+                       const uint32_t a[3], const uint32_t b[3])
+{
+	uint32_t d[3], total = 0u;
+
+	for (int k = 0; k < 3; k++) {
+		d[k] = (a[k] > b[k]) ? a[k] - b[k] : b[k] - a[k];
+		total += d[k];
+	}
+	if (total > s->total) {
+		s->total = total;
+		s->row   = row;
+		for (int k = 0; k < 3; k++)
+			s->d[k] = d[k];
+	}
+}
+
+static int cmd_camera_capture(struct cli_instance *sh, int argc, char **argv)
+{
+	static const char *const chan[3] = { "R(5)", "G(6)", "B(5)" };
+	struct seam_max seam = { 0u, { 0u, 0u, 0u }, 0u };
+	struct rgb_stats st;
+	struct camera_mode m;
+	uint8_t buf[CAM_IO_CHUNK];
+	uint32_t prev[3] = { 0u, 0u, 0u };
+	uint32_t gen0 = 0, gen, off, row;
+	int colorbar = 0, have_psram = 0, ret = 1, rc;
+
+	if (argc > 1) {
+		if (strcmp(argv[1], "test") != 0) {
+			cli_error(sh, "camera: unknown option '%s' (try: test)\r\n", argv[1]);
+			return 1;
+		}
+		colorbar = 1;
+	}
+	(void)camera_get_mode(&m);
+
+	if (!cam_psram_take(sh))
+		return 1;
+	have_psram = 1;
+
+	/* Every capture pays for the warm-up frames (~1 s at 15).  The FIRST one
+	   after a power cycle also pays for the sensor bring-up: 200 ms COM7 reset +
+	   220 ms register table + 100 ms settle, plus 100 ms more if the colorbar
+	   state has to change. */
+	cli_print(sh, "camera: capturing %s frame (~1 s of warm-up; +0.6 s on the "
+	              "first one after a power cycle) ...\r\n",
+	          colorbar ? "colorbar test" : "live");
+	rc = camera_capture(colorbar);
+	if (rc != CAM_OK) {
+		report(sh, rc);
+		goto out;
+	}
+
+	stats_init(&st);
+	for (off = 0, row = 0; off < m.frame_bytes; row++) {
+		uint32_t n = (m.frame_bytes - off < CAM_IO_CHUNK)
+		             ? m.frame_bytes - off : CAM_IO_CHUNK;
+		uint32_t rmean[3];
+
+		rc = camera_frame_read(off, buf, n, &gen);
+		if (rc != CAM_OK) {
+			report(sh, rc);
+			goto out;
+		}
+		if (off == 0u)
+			gen0 = gen;
+		else if (gen != gen0) {
+			cli_error(sh, "camera: frame changed mid-read "
+			              "(concurrent capture)\r\n");
+			goto out;
+		}
+		stats_add_rgb565(&st, buf, n);
+		row_means_x100(buf, n, rmean);
+		if (row != 0u)
+			seam_track(&seam, row, prev, rmean);
+		prev[0] = rmean[0]; prev[1] = rmean[1]; prev[2] = rmean[2];
+		off += n;
+	}
+
+	cli_print(sh, "frame: %ux%u %s (%lu bytes, %u warm-up frames)\r\n",
+	          (unsigned)m.width, (unsigned)m.height, m.format,
+	          (unsigned long)m.frame_bytes, camera_get_warm_frames());
+	for (int k = 0; k < 3; k++)
+		cli_print(sh, "%s: min %3lu  max %3lu  mean %3lu\r\n", chan[k],
+		          (unsigned long)st.min[k], (unsigned long)st.max[k],
+		          (unsigned long)(st.npx ? st.sum[k] / st.npx : 0u));
+	/* The banding metric: the largest jump between two adjacent rows' channel
+	   means (x100).  A settled frame is single digits; a gain change landing
+	   mid-readout shows up as hundreds, at the row where it landed. */
+	cli_print(sh, "seam: row %3lu  dR %lu.%02lu  dG %lu.%02lu  dB %lu.%02lu\r\n",
+	          (unsigned long)seam.row,
+	          (unsigned long)(seam.d[0] / 100u), (unsigned long)(seam.d[0] % 100u),
+	          (unsigned long)(seam.d[1] / 100u), (unsigned long)(seam.d[1] % 100u),
+	          (unsigned long)(seam.d[2] / 100u), (unsigned long)(seam.d[2] % 100u));
+	ret = 0;
+out:
+	if (have_psram)
+		cam_psram_give();
+	return ret;
+}
+
+/* ---- save / send --------------------------------------------------------- */
+
+#if BSP_ENABLE_SD
+static int cmd_camera_save(struct cli_instance *sh, int argc, char **argv)
+{
+	const struct fs_device *dev = fs_sd_device();
+	struct camera_mode m;
+	uint8_t buf[CAM_IO_CHUNK];
+	FX_MEDIA *media;
+	FX_FILE file;
+	uint32_t gen0 = 0, gen, off;
+	int have_psram = 0, have_op = 0, have_file = 0, ret = 1, rc;
+	UINT st;
+
+	(void)argc;
+	(void)camera_get_mode(&m);
+
+	if (!cam_psram_take(sh))
+		return 1;
+	have_psram = 1;
+
+	media = fs_core_mount(dev, sh);
+	if (media == NULL)
+		goto out;
+	st = dev->op_begin();
+	if (st != FX_SUCCESS) {
+		cli_error(sh, "camera: %s: %s\r\n", dev->name, fs_strerror(st));
+		goto out;
+	}
+	have_op = 1;
+
+	(void)fx_file_delete(media, argv[1]);   /* overwrite semantics */
+	st = fx_file_create(media, argv[1]);
+	if (st != FX_SUCCESS && st != FX_ALREADY_CREATED) {
+		cli_error(sh, "camera: create %s: %s\r\n", argv[1], fs_strerror(st));
+		goto out;
+	}
+	st = fx_file_open(media, &file, argv[1], FX_OPEN_FOR_WRITE);
+	if (st != FX_SUCCESS) {
+		cli_error(sh, "camera: open %s: %s\r\n", argv[1], fs_strerror(st));
+		goto out;
+	}
+	have_file = 1;
+
+	for (off = 0; off < m.frame_bytes; ) {
+		uint32_t n = (m.frame_bytes - off < CAM_IO_CHUNK)
+		             ? m.frame_bytes - off : CAM_IO_CHUNK;
+
+		rc = camera_frame_read(off, buf, n, &gen);
+		if (rc != CAM_OK) {
+			report(sh, rc);
+			goto out;
+		}
+		if (off == 0u)
+			gen0 = gen;
+		else if (gen != gen0) {
+			cli_error(sh, "camera: frame changed mid-save by a concurrent "
+			              "capture (file left partial)\r\n");
+			goto out;
+		}
+		st = fx_file_write(&file, buf, n);
+		if (st != FX_SUCCESS) {
+			cli_error(sh, "camera: write failed: %s\r\n", fs_strerror(st));
+			goto out;
+		}
+		off += n;
+	}
+	cli_print(sh, "camera: wrote %s (%lu bytes, %ux%u %s)\r\n", argv[1],
+	          (unsigned long)m.frame_bytes, (unsigned)m.width,
+	          (unsigned)m.height, m.format);
+	ret = 0;
+out:
+	if (have_file) {
+		(void)fx_file_close(&file);
+		(void)fx_media_flush(media);
+	}
+	if (have_op)
+		dev->op_end();
+	if (have_psram)
+		cam_psram_give();
+	return ret;
+}
+#endif /* BSP_ENABLE_SD */
+
+/* YMODEM source over the captured frame.  The generation check makes a
+   concurrent capture a read fault rather than a silently spliced file. */
+struct cam_ym_ctx {
+	uint32_t pos;
+	uint32_t gen;
+	int      have_gen;
+};
+
+static int cam_ym_read(void *ctx, uint8_t *dst, uint32_t want, uint32_t *got)
+{
+	struct cam_ym_ctx *c = ctx;
+	struct camera_mode m;
+	uint32_t gen, n;
+
+	(void)camera_get_mode(&m);
+	if (c->pos >= m.frame_bytes) {
+		*got = 0u;
+		return 0;
+	}
+	n = m.frame_bytes - c->pos;
+	if (n > want)
+		n = want;
+	if (camera_frame_read(c->pos, dst, n, &gen) != CAM_OK)
+		return -1;
+	if (!c->have_gen) {
+		c->gen = gen;
+		c->have_gen = 1;
+	} else if (gen != c->gen) {
+		return -1;
+	}
+	c->pos += n;
+	*got = n;
+	return 0;
+}
+
+/*
+ * On the PC side use `rz -y -b`, and `ffmpeg -y` to render.  Without those flags
+ * neither tool overwrites an existing file -- YMODEM block 0 carries a name and a
+ * size but no mtime, so rz has nothing to compare -- and you quietly keep looking
+ * at the PREVIOUS capture, which is indistinguishable from a camera that has
+ * stopped producing new frames.  That is exactly what happened during bring-up.
+ */
+static int cmd_camera_send(struct cli_instance *sh, int argc, char **argv)
+{
+	struct cam_ym_ctx ctx = { 0u, 0u, 0 };
+	struct camera_mode m;
+	struct camera_info ci;
+	struct ym_source src;
+	int have_psram = 0, ret = 1;
+
+	(void)camera_get_mode(&m);
+	if (camera_get_info(&ci) != CAM_OK || !ci.frame_valid) {
+		report(sh, CAM_ERR_NO_FRAME);
+		return 1;
+	}
+	if (!cam_psram_take(sh))
+		return 1;
+	have_psram = 1;
+
+	src.ctx  = &ctx;
+	src.name = (argc > 1) ? argv[1] : "frame.raw";
+	src.size = m.frame_bytes;
+	src.read = cam_ym_read;
+	cli_print(sh, "camera: receive with `rz -y -b` -- without -y an existing "
+	              "file is kept and you get the previous frame\r\n");
+	ret = xfer_send_source(sh, &src);
+
+	if (have_psram)
+		cam_psram_give();
+	return ret;
+}
+
 /* ---- tune ---------------------------------------------------------------- */
 
 static int tune_apply(struct cli_instance *sh, const struct camera_tuning *t,
@@ -395,6 +790,40 @@ static int cmd_tune_sccb(struct cli_instance *sh, int argc, char **argv)
 	return tune_apply(sh, &t, "sccb", argv[1]);
 }
 
+static int cmd_tune_swap(struct cli_instance *sh, int argc, char **argv)
+{
+	struct camera_tuning t;
+
+	(void)argc;
+	if (camera_get_tuning(&t) != CAM_OK)
+		return 1;
+	if (strcmp(argv[1], "on") == 0)
+		t.dvp_swap = 1u;
+	else if (strcmp(argv[1], "off") == 0)
+		t.dvp_swap = 0u;
+	else {
+		cli_error(sh, "camera: swap takes on|off\r\n");
+		return 1;
+	}
+	return tune_apply(sh, &t, "swap", argv[1]);
+}
+
+/* Not part of `tune`'s struct -- it lives in the driver's capture path, not in
+   the board-assumption set the other knobs override. */
+static int cmd_tune_warm(struct cli_instance *sh, int argc, char **argv)
+{
+	uint32_t n;
+
+	(void)argc;
+	if (cli_parse_u32(argv[1], &n) != 0 ||
+	    camera_set_warm_frames((unsigned)n) != CAM_OK) {
+		cli_error(sh, "camera: warm takes 0..31 (frames discarded per capture)\r\n");
+		return 1;
+	}
+	cli_print(sh, "camera: warm = %s\r\n", argv[1]);
+	return 0;
+}
+
 static int cmd_camera_tune(struct cli_instance *sh, int argc, char **argv)
 {
 	struct camera_tuning t;
@@ -413,6 +842,8 @@ static int cmd_camera_tune(struct cli_instance *sh, int argc, char **argv)
 	cli_print(sh, "i2c:  %lu\r\n", (unsigned long)(t.i2c_hz / 1000u));
 	cli_print(sh, "sccb: %s\r\n",
 	          (t.sccb_style == CAM_SCCB_RESTART) ? "restart" : "split");
+	cli_print(sh, "swap: %s\r\n", t.dvp_swap ? "on" : "off");
+	cli_print(sh, "warm: %u\r\n", camera_get_warm_frames());
 	return 0;
 }
 
@@ -422,6 +853,9 @@ CLI_SUBCMD_SET_CREATE(camera_tune_subcmds,
 	CLI_CMD_ARG(pull, NULL, "internal SCCB pull-ups <on|off>", cmd_tune_pull, 2, 0),
 	CLI_CMD_ARG(i2c,  NULL, "SCCB bit rate <50|100|400> kHz", cmd_tune_i2c, 2, 0),
 	CLI_CMD_ARG(sccb, NULL, "read style <split|restart>", cmd_tune_sccb, 2, 0),
+	CLI_CMD_ARG(swap, NULL, "DVP byte swap <on|off>", cmd_tune_swap, 2, 0),
+	CLI_CMD_ARG(warm, NULL, "frames discarded per capture <0..31>",
+	            cmd_tune_warm, 2, 0),
 	CLI_SUBCMD_SET_END);
 
 CLI_SUBCMD_SET_CREATE(camera_subcmds,
@@ -433,6 +867,14 @@ CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	CLI_CMD(info, NULL, "driver / sensor / XCLK / SCCB state", cmd_camera_info),
 	CLI_CMD(scan, NULL, "list SCCB addresses that ACK (0x08..0x77)",
 	        cmd_camera_scan),
+	CLI_CMD_ARG(capture, NULL, "snapshot one frame + channel stats ('test' = colorbar)",
+	            cmd_camera_capture, 1, 1),
+#if BSP_ENABLE_SD
+	CLI_CMD_ARG(save, NULL, "write the frame raw to the microSD <path>",
+	            cmd_camera_save, 2, 0),
+#endif
+	CLI_CMD_ARG(send, NULL, "stream the frame to the PC over YMODEM [name]",
+	            cmd_camera_send, 1, 1),
 	CLI_CMD_ARG(reg, NULL, "raw SCCB access <addr> <reg> [value] [-16]",
 	            cmd_camera_reg, 3, 2),
 	CLI_CMD_ARG(xclk, NULL, "show or set the master clock [hz]",
@@ -442,5 +884,5 @@ CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(camera, camera_subcmds,
-                 "FPC-24 DVP camera (DCMI, issue #8 phase 1: XCLK + SCCB)",
+                 "FPC-24 DVP camera (OV2640 over DCMI, QVGA RGB565 snapshot)",
                  NULL, 1, 0);

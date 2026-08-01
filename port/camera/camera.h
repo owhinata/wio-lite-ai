@@ -4,14 +4,16 @@
  */
 /**
  * @file    camera.h
- * @brief   DVP camera bring-up: XCLK generation, SCCB bus, sensor identification
- *          (issue #8 phase 1).
+ * @brief   OV2640 DVP camera over DCMI: XCLK, SCCB, snapshot capture (issue #8
+ *          phases 1-2).
  *
  * The board's J7 FPC-24 connector carries a plain 8-bit DVP camera into the
- * STM32H725's DCMI.  This phase brings up everything the sensor needs *before*
- * a single pixel can move, and nothing else: the master clock, the SCCB
- * (I2C) control bus, the PWDN/RESETB lines, and a chip-ID read that tells us
- * which sensor is actually plugged in.  DCMI and DMA arrive in phase 2.
+ * STM32H725's DCMI.  Phase 1 brought up everything the sensor needs *before* a
+ * single pixel can move -- the master clock, the SCCB (I2C) control bus, the
+ * PWDN/RESETB lines and a chip-ID read (the part in hand is an OV2640, SCCB
+ * 0x30, chip ID 0x2642).  Phase 2 adds the pixel path: the QVGA RGB565 register
+ * sequence, and one frame captured over DCMI + DMA2_Stream1 into a PSRAM frame
+ * buffer.  Continuous capture and the frame pipeline are phase 3.
  *
  * Two board facts drive the whole design and both differ from the STM32F746
  * Discovery firmware this project is otherwise ported from
@@ -58,6 +60,8 @@ extern "C" {
 #define CAM_ERR_TIMEOUT   -3   /* bus never went idle                           */
 #define CAM_ERR_STATE     -4   /* driver not initialized / sensor not powered   */
 #define CAM_ERR_NO_SENSOR -5   /* nothing answered, or an unrecognised chip ID  */
+#define CAM_ERR_NO_FRAME  -6   /* no captured frame available                   */
+#define CAM_ERR_BUSY      -7   /* a capture already owns the DCMI               */
 
 /** Sensors this phase knows how to identify.  CAM_SENSOR_UNKNOWN means "some
  *  device ACKed on the SCCB bus but its ID did not match any candidate" -- a
@@ -80,6 +84,20 @@ enum camera_sensor {
 #define CAM_SCCB_SPLIT    0u   /* write reg + STOP, then a separate read (default) */
 #define CAM_SCCB_RESTART  1u   /* single transfer with a repeated START            */
 
+/** Capture geometry.  Phase 2 has exactly one mode; the struct exists so the
+ *  shell never hardcodes the numbers and phase 3 can add modes without changing
+ *  the command surface. */
+#define CAMERA_FRAME_WIDTH   320u
+#define CAMERA_FRAME_HEIGHT  240u
+#define CAMERA_FRAME_BYTES   (CAMERA_FRAME_WIDTH * CAMERA_FRAME_HEIGHT * 2u)
+
+struct camera_mode {
+	uint16_t width;
+	uint16_t height;
+	uint32_t frame_bytes;
+	const char *format;    /**< "RGB565" */
+};
+
 /** Snapshot of driver + sensor state (camera_get_info). */
 struct camera_info {
 	uint8_t  ready;        /**< camera_init() completed                        */
@@ -87,8 +105,11 @@ struct camera_info {
 	uint8_t  sensor;       /**< enum camera_sensor                             */
 	uint8_t  i2c_addr;     /**< 7-bit SCCB address that answered, 0 if none    */
 	uint8_t  reg_width;    /**< CAM_REG_WIDTH_8 / _16 of the identified sensor */
+	uint8_t  configured;   /**< the QVGA RGB565 register sequence is loaded    */
+	uint8_t  frame_valid;  /**< the frame buffer holds a captured image        */
 	uint16_t chip_id;      /**< product ID (0x2642 = OV2640, 0x5640 = OV5640)  */
 	uint16_t manuf_id;     /**< manufacturer ID (0x7FA2 for OmniVision), or 0  */
+	uint32_t frame_bytes;  /**< bytes valid in the frame buffer                */
 	uint32_t xclk_hz;      /**< XCLK actually being emitted, 0 when stopped    */
 	uint32_t xclk_src_hz;  /**< TIM5 kernel clock the divider works from       */
 	uint32_t i2c_ker_hz;   /**< I2C4 kernel clock (rcc_pclk4)                  */
@@ -103,6 +124,7 @@ struct camera_tuning {
 	uint8_t rst_active_low;   /**< 1 = RESETB low holds the sensor in reset (default) */
 	uint8_t i2c_pullup;       /**< 1 = also enable the MCU's internal pull-ups       */
 	uint8_t sccb_style;       /**< CAM_SCCB_SPLIT / CAM_SCCB_RESTART                 */
+	uint8_t dvp_swap;         /**< 1 = IMAGE_MODE bit0 set (ST's shipped default)    */
 	uint32_t i2c_hz;          /**< nominal SCCB bit rate: 50000 / 100000 / 400000    */
 };
 
@@ -146,6 +168,53 @@ int camera_probe(void);
 
 /** Copy the current state out.  Never fails once camera_init() ran. */
 int camera_get_info(struct camera_info *out);
+
+/** Capture geometry / pixel format.  Constant in phase 2. */
+int camera_get_mode(struct camera_mode *out);
+
+/**
+ * Frames discarded before the one camera_capture() keeps (default 15, max 31).
+ *
+ * The OV2640's exposure loop starts from the register table's defaults, so the
+ * frames right after a power cycle are badly under-exposed -- measured here, the
+ * first frame at 0 is seven times too dark and three back-to-back captures still
+ * have not converged, while 15 discarded frames put the first kept frame at the
+ * settled value.  0 restores the single-frame behaviour, which is what makes the
+ * effect measurable instead of a matter of belief.
+ */
+int      camera_set_warm_frames(unsigned n);
+unsigned camera_get_warm_frames(void);
+
+/**
+ * Configure the sensor if needed, then capture ONE frame into the driver's
+ * frame buffer over DCMI + DMA.  Blocks until the frame lands or the transfer
+ * times out (~1 s); the first call after a power cycle also spends ~250 ms
+ * writing the QVGA RGB565 register sequence.
+ *
+ * @param colorbar  nonzero selects the sensor's internal test pattern instead
+ *                  of the live image -- it proves the DCMI/DMA path without
+ *                  involving optics or lighting.
+ *
+ * The frame buffer lives in the OCTOSPI1 PSRAM.  This call does NOT arbitrate
+ * that bus: the caller must hold the psram guard (the shell does), because a
+ * concurrent retune of OCTOSPI1 would stall the AXI, not merely spoil the
+ * frame.
+ *
+ * @return CAM_OK, CAM_ERR_NO_SENSOR, CAM_ERR_HAL (sync/overrun/DMA error),
+ *         CAM_ERR_TIMEOUT (no frame arrived), CAM_ERR_BUSY, CAM_ERR_STATE.
+ */
+int camera_capture(int colorbar);
+
+/**
+ * Copy @p len bytes at @p offset out of the captured frame.
+ *
+ * @param gen  (may be NULL) receives the frame generation counter.  A caller
+ *             that reads the frame in several calls must check it does not
+ *             change between them -- frame_valid alone cannot tell that a
+ *             concurrent capture replaced the pixels underneath.
+ * @return CAM_OK, CAM_ERR_NO_FRAME, CAM_ERR_PARAM, CAM_ERR_STATE.
+ */
+int camera_frame_read(uint32_t offset, void *dst, uint32_t len, uint32_t *gen);
 
 /**
  * Scan 7-bit SCCB addresses 0x08..0x77 and store the ones that ACK.

@@ -55,9 +55,11 @@
  */
 #include "camera.h"
 
+#include "ov2640_regs.h"
 #include "stm32h7xx_hal.h"
 #include "timebase.h"   /* udelay: DWT-based, used by the bit-banged bus clear */
 #include "tx_api.h"
+#include "tx_glue.h"    /* tx_glue_isr_enter/exit: EPK (issue #2) accounting  */
 
 #define LOG_TAG "cam"
 #include "log.h"
@@ -81,6 +83,21 @@
 #define CAM_SDA_PORT      GPIOF
 #define CAM_SDA_PIN       GPIO_PIN_15
 #define CAM_I2C_AF        GPIO_AF4_I2C4
+
+/*
+ * DCMI, 8-bit parallel (issue #8 phase 2).  All eleven lines are AF13 on this
+ * UFBGA169 package -- checked against the schematic, against ST's published pin
+ * data for this exact part, and against the factory Arduino firmware's
+ * HAL_DCMI_MspInit, which programs the same set.  Grouped by port because
+ * HAL_GPIO_Init takes a pin mask.
+ */
+#define CAM_DCMI_AF       GPIO_AF13_DCMI
+#define CAM_DCMI_A_PINS   (GPIO_PIN_4 | GPIO_PIN_6 | GPIO_PIN_9)  /* HSYNC PIXCLK D0 */
+#define CAM_DCMI_D_PINS   (GPIO_PIN_3)                            /* D5              */
+#define CAM_DCMI_E_PINS   (GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_4 | \
+                           GPIO_PIN_5 | GPIO_PIN_6)               /* D2 D3 D4 D6 D7  */
+#define CAM_DCMI_G_PINS   (GPIO_PIN_9)                            /* VSYNC           */
+#define CAM_DCMI_H_PINS   (GPIO_PIN_10)                           /* D1              */
 
 /* ---- XCLK ---------------------------------------------------------------- */
 
@@ -148,10 +165,63 @@
 #define OV5640_REG_IDL     0x300Bu
 #define OV5640_ID          0x5640u
 
+/* OV2640 registers this driver writes outside the vendored table. */
+#define OV2640_REG_COM7        0x12u   /* sensor bank */
+#define OV2640_COM7_COLORBAR   0x02u
+#define OV2640_REG_IMAGE_MODE  0xDAu   /* DSP bank    */
+#define OV2640_IMAGE_MODE_RGB565 0x08u
+#define OV2640_IMAGE_MODE_SWAP   0x01u
+#define OV2640_BANK_DSP    0x00u
+
+/* ---- capture ------------------------------------------------------------- */
+
+/* One frame's DMA budget in 32-bit words.  38400 < 65535, so HAL_DCMI_Start_DMA
+   programs a single stream transfer -- the intra-frame banding (DBM) path that
+   a >64 K-word frame would take, and the DMA FIFO-error handling it drags in,
+   is NOT exercised here.  Adding VGA in a later phase changes that. */
+#define CAM_FRAME_WORDS   (CAMERA_FRAME_BYTES / 4u)
+
+/* A frame is ~1/15 s; a second is "the sensor is not producing frames at all". */
+#define CAM_XFER_TIMEOUT_TICKS  1000u
+
+/* Frames thrown away before the one we keep, so the sensor's exposure loop has
+   converged.  15 is not a guess -- see camera_capture_locked(). */
+#define CAM_WARM_FRAMES_DEF     15u
+#define CAM_WARM_FRAMES_MAX     31u
+
+/* Settle after the register sequence before the first frame is trusted. */
+#define CAM_SETTLE_CONFIG_MS    100u
+/* ST's driver spaces the sequence out: 200 ms after the COM7 soft reset and
+   1 ms between rows.  Kept as-is -- shortening it turns a failure into "is the
+   table wrong or is the pacing wrong?", which is the expensive question. */
+#define CAM_T_SOFT_RESET_MS     200u
+
 /* ---- state --------------------------------------------------------------- */
 
 static TX_MUTEX cam_lock;
+static TX_SEMAPHORE cam_done;
 static I2C_HandleTypeDef hcam_i2c;
+static DCMI_HandleTypeDef hdcmi;
+static DMA_HandleTypeDef hdma_dcmi;
+
+/*
+ * The frame buffer.  AXI-SRAM has ~113 KB free and a QVGA RGB565 frame is 150 KB,
+ * so the PSRAM is not a preference here, it is the only place it fits.
+ *
+ * CACHE CONTRACT: app/mpu.c maps the whole OCTOSPI1 window Normal non-cacheable,
+ * so the CPU and the DCMI's DMA see the same bytes with no clean/invalidate.
+ * That holds ONLY while this buffer stays in .psram_noinit -- move it to
+ * AXI-SRAM and every read below needs cache maintenance (and the .axi_dma
+ * treatment port/sd/sd_card.c uses for its bounce buffer).
+ */
+static uint8_t cam_frame[CAMERA_FRAME_BYTES]
+	__attribute__((aligned(32), section(".psram_noinit.camera")));
+
+static volatile int cam_xfer_active;   /* a capture owns the DCMI right now   */
+static volatile int cam_xfer_err;      /* set by HAL_DCMI_ErrorCallback       */
+static uint32_t cam_frame_gen;         /* bumped on every successful capture  */
+static int cam_colorbar = -1;          /* live/colorbar state, -1 = unknown   */
+static unsigned cam_warm_frames = CAM_WARM_FRAMES_DEF;
 
 static struct camera_info info;
 static struct camera_tuning tune = {
@@ -159,6 +229,7 @@ static struct camera_tuning tune = {
 	.rst_active_low   = 1u,
 	.i2c_pullup       = 0u,
 	.sccb_style       = CAM_SCCB_SPLIT,
+	.dvp_swap         = 1u,   /* ST's table ends with IMAGE_MODE = 0x09 */
 	.i2c_hz           = 100000u,
 };
 static uint32_t cam_xclk_div = CAM_XCLK_DIV_DEF;
@@ -306,6 +377,12 @@ static void power_off_locked(void)
 	info.reg_width = 0u;
 	info.chip_id   = 0u;
 	info.manuf_id  = 0u;
+	/* The sensor's registers do not survive PWDN/reset, so the loaded sequence
+	   is gone and the next capture must re-run it.  The FRAME, however, is still
+	   in PSRAM and still readable -- `camera off` then `camera send` is a
+	   reasonable thing to do, so frame_valid deliberately stays set. */
+	info.configured = 0u;
+	cam_colorbar    = -1;
 }
 
 static void power_on_locked(void)
@@ -581,6 +658,401 @@ static uint8_t first_acking_addr_locked(void)
 	return 0u;
 }
 
+/* Power-cycle and identify.  Split out of camera_probe() so camera_capture()
+   can bring an unpowered sensor up without releasing and re-taking the lock. */
+static int camera_probe_locked(void)
+{
+	int rc;
+
+	power_off_locked();
+	power_on_locked();
+	i2c_ensure_ready_locked();
+
+	rc = ident_ov2640_locked();
+	if (rc != CAM_OK)
+		rc = ident_ov5640_locked();
+
+	if (rc != CAM_OK) {
+		/* Leave the sensor powered: the supply cannot be cut anyway, and a live
+		   bus is what lets `camera scan` / `camera reg` continue the hunt. */
+		uint8_t a = first_acking_addr_locked();
+
+		info.sensor    = (a != 0u) ? CAM_SENSOR_UNKNOWN : CAM_SENSOR_NONE;
+		info.i2c_addr  = a;
+		info.reg_width = 0u;
+		info.chip_id   = 0u;
+		info.manuf_id  = 0u;
+		if (a != 0u)
+			LOG_WRN("unidentified device at SCCB 0x%02x", a);
+		else
+			LOG_WRN("no SCCB response (module connected? XCLK %lu Hz)",
+			        (unsigned long)info.xclk_hz);
+		return CAM_ERR_NO_SENSOR;
+	}
+
+	LOG_INF("%s up: chip ID 0x%04x at SCCB 0x%02x",
+	        camera_sensor_name(info.sensor), info.chip_id, info.i2c_addr);
+	return CAM_OK;
+}
+
+/* ---- sensor configuration (OV2640 QVGA RGB565) --------------------------- */
+
+/*
+ * Walk the vendored ST table.  ST's own driver returns void, so a sensor that
+ * NAKs half way through leaves it happily reporting success and produces a
+ * garbage frame later; going through sccb_write_locked() means a bad row stops
+ * the sequence at the row that failed, and says which one.
+ */
+static int ov2640_write_table_locked(void)
+{
+	for (unsigned i = 0u; i < ov2640_qvga_rgb565_len; i++) {
+		if (sccb_write_locked(OV2640_ADDR, ov2640_qvga_rgb565[i][0],
+		                      CAM_REG_WIDTH_8,
+		                      ov2640_qvga_rgb565[i][1]) != CAM_OK) {
+			LOG_ERR("QVGA sequence failed at row %u (reg 0x%02x)", i,
+			        ov2640_qvga_rgb565[i][0]);
+			return CAM_ERR_HAL;
+		}
+		tx_thread_sleep(1u);   /* ST paces the sequence at 1 ms per row */
+	}
+	return CAM_OK;
+}
+
+/*
+ * Re-write IMAGE_MODE after the table so the DVP byte-swap bit follows the
+ * `camera tune swap` knob.  The table itself keeps ST's shipped 0x09; this is
+ * the one register we are prepared to disagree with them about, because which
+ * order is "right" depends on what reads the frame, not on the sensor.
+ */
+static int ov2640_apply_swap_locked(void)
+{
+	uint8_t v = OV2640_IMAGE_MODE_RGB565 |
+	            (tune.dvp_swap ? OV2640_IMAGE_MODE_SWAP : 0u);
+
+	if (sccb_write_locked(OV2640_ADDR, OV2640_REG_BANK, CAM_REG_WIDTH_8,
+	                      OV2640_BANK_DSP) != CAM_OK ||
+	    sccb_write_locked(OV2640_ADDR, OV2640_REG_IMAGE_MODE, CAM_REG_WIDTH_8,
+	                      v) != CAM_OK)
+		return CAM_ERR_HAL;
+	return CAM_OK;
+}
+
+/* COM7 bit1 swaps the live image for the sensor's internal colour-bar pattern.
+   Worth having: it exercises DVP -> DCMI -> DMA -> PSRAM with a signal that owes
+   nothing to the lens, the light or the exposure loop. */
+static int ov2640_set_colorbar_locked(int on)
+{
+	uint8_t com7;
+
+	if (sccb_write_locked(OV2640_ADDR, OV2640_REG_BANK, CAM_REG_WIDTH_8,
+	                      OV2640_BANK_SENSOR) != CAM_OK)
+		return CAM_ERR_HAL;
+	if (sccb_read_locked(OV2640_ADDR, OV2640_REG_COM7, CAM_REG_WIDTH_8,
+	                     &com7) != CAM_OK)
+		return CAM_ERR_HAL;
+	com7 = on ? (uint8_t)(com7 | OV2640_COM7_COLORBAR)
+	          : (uint8_t)(com7 & (uint8_t)~OV2640_COM7_COLORBAR);
+	if (sccb_write_locked(OV2640_ADDR, OV2640_REG_COM7, CAM_REG_WIDTH_8,
+	                      com7) != CAM_OK)
+		return CAM_ERR_HAL;
+	return CAM_OK;
+}
+
+/* Lazy: the ~250 ms sequence runs on the first capture after a power cycle. */
+static int camera_configure_locked(int colorbar)
+{
+	int rc;
+
+	if (!info.configured) {
+		/* COM7 soft reset first, exactly as ST's ov2640_Init does -- the table
+		   assumes it starts from reset defaults. */
+		if (sccb_write_locked(OV2640_ADDR, OV2640_REG_BANK, CAM_REG_WIDTH_8,
+		                      OV2640_BANK_SENSOR) != CAM_OK ||
+		    sccb_write_locked(OV2640_ADDR, OV2640_REG_COM7, CAM_REG_WIDTH_8,
+		                      0x80u) != CAM_OK)
+			return CAM_ERR_HAL;
+		tx_thread_sleep(CAM_T_SOFT_RESET_MS);
+
+		rc = ov2640_write_table_locked();
+		if (rc != CAM_OK)
+			return rc;
+		rc = ov2640_apply_swap_locked();
+		if (rc != CAM_OK)
+			return rc;
+
+		info.configured = 1u;
+		cam_colorbar    = -1;          /* force the block below to run */
+		tx_thread_sleep(CAM_SETTLE_CONFIG_MS);
+	}
+
+	if (cam_colorbar != colorbar) {
+		rc = ov2640_set_colorbar_locked(colorbar);
+		if (rc != CAM_OK)
+			return rc;
+		/* Committed only on success, so a failed switch is retried next time
+		   instead of being remembered as done. */
+		cam_colorbar = colorbar;
+		tx_thread_sleep(CAM_SETTLE_CONFIG_MS);
+	}
+	return CAM_OK;
+}
+
+/* ---- DCMI + DMA ---------------------------------------------------------- */
+
+/*
+ * Values recovered by disassembling the board's factory Arduino firmware
+ * (its HAL_DCMI_MspInit / HAL_DCMI_Init), which is the only description of this
+ * camera connector that exists: hardware sync (no embedded codes), pixel clock
+ * latched on the RISING edge, VSYNC and HSYNC active LOW, every frame captured,
+ * 8-bit parallel data.
+ */
+static int dcmi_init_locked(void)
+{
+	GPIO_InitTypeDef g = {0};
+
+	__HAL_RCC_GPIOA_CLK_ENABLE();
+	__HAL_RCC_GPIOD_CLK_ENABLE();
+	__HAL_RCC_GPIOE_CLK_ENABLE();
+	__HAL_RCC_GPIOG_CLK_ENABLE();
+	__HAL_RCC_GPIOH_CLK_ENABLE();
+	__HAL_RCC_DCMI_CLK_ENABLE();
+	__HAL_RCC_DMA2_CLK_ENABLE();
+
+	g.Mode      = GPIO_MODE_AF_PP;
+	g.Pull      = GPIO_NOPULL;
+	g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+	g.Alternate = CAM_DCMI_AF;
+	g.Pin = CAM_DCMI_A_PINS; HAL_GPIO_Init(GPIOA, &g);
+	g.Pin = CAM_DCMI_D_PINS; HAL_GPIO_Init(GPIOD, &g);
+	g.Pin = CAM_DCMI_E_PINS; HAL_GPIO_Init(GPIOE, &g);
+	g.Pin = CAM_DCMI_G_PINS; HAL_GPIO_Init(GPIOG, &g);
+	g.Pin = CAM_DCMI_H_PINS; HAL_GPIO_Init(GPIOH, &g);
+
+	hdcmi.Instance              = DCMI;
+	hdcmi.Init.SynchroMode      = DCMI_SYNCHRO_HARDWARE;
+	hdcmi.Init.PCKPolarity      = DCMI_PCKPOLARITY_RISING;
+	hdcmi.Init.VSPolarity       = DCMI_VSPOLARITY_LOW;
+	hdcmi.Init.HSPolarity       = DCMI_HSPOLARITY_LOW;
+	hdcmi.Init.CaptureRate      = DCMI_CR_ALL_FRAME;
+	hdcmi.Init.ExtendedDataMode = DCMI_EXTEND_DATA_8B;
+	hdcmi.Init.JPEGMode         = DCMI_JPEG_DISABLE;
+	hdcmi.Init.ByteSelectMode   = DCMI_BSM_ALL;
+	hdcmi.Init.ByteSelectStart  = DCMI_OEBS_ODD;
+	hdcmi.Init.LineSelectMode   = DCMI_LSM_ALL;
+	hdcmi.Init.LineSelectStart  = DCMI_OELS_ODD;
+	if (HAL_DCMI_Init(&hdcmi) != HAL_OK) {
+		LOG_ERR("DCMI init failed");
+		return CAM_ERR_HAL;
+	}
+
+	/* DMA2_Stream1 with DMAMUX request 75.  Word-wide on both sides: the DCMI
+	   packs four received bytes into its 32-bit DR least-significant byte first
+	   and the core is little-endian, so the bytes land in memory in arrival
+	   order -- no swap is introduced here (the sensor's IMAGE_MODE bit 0 is a
+	   separate, deliberate one). */
+	hdma_dcmi.Instance                 = DMA2_Stream1;
+	hdma_dcmi.Init.Request             = DMA_REQUEST_DCMI_PSSI;
+	hdma_dcmi.Init.Direction           = DMA_PERIPH_TO_MEMORY;
+	hdma_dcmi.Init.PeriphInc           = DMA_PINC_DISABLE;
+	hdma_dcmi.Init.MemInc              = DMA_MINC_ENABLE;
+	hdma_dcmi.Init.PeriphDataAlignment = DMA_PDATAALIGN_WORD;
+	hdma_dcmi.Init.MemDataAlignment    = DMA_MDATAALIGN_WORD;
+	hdma_dcmi.Init.Mode                = DMA_NORMAL;
+	hdma_dcmi.Init.Priority            = DMA_PRIORITY_VERY_HIGH;
+	hdma_dcmi.Init.FIFOMode            = DMA_FIFOMODE_ENABLE;
+	hdma_dcmi.Init.FIFOThreshold       = DMA_FIFO_THRESHOLD_FULL;
+	hdma_dcmi.Init.MemBurst            = DMA_MBURST_SINGLE;
+	hdma_dcmi.Init.PeriphBurst         = DMA_PBURST_SINGLE;
+	if (HAL_DMA_Init(&hdma_dcmi) != HAL_OK) {
+		LOG_ERR("DCMI DMA init failed");
+		return CAM_ERR_HAL;
+	}
+	__HAL_LINKDMA(&hdcmi, DMA_Handle, hdma_dcmi);
+
+	/* Priority 6 alongside SDMMC1 and OTG_HS, below the RTL8720 UART's hard
+	   byte deadline (5).  It only shapes latency: ThreadX masks with PRIMASK,
+	   and an overrun is decided by the DMA's own priority and the 8-word DCMI
+	   FIFO long before any ISR could run.  NOT enabled here -- see
+	   camera_capture(). */
+	HAL_NVIC_SetPriority(DCMI_IRQn, 6, 0);
+	HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 6, 0);
+	return CAM_OK;
+}
+
+/*
+ * NOTE THE NAME.  On this part the vector is DCMI_PSSI_IRQHandler -- the DCMI
+ * shares its interrupt line with the PSSI, and CMSIS spells the handler
+ * accordingly (lib/cmsis_device_h7/Source/Templates/gcc/startup_stm32h725xx.s).
+ * Only the *IRQn* has a compatibility alias (`#define DCMI_IRQn DCMI_PSSI_IRQn`
+ * in stm32h725xx.h), so writing DCMI_IRQHandler compiles, links, and silently
+ * does nothing: the weak DCMI_PSSI_IRQHandler stays bound to Default_Handler and
+ * the function is dropped by --gc-sections.  The symptom would have been every
+ * capture timing out, i.e. an afternoon spent re-checking the FPC wiring.
+ */
+void DCMI_PSSI_IRQHandler(void)
+{
+	tx_glue_isr_enter();
+	HAL_DCMI_IRQHandler(&hdcmi);
+	tx_glue_isr_exit();
+}
+
+void DMA2_Stream1_IRQHandler(void)
+{
+	tx_glue_isr_enter();
+	HAL_DMA_IRQHandler(&hdma_dcmi);
+	tx_glue_isr_exit();
+}
+
+void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *h)
+{
+	(void)h;
+	if (!cam_xfer_active)
+		return;                        /* stale completion after an abort */
+	(void)tx_semaphore_put(&cam_done);
+}
+
+void HAL_DCMI_ErrorCallback(DCMI_HandleTypeDef *h)
+{
+	(void)h;
+	if (!cam_xfer_active)
+		return;
+	cam_xfer_err = 1;
+	(void)tx_semaphore_put(&cam_done);
+}
+
+/* Drop any completion left over from a timed-out or aborted transfer, so the
+   next capture cannot mistake it for its own. */
+static void drain_done(void)
+{
+	while (tx_semaphore_get(&cam_done, TX_NO_WAIT) == TX_SUCCESS)
+		;
+}
+
+/* One snapshot into cam_frame.  Arms, waits, stops -- no sensor state changes,
+   so the warm-up loop can call it repeatedly. */
+static int dcmi_snapshot_locked(void)
+{
+	drain_done();
+	cam_xfer_err    = 0;
+	cam_xfer_active = 1;
+	/* HAL only clears these in Init/DeInit -- Stop() ORs in HAL_DCMI_ERROR_NONE,
+	   which changes nothing -- so without this the log after a failure can carry
+	   bits from an earlier one. */
+	hdcmi.ErrorCode    = HAL_DCMI_ERROR_NONE;
+	hdma_dcmi.ErrorCode = HAL_DMA_ERROR_NONE;
+
+	/*
+	 * Re-arm the error interrupts on EVERY capture.  HAL_DCMI_Init enables
+	 * LINE/VSYNC/ERR/OVR once (stm32h7xx_hal_dcmi.c), but the snapshot FRAME
+	 * handling in HAL_DCMI_IRQHandler disables all of them again, and
+	 * HAL_DCMI_Start_DMA does not put them back.  Without this, an overrun on
+	 * the second and later captures surfaces as a TIMEOUT instead of an error --
+	 * which points the investigation at the wiring rather than at bandwidth.
+	 * Clear the stale flags first so a latched one does not fire the ISR the
+	 * instant the enables go in.  LINE/VSYNC stay off: nothing consumes them and
+	 * they fire per line.
+	 */
+	__HAL_DCMI_CLEAR_FLAG(&hdcmi, DCMI_FLAG_ERRRI | DCMI_FLAG_OVRRI |
+	                              DCMI_FLAG_FRAMERI | DCMI_FLAG_LINERI |
+	                              DCMI_FLAG_VSYNCRI);
+	__HAL_DCMI_ENABLE_IT(&hdcmi, DCMI_IT_ERR | DCMI_IT_OVR);
+
+	HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
+	HAL_NVIC_EnableIRQ(DCMI_IRQn);
+
+	if (HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)(uintptr_t)cam_frame,
+	                       CAM_FRAME_WORDS) != HAL_OK) {
+		cam_xfer_active = 0;
+		(void)HAL_DCMI_Stop(&hdcmi);
+		drain_done();
+		LOG_ERR("DCMI start failed (err 0x%lx)",
+		        (unsigned long)HAL_DCMI_GetError(&hdcmi));
+		return CAM_ERR_HAL;
+	}
+
+	if (tx_semaphore_get(&cam_done, CAM_XFER_TIMEOUT_TICKS) != TX_SUCCESS) {
+		cam_xfer_active = 0;
+		(void)HAL_DCMI_Stop(&hdcmi);
+		drain_done();
+		LOG_ERR("frame timed out -- no VSYNC/PCLK? (XCLK %lu Hz)",
+		        (unsigned long)info.xclk_hz);
+		return CAM_ERR_TIMEOUT;
+	}
+	cam_xfer_active = 0;
+
+	if (cam_xfer_err) {
+		(void)HAL_DCMI_Stop(&hdcmi);
+		drain_done();
+		LOG_ERR("capture error (DCMI err 0x%lx, DMA err 0x%lx)",
+		        (unsigned long)HAL_DCMI_GetError(&hdcmi),
+		        (unsigned long)HAL_DMA_GetError(&hdma_dcmi));
+		return CAM_ERR_HAL;
+	}
+
+	/* Snapshot mode auto-clears CAPTURE; Stop also disables the DCMI and aborts
+	   the DMA, leaving the HAL READY for the next call. */
+	(void)HAL_DCMI_Stop(&hdcmi);
+
+	info.frame_bytes = CAMERA_FRAME_BYTES;
+	cam_frame_gen++;
+	return CAM_OK;
+}
+
+/*
+ * Capture, discarding the first `cam_warm_frames` frames.
+ *
+ * The OV2640 owns its exposure and gain loops and they start from the register
+ * table's defaults, so the frames right after a power cycle are badly
+ * under-exposed.  Measured on this board, capturing back to back immediately
+ * after `camera off; camera probe`:
+ *
+ *     warm = 0   frame 1 mean R2 G11 B0    frame 2 R4 G15 B0   frame 3 R6 G22 B3
+ *     warm = 15  frame 1 mean R14 G28 B12  frame 2 R15 G31 B13 frame 3 R15 G31 B13
+ *
+ * i.e. without warm-up the first frame is seven times too dark and three
+ * consecutive captures still have not converged; with 15 discarded frames the
+ * first kept frame is already at the settled value.  Convergence therefore needs
+ * somewhere between 4 and 16 frames -- 15 is the number actually shown to work,
+ * so it is the default rather than a smaller guess.  The cost is ~1 s per
+ * capture, which is invisible on a human-typed command.
+ *
+ * (An adaptive version -- keep discarding until the frame mean stops moving --
+ * would be tighter, but it is a phase 3 concern: continuous capture will not use
+ * this path at all.)
+ *
+ * NOT claimed: this does not explain the one-off horizontal banding seen in the
+ * very first working capture (a step at row 27, R -37% / G -8% / B ~0 with the
+ * scene continuous across it at 0.996 correlation).  That artifact has not
+ * reproduced since -- not with a lighting transient, not from a cold power cycle,
+ * not at warm = 0 -- so the AWB-mid-readout theory it suggested stays an
+ * unproven hypothesis.  The `seam:` figure the shell prints exists to catch it if
+ * it ever comes back.
+ */
+static int camera_capture_locked(int colorbar)
+{
+	int rc;
+
+	if (cam_xfer_active)
+		return CAM_ERR_BUSY;
+	if (!info.powered || info.sensor != CAM_SENSOR_OV2640) {
+		rc = camera_probe_locked();
+		if (rc != CAM_OK)
+			return rc;
+	}
+	rc = camera_configure_locked(colorbar);
+	if (rc != CAM_OK)
+		return rc;
+
+	info.frame_valid = 0u;
+	for (unsigned i = 0; i <= cam_warm_frames; i++) {
+		rc = dcmi_snapshot_locked();
+		if (rc != CAM_OK)
+			return rc;
+	}
+	info.frame_valid = 1u;
+	return CAM_OK;
+}
+
 /* ---- public API ---------------------------------------------------------- */
 
 int camera_init(void)
@@ -593,6 +1065,12 @@ int camera_init(void)
 
 	if (tx_mutex_create(&cam_lock, "camera", TX_INHERIT) != TX_SUCCESS)
 		return CAM_ERR_STATE;
+	/* The DCMI/DMA ISRs post this, so it exists before any interrupt can be
+	   enabled -- which camera_capture(), not this function, does (issue #12). */
+	if (tx_semaphore_create(&cam_done, "cam_done", 0) != TX_SUCCESS) {
+		(void)tx_mutex_delete(&cam_lock);
+		return CAM_ERR_STATE;
+	}
 
 	__HAL_RCC_GPIOA_CLK_ENABLE();
 	__HAL_RCC_GPIOE_CLK_ENABLE();
@@ -619,7 +1097,10 @@ int camera_init(void)
 	   correct exactly once: camera_init() runs from tx_application_define()
 	   before the scheduler exists, so no other thread can be inside them. */
 	rc = cam_i2c_init_locked();
+	if (rc == CAM_OK)
+		rc = dcmi_init_locked();
 	if (rc != CAM_OK) {
+		(void)tx_semaphore_delete(&cam_done);
 		(void)tx_mutex_delete(&cam_lock);
 		return rc;
 	}
@@ -660,36 +1141,74 @@ int camera_probe(void)
 
 	if (rc != CAM_OK)
 		return rc;
+	rc = camera_probe_locked();
+	op_unlock();
+	return rc;
+}
 
-	power_off_locked();
-	power_on_locked();
-	i2c_ensure_ready_locked();
+int camera_capture(int colorbar)
+{
+	int rc = op_lock();
 
-	rc = ident_ov2640_locked();
 	if (rc != CAM_OK)
-		rc = ident_ov5640_locked();
+		return rc;
+	rc = camera_capture_locked(colorbar);
+	op_unlock();
+	return rc;
+}
 
-	if (rc != CAM_OK) {
-		/* Leave the sensor powered: the supply cannot be cut anyway, and a live
-		   bus is what lets `camera scan` / `camera reg` continue the hunt. */
-		uint8_t a = first_acking_addr_locked();
+int camera_set_warm_frames(unsigned n)
+{
+	int rc;
 
-		info.sensor    = (a != 0u) ? CAM_SENSOR_UNKNOWN : CAM_SENSOR_NONE;
-		info.i2c_addr  = a;
-		info.reg_width = 0u;
-		info.chip_id   = 0u;
-		info.manuf_id  = 0u;
-		if (a != 0u)
-			LOG_WRN("unidentified device at SCCB 0x%02x", a);
-		else
-			LOG_WRN("no SCCB response (module connected? XCLK %lu Hz)",
-			        (unsigned long)info.xclk_hz);
+	if (n > CAM_WARM_FRAMES_MAX)
+		return CAM_ERR_PARAM;
+	rc = op_lock();
+	if (rc != CAM_OK)
+		return rc;
+	cam_warm_frames = n;
+	op_unlock();
+	return CAM_OK;
+}
+
+unsigned camera_get_warm_frames(void)
+{
+	return cam_warm_frames;
+}
+
+int camera_get_mode(struct camera_mode *out)
+{
+	if (out == NULL)
+		return CAM_ERR_PARAM;
+	out->width       = CAMERA_FRAME_WIDTH;
+	out->height      = CAMERA_FRAME_HEIGHT;
+	out->frame_bytes = CAMERA_FRAME_BYTES;
+	out->format      = "RGB565";
+	return CAM_OK;
+}
+
+int camera_frame_read(uint32_t offset, void *dst, uint32_t len, uint32_t *gen)
+{
+	int rc;
+
+	if (dst == NULL || len == 0u)
+		return CAM_ERR_PARAM;
+	rc = op_lock();
+	if (rc != CAM_OK)
+		return rc;
+	if (!info.frame_valid) {
 		op_unlock();
-		return CAM_ERR_NO_SENSOR;
+		return CAM_ERR_NO_FRAME;
 	}
-
-	LOG_INF("%s up: chip ID 0x%04x at SCCB 0x%02x",
-	        camera_sensor_name(info.sensor), info.chip_id, info.i2c_addr);
+	if (offset > info.frame_bytes || len > info.frame_bytes - offset) {
+		op_unlock();
+		return CAM_ERR_PARAM;
+	}
+	/* Straight memcpy: the frame is in the MPU's non-cacheable PSRAM window, so
+	   there is nothing to invalidate before reading what the DMA wrote. */
+	memcpy(dst, cam_frame + offset, len);
+	if (gen != NULL)
+		*gen = cam_frame_gen;
 	op_unlock();
 	return CAM_OK;
 }
@@ -829,7 +1348,7 @@ int camera_get_tuning(struct camera_tuning *out)
 
 int camera_set_tuning(const struct camera_tuning *in)
 {
-	int i2c_changed;
+	int i2c_changed, swap_changed;
 	int rc;
 
 	if (in == NULL)
@@ -845,9 +1364,16 @@ int camera_set_tuning(const struct camera_tuning *in)
 
 	i2c_changed = (in->i2c_hz != tune.i2c_hz) ||
 	              (in->i2c_pullup != tune.i2c_pullup);
+	swap_changed = (in->dvp_swap != tune.dvp_swap);
 	tune = *in;
 	if (i2c_changed)
 		rc = cam_i2c_init_locked();
+	/* The swap bit is one live register, so push it now rather than making the
+	   user power-cycle; if the sensor has not been configured yet the next
+	   capture writes it anyway. */
+	if (rc == CAM_OK && swap_changed && info.configured &&
+	    info.sensor == CAM_SENSOR_OV2640)
+		rc = ov2640_apply_swap_locked();
 	op_unlock();
 	return rc;
 }
@@ -861,6 +1387,8 @@ const char *cam_strerror(int rc)
 	case CAM_ERR_TIMEOUT:    return "timeout";
 	case CAM_ERR_STATE:      return "camera not initialized or not powered";
 	case CAM_ERR_NO_SENSOR:  return "no sensor identified";
+	case CAM_ERR_NO_FRAME:   return "no frame captured yet";
+	case CAM_ERR_BUSY:       return "a capture is already running";
 	default:                 return "unknown error";
 	}
 }

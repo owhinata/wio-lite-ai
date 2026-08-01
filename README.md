@@ -105,11 +105,59 @@ time as the USB console. 24 commands:
     is on** — they tell you to run `lcd off` first. Retuning the octal bus under a live
     scanout starves the LTDC FIFO, and a memory-mapped read of a half-configured
     OCTOSPI stalls the AXI until the IWDG fires.
-- **`camera`** — the **DVP camera on the 24-pin FPC connector** (J7), feeding the
-  **DCMI** (issue #8). **Phase 1 only so far**: everything the sensor needs before a
-  pixel can move — the master clock, the SCCB control bus and the PWDN/RESETB lines
-  — plus the chip-ID read that says which sensor is actually plugged in. DCMI, DMA
-  and the frame pipeline come in phases 2/3.
+- **`camera`** — the **OV2640 DVP camera on the 24-pin FPC connector** (J7), feeding
+  the **DCMI** (issue #8). **Phases 1–2 so far**: the sensor's master clock, SCCB
+  control bus, PWDN/RESETB lines and chip-ID probe (phase 1), then QVGA RGB565
+  single-frame capture over DCMI + DMA into the PSRAM (phase 2). Continuous capture,
+  the frame pipeline and LCD preview come in phase 3.
+  - *capture*: `camera capture` snapshots one 320x240 RGB565 frame (153600 B) and
+    prints **per-channel min/max/mean**. That statistic is the whole point — a frame
+    that never arrived reads all-zero, a saturated one pins at max, and a DCMI
+    latching on the wrong edge scatters min/max across the range with a mid-grey
+    mean. Covering the lens and pointing at a light must move the means in opposite
+    directions. `camera capture test` uses the sensor's internal colour bars, which
+    exercise DVP → DCMI → DMA → PSRAM without involving optics or exposure.
+  - *warm-up frames*: the sensor's exposure loop starts from the register table's
+    defaults, so the frames right after a power cycle are badly under-exposed. Back
+    to back after `camera off; camera probe`, means measured **R2 G11 B0 → R4 G15 B0
+    → R6 G22 B3** with no warm-up (still climbing after three captures) versus
+    **R14 G28 B12** on the *first* kept frame with 15 discarded. So a capture throws
+    away **15 frames** (~1 s) and keeps the sixteenth. `camera tune warm <0..31>`
+    sweeps it; 0 restores the single-frame behaviour, which is what made the effect
+    measurable rather than assumed.
+  - *`seam:`*: `camera capture` also reports the largest step between adjacent rows'
+    channel means, and its row. It exists because one early capture showed a sharp
+    band — at row 27 the red mean dropped 37 % while blue did not move, with the
+    scene correlating 0.996 across the boundary (one frame, one scene, two gains;
+    nothing the DCMI or DMA can produce). **That has never reproduced** — not with a
+    lighting transient, not from a cold power cycle, not with warm-up disabled — so
+    it is recorded as unexplained rather than fixed, and the metric is there to catch
+    it if it returns. A settled frame reads well under 1.
+  - *getting the frame out*: `camera send [name]` streams it over YMODEM,
+    `camera save <path>` writes it to the microSD. View with
+
+    ```
+    rz -y -b                                    # -y: overwrite, -b: binary
+    ffmpeg -y -f rawvideo -pix_fmt rgb565le -s 320x240 -i frame.raw frame.png
+    ```
+
+    **Both `-y` flags matter.** `rz` will not overwrite an existing file by default
+    (YMODEM block 0 carries only a name and a size, no mtime), and `ffmpeg` without
+    `-y` stops at an overwrite prompt and leaves the old PNG in place. Either one
+    silently gives you the *previous* capture, which looks exactly like a camera
+    that has stopped updating — it cost an evening here before the raw's channel
+    means were compared against the PNG's and did not match.
+  - *sensor setup*: the QVGA RGB565 register sequence is ST's, vendored as data into
+    `port/camera/ov2640_regs.c` (BSD-3-Clause, see `NOTICE`). Only the table is
+    reused — ST's driver returns `void` everywhere, so a NAKed SCCB write is
+    invisible to it; `port/camera/camera.c` walks the table with error-checked
+    writes and stops at the row that failed. It runs lazily on the first capture
+    (~350 ms) and again after any power cycle.
+  - *OCTOSPI1 interlock*: the frame buffer is in the PSRAM, so `camera
+    capture`/`save`/`send` take the same `psram_acquire()` guard as `lcd on` —
+    they need `lcd off` first, exactly like `psram`/`membench`/`devmem`. Retuning
+    that bus under a live DMA does not spoil an image, it stalls the AXI.
+    Running scanout and capture *simultaneously* is a phase 3 design problem.
   - *the host must generate XCLK*. Schematic sheet 7 leaves the 24 MHz oscillator
     OSC1 and its series R15 **DNP**; the only populated path to the module's clock
     pin is R11 (0R) from `DCMI_XCLK` = **PA2**, driven by **TIM5_CH3** (AF2) at
@@ -653,8 +701,10 @@ port/       threadx/ ThreadX low-level init + shared SysTick glue
             ltdc/    LTDC + DMA2D display driver: PLL3R pixel clock, double buffer
                      in PSRAM, tear-free flip, draw primitives, and the ST7789
                      serial wake-up the panel needs first (issue #7)
-            camera/  DVP camera bring-up: XCLK on TIM5_CH3, SCCB on I2C4,
-                     PWDN/RESETB and sensor identification (issue #8 phase 1)
+            camera/  OV2640 over DCMI: XCLK on TIM5_CH3, SCCB on I2C4,
+                     PWDN/RESETB, sensor identification (issue #8 phase 1) and
+                     QVGA RGB565 snapshot over DMA2_Stream1 (phase 2).
+                     ov2640_regs.c holds ST's register table (BSD-3, see NOTICE)
             coremark/ EEMBC CoreMark port (core_portme.*)
             netxduo/ nx_user.h (NetX Duo build configuration; the driver is in app/,
                      because what it sits on is the RTL8720 link, not a MAC)

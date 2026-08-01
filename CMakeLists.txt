@@ -393,6 +393,7 @@ option(BSP_ENABLE_CAMERA "Enable the FPC-24 DVP camera (DCMI) and the camera com
 if(BSP_ENABLE_CAMERA)
     list(APPEND SHELL_SOURCES
         "${CMAKE_SOURCE_DIR}/port/camera/camera.c"
+        "${CMAKE_SOURCE_DIR}/port/camera/ov2640_regs.c"
         "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_camera.c")
 endif()
 
