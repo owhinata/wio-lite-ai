@@ -26,6 +26,7 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/stm32h7xx_hal_driver/Src/stm32h7x
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/tinyusb/src/tusb.h"
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/coremark/core_main.c"
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/netxduo/common/src/nx_ip_create.c"
+   OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/flashdb/src/fdb_kvdb.c"
    OR NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/filex/common/src/fx_media_open.c")
     message(STATUS "Initializing git submodules ...")
     execute_process(
@@ -399,12 +400,31 @@ endif()
 # either way -- see port/nor/nor_flash.h for why that fence stays.
 option(BSP_ENABLE_KV "Enable the external NOR flash (OCTOSPI2) and the config KV store" ON)
 
-# Driver and command move together, and -- like the SD/LCD/camera blocks -- this
-# append must stay BELOW the option().
+# Driver, database and commands move together, and -- like the SD/LCD/camera
+# blocks -- this append must stay BELOW the option().
+#
+# FlashDB (armink/FlashDB, Apache-2.0, pinned to 2.2.0) is taken as three core
+# sources plus the FAL it ships in its own port/ directory.  Unlike ThreadX/FileX/
+# NetX Duo above, this one is NOT GLOB'd whole: fdb_tsdb.c (time-series database)
+# and fdb_file.c (filesystem-backed storage) are features port/flashdb/fdb_cfg.h
+# does not enable, and fal_rtt.c is the RT-Thread integration and does not build
+# outside it.  Configuration comes from port/flashdb (fdb_cfg.h + fal_cfg.h), which
+# is why that directory is on the include path before FlashDB's own.
 if(BSP_ENABLE_KV)
+    set(FDB_DIR "${CMAKE_SOURCE_DIR}/lib/flashdb")
     list(APPEND SHELL_SOURCES
         "${CMAKE_SOURCE_DIR}/port/nor/nor_flash.c"
-        "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_nor.c")
+        "${CMAKE_SOURCE_DIR}/port/flashdb/fal_nor.c"
+        "${CMAKE_SOURCE_DIR}/app/kv.c"
+        "${CMAKE_SOURCE_DIR}/app/kv_boot.c"
+        "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_nor.c"
+        "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_kv.c"
+        "${FDB_DIR}/src/fdb.c"
+        "${FDB_DIR}/src/fdb_kvdb.c"
+        "${FDB_DIR}/src/fdb_utils.c"
+        "${FDB_DIR}/port/fal/src/fal.c"
+        "${FDB_DIR}/port/fal/src/fal_flash.c"
+        "${FDB_DIR}/port/fal/src/fal_partition.c")
 endif()
 
 # issue #8: the FPC-24 DVP camera.  Phase 1 builds only the sensor-side bring-up
@@ -472,6 +492,11 @@ target_include_directories(shell PRIVATE
     "${CMAKE_SOURCE_DIR}/port/ltdc"              # issue #7: ltdc_display.h
     "${CMAKE_SOURCE_DIR}/port/camera"            # issue #8: camera.h
     "${CMAKE_SOURCE_DIR}/port/nor"               # issue #37: nor_flash.h
+    # issue #37: our fdb_cfg.h / fal_cfg.h must be found BEFORE FlashDB's own inc/,
+    # which ships fdb_cfg_template.h only -- FlashDB includes <fdb_cfg.h> by name.
+    "${CMAKE_SOURCE_DIR}/port/flashdb"
+    "${CMAKE_SOURCE_DIR}/lib/flashdb/inc"
+    "${CMAKE_SOURCE_DIR}/lib/flashdb/port/fal/inc"
     "${CMAKE_SOURCE_DIR}/lib/filex/common/inc"
     "${CMAKE_SOURCE_DIR}/lib/filex/ports/cortex_m7/gnu/inc"
     "${CMAKE_SOURCE_DIR}/shell/include"

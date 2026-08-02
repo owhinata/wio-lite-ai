@@ -23,3 +23,6 @@
 [submodule "lib/filex"]
 	path = lib/filex
 	url = https://github.com/eclipse-threadx/filex
+[submodule "lib/flashdb"]
+	path = lib/flashdb
+	url = https://github.com/armink/FlashDB.git

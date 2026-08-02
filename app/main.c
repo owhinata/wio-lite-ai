@@ -40,6 +40,7 @@
 #endif
 #if BSP_ENABLE_KV
 #include "nor_flash.h"  /* external W25Q128 NOR on OCTOSPI2 (issue #37) */
+#include "kv.h"         /* configuration key-value store on that NOR (issue #37) */
 #endif
 #if BSP_ENABLE_CAMERA
 #include "camera.h"     /* FPC-24 DVP camera: XCLK + SCCB bring-up (issue #8) */
@@ -137,6 +138,11 @@ void tx_application_define(void *first_unused_memory)
    * this point, under this mutex.  Fail-soft: without it the `nor` command
    * reports the device down and nothing else changes. */
   (void) nor_flash_lock_init();
+  /* Configuration thread.  Creation only -- opening the store is the FIRST thing
+   * that thread does, not something that happens here, because a first boot on a
+   * blank partition formats it and an erase waits by sleeping.  Fail-soft: without
+   * the thread the store simply never opens and `kv` says so. */
+  (void) kv_boot_init();
 #endif
 
   /* RTL8720DN link ownership (issue #21 increment 8): the coarse mutex that serialises

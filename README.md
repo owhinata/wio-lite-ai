@@ -32,7 +32,7 @@ time as the USB console. 24 commands:
 | system | `version` · `uptime` · `reboot` · `free` · `thread` |
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
-| storage | `sd` (card: info/read/format · FAT: ls/cat/write/rm/mkdir/df/umount) · `nor` (info/read/erase/write/test) |
+| storage | `sd` (card: info/read/format · FAT: ls/cat/write/rm/mkdir/df/umount) · `nor` (info/read/erase/write/test) · `kv` (list/get/set/del/info/format) |
 | display | `lcd` (info/on/off · fill/bar/grad/clear/anim/blit) |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
 | wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench · **flash** info/read/backup/imgload/imginfo/write) · `net` (L3 = **host NetX Duo only**: info/ip/dhcp/ping/echo/shell) |
@@ -55,6 +55,14 @@ time as the USB console. 24 commands:
 - **`coremark`** — EEMBC CoreMark. **≈2333 (4.24 CoreMark/MHz)** with both L1 caches on.
 - **`membench`** — DWT-cycle-precise read/write/copy bandwidth + pointer-chase
   latency for DTCM / AXI-SRAM (cached vs refill) / PSRAM / internal + external flash.
+- **`kv`** — the **persistent configuration store**: a FlashDB key-value database in
+  the first megabyte of that NOR. `kv set`/`get`/`del`/`list` operate on string keys
+  and values; `kv info` reports state and usage; `kv format yes` erases everything
+  (~15 s — FlashDB erases all 256 sectors individually as it lays down headers).
+  A store it cannot open is **reported, never silently reformatted** — the first
+  boot on this board found the leftover XIP application image in that partition and
+  said so, which is exactly the intent. **`wifi.psk` is stored in the clear**; see
+  *Key design points*.
 - **`nor`** — the on-board **16 MB W25Q128JV serial NOR flash** on OCTOSPI2, driven
   **indirect-only** (never memory-mapped; the `0x70000000` window stays fenced off in
   the MPU — see *Key design points*). `nor info` reports the JEDEC id, geometry and the
@@ -677,6 +685,37 @@ time as the USB console. 24 commands:
   between status polls, so a 400 ms sector erase never starves the IWDG petter. On this
   device a partial page program leaves the rest of the page at `0xFF` **and** a
   same-byte overwrite (`0xFF`→`0xFE`→`0xFC`) is accepted — both measured by `nor test`.
+- **Configuration store (issue #37)**: `app/kv.c` runs a **FlashDB KVDB** (Apache-2.0,
+  pinned to 2.2.0) in the NOR's first megabyte, so a setting is readable at every
+  boot — before any filesystem, on a board whose microSD slot may be empty and has
+  no card-detect line to say so. Three decisions carry it:
+  - **`FDB_WRITE_GRAN = 8`.** FlashDB marks record state by writing a status field;
+    at granularity 1 it re-programs the *same byte* (`0xFF`→`0x7F`→`0x3F`), at 8 it
+    gives each status its *own* byte. The W25Q128JV specifies programming "at
+    previously erased (FFh) memory locations" (§8.2.13) — a constraint on the state
+    of the target bytes, not the history of the page — so granularity 8 stays inside
+    what the datasheet promises for 4 extra bytes per record. `nor test` measured
+    this device accepting same-byte overwrites too, but "probably, on this chip,
+    today" is not what a configuration store should rest on.
+  - **It never formats on its own.** Initialisation runs with
+    `FDB_KVDB_CTRL_SET_NOT_FORMAT`, and only a *second* attempt — reached solely when
+    a full scan shows the partition is erased — is allowed to create a database.
+    Anything else is reported as corrupt and left for `kv format yes`. This paid for
+    itself immediately: the first boot found the old XIP application image still
+    sitting in that partition and refused it instead of erasing the evidence.
+  - **One lock around whole operations.** FlashDB locks inside
+    `fdb_kv_set_blob()`/`fdb_kv_get_blob()` but *not* inside its iterator or
+    `fdb_blob_read()`, so `app/kv.c` takes the NOR device mutex for the duration of
+    every entry point; the mutex is recursive, so FlashDB re-taking it costs nothing.
+    `fdb_kv_get()` is never called (it returns a pointer into a `static` buffer), and
+    neither is `fdb_kv_get_blob()` — it reports a failed value read as a successful
+    one, so reads go through `fdb_kv_get_obj()` + `fdb_blob_read()` instead.
+
+  **`wifi.psk` is stored in the clear.** Encrypting it would need somewhere to keep
+  a key, and this board has nowhere: the option bytes and RDP are deliberately never
+  touched (see *Brick safety*), and the external flash is readable over SWD or with a
+  hot-air gun regardless. `kv list` masks the value so it does not end up in a pasted
+  log, which is shoulder-surfing hygiene and not protection — do not treat it as such.
 - **LCD (issue #7)**: `port/ltdc/ltdc_display.c` drives the FPC-40 RGB panel. All 28
   LTDC signals are **AF14 except `LTDC_R3` on PA15, which is AF9** — a detail taken
   from ST's own machine-readable pin data (`_ref/stm32_open_pin_data/`, cross-checked
@@ -750,6 +789,8 @@ time as the USB console. 24 commands:
 ```
 app/        main + USB CDC wiring, fault handlers, USB descriptors, retarget,
             OCTOSPI1 PSRAM bring-up (psram.c), MPU regions (mpu.c),
+            configuration store: kv.c (the only FlashDB caller) +
+            kv_boot.c (the thread that opens it, issue #37),
             RTL8720DN link: erpc.c (service thread) / link_data.c (DATA channel) /
             wifi_rpc.c (typed wrappers) / rtl_link.c (ownership) /
             net_shell.c (telnet console transport + server) /
@@ -761,7 +802,9 @@ shell/      core/    HW-independent CLI engine (parse/edit/history/complete/...)
             test/    host unit tests (run with host gcc; see below)
 port/       threadx/ ThreadX low-level init + shared SysTick glue
             nor/     external W25Q128 NOR on OCTOSPI2, indirect-only, with the
-                     recursive device mutex the config store will share (issue #37)
+                     recursive device mutex the config store shares (issue #37)
+            flashdb/ FlashDB build config + its FAL device over port/nor,
+                     and the log/assert hooks that keep it fail-soft (issue #37)
             sd/      microSD block driver over SDMMC1 + its internal IDMA (issue #6)
             filex/   FileX media driver on that block API + the lazy-mount
                      singleton and its ownership gates (issue #6)
@@ -804,7 +847,7 @@ Listed in memory-hierarchy order — the same order `free` and `membench` print
 | FLASH | `0x08020000` | internal flash **sectors 1-3 = 384 KB** (issue #25). Sector 0 (`0x08000000`, 128 KB) is the DFU bootloader; the 128 KB erase granule is what keeps the two apart, so no programming path can reach it. ~905 MB/s read (`membench`). |
 | PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). Since issue #7 the first 300 KB are the **LTDC double frame buffer**, which the display controller reads continuously while scanout is on — hence the `lcd off` interlock on every path that retunes OCTOSPI1. |
 | *(bootloader)* | `0x08000000` | internal flash **sector 0, 128 KB** — the DFU bootloader. The app does not own it and no app-side path can erase it (the 128 KB erase granule is the sector granule). |
-| *(external flash)* | `0x70000000` | the 16 MB W25Q128 the app used to execute from. **Deliberately still not mapped**, even though issue #37 brought OCTOSPI2 back up: `port/nor` reaches the device only through indirect transactions, and `app/mpu.c` keeps the 256 MB window no-access + execute-never so a stray or *speculative* access raises MemManage (recorded in `dmesg`) instead of hitting a controller that is not in memory-mapped mode. Opening a window here is a separate design with its own MPU region — the blob-storage half of issue #10. |
+| *(external flash)* | `0x70000000` | the 16 MB W25Q128 the app used to execute from, now storage: its **first 1 MB is the `kv` configuration partition** (FlashDB) and the remaining 15 MB is reserved for the blob region issue #10 still has to design — deliberately with no FAL partition entry, so nothing can reach it by accident. **Deliberately still not mapped**, even though issue #37 brought OCTOSPI2 back up: `port/nor` reaches the device only through indirect transactions, and `app/mpu.c` keeps the 256 MB window no-access + execute-never so a stray or *speculative* access raises MemManage (recorded in `dmesg`) instead of hitting a controller that is not in memory-mapped mode. Opening a window here is a separate design with its own MPU region. |
 
 ## Build
 
