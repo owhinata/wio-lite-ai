@@ -38,6 +38,9 @@
 #if BSP_ENABLE_LCD
 #include "ltdc_display.h" /* FPC-40 RGB panel over LTDC + DMA2D (issue #7) */
 #endif
+#if BSP_ENABLE_KV
+#include "nor_flash.h"  /* external W25Q128 NOR on OCTOSPI2 (issue #37) */
+#endif
 #if BSP_ENABLE_CAMERA
 #include "camera.h"     /* FPC-24 DVP camera: XCLK + SCCB bring-up (issue #8) */
 #if BSP_ENABLE_LCD
@@ -125,6 +128,16 @@ void tx_application_define(void *first_unused_memory)
    * `wifi` command runs, so the module never floats after reset (issue #17).
    * Register-only GPIO; safe here (pre-scheduler), like led_init_off(). */
   rtl8720_init();
+
+#if BSP_ENABLE_KV
+  /* External NOR mutex (issue #37).  Pure ThreadX object creation, like the two
+   * calls below it: the controller and the device itself were already brought up
+   * by nor_flash_init() in main(), which runs before there is a scheduler and
+   * therefore takes no lock.  Everything that erases or programs happens after
+   * this point, under this mutex.  Fail-soft: without it the `nor` command
+   * reports the device down and nothing else changes. */
+  (void) nor_flash_lock_init();
+#endif
 
   /* RTL8720DN link ownership (issue #21 increment 8): the coarse mutex that serialises
    * whole `wifi`/`net` flows, then the resident eRPC service thread that owns USART1
@@ -304,6 +317,19 @@ int main(void)
    * against real mmap access and either record + reset, or (on a hang) let the
    * IWDG reset -- headless, before the shell.  No-op when no sweep is active. */
   psram_mmapscan_boot();
+#endif
+
+#if BSP_ENABLE_KV
+  /* OCTOSPI2 W25Q128 NOR bring-up (issue #37).  Same shape as the PSRAM above --
+   * register-only, per-pin GPIO RMW, no RCC write, fail-soft -- and it sits here
+   * for the same reason: it needs no lock (nothing else runs yet) and it performs
+   * no erase or program, so it never has to sleep.  It does NOT enter the
+   * memory-mapped window: the driver is indirect-only and the MPU keeps its fence
+   * over 0x70000000 (see port/nor/nor_flash.h).  Deliberately outside the PSRAM
+   * block above: these are two different OCTOSPIs owning two disjoint pin sets, so
+   * a build with the PSRAM bring-up turned off must still get the NOR.  Fail-soft:
+   * a failed bring-up just leaves `nor info` reporting the device down. */
+  (void) nor_flash_init();
 #endif
 
   setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered so printf reaches _write */

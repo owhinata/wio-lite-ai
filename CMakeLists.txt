@@ -387,6 +387,26 @@ if(BSP_ENABLE_LCD)
         "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_lcd.c")
 endif()
 
+# issue #37 (from the #10 RFC): the external W25Q128 NOR on OCTOSPI2 and the
+# configuration key-value store that lives on it.  ON builds the NOR driver
+# (port/nor) and the `nor` command; the FlashDB key-value layer is added to this
+# same block as it lands.  Turn OFF for a firmware that never configures the
+# OCTOSPI2 pins or registers -- useful when bisecting anything that suspects the
+# second OCTOSPI of disturbing the PSRAM on the first.
+#
+# NOTE: this does NOT open the memory-mapped window at 0x70000000.  The driver is
+# indirect-only and app/mpu.c keeps its no-access + XN region over that quarter
+# either way -- see port/nor/nor_flash.h for why that fence stays.
+option(BSP_ENABLE_KV "Enable the external NOR flash (OCTOSPI2) and the config KV store" ON)
+
+# Driver and command move together, and -- like the SD/LCD/camera blocks -- this
+# append must stay BELOW the option().
+if(BSP_ENABLE_KV)
+    list(APPEND SHELL_SOURCES
+        "${CMAKE_SOURCE_DIR}/port/nor/nor_flash.c"
+        "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_nor.c")
+endif()
+
 # issue #8: the FPC-24 DVP camera.  Phase 1 builds only the sensor-side bring-up
 # (XCLK on TIM5_CH3, SCCB on I2C4, PWDN/RESETB) and the `camera` command; DCMI and
 # DMA arrive in phase 2.  Turn OFF for a firmware that leaves TIM5, I2C4 and the
@@ -451,6 +471,7 @@ target_include_directories(shell PRIVATE
     "${CMAKE_SOURCE_DIR}/port/filex"             # issue #6: fx_user.h + the SD glue
     "${CMAKE_SOURCE_DIR}/port/ltdc"              # issue #7: ltdc_display.h
     "${CMAKE_SOURCE_DIR}/port/camera"            # issue #8: camera.h
+    "${CMAKE_SOURCE_DIR}/port/nor"               # issue #37: nor_flash.h
     "${CMAKE_SOURCE_DIR}/lib/filex/common/inc"
     "${CMAKE_SOURCE_DIR}/lib/filex/ports/cortex_m7/gnu/inc"
     "${CMAKE_SOURCE_DIR}/shell/include"
@@ -490,7 +511,8 @@ target_compile_definitions(shell PRIVATE
     FX_INCLUDE_USER_DEFINE_FILE             # issue #6: port/filex/fx_user.h
     BSP_ENABLE_SD=$<BOOL:${BSP_ENABLE_SD}>                  # issue #6: SDMMC1 microSD + sd cmd
     BSP_ENABLE_LCD=$<BOOL:${BSP_ENABLE_LCD}>                # issue #7: LTDC LCD + lcd cmd
-    BSP_ENABLE_CAMERA=$<BOOL:${BSP_ENABLE_CAMERA}>)         # issue #8: DVP camera + camera cmd
+    BSP_ENABLE_CAMERA=$<BOOL:${BSP_ENABLE_CAMERA}>          # issue #8: DVP camera + camera cmd
+    BSP_ENABLE_KV=$<BOOL:${BSP_ENABLE_KV}>)                 # issue #37: OCTOSPI2 NOR + KV store
 target_compile_options(shell PRIVATE -O2)
 
 firmware_finalize(shell)

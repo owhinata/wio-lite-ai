@@ -13,8 +13,9 @@ its clock tree** — see *Key design points*.
 
 > Until issue #25 the app executed in place (XIP) from the external OCTOSPI2 NOR
 > flash at `0x70000000`. That window reads at ~54 MB/s against ~905 MB/s for the
-> internal flash, so execution moved; the bootloader no longer brings OCTOSPI2 up
-> at all and the app fences the window off in the MPU.
+> internal flash, so execution moved; the bootloader no longer brings OCTOSPI2 up at
+> all. Issue #37 brought it back up **app-side and indirect-only**, as storage rather
+> than as an execution target — the window itself stays fenced off in the MPU.
 
 > Ported from the sibling [`stm32f746g-disco`](https://github.com/owhinata/stm32f746g-disco)
 > ThreadX shell; the HW-independent core is a verbatim port.
@@ -31,7 +32,7 @@ time as the USB console. 24 commands:
 | system | `version` · `uptime` · `reboot` · `free` · `thread` |
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
-| storage | `sd` (card: info/read/format · FAT: ls/cat/write/rm/mkdir/df/umount) |
+| storage | `sd` (card: info/read/format · FAT: ls/cat/write/rm/mkdir/df/umount) · `nor` (info/read/erase/write/test) |
 | display | `lcd` (info/on/off · fill/bar/grad/clear/anim/blit) |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
 | wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench · **flash** info/read/backup/imgload/imginfo/write) · `net` (L3 = **host NetX Duo only**: info/ip/dhcp/ping/echo/shell) |
@@ -54,6 +55,12 @@ time as the USB console. 24 commands:
 - **`coremark`** — EEMBC CoreMark. **≈2333 (4.24 CoreMark/MHz)** with both L1 caches on.
 - **`membench`** — DWT-cycle-precise read/write/copy bandwidth + pointer-chase
   latency for DTCM / AXI-SRAM (cached vs refill) / PSRAM / internal + external flash.
+- **`nor`** — the on-board **16 MB W25Q128JV serial NOR flash** on OCTOSPI2, driven
+  **indirect-only** (never memory-mapped; the `0x70000000` window stays fenced off in
+  the MPU — see *Key design points*). `nor info` reports the JEDEC id, geometry and the
+  live controller registers; `read`/`erase`/`write` are the raw operations; `nor test`
+  is the acceptance test for the partial-page programming the coming configuration
+  store depends on. Addresses are device offsets, not pointers.
 - **`psram`** — the on-board **8 MB APS6408 Octal DDR PSRAM** on OCTOSPI1, memory-mapped
   at `0x90000000`, running **133 MHz Fixed Latency** (≈113 read / 154 write MB/s; see
   *Key design points*). `psram info` shows the operating state, `psram test [bytes]`
@@ -650,6 +657,26 @@ time as the USB console. 24 commands:
   indirect path, and `psram mmapscan` maps the true mmap eye across IWDG-recovered
   auto-reboots). Two lower points (88.7 MHz, 53.2 MHz) are documented at the `PSRAM_*`
   defines for a wider-margin rebuild.
+- **External NOR (issue #37)**: `port/nor/nor_flash.c` brings up the **W25Q128JV 16 MB
+  serial NOR on OCTOSPI2** — the flash the app used to execute from, unused since
+  issue #25 — as ordinary storage. It is deliberately **indirect-only**: a
+  memory-mapped window at `0x70000000` would be Normal memory that the core may read
+  *speculatively*, and a speculative read arriving while the controller is out of
+  memory-mapped mode is a slave error (RM0468 §25.4.16) that no lock can prevent,
+  because the CPU never asked for the access. So the MPU keeps its no-access + XN fence
+  over that quarter and every byte moves through explicit transactions — which also
+  means no DMA, no cache maintenance and no mmap⇄indirect transition to get right.
+  Three details are not guesses: **`CR.FSEL = 1`** because this flash is bonded to Port
+  2's *high* nibble and that bit chooses which nibble carries the transfer (RM0468
+  §25.7.1, matching `OCTOSPIM_P2CR`'s reset `IOHSRC = 0b11`) — with it clear the
+  transaction still completes and reads back zeros, which is how it first failed here;
+  **Fast Read `0x0B`** rather than `0x03`, since the datasheet caps plain Read Data at
+  50 MHz while this bus runs at 88.7 MHz; and **`DCR1.CSHT = 5`** (≈68 ns) because
+  erase/program need tSHSL2 ≥ 50 ns between deassertions, where the bootloader's
+  read-only capture only ever needed 10 ns. Erase and program wait by *sleeping*
+  between status polls, so a 400 ms sector erase never starves the IWDG petter. On this
+  device a partial page program leaves the rest of the page at `0xFF` **and** a
+  same-byte overwrite (`0xFF`→`0xFE`→`0xFC`) is accepted — both measured by `nor test`.
 - **LCD (issue #7)**: `port/ltdc/ltdc_display.c` drives the FPC-40 RGB panel. All 28
   LTDC signals are **AF14 except `LTDC_R3` on PA15, which is AF9** — a detail taken
   from ST's own machine-readable pin data (`_ref/stm32_open_pin_data/`, cross-checked
@@ -733,6 +760,8 @@ shell/      core/    HW-independent CLI engine (parse/edit/history/complete/...)
             cmds/    command implementations
             test/    host unit tests (run with host gcc; see below)
 port/       threadx/ ThreadX low-level init + shared SysTick glue
+            nor/     external W25Q128 NOR on OCTOSPI2, indirect-only, with the
+                     recursive device mutex the config store will share (issue #37)
             sd/      microSD block driver over SDMMC1 + its internal IDMA (issue #6)
             filex/   FileX media driver on that block API + the lazy-mount
                      singleton and its ownership gates (issue #6)
@@ -775,7 +804,7 @@ Listed in memory-hierarchy order — the same order `free` and `membench` print
 | FLASH | `0x08020000` | internal flash **sectors 1-3 = 384 KB** (issue #25). Sector 0 (`0x08000000`, 128 KB) is the DFU bootloader; the 128 KB erase granule is what keeps the two apart, so no programming path can reach it. ~905 MB/s read (`membench`). |
 | PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). Since issue #7 the first 300 KB are the **LTDC double frame buffer**, which the display controller reads continuously while scanout is on — hence the `lcd off` interlock on every path that retunes OCTOSPI1. |
 | *(bootloader)* | `0x08000000` | internal flash **sector 0, 128 KB** — the DFU bootloader. The app does not own it and no app-side path can erase it (the 128 KB erase granule is the sector granule). |
-| *(external flash)* | `0x70000000` | the 16 MB W25Q128 the app used to execute from. **Not mapped**: the bootloader no longer brings OCTOSPI2 up, and `app/mpu.c` marks the 256 MB window no-access + execute-never so a stray or speculative access raises MemManage (recorded in `dmesg`) instead of stalling the AXI bus. Bringing it back up as storage is issue #10. |
+| *(external flash)* | `0x70000000` | the 16 MB W25Q128 the app used to execute from. **Deliberately still not mapped**, even though issue #37 brought OCTOSPI2 back up: `port/nor` reaches the device only through indirect transactions, and `app/mpu.c` keeps the 256 MB window no-access + execute-never so a stray or *speculative* access raises MemManage (recorded in `dmesg`) instead of hitting a controller that is not in memory-mapped mode. Opening a window here is a separate design with its own MPU region — the blob-storage half of issue #10. |
 
 ## Build
 

@@ -84,20 +84,28 @@ static const struct mpu_region mpu_regions[] = {
 	 * Region 2: the external OCTOSPI2 window at 0x70000000, fenced off (issue #25).
 	 *
 	 * The app used to execute in place from here; it now runs from the internal
-	 * flash and the bootloader no longer brings OCTOSPI2 up at all, so this window
-	 * is backed by nothing.  In the ARMv7-M background map 0x60000000-0x7FFFFFFF is
-	 * Normal memory, which the core is allowed to access speculatively -- and an
-	 * access to a disabled memory-mapped OCTOSPI either stalls the AXI read
-	 * indefinitely or returns a slave error (RM0468 sec 25.4.16).  An indefinite
-	 * stall is the bad one: it looks like a lockup with no evidence, and only the
-	 * IWDG gets the board back.
+	 * flash, so nothing memory-maps this window.  In the ARMv7-M background map
+	 * 0x60000000-0x7FFFFFFF is Normal memory, which the core is allowed to access
+	 * speculatively -- and an access to an OCTOSPI that is not in memory-mapped
+	 * mode either stalls the AXI read indefinitely or returns a slave error
+	 * (RM0468 sec 25.4.16).  An indefinite stall is the bad one: it looks like a
+	 * lockup with no evidence, and only the IWDG gets the board back.
 	 *
 	 * No-access + execute-never turns any such access -- speculative or a stale
 	 * pointer someone forgot to update -- into an immediate MemManage fault, which
 	 * app/fault.c records to the reset-persistent log so `dmesg` names the faulting
 	 * PC.  256 MB is the whole 0x70000000-0x7FFFFFFF quarter and is naturally
-	 * aligned, so it needs no sub-region masking.  Remove this row if OCTOSPI2 is
-	 * ever brought up app-side (issue #10).
+	 * aligned, so it needs no sub-region masking.
+	 *
+	 * THIS ROW STAYS EVEN THOUGH OCTOSPI2 IS BROUGHT UP AGAIN (issue #37).  An
+	 * earlier revision of this comment said to remove it in that case; that was
+	 * wrong, and removing it is precisely the mistake it would cause.  port/nor
+	 * drives the device entirely through indirect transactions and never enters the
+	 * memory-mapped window, so there is nothing behind this address range to
+	 * un-fence -- while opening it up would restore exactly the speculative-read
+	 * hazard above, which no lock can arbitrate because the CPU never asked for the
+	 * access.  A window here needs its own MPU region designed alongside it, which
+	 * is the blob-storage work left on issue #10, not a line deleted from this one.
 	 */
 	{
 		.rbar = ARM_MPU_RBAR(2u, 0x70000000u),
