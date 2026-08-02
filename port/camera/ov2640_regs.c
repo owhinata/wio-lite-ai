@@ -54,8 +54,8 @@
  *     = 0 -> DSP enabled;
  *   - IMAGE_MODE (0xDA) is written TWICE: 0x08 (RGB565) and then 0x09, which
  *     adds bit 0 = DVP byte swap.  0x09 is what ST ships, so it is what this
- *     table keeps.  camera.c re-writes that one register afterwards when the
- *     `camera tune swap` knob says otherwise -- the table itself stays
+ *     table keeps.  camera.c re-writes that one register afterwards from
+ *     CAM_DVP_BYTE_SWAP -- the table itself stays
  *     byte-identical to upstream, because "known-good" is the only property it
  *     has that we cannot re-derive.
  */

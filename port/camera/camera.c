@@ -4,9 +4,10 @@
  */
 /**
  * @file    camera.c
- * @brief   DVP camera bring-up: XCLK (TIM5), SCCB (I2C4), sensor ID (issue #8
- *          phase 1).  See camera.h for the API contract and the two board facts
- *          that shape it (host-generated XCLK, ungated camera supply).
+ * @brief   OV2640 over DCMI: XCLK (TIM5), SCCB (I2C4), sensor ID, snapshot and
+ *          continuous capture (issue #8).  See camera.h for the API contract and
+ *          the two board facts that shape it (host-generated XCLK, ungated
+ *          camera supply).
  *
  * Hardware setup, all cross-checked between the board schematic, ST's published
  * pin data for this exact package (_ref/stm32_open_pin_data/STM32H725AEIx.xml --
@@ -26,8 +27,8 @@
  *     45.5% duty.  Both are inside the 6..27 MHz an OV2640 accepts.
  *
  *   - SCCB: I2C4, PF14 = SCL / PF15 = SDA, AF4, open-drain.  The board carries
- *     4.7k pull-ups (R33/R34); the MCU's internal ones can be added on top from
- *     `camera tune pull on` if that reading of the schematic turns out wrong.
+ *     4.7k pull-ups (R33/R34), which the sensor answered on immediately, so the
+ *     MCU's internal ones stay off (CAM_I2C_INT_PULLUP).
  *     I2C4 lives in D3 and is muxed by RCC_D3CCIPR.I2C4SEL, whose RESET value
  *     selects rcc_pclk4 = 137.5 MHz.  The __HAL_RCC_I2C4_CONFIG below re-states
  *     that default rather than changing anything -- the same idiom, and the same
@@ -39,12 +40,13 @@
  *     their asserted level while still inputs, so switching them to outputs
  *     cannot glitch the module awake.
  *
- * Why the SCCB reads are two transactions by default: OmniVision's SCCB is
- * I2C-like but documents a read as "write the sub-address and STOP, then a
- * separate read", not as a repeated START.  HAL_I2C_Mem_Read emits a repeated
- * START, which most parts tolerate but not all.  Both forms are selectable
- * (struct camera_tuning::sccb_style) because "the address ACKs but every read
- * returns 0xFF" is otherwise an unfalsifiable dead end.
+ * Why the SCCB reads are two transactions: OmniVision's SCCB is I2C-like but
+ * documents a read as "write the sub-address and STOP, then a separate read",
+ * not as a repeated START.  HAL_I2C_Mem_Read emits a repeated START, which most
+ * parts tolerate but not all.  Both forms were selectable during bring-up
+ * because "the address ACKs but every read returns 0xFF" is otherwise an
+ * unfalsifiable dead end; the split form worked on the first try and is now the
+ * only one (CAM_SCCB_READ_SPLIT).
  *
  * Concurrency: one TX_MUTEX serializes every public call for the whole
  * operation; the work lives in *_locked() helpers so a public entry never
@@ -103,11 +105,11 @@
 /* ---- XCLK ---------------------------------------------------------------- */
 
 #define CAM_TIM           TIM5
-#define CAM_XCLK_DIV_DEF  12u    /* 275 MHz / 12 = 22.917 MHz, exact 50% duty */
-/* Divider bounds.  6 -> 45.8 MHz and 69 -> 3.99 MHz off a 275 MHz kernel clock;
-   the range brackets every DVP sensor's XVCLK window with margin. */
-#define CAM_XCLK_DIV_MIN  6u
-#define CAM_XCLK_DIV_MAX  69u
+/* 275 MHz / 12 = 22.917 MHz at an exact 50% duty.  `camera xclk <hz>` used to
+   pick this divider at run time (bounds 6 -> 45.8 MHz, 69 -> 3.99 MHz, which
+   bracket every DVP sensor's XVCLK window); the OV2640 was happy here from the
+   first probe, so phase 3c-2 fixed it. */
+#define CAM_XCLK_DIV_DEF  12u
 
 /* ---- SCCB ---------------------------------------------------------------- */
 
@@ -120,8 +122,11 @@
  *   fields: PRESC[31:28] SCLDEL[23:20] SDADEL[19:16] SCLH[15:8] SCLL[7:0]
  *
  *   100 kHz: SCLL=40, SCLH=44 -> tLOW 4.77 us + tHIGH 5.24 us = 99.93 kHz
- *    50 kHz: SCLL=81, SCLH=89 -> 9.54 us + 10.47 us           = 49.96 kHz
- *   400 kHz: SCLL=12, SCLH= 8 -> 1.51 us +  1.05 us           = 390.6 kHz
+ *
+ * 50 kHz (0xF0425951) and 400 kHz (0xF031080C) were derived the same way and
+ * selectable through `camera tune i2c` during bring-up; the sensor was happy at
+ * 100 kHz from the first probe, so only that one survives.  The values are
+ * recorded here in case a future module needs them.
  *
  * Those are the register-derived periods; the bus runs slightly slower because
  * the peripheral adds its own synchronisation delay to each edge.
@@ -130,9 +135,7 @@
  * is not 137.5 MHz, because these constants would then be silently wrong.
  */
 #define CAM_I2C_KER_EXPECTED  137500000u
-#define CAM_I2C_TIMING_50K    0xF0425951u
 #define CAM_I2C_TIMING_100K   0xF0422C28u
-#define CAM_I2C_TIMING_400K   0xF031080Cu
 
 /* Power-up delays (ms).  OmniVision's module application notes ask for ~10 ms
    between applying XCLK and releasing PWDN, and again before releasing RESETB;
@@ -185,10 +188,8 @@
 /* A frame is ~1/15 s; a second is "the sensor is not producing frames at all". */
 #define CAM_XFER_TIMEOUT_TICKS  1000u
 
-/* Frames thrown away before the one we keep, so the sensor's exposure loop has
-   converged.  15 is not a guess -- see camera_capture_locked(). */
-#define CAM_WARM_FRAMES_DEF     15u
-#define CAM_WARM_FRAMES_MAX     31u
+/* Frames thrown away before the one we keep live in camera.h (the shell says how
+   long a capture will take).  15 is not a guess -- see camera_capture_locked(). */
 
 /* Streaming producer thread.  Priority 10 sits below the IWDG petter (5) and the
    RTL8720 UART (which has a hard byte deadline); it only has to keep up with the
@@ -232,7 +233,6 @@ static volatile int cam_xfer_active;   /* a capture owns the DCMI right now   */
 static volatile int cam_xfer_err;      /* set by HAL_DCMI_ErrorCallback       */
 static uint32_t cam_frame_gen;         /* bumped on every successful capture  */
 static int cam_colorbar = -1;          /* live/colorbar state, -1 = unknown   */
-static unsigned cam_warm_frames = CAM_WARM_FRAMES_DEF;
 
 /* ---- streaming state ----------------------------------------------------- */
 
@@ -285,15 +285,20 @@ static volatile uint32_t cam_ext_pins;
 #define CAM_EXT_PIN_DRAIN_MS  200u
 
 static struct camera_info info;
-static struct camera_tuning tune = {
-	.pwdn_active_high = 1u,
-	.rst_active_low   = 1u,
-	.i2c_pullup       = 0u,
-	.sccb_style       = CAM_SCCB_SPLIT,
-	.dvp_swap         = 1u,   /* ST's table ends with IMAGE_MODE = 0x09 */
-	.i2c_hz           = 100000u,
-};
-static uint32_t cam_xclk_div = CAM_XCLK_DIV_DEF;
+/*
+ * These six were run-time knobs through phases 1-2, because none of them could
+ * be proven from the schematic and reflashing to sweep an unknown eats the
+ * internal flash's ~10k erase cycles.  The board answered all of them on the
+ * first try and has not contradicted itself since, so they are constants now --
+ * a knob that has served its purpose is a liability, not a feature.  The values
+ * and how they were established are in the file header and in issue #8.
+ */
+#define CAM_PWDN_ACTIVE_HIGH  1     /* PWDN high powers the sensor down          */
+#define CAM_RST_ACTIVE_LOW    1     /* RESETB low holds it in reset              */
+#define CAM_I2C_INT_PULLUP    0     /* the board's 4.7k pull-ups are enough      */
+#define CAM_SCCB_READ_SPLIT   1     /* OmniVision's two-transaction read         */
+#define CAM_DVP_BYTE_SWAP     1     /* IMAGE_MODE bit0, as ST's table ships it   */
+#define CAM_I2C_TIMING        CAM_I2C_TIMING_100K
 
 /* ---- locking ------------------------------------------------------------- */
 
@@ -339,10 +344,11 @@ static uint32_t xclk_hz_for(uint32_t div)
 /*
  * Program the divider, stopping the counter across the update.
  *
+ * Only xclk_start_locked() calls this now, where the counter is already stopped,
+ * but the sequence is kept because it is what makes the write safe in general:
  * ARR has no preload here (CR1.ARPE = 0), so shrinking it while the counter is
  * above the new value would let a 32-bit CNT run all the way to 0xFFFFFFFF
- * before wrapping -- a ~15 second stuck output level, not a glitch.  Stopping,
- * clearing CNT and forcing the update event makes the retune bounded.
+ * before wrapping -- a ~15 second stuck output level, not a glitch.
  */
 static void xclk_apply_div(uint32_t div)
 {
@@ -373,7 +379,7 @@ static void xclk_start_locked(void)
 	CAM_TIM->CCMR2 = (6u << TIM_CCMR2_OC3M_Pos) | TIM_CCMR2_OC3PE;
 	CAM_TIM->CCER  = TIM_CCER_CC3E;
 	CAM_TIM->CNT   = 0u;
-	xclk_apply_div(cam_xclk_div);
+	xclk_apply_div(CAM_XCLK_DIV_DEF);
 	CAM_TIM->CR1   = TIM_CR1_CEN;
 
 	g.Pin       = CAM_XCLK_PIN;
@@ -383,7 +389,7 @@ static void xclk_start_locked(void)
 	g.Alternate = CAM_XCLK_AF;
 	HAL_GPIO_Init(CAM_XCLK_PORT, &g);
 
-	info.xclk_hz = xclk_hz_for(cam_xclk_div);
+	info.xclk_hz = xclk_hz_for(CAM_XCLK_DIV_DEF);
 }
 
 static void xclk_stop_locked(void)
@@ -414,14 +420,14 @@ static void xclk_stop_locked(void)
 
 static GPIO_PinState pwdn_level(int assert_powerdown)
 {
-	int high = tune.pwdn_active_high ? assert_powerdown : !assert_powerdown;
+	int high = CAM_PWDN_ACTIVE_HIGH ? assert_powerdown : !assert_powerdown;
 
 	return high ? GPIO_PIN_SET : GPIO_PIN_RESET;
 }
 
 static GPIO_PinState rst_level(int assert_reset)
 {
-	int high = tune.rst_active_low ? !assert_reset : assert_reset;
+	int high = CAM_RST_ACTIVE_LOW ? !assert_reset : assert_reset;
 
 	return high ? GPIO_PIN_SET : GPIO_PIN_RESET;
 }
@@ -459,13 +465,28 @@ static void power_on_locked(void)
 
 /* ---- SCCB ---------------------------------------------------------------- */
 
-static uint32_t i2c_timing_for(uint32_t hz)
+/*
+ * The I2C4 kernel clock, resolved from the mux we just wrote.
+ *
+ * NOT HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_I2C4): that function has no I2C4
+ * branch on this family -- it falls through its switch and returns 0.  So the
+ * check below has been firing on every boot since phase 1, reporting "kernel
+ * clock 0 Hz", and `camera info` printed `kernel 0.0 MHz`.  Nothing was actually
+ * wrong; the question was simply unsupported.  A self-check that cannot tell a
+ * wrong value from an unanswerable question is worse than no self-check, because
+ * it trains you to ignore it.
+ *
+ * RM0468 s8.7.21 (RCC_D3CCIPR): I2C4SEL selects rcc_pclk4 / pll3_r_ck /
+ * hsi_ker_ck / csi_ker_ck.  Only the first is resolvable here without pulling in
+ * the PLL3 plumbing, and it is the one this driver sets and the reset default;
+ * anything else means someone moved the mux, which is exactly what the warning
+ * should shout about, so 0 ("unknown") is the right answer for those.
+ */
+static uint32_t cam_i2c_kernel_hz(void)
 {
-	if (hz <= 50000u)
-		return CAM_I2C_TIMING_50K;
-	if (hz >= 400000u)
-		return CAM_I2C_TIMING_400K;
-	return CAM_I2C_TIMING_100K;
+	if (__HAL_RCC_GET_I2C4_SOURCE() != RCC_I2C4CLKSOURCE_D3PCLK1)
+		return 0u;
+	return HAL_RCCEx_GetD3PCLK1Freq();
 }
 
 static int cam_i2c_init_locked(void)
@@ -479,7 +500,7 @@ static int cam_i2c_init_locked(void)
 	__HAL_RCC_I2C4_CONFIG(RCC_I2C4CLKSOURCE_D3PCLK1);
 	__HAL_RCC_I2C4_CLK_ENABLE();
 
-	info.i2c_ker_hz = (uint32_t)HAL_RCCEx_GetPeriphCLKFreq(RCC_PERIPHCLK_I2C4);
+	info.i2c_ker_hz = cam_i2c_kernel_hz();
 	if (info.i2c_ker_hz != CAM_I2C_KER_EXPECTED)
 		LOG_WRN("I2C4 kernel clock %lu Hz, not %lu -- SCCB bit rate will be off",
 		        (unsigned long)info.i2c_ker_hz,
@@ -487,7 +508,7 @@ static int cam_i2c_init_locked(void)
 
 	g.Pin       = CAM_SCL_PIN | CAM_SDA_PIN;
 	g.Mode      = GPIO_MODE_AF_OD;
-	g.Pull      = tune.i2c_pullup ? GPIO_PULLUP : GPIO_NOPULL;
+	g.Pull      = CAM_I2C_INT_PULLUP ? GPIO_PULLUP : GPIO_NOPULL;
 	g.Speed     = GPIO_SPEED_FREQ_HIGH;
 	g.Alternate = CAM_I2C_AF;
 	HAL_GPIO_Init(CAM_SCL_PORT, &g);
@@ -496,7 +517,7 @@ static int cam_i2c_init_locked(void)
 		(void)HAL_I2C_DeInit(&hcam_i2c);
 
 	hcam_i2c.Instance              = CAM_I2C;
-	hcam_i2c.Init.Timing           = i2c_timing_for(tune.i2c_hz);
+	hcam_i2c.Init.Timing           = CAM_I2C_TIMING;
 	hcam_i2c.Init.OwnAddress1      = 0u;
 	hcam_i2c.Init.AddressingMode   = I2C_ADDRESSINGMODE_7BIT;
 	hcam_i2c.Init.DualAddressMode  = I2C_DUALADDRESS_DISABLE;
@@ -532,7 +553,7 @@ static void i2c_bus_clear_locked(void)
 	HAL_GPIO_WritePin(CAM_SCL_PORT, CAM_SCL_PIN | CAM_SDA_PIN, GPIO_PIN_SET);
 	g.Pin   = CAM_SCL_PIN | CAM_SDA_PIN;
 	g.Mode  = GPIO_MODE_OUTPUT_OD;
-	g.Pull  = tune.i2c_pullup ? GPIO_PULLUP : GPIO_NOPULL;
+	g.Pull  = CAM_I2C_INT_PULLUP ? GPIO_PULLUP : GPIO_NOPULL;
 	g.Speed = GPIO_SPEED_FREQ_LOW;
 	HAL_GPIO_Init(CAM_SCL_PORT, &g);
 
@@ -621,7 +642,7 @@ static int sccb_read_locked(uint8_t addr7, uint16_t reg, unsigned width,
 	uint8_t buf[2];
 	unsigned n = reg_bytes(reg, width, buf);
 
-	if (tune.sccb_style == CAM_SCCB_RESTART) {
+	if (!CAM_SCCB_READ_SPLIT) {
 		if (HAL_I2C_Mem_Read(&hcam_i2c, (uint16_t)(addr7 << 1), reg,
 		                     (width == CAM_REG_WIDTH_16)
 		                             ? I2C_MEMADD_SIZE_16BIT
@@ -780,15 +801,16 @@ static int ov2640_write_table_locked(void)
 }
 
 /*
- * Re-write IMAGE_MODE after the table so the DVP byte-swap bit follows the
- * `camera tune swap` knob.  The table itself keeps ST's shipped 0x09; this is
- * the one register we are prepared to disagree with them about, because which
- * order is "right" depends on what reads the frame, not on the sensor.
+ * Re-write IMAGE_MODE after the table so the DVP byte-swap bit is set from
+ * CAM_DVP_BYTE_SWAP rather than buried in the vendored sequence.  The table
+ * itself keeps ST's shipped 0x09; this is the one register we are prepared to
+ * disagree with them about, because which order is "right" depends on what reads
+ * the frame, not on the sensor -- so it is stated where it can be found.
  */
 static int ov2640_apply_swap_locked(void)
 {
 	uint8_t v = OV2640_IMAGE_MODE_RGB565 |
-	            (tune.dvp_swap ? OV2640_IMAGE_MODE_SWAP : 0u);
+	            (CAM_DVP_BYTE_SWAP ? OV2640_IMAGE_MODE_SWAP : 0u);
 
 	if (sccb_write_locked(OV2640_ADDR, OV2640_REG_BANK, CAM_REG_WIDTH_8,
 	                      OV2640_BANK_DSP) != CAM_OK ||
@@ -1086,7 +1108,7 @@ static int dcmi_snapshot_locked(void)
 }
 
 /*
- * Capture, discarding the first `cam_warm_frames` frames.
+ * Capture, discarding the first CAMERA_WARM_FRAMES frames.
  *
  * The OV2640 owns its exposure and gain loops and they start from the register
  * table's defaults, so the frames right after a power cycle are badly
@@ -1132,7 +1154,7 @@ static int camera_capture_locked(int colorbar)
 		return rc;
 
 	info.frame_valid = 0u;
-	for (unsigned i = 0; i <= cam_warm_frames; i++) {
+	for (unsigned i = 0; i <= CAMERA_WARM_FRAMES; i++) {
 		rc = dcmi_snapshot_locked();
 		if (rc != CAM_OK)
 			return rc;
@@ -1642,25 +1664,6 @@ int camera_capture(int colorbar)
 	return rc;
 }
 
-int camera_set_warm_frames(unsigned n)
-{
-	int rc;
-
-	if (n > CAM_WARM_FRAMES_MAX)
-		return CAM_ERR_PARAM;
-	rc = op_lock();
-	if (rc != CAM_OK)
-		return rc;
-	cam_warm_frames = n;
-	op_unlock();
-	return CAM_OK;
-}
-
-unsigned camera_get_warm_frames(void)
-{
-	return cam_warm_frames;
-}
-
 int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs)
 {
 	int rc = op_lock();
@@ -1890,99 +1893,6 @@ int camera_reg_write(uint8_t i2c_addr, uint16_t reg, unsigned reg_width,
 	}
 	i2c_ensure_ready_locked();
 	rc = sccb_write_locked(i2c_addr, reg, reg_width, val);
-	op_unlock();
-	return rc;
-}
-
-int camera_set_xclk(uint32_t hz, uint32_t *actual)
-{
-	uint32_t src, div;
-	int rc;
-
-	if (hz == 0u)
-		return CAM_ERR_PARAM;
-	rc = op_lock();
-	if (rc != CAM_OK)
-		return rc;
-	if (cam_stream_active) {       /* retuning the master clock mid-capture */
-		op_unlock();
-		return CAM_ERR_BUSY;
-	}
-
-	src = cam_tim_ker_hz();
-	div = (src + hz / 2u) / hz;          /* nearest integer divider */
-	if (div < CAM_XCLK_DIV_MIN)
-		div = CAM_XCLK_DIV_MIN;
-	if (div > CAM_XCLK_DIV_MAX)
-		div = CAM_XCLK_DIV_MAX;
-
-	cam_xclk_div     = div;
-	info.xclk_src_hz = src;
-	if (info.xclk_hz != 0u) {            /* running: retune in place */
-		xclk_apply_div(div);
-		info.xclk_hz = xclk_hz_for(div);
-	}
-	op_unlock();
-	if (actual != NULL)
-		*actual = src / div;
-	return CAM_OK;
-}
-
-/*
- * The shell's tune leaves do get -> modify -> set, which is not atomic across
- * the two calls.  With two consoles live (USB CDC and telnet) that is a
- * last-writer-wins race on a bring-up knob, which is acceptable and deliberately
- * not papered over with a read-modify-write API; the copies themselves are
- * serialized so neither side ever observes a torn struct.
- */
-int camera_get_tuning(struct camera_tuning *out)
-{
-	int rc;
-
-	if (out == NULL)
-		return CAM_ERR_PARAM;
-	rc = op_lock();
-	if (rc != CAM_OK)
-		return rc;
-	*out = tune;
-	op_unlock();
-	return CAM_OK;
-}
-
-int camera_set_tuning(const struct camera_tuning *in)
-{
-	int i2c_changed, swap_changed;
-	int rc;
-
-	if (in == NULL)
-		return CAM_ERR_PARAM;
-	if (in->sccb_style != CAM_SCCB_SPLIT && in->sccb_style != CAM_SCCB_RESTART)
-		return CAM_ERR_PARAM;
-	if (in->i2c_hz != 50000u && in->i2c_hz != 100000u && in->i2c_hz != 400000u)
-		return CAM_ERR_PARAM;
-
-	rc = op_lock();
-	if (rc != CAM_OK)
-		return rc;
-	/* Several of these write live sensor registers (the DVP byte swap) or
-	   re-initialise I2C4; none of it is safe under a running capture. */
-	if (cam_stream_active) {
-		op_unlock();
-		return CAM_ERR_BUSY;
-	}
-
-	i2c_changed = (in->i2c_hz != tune.i2c_hz) ||
-	              (in->i2c_pullup != tune.i2c_pullup);
-	swap_changed = (in->dvp_swap != tune.dvp_swap);
-	tune = *in;
-	if (i2c_changed)
-		rc = cam_i2c_init_locked();
-	/* The swap bit is one live register, so push it now rather than making the
-	   user power-cycle; if the sensor has not been configured yet the next
-	   capture writes it anyway. */
-	if (rc == CAM_OK && swap_changed && info.configured &&
-	    info.sensor == CAM_SENSOR_OV2640)
-		rc = ov2640_apply_swap_locked();
 	op_unlock();
 	return rc;
 }

@@ -108,8 +108,8 @@ time as the USB console. 24 commands:
 - **`camera`** — the **OV2640 DVP camera on the 24-pin FPC connector** (J7), feeding
   the **DCMI** (issue #8). **Phases 1–2 so far**: the sensor's master clock, SCCB
   control bus, PWDN/RESETB lines and chip-ID probe (phase 1), then QVGA RGB565
-  single-frame capture over DCMI + DMA into the PSRAM (phase 2). Continuous capture,
-  the frame pipeline and LCD preview come in phase 3.
+  single-frame capture over DCMI + DMA into the PSRAM (phase 2), then continuous
+  capture through `svc/frame_pipeline` and a live LCD preview (phase 3).
   - *capture*: `camera capture` snapshots one 320x240 RGB565 frame (153600 B) and
     prints **per-channel min/max/mean**. That statistic is the whole point — a frame
     that never arrived reads all-zero, a saturated one pins at max, and a DCMI
@@ -122,9 +122,9 @@ time as the USB console. 24 commands:
     to back after `camera off; camera probe`, means measured **R2 G11 B0 → R4 G15 B0
     → R6 G22 B3** with no warm-up (still climbing after three captures) versus
     **R14 G28 B12** on the *first* kept frame with 15 discarded. So a capture throws
-    away **15 frames** (~1 s) and keeps the sixteenth. `camera tune warm <0..31>`
-    sweeps it; 0 restores the single-frame behaviour, which is what made the effect
-    measurable rather than assumed.
+    away **15 frames** (~1 s) and keeps the sixteenth. The count was a run-time knob
+    while it was being measured — sweeping it down to 0 is what made the effect
+    measurable rather than assumed — and is a constant now that the answer is known.
   - *`seam:`*: `camera capture` also reports the largest step between adjacent rows'
     channel means, and its row. It exists because one early capture showed a sharp
     band — at row 27 the red mean dropped 37 % while blue did not move, with the
@@ -204,11 +204,14 @@ time as the USB console. 24 commands:
     and leaves the sensor powered so `camera scan` / `camera reg <addr> <reg>` can
     keep digging. SCCB is I2C4 on **PF14/PF15** (AF4, 4.7k board pull-ups), kernel
     clock `rcc_pclk4` = 137.5 MHz at 100 kHz nominal.
-  - *bring-up knobs*: `camera xclk <hz>` and `camera tune {pwdn|rst|pull|i2c|sccb}`
-    make every unproven board assumption switchable at run time — the internal
-    flash is rated for only ~10k erase cycles, so sweeping an unknown by reflashing
-    is exactly what these replace (the lesson from the LCD bring-up above). They are
-    instruments, not a permanent command surface.
+  - *the bring-up knobs are gone*. `camera xclk <hz>` and
+    `camera tune {pwdn|rst|pull|i2c|sccb|swap|warm}` made every unproven board
+    assumption switchable at run time, because the internal flash is rated for only
+    ~10k erase cycles and sweeping an unknown by reflashing burns them (the lesson
+    from the LCD bring-up above). The board answered all seven and never contradicted
+    itself, so they are compile-time constants now and the commands are deleted.
+    `camera reg` stays — poking the sensor's registers is still how you learn
+    anything about it.
 - **`wifi`** — the on-board **RTL8720DN** Wi-Fi/BLE companion (issues #17/#5/#23).
   The host reaches it over `CHIP_EN` (PC3), a **LOG UART** (UART9 PD14/PD15) and an
   **AT/HS UART** (USART1 PA10/PB14); the module is held powered-off (PC3 low) at boot.

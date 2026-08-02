@@ -4,8 +4,8 @@
  */
 /**
  * @file    cmd_camera.c
- * @brief   `camera` shell command: OV2640 bring-up and snapshot (issue #8
- *          phases 1-2).
+ * @brief   `camera` shell command: OV2640 bring-up, snapshot, continuous stream
+ *          and LCD preview (issue #8).
  *
  *   camera probe          power-cycle the module and identify the sensor
  *   camera on | off       run / undo the power-up sequence (no ID read)
@@ -15,9 +15,6 @@
  *   camera send [name]    stream the frame to the PC over YMODEM
  *   camera scan           list every 7-bit SCCB address that ACKs
  *   camera reg <a> <r> .. raw SCCB register read / write
- *   camera xclk [hz]      show or retune the master clock
- *   camera tune ...       polarity / pull-up / bit-rate / read-style /
- *                         byte-swap / warm-up frames
  *
  * `camera probe` proves the sensor-control side: a chip ID means XCLK is at a
  * frequency the sensor accepts, PWDN and RESETB have the polarity assumed, and
@@ -33,12 +30,14 @@
  * is what lets `camera preview` put a live image on the display; see
  * cam_psram_take() and app/psram.h.
  *
- * `xclk` and `tune` exist because none of those four can be proven from the
- * schematic alone, and the internal flash is only rated for ~10k erase cycles:
- * sweeping an unknown by reflashing is what these knobs replace (the lesson
- * carried over from issue #7's LCD bring-up).  They are bring-up instruments,
- * not a permanent part of the command surface -- expect them to shrink once the
- * sensor is known.
+ * `xclk` and `tune` used to sit here: seven run-time knobs for board facts the
+ * schematic could not settle (XCLK rate, PWDN/RESETB polarity, SCCB pull-ups and
+ * bit rate, the read style, the DVP byte swap, the warm-up count).  They existed
+ * because the internal flash is rated for ~10k erase cycles and sweeping an
+ * unknown by reflashing burns them -- the lesson from issue #7's LCD bring-up.
+ * The board answered every one of them and has not changed its mind since, so
+ * phase 3c-2 folded the answers into constants and deleted the knobs.  `reg`
+ * stays: poking the sensor's registers is still how you learn anything about it.
  *
  * Note `camera off` does NOT remove power: the camera's 2V8 rail comes off a
  * fixed LDO with no enable pin (schematic U8), so the deepest state reachable
@@ -133,7 +132,7 @@ static int cmd_camera_probe(struct cli_instance *sh, int argc, char **argv)
 			          (unsigned)ci.i2c_addr, (unsigned)ci.i2c_addr);
 		else
 			cli_error(sh, "camera: nothing answered on SCCB (XCLK %lu.%02lu MHz) -- "
-			              "module connected? try `camera tune` / `camera xclk`\r\n",
+			              "module connected?\r\n",
 			          (unsigned long)(ci.xclk_hz / 1000000u),
 			          (unsigned long)(ci.xclk_hz % 1000000u / 10000u));
 		return 1;
@@ -180,7 +179,6 @@ static int cmd_camera_off(struct cli_instance *sh, int argc, char **argv)
 
 static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 {
-	struct camera_tuning t;
 	struct camera_info ci;
 	struct camera_mode m;
 	int rc;
@@ -192,7 +190,6 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 		report(sh, rc);
 		return 1;
 	}
-	(void)camera_get_tuning(&t);
 
 	cli_print(sh, "state:   %s\r\n", ci.powered ? "powered" : "powered down");
 	cli_print(sh, "sensor:  %s", camera_sensor_name(ci.sensor));
@@ -213,17 +210,15 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 		          (unsigned long)(ci.xclk_src_hz / ci.xclk_hz));
 	else
 		cli_print(sh, "stopped (PA2 driven low)\r\n");
-	cli_print(sh, "sccb:    I2C4 PF14/PF15, %lu kHz nominal, kernel %lu.%lu MHz, "
-	              "%s reads\r\n",
-	          (unsigned long)(t.i2c_hz / 1000u),
+	/* Everything below the kernel clock is a compile-time constant now (phase
+	   3c-2 folded away the `tune` knobs), so it is spelled out rather than read
+	   back.  The kernel clock is not: it is what the SCCB TIMINGR constants were
+	   computed against, and 0.0 MHz here means the mux moved off rcc_pclk4. */
+	cli_print(sh, "sccb:    I2C4 PF14/PF15, 100 kHz nominal, kernel %lu.%lu MHz, "
+	              "split reads, board pull-ups\r\n",
 	          (unsigned long)(ci.i2c_ker_hz / 1000000u),
-	          (unsigned long)(ci.i2c_ker_hz % 1000000u / 100000u),
-	          (t.sccb_style == CAM_SCCB_RESTART) ? "repeated-START" : "split");
-	cli_print(sh, "lines:   PWDN PE7 active %s, RESETB PH12 active %s, "
-	              "pull-ups %s\r\n",
-	          t.pwdn_active_high ? "high" : "low",
-	          t.rst_active_low ? "low" : "high",
-	          t.i2c_pullup ? "board + internal" : "board only");
+	          (unsigned long)(ci.i2c_ker_hz % 1000000u / 100000u));
+	cli_print(sh, "lines:   PWDN PE7 active high, RESETB PH12 active low\r\n");
 	cli_print(sh, "dcmi:    8-bit, PCK rising, VS/HS low, DMA2_Stream1 -> PSRAM\r\n");
 #if BSP_ENABLE_LCD
 	{
@@ -236,9 +231,8 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 		          (unsigned long)shown, (unsigned long)dropped);
 	}
 #endif
-	cli_print(sh, "sensor cfg: %s, DVP byte swap %s\r\n",
-	          ci.configured ? "QVGA RGB565 loaded" : "not loaded (lazy)",
-	          t.dvp_swap ? "on" : "off");
+	cli_print(sh, "sensor cfg: %s, DVP byte swap on\r\n",
+	          ci.configured ? "QVGA RGB565 loaded" : "not loaded (lazy)");
 	if (camera_get_mode(&m) == CAM_OK)
 		cli_print(sh, "frame:   %ux%u %s (%lu bytes) -- %s\r\n",
 		          (unsigned)m.width, (unsigned)m.height, m.format,
@@ -344,37 +338,6 @@ static int cmd_camera_reg(struct cli_instance *sh, int argc, char **argv)
 	else
 		cli_print(sh, "0x%02x[0x%02x] = 0x%02x\r\n", (unsigned)addr,
 		          (unsigned)reg, (unsigned)v);
-	return 0;
-}
-
-static int cmd_camera_xclk(struct cli_instance *sh, int argc, char **argv)
-{
-	struct camera_info ci;
-	uint32_t hz, actual;
-	int rc;
-
-	if (argc < 2) {
-		if (camera_get_info(&ci) != CAM_OK) {
-			report(sh, CAM_ERR_STATE);
-			return 1;
-		}
-		cli_print(sh, "xclk: %lu Hz (source %lu Hz)\r\n",
-		          (unsigned long)ci.xclk_hz, (unsigned long)ci.xclk_src_hz);
-		return 0;
-	}
-	if (cli_parse_u32(argv[1], &hz) != 0 || hz == 0u) {
-		cli_error(sh, "camera: bad frequency '%s' (Hz)\r\n", argv[1]);
-		return 1;
-	}
-	rc = camera_set_xclk(hz, &actual);
-	if (rc != CAM_OK) {
-		report(sh, rc);
-		return 1;
-	}
-	cli_print(sh, "xclk: %lu Hz requested, %lu Hz emitted%s\r\n",
-	          (unsigned long)hz, (unsigned long)actual,
-	          (camera_get_info(&ci) == CAM_OK && ci.xclk_hz == 0u)
-	                  ? " on the next `camera on`" : "");
 	return 0;
 }
 
@@ -528,7 +491,7 @@ static int cmd_camera_capture(struct cli_instance *sh, int argc, char **argv)
 
 	cli_print(sh, "frame: %ux%u %s (%lu bytes, %u warm-up frames)\r\n",
 	          (unsigned)m.width, (unsigned)m.height, m.format,
-	          (unsigned long)m.frame_bytes, camera_get_warm_frames());
+	          (unsigned long)m.frame_bytes, (unsigned)CAMERA_WARM_FRAMES);
 	for (int k = 0; k < 3; k++)
 		cli_print(sh, "%s: min %3lu  max %3lu  mean %3lu\r\n", chan[k],
 		          (unsigned long)st.min[k], (unsigned long)st.max[k],
@@ -857,178 +820,6 @@ static int cmd_camera_preview(struct cli_instance *sh, int argc, char **argv)
 }
 #endif /* BSP_ENABLE_LCD */
 
-/* ---- tune ---------------------------------------------------------------- */
-
-static int tune_apply(struct cli_instance *sh, const struct camera_tuning *t,
-                      const char *name, const char *val)
-{
-	int rc = camera_set_tuning(t);
-
-	if (rc != CAM_OK) {
-		cli_error(sh, "camera: %s for %s\r\n", cam_strerror(rc), name);
-		return 1;
-	}
-	cli_print(sh, "camera: %s = %s\r\n", name, val);
-	return 0;
-}
-
-static int cmd_tune_pwdn(struct cli_instance *sh, int argc, char **argv)
-{
-	struct camera_tuning t;
-
-	(void)argc;
-	if (camera_get_tuning(&t) != CAM_OK)
-		return 1;
-	if (strcmp(argv[1], "high") == 0)
-		t.pwdn_active_high = 1u;
-	else if (strcmp(argv[1], "low") == 0)
-		t.pwdn_active_high = 0u;
-	else {
-		cli_error(sh, "camera: pwdn takes high|low\r\n");
-		return 1;
-	}
-	return tune_apply(sh, &t, "pwdn", argv[1]);
-}
-
-static int cmd_tune_rst(struct cli_instance *sh, int argc, char **argv)
-{
-	struct camera_tuning t;
-
-	(void)argc;
-	if (camera_get_tuning(&t) != CAM_OK)
-		return 1;
-	if (strcmp(argv[1], "low") == 0)
-		t.rst_active_low = 1u;
-	else if (strcmp(argv[1], "high") == 0)
-		t.rst_active_low = 0u;
-	else {
-		cli_error(sh, "camera: rst takes low|high\r\n");
-		return 1;
-	}
-	return tune_apply(sh, &t, "rst", argv[1]);
-}
-
-static int cmd_tune_pull(struct cli_instance *sh, int argc, char **argv)
-{
-	struct camera_tuning t;
-
-	(void)argc;
-	if (camera_get_tuning(&t) != CAM_OK)
-		return 1;
-	if (strcmp(argv[1], "on") == 0)
-		t.i2c_pullup = 1u;
-	else if (strcmp(argv[1], "off") == 0)
-		t.i2c_pullup = 0u;
-	else {
-		cli_error(sh, "camera: pull takes on|off\r\n");
-		return 1;
-	}
-	return tune_apply(sh, &t, "pull", argv[1]);
-}
-
-static int cmd_tune_i2c(struct cli_instance *sh, int argc, char **argv)
-{
-	struct camera_tuning t;
-	uint32_t khz;
-
-	(void)argc;
-	if (camera_get_tuning(&t) != CAM_OK)
-		return 1;
-	if (cli_parse_u32(argv[1], &khz) != 0 ||
-	    (khz != 50u && khz != 100u && khz != 400u)) {
-		cli_error(sh, "camera: i2c takes 50|100|400 (kHz)\r\n");
-		return 1;
-	}
-	t.i2c_hz = khz * 1000u;
-	return tune_apply(sh, &t, "i2c", argv[1]);
-}
-
-static int cmd_tune_sccb(struct cli_instance *sh, int argc, char **argv)
-{
-	struct camera_tuning t;
-
-	(void)argc;
-	if (camera_get_tuning(&t) != CAM_OK)
-		return 1;
-	if (strcmp(argv[1], "split") == 0)
-		t.sccb_style = CAM_SCCB_SPLIT;
-	else if (strcmp(argv[1], "restart") == 0)
-		t.sccb_style = CAM_SCCB_RESTART;
-	else {
-		cli_error(sh, "camera: sccb takes split|restart\r\n");
-		return 1;
-	}
-	return tune_apply(sh, &t, "sccb", argv[1]);
-}
-
-static int cmd_tune_swap(struct cli_instance *sh, int argc, char **argv)
-{
-	struct camera_tuning t;
-
-	(void)argc;
-	if (camera_get_tuning(&t) != CAM_OK)
-		return 1;
-	if (strcmp(argv[1], "on") == 0)
-		t.dvp_swap = 1u;
-	else if (strcmp(argv[1], "off") == 0)
-		t.dvp_swap = 0u;
-	else {
-		cli_error(sh, "camera: swap takes on|off\r\n");
-		return 1;
-	}
-	return tune_apply(sh, &t, "swap", argv[1]);
-}
-
-/* Not part of `tune`'s struct -- it lives in the driver's capture path, not in
-   the board-assumption set the other knobs override. */
-static int cmd_tune_warm(struct cli_instance *sh, int argc, char **argv)
-{
-	uint32_t n;
-
-	(void)argc;
-	if (cli_parse_u32(argv[1], &n) != 0 ||
-	    camera_set_warm_frames((unsigned)n) != CAM_OK) {
-		cli_error(sh, "camera: warm takes 0..31 (frames discarded per capture)\r\n");
-		return 1;
-	}
-	cli_print(sh, "camera: warm = %s\r\n", argv[1]);
-	return 0;
-}
-
-static int cmd_camera_tune(struct cli_instance *sh, int argc, char **argv)
-{
-	struct camera_tuning t;
-
-	if (argc > 1) {
-		cli_error(sh, "camera: unknown tune setting '%s'\r\n", argv[1]);
-		return 1;
-	}
-	if (camera_get_tuning(&t) != CAM_OK) {
-		report(sh, CAM_ERR_STATE);
-		return 1;
-	}
-	cli_print(sh, "pwdn: %s\r\n", t.pwdn_active_high ? "high" : "low");
-	cli_print(sh, "rst:  %s\r\n", t.rst_active_low ? "low" : "high");
-	cli_print(sh, "pull: %s\r\n", t.i2c_pullup ? "on" : "off");
-	cli_print(sh, "i2c:  %lu\r\n", (unsigned long)(t.i2c_hz / 1000u));
-	cli_print(sh, "sccb: %s\r\n",
-	          (t.sccb_style == CAM_SCCB_RESTART) ? "restart" : "split");
-	cli_print(sh, "swap: %s\r\n", t.dvp_swap ? "on" : "off");
-	cli_print(sh, "warm: %u\r\n", camera_get_warm_frames());
-	return 0;
-}
-
-CLI_SUBCMD_SET_CREATE(camera_tune_subcmds,
-	CLI_CMD_ARG(pwdn, NULL, "PWDN assert level <high|low>", cmd_tune_pwdn, 2, 0),
-	CLI_CMD_ARG(rst,  NULL, "RESETB assert level <low|high>", cmd_tune_rst, 2, 0),
-	CLI_CMD_ARG(pull, NULL, "internal SCCB pull-ups <on|off>", cmd_tune_pull, 2, 0),
-	CLI_CMD_ARG(i2c,  NULL, "SCCB bit rate <50|100|400> kHz", cmd_tune_i2c, 2, 0),
-	CLI_CMD_ARG(sccb, NULL, "read style <split|restart>", cmd_tune_sccb, 2, 0),
-	CLI_CMD_ARG(swap, NULL, "DVP byte swap <on|off>", cmd_tune_swap, 2, 0),
-	CLI_CMD_ARG(warm, NULL, "frames discarded per capture <0..31>",
-	            cmd_tune_warm, 2, 0),
-	CLI_SUBCMD_SET_END);
-
 CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	CLI_CMD(probe, NULL, "power-cycle the module and read the sensor chip ID",
 	        cmd_camera_probe),
@@ -1054,10 +845,6 @@ CLI_SUBCMD_SET_CREATE(camera_subcmds,
 #endif
 	CLI_CMD_ARG(reg, NULL, "raw SCCB access <addr> <reg> [value] [-16]",
 	            cmd_camera_reg, 3, 2),
-	CLI_CMD_ARG(xclk, NULL, "show or set the master clock [hz]",
-	            cmd_camera_xclk, 1, 1),
-	CLI_CMD_ARG(tune, camera_tune_subcmds,
-	            "bring-up overrides (no arg = show current)", cmd_camera_tune, 1, 1),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(camera, camera_subcmds,

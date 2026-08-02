@@ -5,7 +5,7 @@
 /**
  * @file    camera.h
  * @brief   OV2640 DVP camera over DCMI: XCLK, SCCB, snapshot and continuous
- *          capture (issue #8 phases 1-3b).
+ *          capture (issue #8).
  *
  * The board's J7 FPC-24 connector carries a plain 8-bit DVP camera into the
  * STM32H725's DCMI.  Phase 1 brought up everything the sensor needs *before* a
@@ -15,8 +15,8 @@
  * sequence, and one frame captured over DCMI + DMA2_Stream1 into a PSRAM frame
  * buffer.  Phase 3b adds continuous capture: the DCMI runs free with the DMA in
  * double-buffer mode over a ring of PSRAM slots, and a producer thread publishes
- * each finished frame into svc/frame_pipeline.  The display preview that consumes
- * those frames is phase 3c.
+ * each finished frame into svc/frame_pipeline.  Phase 3c puts those frames on the
+ * LCD (app/cam_preview.c) and lets the DCMI and the LTDC share OCTOSPI1.
  *
  * Two board facts drive the whole design and both differ from the STM32F746
  * Discovery firmware this project is otherwise ported from
@@ -82,19 +82,18 @@ enum camera_sensor {
 #define CAM_REG_WIDTH_8   8u
 #define CAM_REG_WIDTH_16  16u
 
-/** SCCB read style (see struct camera_tuning).  OmniVision documents reads as
- *  two separate transactions; most parts also tolerate a repeated START, which
- *  is what HAL_I2C_Mem_Read emits.  Both are selectable because "the sensor
- *  ACKs its address but every read returns 0xFF" is otherwise a dead end. */
-#define CAM_SCCB_SPLIT    0u   /* write reg + STOP, then a separate read (default) */
-#define CAM_SCCB_RESTART  1u   /* single transfer with a repeated START            */
-
 /** Capture geometry.  Phase 2 has exactly one mode; the struct exists so the
  *  shell never hardcodes the numbers and phase 3 can add modes without changing
  *  the command surface. */
 #define CAMERA_FRAME_WIDTH   320u
 #define CAMERA_FRAME_HEIGHT  240u
 #define CAMERA_FRAME_BYTES   (CAMERA_FRAME_WIDTH * CAMERA_FRAME_HEIGHT * 2u)
+
+/** Frames a snapshot discards before the one it keeps, so the sensor's own
+ *  exposure and gain loops have converged.  Measured, not guessed: see
+ *  camera_capture_locked() in camera.c.  Public because it is what makes a
+ *  capture take ~1 s, and the shell says so before it blocks. */
+#define CAMERA_WARM_FRAMES   15u
 
 struct camera_mode {
 	uint16_t width;
@@ -118,19 +117,6 @@ struct camera_info {
 	uint32_t xclk_hz;      /**< XCLK actually being emitted, 0 when stopped    */
 	uint32_t xclk_src_hz;  /**< TIM5 kernel clock the divider works from       */
 	uint32_t i2c_ker_hz;   /**< I2C4 kernel clock (rcc_pclk4)                  */
-};
-
-/** Bring-up escape hatches.  Every one of these is a board fact this phase
- *  cannot prove from the schematic alone, so each is switchable at run time --
- *  the internal flash is only rated for ~10k erase cycles and sweeping an
- *  unknown by reflashing burns them (the lesson from issue #7's LCD bring-up). */
-struct camera_tuning {
-	uint8_t pwdn_active_high; /**< 1 = PWDN high powers the sensor down (default) */
-	uint8_t rst_active_low;   /**< 1 = RESETB low holds the sensor in reset (default) */
-	uint8_t i2c_pullup;       /**< 1 = also enable the MCU's internal pull-ups       */
-	uint8_t sccb_style;       /**< CAM_SCCB_SPLIT / CAM_SCCB_RESTART                 */
-	uint8_t dvp_swap;         /**< 1 = IMAGE_MODE bit0 set (ST's shipped default)    */
-	uint32_t i2c_hz;          /**< nominal SCCB bit rate: 50000 / 100000 / 400000    */
 };
 
 /**
@@ -239,19 +225,6 @@ const struct frame_desc *camera_stream_pin_latest(void);
 void camera_stream_put(const struct frame_desc *f);
 
 /**
- * Frames discarded before the one camera_capture() keeps (default 15, max 31).
- *
- * The OV2640's exposure loop starts from the register table's defaults, so the
- * frames right after a power cycle are badly under-exposed -- measured here, the
- * first frame at 0 is seven times too dark and three back-to-back captures still
- * have not converged, while 15 discarded frames put the first kept frame at the
- * settled value.  0 restores the single-frame behaviour, which is what makes the
- * effect measurable instead of a matter of belief.
- */
-int      camera_set_warm_frames(unsigned n);
-unsigned camera_get_warm_frames(void);
-
-/**
  * Configure the sensor if needed, then capture ONE frame into the driver's
  * frame buffer over DCMI + DMA.  Blocks until the frame lands or the transfer
  * times out (~1 s); the first call after a power cycle also spends ~250 ms
@@ -301,21 +274,6 @@ int camera_reg_read(uint8_t i2c_addr, uint16_t reg, unsigned reg_width,
                     uint8_t *val);
 int camera_reg_write(uint8_t i2c_addr, uint16_t reg, unsigned reg_width,
                      uint8_t val);
-
-/**
- * Retune XCLK.  @p hz is clamped to the range the TIM5 divider can express
- * (roughly 4..46 MHz off the 275 MHz kernel clock); @p actual (may be NULL)
- * receives the frequency really emitted.  Takes effect immediately when the
- * clock is already running.  The default is ~22.92 MHz = 275 MHz / 12, the
- * closest exact-50%-duty point to the 24 MHz an OmniVision sensor expects.
- */
-int camera_set_xclk(uint32_t hz, uint32_t *actual);
-
-/** Current tuning knobs / replace them.  A change to the I2C fields
- *  re-initialises I2C4; a change to a polarity takes effect on the next
- *  camera_on()/camera_off(). */
-int camera_get_tuning(struct camera_tuning *out);
-int camera_set_tuning(const struct camera_tuning *in);
 
 /** Human-readable forms for the shell. */
 const char *cam_strerror(int rc);
