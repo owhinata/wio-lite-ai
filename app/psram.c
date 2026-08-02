@@ -38,6 +38,9 @@
 #if BSP_ENABLE_LCD
 #include "ltdc_display.h"   /* ltdc_scanout_active(): see psram_acquire() (issue #7) */
 #endif
+#if BSP_ENABLE_CAMERA
+#include "camera.h"         /* camera_streaming(): see psram_acquire() (issue #8) */
+#endif
 
 /* ------------------------------------------------------------------ *
  *  Tunable bring-up parameters (validate / adjust on board #2)
@@ -658,6 +661,15 @@ int psram_acquire(void)
 #if BSP_ENABLE_LCD
 	if (ltdc_scanout_active())
 		return 0;               /* LTDC is reading this bus right now */
+#endif
+#if BSP_ENABLE_CAMERA
+	/* A camera stream has the DCMI's DMA writing the ring in this window,
+	   open-endedly.  Unlike a one-shot capture -- where the shell can hold this
+	   guard across the whole command -- a stream can also stop itself on
+	   --frames/--secs, so there would be no one left to release a held guard.
+	   Hence the same shape as the LTDC gate above: ask the owner. */
+	if (camera_streaming())
+		return 0;
 #endif
 	do {
 		if (__LDREXB(&psram_busy) != 0u) {

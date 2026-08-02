@@ -32,6 +32,9 @@
 #include "cli.h"
 #include "ltdc_display.h"
 #include "psram.h"           /* psram_acquire(): OCTOSPI1 interlock (see lcd on) */
+#if BSP_ENABLE_CAMERA
+#include "camera.h"          /* camera_streaming(): name the right culprit in `lcd on` */
+#endif
 #include "stm32h7xx_hal.h"   /* __HAL_RCC_DMA2D_IS_CLK_ENABLED (AHB3ENR read-back) */
 
 #include <stdint.h>
@@ -292,6 +295,16 @@ static int cmd_lcd_on(struct cli_instance *sh, int argc, char **argv)
 	 * keeps the two apart from this point on.
 	 */
 	if (!psram_acquire()) {
+		/* A camera stream is one of the things that refuses this now, and
+		   "a psram/membench command holds it" would send the reader looking in
+		   the wrong place entirely (issue #8 phase 3b). */
+#if BSP_ENABLE_CAMERA
+		if (camera_streaming()) {
+			cli_error(sh, "lcd: a camera stream owns OCTOSPI1 "
+			              "(run 'camera stream stop')\r\n");
+			return 1;
+		}
+#endif
 		cli_error(sh, "lcd: OCTOSPI1 busy (a psram/membench command holds "
 		              "it)\r\n");
 		return 1;

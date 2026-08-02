@@ -4,8 +4,8 @@
  */
 /**
  * @file    camera.h
- * @brief   OV2640 DVP camera over DCMI: XCLK, SCCB, snapshot capture (issue #8
- *          phases 1-2).
+ * @brief   OV2640 DVP camera over DCMI: XCLK, SCCB, snapshot and continuous
+ *          capture (issue #8 phases 1-3b).
  *
  * The board's J7 FPC-24 connector carries a plain 8-bit DVP camera into the
  * STM32H725's DCMI.  Phase 1 brought up everything the sensor needs *before* a
@@ -13,7 +13,10 @@
  * PWDN/RESETB lines and a chip-ID read (the part in hand is an OV2640, SCCB
  * 0x30, chip ID 0x2642).  Phase 2 adds the pixel path: the QVGA RGB565 register
  * sequence, and one frame captured over DCMI + DMA2_Stream1 into a PSRAM frame
- * buffer.  Continuous capture and the frame pipeline are phase 3.
+ * buffer.  Phase 3b adds continuous capture: the DCMI runs free with the DMA in
+ * double-buffer mode over a ring of PSRAM slots, and a producer thread publishes
+ * each finished frame into svc/frame_pipeline.  The display preview that consumes
+ * those frames is phase 3c.
  *
  * Two board facts drive the whole design and both differ from the STM32F746
  * Discovery firmware this project is otherwise ported from
@@ -61,7 +64,7 @@ extern "C" {
 #define CAM_ERR_STATE     -4   /* driver not initialized / sensor not powered   */
 #define CAM_ERR_NO_SENSOR -5   /* nothing answered, or an unrecognised chip ID  */
 #define CAM_ERR_NO_FRAME  -6   /* no captured frame available                   */
-#define CAM_ERR_BUSY      -7   /* a capture already owns the DCMI               */
+#define CAM_ERR_BUSY      -7   /* a capture or stream already owns the DCMI      */
 
 /** Sensors this phase knows how to identify.  CAM_SENSOR_UNKNOWN means "some
  *  device ACKed on the SCCB bus but its ID did not match any candidate" -- a
@@ -171,6 +174,45 @@ int camera_get_info(struct camera_info *out);
 
 /** Capture geometry / pixel format.  Constant in phase 2. */
 int camera_get_mode(struct camera_mode *out);
+
+/** Streaming counters (camera_stream_stats). */
+struct camera_stream_stats {
+	uint8_t  active;       /**< a stream is running right now                 */
+	uint32_t frames;       /**< frames published into the pipeline            */
+	uint32_t elapsed_ms;   /**< run time (frozen at teardown for a post-stop read) */
+	uint32_t dcmi_ovr;     /**< DCMI overrun / sync errors (terminal)         */
+	uint32_t ring_ovr;     /**< completions with no free slot -> frame dropped */
+	uint32_t dma_fe;       /**< DMA FIFO/direct-mode errors tolerated          */
+	uint32_t repoint_skip; /**< DBM repoints skipped because CT moved (see .c) */
+	uint32_t delivered;    /**< stat sink: frames consumed                    */
+	uint32_t dropped;      /**< stat sink: frames dropped by policy           */
+	uint32_t slots;        /**< ring depth                                    */
+};
+
+/**
+ * Start / stop continuous capture.
+ *
+ * The DCMI runs in continuous mode with the DMA in double-buffer mode over a
+ * ring of frame slots; a dedicated producer thread publishes each completed
+ * frame into the pipeline.  @p frames / @p secs are optional self-stop limits
+ * (0 = run until camera_stream_stop()).  @p colorbar selects the test pattern.
+ *
+ * Streaming and camera_capture() share the DCMI and are mutually exclusive.
+ *
+ * The frames land in the OCTOSPI1 PSRAM, so while a stream runs nothing else may
+ * retune that bus -- psram_acquire() refuses on camera_streaming() for exactly
+ * that reason.  The caller does NOT hold a guard for the stream's lifetime
+ * (a stream is open-ended and can self-stop, so there would be no one left to
+ * release it).
+ */
+int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs);
+int camera_stream_stop(void);
+
+/** Nonzero while a stream owns the DCMI and is writing the PSRAM ring.
+ *  Read by app/psram.c to refuse OCTOSPI1 retunes -- see psram_acquire(). */
+int camera_streaming(void);
+
+int camera_stream_stats(struct camera_stream_stats *out);
 
 /**
  * Frames discarded before the one camera_capture() keeps (default 15, max 31).

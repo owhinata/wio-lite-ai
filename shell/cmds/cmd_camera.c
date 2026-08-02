@@ -82,8 +82,15 @@ static int cam_psram_take(struct cli_instance *sh)
 {
 #if BSP_ENABLE_PSRAM
 	if (!psram_acquire()) {
-		cli_error(sh, "camera: OCTOSPI1 busy (run 'lcd off', or wait for "
-		              "psram/membench/devmem/wifi flash)\r\n");
+		/* psram_acquire() is a try-lock and cannot say who holds it, but one of
+		   its refusal reasons IS us -- and "run lcd off" is actively wrong advice
+		   when the real answer is `camera stream stop`.  Name that case. */
+		if (camera_streaming())
+			cli_error(sh, "camera: a stream owns OCTOSPI1 "
+			              "(run 'camera stream stop')\r\n");
+		else
+			cli_error(sh, "camera: OCTOSPI1 busy (run 'lcd off', or wait for "
+			              "psram/membench/devmem/wifi flash)\r\n");
 		return 0;
 	}
 	return 1;
@@ -686,6 +693,131 @@ static int cmd_camera_send(struct cli_instance *sh, int argc, char **argv)
 	return ret;
 }
 
+/* ---- streaming ----------------------------------------------------------- */
+
+/*
+ * `camera stream start` is the one command that does NOT hold the OCTOSPI1 guard
+ * for its own duration: a stream is open-ended and can stop itself on
+ * --frames/--secs, so there would be nobody left to release it.  It takes the
+ * guard only across the arm -- long enough to be refused if the LTDC is scanning
+ * out or another command owns the bus -- and hands over to camera_streaming(),
+ * which app/psram.c consults from then on.  camera_stream_start() has set that
+ * flag by the time it returns, so there is no gap between the two.
+ */
+static int cmd_stream_start(struct cli_instance *sh, int argc, char **argv)
+{
+	uint32_t frames = 0u, secs = 0u, v;
+	int colorbar = 0, rc;
+
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "test") == 0) {
+			colorbar = 1;
+		} else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+			if (cli_parse_u32(argv[++i], &v) != 0 || v == 0u)
+				goto bad;
+			frames = v;
+		} else if (strcmp(argv[i], "--secs") == 0 && i + 1 < argc) {
+			if (cli_parse_u32(argv[++i], &v) != 0 || v == 0u)
+				goto bad;
+			secs = v;
+		} else {
+			goto bad;
+		}
+	}
+
+	if (!cam_psram_take(sh))
+		return 1;
+	rc = camera_stream_start(colorbar, frames, secs);
+	cam_psram_give();
+	if (rc != CAM_OK) {
+		report(sh, rc);
+		return 1;
+	}
+	cli_print(sh, "camera: streaming %s", colorbar ? "colorbar" : "live");
+	if (frames)
+		cli_print(sh, ", stopping after %lu frames", (unsigned long)frames);
+	if (secs)
+		cli_print(sh, ", stopping after %lu s", (unsigned long)secs);
+	cli_print(sh, " -- `camera stream stats` / `stop`\r\n");
+	return 0;
+bad:
+	cli_error(sh, "camera: usage: stream start [test] [--frames N] [--secs S]\r\n");
+	return 1;
+}
+
+static int cmd_stream_stop(struct cli_instance *sh, int argc, char **argv)
+{
+	int rc;
+
+	(void)argc;
+	(void)argv;
+	rc = camera_stream_stop();
+	if (rc != CAM_OK) {
+		report(sh, rc);
+		return 1;
+	}
+	cli_print(sh, "camera: stream stopped\r\n");
+	return 0;
+}
+
+static int cmd_stream_stats(struct cli_instance *sh, int argc, char **argv)
+{
+	struct camera_stream_stats st;
+	int rc;
+
+	(void)argc;
+	(void)argv;
+	rc = camera_stream_stats(&st);
+	if (rc != CAM_OK) {
+		report(sh, rc);
+		return 1;
+	}
+	cli_print(sh, "state:     %s\r\n", st.active ? "streaming" : "stopped");
+	cli_print(sh, "frames:    %lu\r\n", (unsigned long)st.frames);
+	cli_print(sh, "elapsed:   %lu ms\r\n", (unsigned long)st.elapsed_ms);
+	if (st.elapsed_ms != 0u) {
+		uint32_t f10 = (uint32_t)((uint64_t)st.frames * 10000u / st.elapsed_ms);
+
+		cli_print(sh, "fps:       %lu.%lu\r\n", (unsigned long)(f10 / 10u),
+		          (unsigned long)(f10 % 10u));
+	}
+	cli_print(sh, "ovr dcmi:  %lu\r\n", (unsigned long)st.dcmi_ovr);
+	cli_print(sh, "ovr ring:  %lu\r\n", (unsigned long)st.ring_ovr);
+	/* The figure of merit for the OCTOSPI1 contention work: DMA FIFO errors are
+	   tolerated (they do not stop the stream) but their RATE says how close the
+	   bus is to not keeping up -- which is what decides whether the LTDC can
+	   scan out at the same time (phase 3c). */
+	cli_print(sh, "dma fe:    %lu\r\n", (unsigned long)st.dma_fe);
+	if (st.elapsed_ms != 0u) {
+		uint32_t e10 = (uint32_t)((uint64_t)st.dma_fe * 10000u / st.elapsed_ms);
+
+		cli_print(sh, "dma fe/s:  %lu.%lu\r\n", (unsigned long)(e10 / 10u),
+		          (unsigned long)(e10 % 10u));
+	}
+	cli_print(sh, "repoint skip: %lu\r\n", (unsigned long)st.repoint_skip);
+	cli_print(sh, "ring:      %lu slots x %lu B\r\n", (unsigned long)st.slots,
+	          (unsigned long)CAMERA_FRAME_BYTES);
+	cli_print(sh, "delivered: %lu  dropped: %lu\r\n",
+	          (unsigned long)st.delivered, (unsigned long)st.dropped);
+	return 0;
+}
+
+static int cmd_camera_stream(struct cli_instance *sh, int argc, char **argv)
+{
+	if (argc > 1)
+		cli_error(sh, "camera: unknown stream subcommand '%s'\r\n", argv[1]);
+	cli_print(sh, "usage: camera stream <start [test] [--frames N] [--secs S]"
+	              " | stop | stats>\r\n");
+	return argc > 1 ? 1 : 0;
+}
+
+CLI_SUBCMD_SET_CREATE(camera_stream_subcmds,
+	CLI_CMD_ARG(start, NULL, "begin continuous capture (test, --frames N, --secs S)",
+	            cmd_stream_start, 1, 5),
+	CLI_CMD(stop,  NULL, "stop the running stream", cmd_stream_stop),
+	CLI_CMD(stats, NULL, "frame / fps / overrun counters", cmd_stream_stats),
+	CLI_SUBCMD_SET_END);
+
 /* ---- tune ---------------------------------------------------------------- */
 
 static int tune_apply(struct cli_instance *sh, const struct camera_tuning *t,
@@ -875,6 +1007,8 @@ CLI_SUBCMD_SET_CREATE(camera_subcmds,
 #endif
 	CLI_CMD_ARG(send, NULL, "stream the frame to the PC over YMODEM [name]",
 	            cmd_camera_send, 1, 1),
+	CLI_CMD_ARG(stream, camera_stream_subcmds,
+	            "continuous capture (start/stop/stats)", cmd_camera_stream, 1, 1),
 	CLI_CMD_ARG(reg, NULL, "raw SCCB access <addr> <reg> [value] [-16]",
 	            cmd_camera_reg, 3, 2),
 	CLI_CMD_ARG(xclk, NULL, "show or set the master clock [hz]",

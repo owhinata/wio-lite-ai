@@ -133,6 +133,16 @@ time as the USB console. 24 commands:
     lighting transient, not from a cold power cycle, not with warm-up disabled — so
     it is recorded as unexplained rather than fixed, and the metric is there to catch
     it if it returns. A settled frame reads well under 1.
+  - *streaming* (`camera stream start [test] [--frames N] [--secs S] | stop | stats`):
+    the DCMI runs continuously with the DMA in **double-buffer mode** over a 4-slot
+    PSRAM ring, and a dedicated producer thread publishes each finished frame into
+    `svc/frame_pipeline`. The tear-free trick is the ordering: the producer reads
+    `CT` to find the slot the DMA just left, takes a free slot, **repoints that
+    memory register first**, and only then publishes — so a slot handed to a sink
+    is never a live DMA target. `camera stream stats` reports fps and the
+    overrun/FIFO-error counters; **`dma fe/s` is the figure of merit** for whether
+    the LTDC can scan out at the same time (phase 3c). Stopping copies the last
+    streamed frame into the snapshot buffer, so `save`/`send` still work afterwards.
   - *getting the frame out*: `camera send [name]` streams it over YMODEM,
     `camera save <path>` writes it to the microSD. View with
 
