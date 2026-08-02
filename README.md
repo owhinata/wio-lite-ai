@@ -566,6 +566,12 @@ time as the USB console. 24 commands:
   `src/system_stm32h7xx.c` is a custom clock-free `SystemInit` (FPU + VTOR + the
   ITCM load only, with VTOR taken from the linker's `g_pfnVectors`);
   the ThreadX SysTick reload is computed from the inherited `SystemCoreClock`.
+  Inheriting still means *reporting* the tree correctly, and that has one trap:
+  `D1CorePrescTable` in the same file is the table ST's HAL indexes for **both** the
+  4-bit `HPRE`/`D1CPRE` fields and the 3-bit APB prescalers, whose encodings disagree
+  over indices 4–7. Writing it out for `HPRE` alone — which this file did until issue
+  #8 — leaves every `HAL_RCC_GetPCLKxFreq()` returning HCLK unshifted, so a 137.5 MHz
+  APB4 read back as 275 MHz. It carries ST's values now.
 - **The one exception: the LTDC pixel clock** (issue #7, `port/ltdc/ltdc_display.c`).
   RM0468 Figure 55 wires `ltdc_ker_ck` straight to `pll3_r_ck` — no kernel-clock mux —
   and sec 8.7.16 makes `DIVR3` writable **only with PLL3 stopped** (`PLL3ON = 0 &&

@@ -133,8 +133,32 @@ uint32_t SystemCoreClock = 550000000UL;
  * explicitly for the inherited clock rather than relying on incidental linkage. */
 uint32_t SystemD2Clock = 275000000UL;
 
-/* Referenced by stm32h7xx_hal_rcc.c (HAL_RCC_GetHCLKFreq etc.). */
-const uint8_t D1CorePrescTable[16] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 6, 7, 8, 9};
+/*
+ * Referenced by stm32h7xx_hal_rcc.c (HAL_RCC_GetHCLKFreq etc.).  Entries are
+ * right-shift counts, and this ONE table decodes TWO different field encodings,
+ * which is why the low half looks inconsistent:
+ *
+ *   - D1CPRE / HPRE are 4-bit (RM0468 s8.7.7, RCC_D1CFGR): 0xxx = /1,
+ *     1000..1111 = /2../512.  Indices 8..15 are that range.
+ *   - D1PPRE (s8.7.7), D2PPRE1 / D2PPRE2 (s8.7.8, RCC_D2CFGR) and D3PPRE
+ *     (s8.7.9, RCC_D3CFGR) are 3-bit: 0xx = /1, 100 = /2, 101 = /4, 110 = /8,
+ *     111 = /16.  Indices 4..7 are that range -- and HAL_RCC_GetPCLKxFreq() /
+ *     HAL_RCCEx_GetD3PCLK1Freq() index this same table with those 3-bit fields.
+ *
+ * This file used to carry 0 at indices 4..7, decoded strictly for HPRE.  That is
+ * correct for HPRE and WRONG for every APB prescaler, and the bootloader writes
+ * /2 into all four of them (= 0b100 = index 4), so every APB clock query in this
+ * firmware silently returned HCLK: HAL_RCC_GetPCLK1Freq() answered 275 MHz for a
+ * 137.5 MHz bus, and `camera info` printed a 275.0 MHz I2C4 kernel clock for a
+ * peripheral that is really fed 137.5 MHz.  Found in issue #8 phase 3c-2, when
+ * fixing the camera's kernel-clock self-check finally made the number visible.
+ *
+ * The values below are ST's, byte-identical to the CMSIS template.  The overlap
+ * costs the 4-bit fields their 0100..0111 encodings (legal, and also /1), but the
+ * bootloader writes only 0 or 1000..1111 there, and nothing in this app writes
+ * RCC at all.
+ */
+const uint8_t D1CorePrescTable[16] = {0, 0, 0, 0, 1, 2, 3, 4, 1, 2, 3, 4, 6, 7, 8, 9};
 
 void SystemInit(void)
 {
