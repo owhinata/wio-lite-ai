@@ -278,6 +278,12 @@ static uint32_t cam_elapsed_ms;              /* frozen at teardown for `stats`  
 static uint32_t cam_target_frames;
 static uint32_t cam_target_secs;
 
+/* Slots pinned by camera_stream_pin_latest() outside this driver (the preview).
+   A stream start waits for this to reach zero before it re-initialises the
+   pipeline -- see cam_stream_start_locked(). */
+static volatile uint32_t cam_ext_pins;
+#define CAM_EXT_PIN_DRAIN_MS  200u
+
 static struct camera_info info;
 static struct camera_tuning tune = {
 	.pwdn_active_high = 1u,
@@ -916,7 +922,23 @@ static int dcmi_init_locked(void)
 	hdma_dcmi.Init.Priority            = DMA_PRIORITY_VERY_HIGH;
 	hdma_dcmi.Init.FIFOMode            = DMA_FIFOMODE_ENABLE;
 	hdma_dcmi.Init.FIFOThreshold       = DMA_FIFO_THRESHOLD_FULL;
-	hdma_dcmi.Init.MemBurst            = DMA_MBURST_SINGLE;
+	/*
+	 * Burst the memory side.  The factory firmware used SINGLE and phase 2 copied
+	 * it, which is fine on a bus nobody else wants -- but it means one AXI write
+	 * per 32-bit word, 38400 arbitrations per frame.  Put the LTDC on the same
+	 * OCTOSPI and that falls apart: the DCMI FIFO is 8 words (RM0468 sec 36.3.10)
+	 * and an active line arrives at PCLK x 2 B/s, so the DMA has roughly 1.3 us to
+	 * win each round.  Measured with scan-out live and SINGLE bursts: 333 FIFO
+	 * errors in 320 ms, then a DCMI overrun killed the stream.  INC4 cuts the
+	 * arbitration count by four.
+	 *
+	 * INC4 is the ceiling here, not a choice: with MSIZE = word and the FIFO at
+	 * the full threshold the HAL rejects INC8/INC16 (DMA_CheckFifoParam refuses
+	 * any MemBurst with MBURST_1 set), because a burst may not exceed the 4-word
+	 * FIFO.  The peripheral side stays SINGLE -- it reads one fixed register
+	 * (PINC off), which cannot be bursted.
+	 */
+	hdma_dcmi.Init.MemBurst            = DMA_MBURST_INC4;
 	hdma_dcmi.Init.PeriphBurst         = DMA_PBURST_SINGLE;
 	if (HAL_DMA_Init(&hdma_dcmi) != HAL_OK) {
 		LOG_ERR("DCMI DMA init failed");
@@ -1370,6 +1392,26 @@ static int cam_stream_start_locked(int colorbar, uint32_t frames, uint32_t secs)
 	 * second run.  init() memsets the whole struct and re-seeds the slots, so it
 	 * fixes both at once and needs no change to the (byte-identical) core.
 	 */
+	/*
+	 * Wait for external pins (the preview) to drain before re-initialising.
+	 *
+	 * init() memsets the pipeline, so a slot pinned by camera_stream_pin_latest()
+	 * would come back with its refcount zeroed and the holder's later put() would
+	 * corrupt a slot that now belongs to this new run.  Pinning takes cam_lock,
+	 * which this function already holds, so nothing new can be pinned from here
+	 * on -- waiting is enough to close the window, and it only has to outlast one
+	 * blit+flip.  put() deliberately does NOT take cam_lock, or this wait would
+	 * deadlock against the very pin it is waiting for.
+	 */
+	for (unsigned waited = 0u; cam_ext_pins != 0u; waited += 5u) {
+		if (waited >= CAM_EXT_PIN_DRAIN_MS) {
+			LOG_ERR("stream start: %lu external frame pin(s) never released",
+			        (unsigned long)cam_ext_pins);
+			return CAM_ERR_BUSY;
+		}
+		tx_thread_sleep(5u);
+	}
+
 	/* Under cam_pipe_lock, taken directly rather than through the pipeline's own
 	   os vtable: init() memsets the struct -- p->os included -- so a concurrent
 	   `camera stream stats` on the other console must not be inside the core
@@ -1680,6 +1722,51 @@ int camera_stream_stats(struct camera_stream_stats *out)
 	out->dropped    = cam_stat_sink.dropped;
 	out->slots      = CAM_RING_SLOTS;
 	return CAM_OK;
+}
+
+/*
+ * Pin the newest streamed frame for an outside reader (app/cam_preview.c).
+ *
+ * The count goes up BEFORE the pin and comes down AFTER the unpin, so a stream
+ * start that samples it can only ever be too cautious, never too permissive.
+ * Taking cam_lock here is what actually closes the window: a start holds that
+ * lock across both its drain wait and the frame_pipeline_init() that follows, so
+ * no pin can be created in between.
+ */
+const struct frame_desc *camera_stream_pin_latest(void)
+{
+	const struct frame_desc *d;
+
+	if (!info.ready)
+		return NULL;
+	if (tx_mutex_get(&cam_lock, TX_WAIT_FOREVER) != TX_SUCCESS)
+		return NULL;
+	if (!cam_stream_active) {
+		(void)tx_mutex_put(&cam_lock);
+		return NULL;
+	}
+	cam_ext_pins++;
+	d = frame_pipeline_pin_latest(&cam_pipe);
+	if (d == NULL) {
+		/* Nothing published yet -- a start has armed the DMA but no frame has
+		   completed.  Give the count back, or the next start spends its whole
+		   drain timeout waiting for a pin that was never taken. */
+		cam_ext_pins--;
+		(void)tx_mutex_put(&cam_lock);
+		return NULL;
+	}
+	(void)tx_mutex_put(&cam_lock);
+	return d;
+}
+
+/* Release a pin.  Deliberately does NOT take cam_lock: a stream start waits for
+   the pin count with that lock held, so needing it here would deadlock. */
+void camera_stream_put(const struct frame_desc *f)
+{
+	if (f == NULL)
+		return;
+	frame_pipeline_put(&cam_pipe, NULL, f);
+	cam_ext_pins--;
 }
 
 int camera_get_mode(struct camera_mode *out)

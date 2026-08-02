@@ -52,12 +52,36 @@ int psram_hw_init(void);
 /* 1 once psram_hw_init() has entered memory-mapped mode. */
 int psram_ready(void);
 
-/* Serialize access to the single OCTOSPI1 resource across concurrent shell
- * commands (`cmd &` background workers).  psram_acquire() returns 1 on success,
- * 0 if another command already holds it (caller should reject and return).
- * Bracket every shell path that mutates OCTOSPI1 state or does memory-mapped
- * access at 0x90000000; release on every exit.  Thread context only. */
+/*
+ * Serialize access to the single OCTOSPI1 resource across concurrent shell
+ * commands (`cmd &` background workers).  Both calls return 1 on success and 0
+ * when refused (the caller rejects and returns); both are released with
+ * psram_release().  Thread context only.
+ *
+ * The two differ in what they refuse, because the callers differ in what they
+ * do to the bus:
+ *
+ *   psram_acquire()        -- for anything that RECONFIGURES OCTOSPI1: the
+ *                             `psram` tuning subcommands, `membench`, `devmem`,
+ *                             `wifi flash`.  Refused while a continuous user
+ *                             (LTDC scan-out, a camera stream) is on the bus,
+ *                             because retuning underneath one does not spoil a
+ *                             frame -- it stalls the AXI indefinitely.
+ *
+ *   psram_acquire_shared() -- for callers that only READ OR WRITE the memory:
+ *                             `lcd on`, `camera stream start`, `camera capture`
+ *                             / `save` / `send`.  Refused only while a
+ *                             reconfiguring command holds the bus.  These do not
+ *                             exclude each other, which is what lets the display
+ *                             scan out while the camera streams (issue #8 3c).
+ *
+ * A continuous user takes the shared guard just long enough to arm itself, then
+ * releases it: from that point the gates above (ltdc_scanout_active(),
+ * camera_streaming()) are what keep the reconfigurers away.  It cannot simply
+ * hold the guard, because a stream is open-ended and may stop itself.
+ */
 int psram_acquire(void);
+int psram_acquire_shared(void);
 void psram_release(void);
 
 /* Which bring-up stage failed (PSRAM_STAGE_*); PSRAM_STAGE_OK when ready, for

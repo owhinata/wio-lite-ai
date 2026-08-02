@@ -294,17 +294,11 @@ static int cmd_lcd_on(struct cli_instance *sh, int argc, char **argv)
 	 * acquisitions, so handing the guard back here is safe -- that gate is what
 	 * keeps the two apart from this point on.
 	 */
-	if (!psram_acquire()) {
-		/* A camera stream is one of the things that refuses this now, and
-		   "a psram/membench command holds it" would send the reader looking in
-		   the wrong place entirely (issue #8 phase 3b). */
-#if BSP_ENABLE_CAMERA
-		if (camera_streaming()) {
-			cli_error(sh, "lcd: a camera stream owns OCTOSPI1 "
-			              "(run 'camera stream stop')\r\n");
-			return 1;
-		}
-#endif
+	/* The SHARED guard: scan-out only reads the frame buffer, so it has to be
+	   kept away from a command that is reconfiguring OCTOSPI1 -- but not from a
+	   camera stream, which merely writes a different part of the same memory.
+	   That is what lets the preview exist at all (issue #8 phase 3c). */
+	if (!psram_acquire_shared()) {
 		cli_error(sh, "lcd: OCTOSPI1 busy (a psram/membench command holds "
 		              "it)\r\n");
 		return 1;

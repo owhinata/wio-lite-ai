@@ -401,6 +401,12 @@ if(BSP_ENABLE_CAMERA)
         "${CMAKE_SOURCE_DIR}/port/camera/camera.c"
         "${CMAKE_SOURCE_DIR}/port/camera/ov2640_regs.c"
         "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_camera.c")
+    # The LCD preview (issue #8 phase 3c) needs BOTH drivers, so it is the one
+    # source gated on the pair.  With either option off there is nothing to glue
+    # and the file is simply not built.
+    if(BSP_ENABLE_LCD)
+        list(APPEND SHELL_SOURCES "${CMAKE_SOURCE_DIR}/app/cam_preview.c")
+    endif()
 endif()
 
 add_executable(shell

@@ -40,6 +40,9 @@
 #endif
 #if BSP_ENABLE_CAMERA
 #include "camera.h"     /* FPC-24 DVP camera: XCLK + SCCB bring-up (issue #8) */
+#if BSP_ENABLE_LCD
+#include "cam_preview.h" /* live camera preview on the LCD (issue #8 phase 3c) */
+#endif
 #endif
 
 /* --- interactive shell over USB CDC ------------------------------------- */
@@ -177,6 +180,11 @@ void tx_application_define(void *first_unused_memory)
    * makes it safe here; anything that had to sleep would have to move to a
    * thread entry.  Fail-soft: without it the `camera` commands report it down. */
   (void) camera_init();
+#if BSP_ENABLE_LCD
+  /* Preview thread, parked until `camera preview on`.  Creation only -- it
+   * blocks on its first sleep, so it is safe here like every other service. */
+  (void) cam_preview_init();
+#endif
 #endif
 
   /* Telnet console service (issue #21 increment 9): owns the module's listening/session

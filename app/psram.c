@@ -656,21 +656,10 @@ int psram_ready(void) { return psram_up; }
  * boot without a display behaves exactly as before. */
 static volatile uint8_t psram_busy;
 
-int psram_acquire(void)
+/* The try-lock both entry points share: refuses only if another command already
+   holds the bus.  This is all a reader/writer needs. */
+int psram_acquire_shared(void)
 {
-#if BSP_ENABLE_LCD
-	if (ltdc_scanout_active())
-		return 0;               /* LTDC is reading this bus right now */
-#endif
-#if BSP_ENABLE_CAMERA
-	/* A camera stream has the DCMI's DMA writing the ring in this window,
-	   open-endedly.  Unlike a one-shot capture -- where the shell can hold this
-	   guard across the whole command -- a stream can also stop itself on
-	   --frames/--secs, so there would be no one left to release a held guard.
-	   Hence the same shape as the LTDC gate above: ask the owner. */
-	if (camera_streaming())
-		return 0;
-#endif
 	do {
 		if (__LDREXB(&psram_busy) != 0u) {
 			__CLREX();
@@ -678,6 +667,41 @@ int psram_acquire(void)
 		}
 	} while (__STREXB(1u, &psram_busy) != 0u);
 	__DMB();
+	return 1;
+}
+
+/*
+ * The exclusive guard: the try-lock PLUS a refusal while any continuous user is
+ * on the bus.  Everything that reconfigures OCTOSPI1 goes through here.
+ *
+ * The gates are asked rather than held.  A scan-out or a camera stream is
+ * open-ended -- and a stream can even stop itself on --frames/--secs -- so there
+ * would be nobody left to release a guard they had taken; instead they arm
+ * themselves under psram_acquire_shared() and then answer for themselves.
+ */
+int psram_acquire(void)
+{
+	/* TAKE THE LOCK FIRST, THEN LOOK.  Checking the gates before locking is a
+	   time-of-check/time-of-use bug: a continuous user arms itself by taking this
+	   same lock briefly, so between "no scan-out" and "lock acquired" an `lcd on`
+	   or a `camera stream start` can slip in, enable itself, release -- and the
+	   reconfiguration then proceeds underneath it.  Holding the lock while
+	   checking makes the two orders mutually exclusive: whoever gets the lock
+	   first wins, and the loser sees a state that cannot change under it. */
+	if (!psram_acquire_shared())
+		return 0;
+#if BSP_ENABLE_LCD
+	if (ltdc_scanout_active()) {    /* LTDC is reading this bus right now */
+		psram_release();
+		return 0;
+	}
+#endif
+#if BSP_ENABLE_CAMERA
+	if (camera_streaming()) {       /* the DCMI's DMA is writing the ring */
+		psram_release();
+		return 0;
+	}
+#endif
 	return 1;
 }
 

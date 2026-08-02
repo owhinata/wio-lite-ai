@@ -51,6 +51,8 @@
 
 #include <stdint.h>
 
+#include "frame.h"   /* struct frame_desc: what camera_stream_pin_latest() hands out */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -213,6 +215,28 @@ int camera_stream_stop(void);
 int camera_streaming(void);
 
 int camera_stream_stats(struct camera_stream_stats *out);
+
+/**
+ * Pin the newest streamed frame for read-only access, or NULL if none.
+ *
+ * For a consumer that wants to look at live frames without going through a
+ * push sink -- the LCD preview in app/cam_preview.c.  The returned pointer stays
+ * valid, and the producer will not recycle that slot, until the caller balances
+ * it with exactly one camera_stream_put().  Holding it costs the ring one slot,
+ * so hold it for the work and no longer.
+ *
+ * Pinning takes the driver lock briefly; releasing does not.  That asymmetry is
+ * deliberate: a stream start has to wait for outstanding pins to drain before it
+ * re-initialises the pipeline, and it does that waiting with the driver lock
+ * held -- so a put() that needed the same lock would deadlock against it, while
+ * a pin() that needs it is exactly what must be kept out.
+ *
+ * The descriptor carries the slot address, length and geometry, plus a
+ * generation counter -- an unchanged gen means the same picture, which is how a
+ * preview skips redundant work.
+ */
+const struct frame_desc *camera_stream_pin_latest(void);
+void camera_stream_put(const struct frame_desc *f);
 
 /**
  * Frames discarded before the one camera_capture() keeps (default 15, max 31).

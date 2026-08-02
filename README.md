@@ -143,6 +143,21 @@ time as the USB console. 24 commands:
     overrun/FIFO-error counters; **`dma fe/s` is the figure of merit** for whether
     the LTDC can scan out at the same time (phase 3c). Stopping copies the last
     streamed frame into the snapshot buffer, so `save`/`send` still work afterwards.
+  - *live preview* (`camera preview on|off`, needs `lcd on` + a running stream):
+    a thread in `app/cam_preview.c` pins the newest published frame, blits the
+    **centre 240x240** into the LTDC back buffer and presents it. It **pulls**
+    rather than registering a `frame_sink`, because a sink's `consume()` runs on
+    the producer thread and the ~20 ms of blit + vertical-blanking wait would eat
+    the very margin that keeps the DBM repoint safe. The crop is free: passing the
+    *source* width to `ltdc_blit()` makes its existing clipping copy 240 columns
+    and step the source by 320.
+  - *the display and the camera share OCTOSPI1*: `psram_acquire()` refuses while
+    either is live, but `psram_acquire_shared()` — what `lcd on` and the camera
+    commands take — only refuses a command that is **reconfiguring** the bus. So
+    scan-out and streaming coexist, while `psram`/`membench`/`devmem`/`wifi flash`
+    stay locked out of both. Watch `lcd info`'s underrun flag and `camera stream
+    stats`' overrun/FIFO counters: those are the instruments that say whether the
+    arbitration is holding.
   - *getting the frame out*: `camera send [name]` streams it over YMODEM,
     `camera save <path>` writes it to the microSD. View with
 
@@ -172,11 +187,6 @@ time as the USB console. 24 commands:
     does not work** — see the comment above `st_send_sequence()` in
     `port/ltdc/st7789_rgb.c` for exactly what was tried and what the panel did.
     Rotation therefore has to happen host-side (issue #8 phase 3c).
-  - *OCTOSPI1 interlock*: the frame buffer is in the PSRAM, so `camera
-    capture`/`save`/`send` take the same `psram_acquire()` guard as `lcd on` —
-    they need `lcd off` first, exactly like `psram`/`membench`/`devmem`. Retuning
-    that bus under a live DMA does not spoil an image, it stalls the AXI.
-    Running scanout and capture *simultaneously* is a phase 3 design problem.
   - *the host must generate XCLK*. Schematic sheet 7 leaves the 24 MHz oscillator
     OSC1 and its series R15 **DNP**; the only populated path to the module's clock
     pin is R11 (0R) from `DCMI_XCLK` = **PA2**, driven by **TIM5_CH3** (AF2) at

@@ -27,9 +27,11 @@
  * a settled frame is well under 1, and anything in the tens is a gain landing
  * mid-readout (see camera_capture_locked() for the one unexplained sighting).
  *
- * The frame lives in the PSRAM, so `capture`, `save` and `send` all hold the
- * OCTOSPI1 guard for their whole duration -- see cam_psram_take() for why that
- * is not optional.
+ * The frames live in the PSRAM, so `capture`, `save`, `send` and `stream start`
+ * all take the SHARED OCTOSPI1 guard -- which keeps out a command that is
+ * reconfiguring the bus, but not the LTDC scanning out of it.  That distinction
+ * is what lets `camera preview` put a live image on the display; see
+ * cam_psram_take() and app/psram.h.
  *
  * `xclk` and `tune` exist because none of those four can be proven from the
  * schematic alone, and the internal flash is only rated for ~10k erase cycles:
@@ -52,6 +54,9 @@
 #if BSP_ENABLE_SD
 #include "fs_cmd_core.h"  /* fs_sd_device(): the microSD media + its ownership gates */
 #endif
+#if BSP_ENABLE_LCD
+#include "cam_preview.h"  /* the LCD preview this command switches on and off */
+#endif
 #include "cmd_xfer.h"     /* xfer_send_source(): YMODEM over the console */
 
 #include <stdint.h>
@@ -71,26 +76,21 @@
  * to a half-configured OCTOSPI stalls the AXI indefinitely (issue #3).  There
  * are two consoles, so "the user would not do that" is not an argument.
  *
- * psram_acquire() is the existing try-lock and it also refuses while the LTDC is
- * scanning out, so taking it here buys mutual exclusion in both directions with
- * no new mechanism -- at the cost of needing `lcd off` first, exactly like every
- * other OCTOSPI1 consumer in this firmware.  Simultaneous scanout and capture is
- * a phase 3 design problem, not something to discover by accident on the only
- * surviving board.
+ * psram_acquire_shared() is the right guard for that: it refuses a command that
+ * is RECONFIGURING OCTOSPI1, and nothing else.  It deliberately does NOT refuse
+ * the LTDC scanning out of the same memory -- the display and the camera can
+ * share the bus, and since phase 3c they must, or there is no live preview.
  */
 static int cam_psram_take(struct cli_instance *sh)
 {
 #if BSP_ENABLE_PSRAM
-	if (!psram_acquire()) {
-		/* psram_acquire() is a try-lock and cannot say who holds it, but one of
-		   its refusal reasons IS us -- and "run lcd off" is actively wrong advice
-		   when the real answer is `camera stream stop`.  Name that case. */
-		if (camera_streaming())
-			cli_error(sh, "camera: a stream owns OCTOSPI1 "
-			              "(run 'camera stream stop')\r\n");
-		else
-			cli_error(sh, "camera: OCTOSPI1 busy (run 'lcd off', or wait for "
-			              "psram/membench/devmem/wifi flash)\r\n");
+	/* The SHARED guard: capturing and streaming only read and write the ring, so
+	   they have to be kept away from a command that is RECONFIGURING OCTOSPI1 --
+	   but not from the LTDC scanning out of the same memory.  Since phase 3c that
+	   distinction is what lets the display show a live preview. */
+	if (!psram_acquire_shared()) {
+		cli_error(sh, "camera: OCTOSPI1 busy (wait for "
+		              "psram/membench/devmem/wifi flash)\r\n");
 		return 0;
 	}
 	return 1;
@@ -225,6 +225,17 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 	          t.rst_active_low ? "low" : "high",
 	          t.i2c_pullup ? "board + internal" : "board only");
 	cli_print(sh, "dcmi:    8-bit, PCK rising, VS/HS low, DMA2_Stream1 -> PSRAM\r\n");
+#if BSP_ENABLE_LCD
+	{
+		uint32_t shown, dropped;
+
+		cam_preview_stats(&shown, &dropped);
+		cli_print(sh, "preview: %s (centre 240x240 on the panel), "
+		              "shown %lu dropped %lu\r\n",
+		          cam_preview_enabled() ? "on" : "off",
+		          (unsigned long)shown, (unsigned long)dropped);
+	}
+#endif
 	cli_print(sh, "sensor cfg: %s, DVP byte swap %s\r\n",
 	          ci.configured ? "QVGA RGB565 loaded" : "not loaded (lazy)",
 	          t.dvp_swap ? "on" : "off");
@@ -699,8 +710,8 @@ static int cmd_camera_send(struct cli_instance *sh, int argc, char **argv)
  * `camera stream start` is the one command that does NOT hold the OCTOSPI1 guard
  * for its own duration: a stream is open-ended and can stop itself on
  * --frames/--secs, so there would be nobody left to release it.  It takes the
- * guard only across the arm -- long enough to be refused if the LTDC is scanning
- * out or another command owns the bus -- and hands over to camera_streaming(),
+ * shared guard only across the arm -- long enough to be refused if another
+ * command is reconfiguring the bus -- and hands over to camera_streaming(),
  * which app/psram.c consults from then on.  camera_stream_start() has set that
  * flag by the time it returns, so there is no gap between the two.
  */
@@ -817,6 +828,34 @@ CLI_SUBCMD_SET_CREATE(camera_stream_subcmds,
 	CLI_CMD(stop,  NULL, "stop the running stream", cmd_stream_stop),
 	CLI_CMD(stats, NULL, "frame / fps / overrun counters", cmd_stream_stats),
 	CLI_SUBCMD_SET_END);
+
+/* ---- preview ------------------------------------------------------------- */
+
+#if BSP_ENABLE_LCD
+static int cmd_camera_preview(struct cli_instance *sh, int argc, char **argv)
+{
+	int on;
+
+	(void)argc;
+	if (strcmp(argv[1], "on") == 0)
+		on = 1;
+	else if (strcmp(argv[1], "off") == 0)
+		on = 0;
+	else {
+		cli_error(sh, "camera: preview takes on|off\r\n");
+		return 1;
+	}
+	if (cam_preview_enable(on) != 0) {
+		cli_error(sh, "camera: the display is down or its scanout is off "
+		              "(run 'lcd on')\r\n");
+		return 1;
+	}
+	cli_print(sh, "camera: preview %s%s\r\n", on ? "on" : "off",
+	          (on && !camera_streaming())
+	                  ? " -- nothing to show until `camera stream start`" : "");
+	return 0;
+}
+#endif /* BSP_ENABLE_LCD */
 
 /* ---- tune ---------------------------------------------------------------- */
 
@@ -1009,6 +1048,10 @@ CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	            cmd_camera_send, 1, 1),
 	CLI_CMD_ARG(stream, camera_stream_subcmds,
 	            "continuous capture (start/stop/stats)", cmd_camera_stream, 1, 1),
+#if BSP_ENABLE_LCD
+	CLI_CMD_ARG(preview, NULL, "show the running stream on the LCD <on|off>",
+	            cmd_camera_preview, 2, 0),
+#endif
 	CLI_CMD_ARG(reg, NULL, "raw SCCB access <addr> <reg> [value] [-16]",
 	            cmd_camera_reg, 3, 2),
 	CLI_CMD_ARG(xclk, NULL, "show or set the master clock [hz]",
