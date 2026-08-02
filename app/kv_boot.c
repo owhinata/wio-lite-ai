@@ -30,7 +30,10 @@
 #include "log.h"
 
 #define KV_BOOT_PRIORITY    15u
-#define KV_BOOT_STACK_SIZE  2048u
+/* 3 KB.  A kv_get_str() costs about 700 bytes of stack on its own -- a whole
+ * record buffer plus the decoded copy -- and the boot sequence reads several
+ * settings, so this leaves room for that plus the logging underneath it. */
+#define KV_BOOT_STACK_SIZE  3072u
 
 static TX_THREAD kv_boot_thread;
 static UCHAR     kv_boot_stack[KV_BOOT_STACK_SIZE] __attribute__((aligned(8)));

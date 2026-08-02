@@ -32,7 +32,7 @@ time as the USB console. 24 commands:
 | system | `version` · `uptime` · `reboot` · `free` · `thread` |
 | shell | `help` · `echo` |
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
-| storage | `sd` (card: info/read/format · FAT: ls/cat/write/rm/mkdir/df/umount) · `nor` (info/read/erase/write/test) · `kv` (list/get/set/del/info/format) |
+| storage | `sd` (card: info/read/format · FAT: ls/cat/write/rm/mkdir/df/umount) · `nor` (info/read/erase/write/test) · `kv` (list/get/set/desc/del/info/format) |
 | display | `lcd` (info/on/off · fill/bar/grad/clear/anim/blit) |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
 | wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench · **flash** info/read/backup/imgload/imginfo/write) · `net` (L3 = **host NetX Duo only**: info/ip/dhcp/ping/echo/shell) |
@@ -56,13 +56,26 @@ time as the USB console. 24 commands:
 - **`membench`** — DWT-cycle-precise read/write/copy bandwidth + pointer-chase
   latency for DTCM / AXI-SRAM (cached vs refill) / PSRAM / internal + external flash.
 - **`kv`** — the **persistent configuration store**: a FlashDB key-value database in
-  the first megabyte of that NOR. `kv set`/`get`/`del`/`list` operate on string keys
-  and values; `kv info` reports state and usage; `kv format yes` erases everything
-  (~15 s — FlashDB erases all 256 sectors individually as it lays down headers).
-  A store it cannot open is **reported, never silently reformatted** — the first
-  boot on this board found the leftover XIP application image in that partition and
-  said so, which is exactly the intent. **`wifi.psk` is stored in the clear**; see
-  *Key design points*.
+  the first megabyte of that NOR. Each entry carries its **type** (`str`/`u32`/`bool`/
+  `bytes`) and a **description**, both stored on the flash next to the value, so a
+  listing explains itself:
+
+  ```
+  wio> kv list
+    net.shell.port         u32   2323 (0x913)
+    wifi.psk               str   (hidden, 7 B)
+    net.mode               str   static   -- dhcp / static / manual
+    wifi.enable            bool  true     -- power the radio at boot
+  ```
+
+  `kv set <key> <value> [type]` (type defaults to `str`, and is never guessed from
+  the text — an SSID of `12345` is a string); `kv desc <key> <text>` documents one,
+  and a later `kv set` keeps that description. `kv info` reports state and usage;
+  `kv format yes` erases everything (~15 s — FlashDB erases all 256 sectors
+  individually as it lays down headers). A store it cannot open is **reported, never
+  silently reformatted** — the first boot on this board found the leftover XIP
+  application image in that partition and said so, which is exactly the intent.
+  **`wifi.psk` is stored in the clear**; see *Key design points*.
 - **`nor`** — the on-board **16 MB W25Q128JV serial NOR flash** on OCTOSPI2, driven
   **indirect-only** (never memory-mapped; the `0x70000000` window stays fenced off in
   the MPU — see *Key design points*). `nor info` reports the JEDEC id, geometry and the
@@ -703,6 +716,21 @@ time as the USB console. 24 commands:
     Anything else is reported as corrupt and left for `kv format yes`. This paid for
     itself immediately: the first boot found the old XIP application image still
     sitting in that partition and refused it instead of erasing the evidence.
+  - **The type and the description live on the external flash**, not in a table
+    compiled into the firmware. What FlashDB stores under a key is a 12-byte header
+    (magic, format version, type, description length, total length) followed by the
+    description and the value — so adding a setting never means reflashing, and the
+    internal flash holds only the pack/unpack. Records are packed byte by byte in
+    little-endian order rather than by overlaying a struct, which would make the
+    on-flash layout depend on the compiler's padding for a format meant to outlive
+    builds. Decoding checks its fields **in a fixed order** — header present, magic
+    and version and type known, `total_len` equal to the real length, `desc_len`
+    within the remainder, and only then the value length derived — because every
+    length is unsigned, so a subtraction taken out of turn wraps to something
+    enormous instead of failing, and that is precisely how a corrupt record becomes
+    an out-of-bounds read. A record that fails any of these is *shown* as
+    unreadable, never skipped: a listing that hid what it could not decode would
+    make a half-corrupt store look healthy.
   - **One lock around whole operations.** FlashDB locks inside
     `fdb_kv_set_blob()`/`fdb_kv_get_blob()` but *not* inside its iterator or
     `fdb_blob_read()`, so `app/kv.c` takes the NOR device mutex for the duration of
