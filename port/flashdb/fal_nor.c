@@ -112,49 +112,22 @@ const struct fal_flash_dev nor_flash_dev = {
  * FlashDB and FAL both emit one logical message as SEVERAL printf fragments -- a
  * prefix, the body, a colour reset -- so forwarding each call to LOG_INF() would
  * shred every message across three records with the formatting split between
- * them.  This assembles fragments into a line and emits one record per newline.
+ * them.  svc/log.c's line assembler puts them back together and emits one record
+ * per newline (and drops the ANSI colour escapes FAL's log_e/log_i wrap them in).
  *
- * The buffer is static and unguarded, which is safe for one specific reason: every
- * FlashDB and FAL code path that logs runs with the NOR device mutex held (app/kv.c
- * takes it around the whole operation, and FlashDB's own lock callback takes it
- * again inside), so there is never a second thread inside this function.  If a
- * caller is ever added that logs outside that lock, this needs a lock of its own.
- *
- * ANSI colour escapes from FAL's log_e/log_i are dropped: they would be stored
- * verbatim in the log ring and then replayed into whatever `dmesg` output goes to.
+ * The assembler is static and unguarded, which is safe for one specific reason:
+ * every FlashDB and FAL code path that logs runs with the NOR device mutex held
+ * (app/kv.c takes it around the whole operation, and FlashDB's own lock callback
+ * takes it again inside), so there is never a second thread inside this function.
+ * If a caller is ever added that logs outside that lock, this needs a lock too.
  */
-#define KV_LOG_LINE_MAX  120
-
-static char kv_log_line[KV_LOG_LINE_MAX];
-static unsigned kv_log_used;
-
-static void kv_log_flush(void)
-{
-	if (kv_log_used == 0u)
-		return;
-	kv_log_line[kv_log_used] = '\0';
-	kv_log_used = 0u;
-	LOG_INF("%s", kv_log_line);
-}
-
-static void kv_log_putc(char c)
-{
-	if (c == '\n' || c == '\r') {
-		kv_log_flush();
-		return;
-	}
-	/* Overlong lines are flushed in pieces rather than truncated: FlashDB prints
-	 * its sector tables this way and a cut-off line hides the interesting end. */
-	if (kv_log_used >= KV_LOG_LINE_MAX - 1u)
-		kv_log_flush();
-	kv_log_line[kv_log_used++] = c;
-}
+static struct log_line kv_log;
 
 void kv_fdb_print(const char *fmt, ...)
 {
-	char frag[KV_LOG_LINE_MAX];
+	char frag[LOG_LINE_ASM_MAX];
 	va_list ap;
-	int n, i;
+	int n;
 
 	va_start(ap, fmt);
 	n = vsnprintf(frag, sizeof frag, fmt, ap);
@@ -162,23 +135,8 @@ void kv_fdb_print(const char *fmt, ...)
 	if (n < 0)
 		return;
 	if (n > (int)sizeof frag - 1)
-		n = (int)sizeof frag - 1;
-
-	for (i = 0; i < n; i++) {
-		/* Strip CSI sequences: ESC '[' then parameter/intermediate bytes
-		 * (0x20-0x3F) then one final byte, which the loop's own i++ skips. */
-		if (frag[i] == '\033') {
-			i++;
-			if (i < n && frag[i] == '[') {
-				i++;
-				while (i < n && (unsigned char)frag[i] >= 0x20u &&
-				       (unsigned char)frag[i] <= 0x3Fu)
-					i++;
-			}
-			continue;
-		}
-		kv_log_putc(frag[i]);
-	}
+		n = (int)sizeof frag - 1;   /* vsnprintf reports the untruncated length */
+	log_line_feed(&kv_log, LOG_TAG, frag, (size_t)n);
 }
 
 /* ------------------------------------------------------------------ *

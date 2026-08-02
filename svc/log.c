@@ -441,3 +441,62 @@ int log_iter_next(struct log_iter *it, struct log_record *out)
 	LOG_CRIT_EXIT();
 	return got;
 }
+
+/* ------------------------------------------------------------------ *
+ *  Line assembler (see log.h)
+ * ------------------------------------------------------------------ */
+
+void log_line_init(struct log_line *l)
+{
+	l->used = 0u;
+	l->esc = 0u;
+}
+
+void log_line_flush(struct log_line *l, const char *tag)
+{
+	if (l->used == 0u)
+		return;
+	l->buf[l->used] = '\0';
+	l->used = 0u;
+	log_write(LOG_LEVEL_INF, tag, "%s", l->buf);
+}
+
+void log_line_feed(struct log_line *l, const char *tag, const void *data,
+                   size_t len)
+{
+	const unsigned char *p = (const unsigned char *)data;
+	size_t i;
+
+	for (i = 0u; i < len; i++) {
+		unsigned char c = p[i];
+
+		/* Escape sequences are consumed, not stored.  The state lives in the
+		 * assembler rather than in a local loop because a sequence can be split
+		 * across two feeds -- a writer flushes whatever it has, not whole
+		 * escapes. */
+		if (l->esc) {
+			if (l->esc == 1u) {
+				l->esc = (c == '[') ? 2u : 0u;   /* only CSI is a sequence */
+				continue;
+			}
+			/* Parameter/intermediate bytes 0x20-0x3F continue it; anything
+			 * else is the final byte and ends it. */
+			if (c < 0x20u || c > 0x3Fu)
+				l->esc = 0u;
+			continue;
+		}
+		if (c == 0x1Bu) {
+			l->esc = 1u;
+			continue;
+		}
+		if (c == '\n' || c == '\r') {
+			log_line_flush(l, tag);
+			continue;
+		}
+		/* An overlong line is flushed in pieces rather than truncated: the
+		 * interesting end of a table row is the end. */
+		if (l->used >= LOG_LINE_ASM_MAX - 1u)
+			log_line_flush(l, tag);
+		l->buf[l->used++] = (char)c;
+	}
+}

@@ -70,7 +70,14 @@ time as the USB console. 24 commands:
 
   `kv set <key> <value> [type]` (type defaults to `str`, and is never guessed from
   the text — an SSID of `12345` is a string); `kv desc <key> <text>` documents one,
-  and a later `kv set` keeps that description. `kv info` reports state and usage;
+  and a later `kv set` keeps that description. The stored settings are applied at
+  boot by the configuration thread (`app/kv_boot.c`): `wifi.enable` powers the
+  radio, `wifi.autoconnect` associates, `net.mode` takes an address, and
+  `net.shell.autoarm` arms the telnet console — each step independent and
+  fail-soft, and each one still doable by hand. **`wifi.autoconnect` does not
+  currently work end to end** (issue #40): associating within ~2 s of powering the
+  module fails inside the module, which predates this sequence but is met every
+  time by one with no typing delay in it. `kv info` reports state and usage;
   `kv format yes` erases everything (~15 s — FlashDB erases all 256 sectors
   individually as it lays down headers). A store it cannot open is **reported, never
   silently reformatted** — the first boot on this board found the leftover XIP

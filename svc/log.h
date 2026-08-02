@@ -25,6 +25,7 @@
 #define LOG_H
 
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -90,6 +91,46 @@ const char *log_reset_cause(void);
  *  INF).  log_get_level() returns the current threshold. */
 void     log_set_level(unsigned level);
 unsigned log_get_level(void);
+
+/*
+ * Line assembler: turn a stream of bytes into whole log records.
+ *
+ * Two producers need this and neither emits one record per call.  FlashDB and FAL
+ * print a single message as several printf fragments (a prefix, the body, a colour
+ * reset), and a shell transport receives whatever byte run the writer happened to
+ * flush.  Feeding those straight to log_write() would shred every message across
+ * records with the formatting split between them, so bytes are accumulated here
+ * and one record is emitted per newline.
+ *
+ * ANSI CSI escapes are dropped on the way through: they would be stored verbatim
+ * and then replayed into whatever `dmesg` output goes to, colouring the wrong text
+ * on a terminal that never asked.
+ *
+ * NOT internally synchronised -- one assembler belongs to one producer, and that
+ * producer is responsible for not feeding it from two threads at once.
+ */
+/* Sized to what a record actually holds.  log_write() truncates to LOG_MSG_MAX,
+ * so an assembler that buffered more would flush lines whose tail was then thrown
+ * away -- silently, and precisely at the end of the long lines (FlashDB's sector
+ * tables) where the interesting part is.  Flushing at the same limit makes the
+ * "split across records rather than truncated" promise below true. */
+#define LOG_LINE_ASM_MAX (LOG_MSG_MAX + 1)
+
+struct log_line {
+	char     buf[LOG_LINE_ASM_MAX];
+	uint16_t used;
+	uint8_t  esc;                   /**< inside an escape sequence */
+};
+
+/** Reset an assembler (also correct on a zero-initialised one). */
+void log_line_init(struct log_line *l);
+
+/** Feed @p len bytes; emits one INF record per newline, tagged @p tag. */
+void log_line_feed(struct log_line *l, const char *tag, const void *data,
+                   size_t len);
+
+/** Emit whatever is buffered, if anything (for a producer that ends mid-line). */
+void log_line_flush(struct log_line *l, const char *tag);
 
 /** One decoded record copied out for display. */
 struct log_record {

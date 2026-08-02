@@ -50,6 +50,7 @@
 #include "wifi_rpc.h"
 #include "rtl_link.h"
 #include "wifi_auto.h" /* issue #32: the host's own re-association policy */
+#include "wifi_connect.h" /* the association sequence, shared with boot (#37) */
 #include "net_shell.h"
 #include "nx_net.h"    /* the host stack owns the module while it is up (issue #23 U3) */
 #include "stm32h7xx_hal.h"   /* #5 inc 6: HAL_GetTick (1 ms SysTick, fed via tx_glue.c)
@@ -277,28 +278,6 @@ static void print_rx_budget(struct cli_instance *sh,
 	          (st->ore || st->ferr || st->drops) ? "  <-- NOT CLEAN" : "  (clean)");
 }
 
-/*
- * Extract N from a "2.1.3+wio-nN" build id; 0 if the string is not one of ours.
- *
- * The generation is what gates every firmware-dependent capability (see
- * erpc_set_module_gen), so it has to be read as an ordered number: a string compare
- * against the newest id withdraws capabilities as soon as the next one is flashed, and a
- * compare against an old one keeps claiming them after a downgrade.
- */
-static uint8_t fw_gen_of(const char *ver)
-{
-	const char *p = strstr(ver, "wio-n");
-	unsigned n = 0u;
-
-	if (p == NULL)
-		return 0u;
-	p += 5;                                     /* past "wio-n" */
-	if (*p < '0' || *p > '9')
-		return 0u;
-	while (*p >= '0' && *p <= '9' && n < 255u)
-		n = n * 10u + (unsigned)(*p++ - '0');
-	return (uint8_t)((n > 255u) ? 255u : n);
-}
 
 static int cmd_wifi_ver(struct cli_instance *sh, int argc, char **argv)
 {
@@ -364,7 +343,7 @@ static int cmd_wifi_ver(struct cli_instance *sh, int argc, char **argv)
 		 * with every firmware increment, and "== wio-n4" silently withdrew the
 		 * capability the moment n5 was flashed. */
 		if (have_ver)
-			erpc_set_module_gen(fw_gen_of(ver));
+			erpc_set_module_gen(wifi_fw_gen_of(ver));
 	}
 	/* Snapshot before the unref: the counters survive the close (they are only reset
 	 * by rtl8720_uart_open) but reading them here keeps them tied to this session. */
@@ -407,140 +386,22 @@ static int cmd_wifi_ver(struct cli_instance *sh, int argc, char **argv)
 	return (rc == 0 && echoed == 0x5Au) ? 0 : 1;
 }
 
-/*
- * Coordinate a long eRPC flow with the L2 bridge (issue #30 B2b).
+/* wifi connect <ssid> [password] [security_hex] (issue #5 inc 3).  The sequence
+ * itself moved to app/wifi_connect.c when the boot configuration grew a second
+ * caller (issue #37 step 4); what is left here is the argument handling.  Default
+ * security is WPA2-AES with a password / OPEN without; a 3rd hex arg overrides it.
  *
- * These flows used to be REFUSED while the host stack was up (`nx_net_guard`), which is
- * why recovering from an AP outage meant tearing the whole interface down.  Two things
- * made the refusal obsolete: issue #30 B1 stopped `wifi connect` touching the module's
- * lwIP address and DHCP client, and the SDK shows the tap survives the off->on(STA)
- * cycle (`netif_add()` runs only inside LwIP_Init(); wifi_on/off only move netif
- * up/down flags, never netif->input).
- *
- * What DOES still conflict is time: the owner refreshes the module's bridge watchdog by
- * taking the coarse mutex, and these flows hold it far longer than the hold.  So instead
- * of refusing, hold the watchdog open first -- and if that cannot be done, refuse after
- * all, because starting the flow would drop the bridge somewhere in the middle of it.
- *
- * Call with the session open (coarse mutex held).  Returns 0 to proceed.
+ * earn_gen is false: on this path there IS an operator, so an unknown firmware
+ * generation is reported and `wifi ver` stays the deliberate act issue #20 made it.
  */
-static int wifi_hold_bridge(struct cli_instance *sh, const char *what)
-{
-	if (nx_net_hold_extend() == 0)
-		return 0;
-	cli_error(sh, "%s: refused -- the module did not renew the L2 bridge, and starting "
-	          "now would drop it mid-flow; retry, then `wifi reset`\r\n", what);
-	return 1;
-}
-
-/*
- * Bring the L2 bridge up after a successful association (issue #30 B2b).  MUST be called
- * with the eRPC session already closed -- see the note at the call site.  Prints what
- * happened and returns the command's exit status.
- */
-#define WIFI_ARM_POLL_MS   100u
-#define WIFI_ARM_WAIT_MS   20000u
-
-/* Firmware generation the L2 bridge needs (2.1.3+wio-n7), mirroring nx_net.c's own gate.
- * Checked here so the failure lands before the association rather than after it. */
-#define WIFI_BRIDGE_MIN_GEN 7u
-
-static int wifi_arm_bridge(struct cli_instance *sh)
-{
-	const char *why = "";
-	unsigned waited = 0u;
-
-	if (nx_net_state() != NX_NET_OFF) {
-		/* Already bridged: re-associating did not disturb the tap (it survives the
-		 * off->on(STA) cycle), so there is nothing to do.  The link flag follows on
-		 * the owner's next association poll, within NXN_REFRESH_MS. */
-		cli_print(sh, "  the host stack is already up (link follows within ~8s)\r\n");
-		return 0;
-	}
-	if (nx_net_up(&why) != 0) {
-		cli_error(sh, "  the host stack did not come up -- %s\r\n", why);
-		return 1;
-	}
-	cli_print(sh, "  bringing the host stack up...\r\n");
-	while (nx_net_state() == NX_NET_ARMING && waited < WIFI_ARM_WAIT_MS) {
-		/* Ctrl+C stops WAITING, not the owner: a half-installed bridge must be
-		 * unwound by the owner, never by a second thread (app/nx_net.h). */
-		if (cli_cancel_requested(sh)) {
-			cli_print(sh, "  still arming in the background; `net info` to check\r\n");
-			return 1;
-		}
-		cli_sleep(sh, WIFI_ARM_POLL_MS);
-		waited += WIFI_ARM_POLL_MS;
-	}
-	if (!nx_net_is_up()) {
-		nx_net_print_status(sh);
-		return 1;
-	}
-	cli_print(sh, "  host stack up -- run `net dhcp` for an address\r\n");
-	return 0;
-}
-
-/* The Ctrl+C-abortable option block every eRPC call in this file uses. */
-static void wifi_opts(struct wifi_rpc_opts *o, struct cli_instance *sh,
-                      struct erpc_diag *diag)
-{
-	o->should_abort = rtl_abort_cb;
-	o->abort_ctx    = sh;
-	o->diag         = diag;
-}
-
-/* The failure epilogue the eRPC subcommands share: what the link saw, and the way out. */
-static void wifi_fail_diag(struct cli_instance *sh, const struct erpc_diag *diag)
-{
-	cli_print(sh, "  diag: crc_fail %u oversize %u timeout %u skipped %u unsupported %u\r\n",
-	          diag->crc_fail, diag->oversize, diag->timeout, diag->skipped_reply,
-	          diag->unsupported_invocation);
-	cli_print(sh, "  note: if the module seems stuck, `wifi reset` power-cycles it\r\n");
-}
-
-/* Land the radio in STA mode the way rpcWiFi's mode() does.  Boot leaves WiFi running
- * in RTW_MODE_NONE and wifi_on() then early-returns "already running" (1) WITHOUT
- * switching mode, so cycle off then on(STA).  wifi_on returns 0 (fresh) or 1 (already
- * on); only RTW_ERROR (<0) is a real failure.  Returns 0, or non-zero with the reason
- * already printed (a Ctrl+C during the settle sleep returns silently, like the
- * callers' other abort paths). */
-static int wifi_enter_sta(struct cli_instance *sh, struct wifi_rpc_opts *o)
-{
-	int32_t result = -1;
-	int rc;
-
-	o->timeout_ms = 5000u;
-	(void)wifi_rpc_off(o, &result);             /* best effort: ignore off's result */
-	if (cli_sleep(sh, 50u))                     /* let the driver settle (Ctrl+C ok) */
-		return -4;
-	o->timeout_ms = 5000u;
-	rc = wifi_rpc_on(o, WIFI_RPC_MODE_STA, &result);
-	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); return -4; }
-	if (rc || result < 0) {
-		cli_error(sh, "wifi: set STA mode failed (rc %d, result %ld)\r\n",
-		          rc, (long)result);
-		return -1;
-	}
-	return 0;
-}
-
-/* wifi connect <ssid> [password] [security_hex] (issue #5 inc 3): put the module in
- * STA mode, associate with the AP, and arm the L2 bridge the host stack rides on
- * (issue #30 B2b) -- L3 is `net`'s job, see the note at the end of this function.
- * The steps are synchronous eRPC calls on the USART1 link (at whatever rate it runs
- * now); associating blocks on the module up to 22 s (abortable with Ctrl+C).  Default
- * security is WPA2-AES with a password / OPEN without; a 3rd hex arg overrides it. */
 static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 {
 	const char *ssid = argv[1];
 	const char *pass = (argc >= 3) ? argv[2] : NULL;
-	struct wifi_rpc_opts o;
-	struct erpc_diag diag;
+	bool security_explicit = (argc >= 4);
 	uint32_t security;
-	int32_t result = -1;
-	int rc;
 
-	if (argc >= 4) {
+	if (security_explicit) {
 		if (cli_parse_u32(argv[3], &security) != 0) {
 			cli_error(sh, "wifi: bad security hex (e.g. 0x00400004)\r\n");
 			return 1;
@@ -548,122 +409,7 @@ static int cmd_wifi_connect(struct cli_instance *sh, int argc, char **argv)
 	} else {
 		security = pass ? WIFI_RPC_SEC_WPA2_AES_PSK : WIFI_RPC_SEC_OPEN;
 	}
-
-	/* Not from the telnet console: dropping the association takes the very session
-	 * running this command away.  Run it from USB CDC. */
-	if (net_shell_guard(sh, "wifi connect"))
-		return 1;
-	/*
-	 * Disarm before claiming (issue #32).  An operator typing `wifi connect` during an
-	 * outage is the very moment an automatic attempt is likely to be holding the coarse
-	 * mutex, and rtl_link_begin() below would give up on it after RTL_LINK_CLAIM_WAIT_MS
-	 * and report a busy link.  The credentials are about to be replaced by this command
-	 * anyway, so cutting the attempt short costs nothing: success re-arms below.
-	 */
-	wifi_auto_disarm("superseded by `wifi connect`");
-	if (rtl_link_begin(sh, true) != RTL_LINK_READY)
-		return 1;
-	/*
-	 * Check the firmware proof BEFORE spending 15 s associating (issue #30 B2b).
-	 *
-	 * Since associating is what brings the interface up, a connect that cannot bridge
-	 * leaves the module joined to an AP with no way to carry a packet -- which is worse
-	 * than not connecting, because it looks like it worked.  The generation is dropped
-	 * by every CHIP_EN move and every flash session (rtl_link_forget_module), so this
-	 * fires exactly when the host genuinely does not know what is on the module.
-	 *
-	 * It cannot be earned automatically: rpc_system_version corrupts the heap of
-	 * pre-N2 firmware, which is why `wifi ver` is a deliberate act (issue #20).
-	 */
-	if (erpc_module_gen() < WIFI_BRIDGE_MIN_GEN) {
-		rtl_link_end(sh);
-		cli_error(sh, "wifi: the host cannot bridge this module -- it does not know "
-		          "which firmware is loaded\r\n");
-		cli_print(sh, "  run `wifi ver` first.  Any `wifi reset` or flash session "
-		          "drops that proof, so it has to be re-earned after one.\r\n");
-		return 1;
-	}
-	if (wifi_hold_bridge(sh, "wifi connect")) {
-		rtl_link_end(sh);
-		return 1;
-	}
-
-	wifi_opts(&o, sh, &diag);
-
-	/* 0) Bring up the module's lwIP stack (tcpip_adapter_init = LwIP_Init) BEFORE the
-	 * WiFi driver (re)binds in step 1: the factory firmware never inits lwIP at boot
-	 * (setup() only calls wifi_init()), so without this the STA netif never exists and
-	 * LwIP_DHCP(DHCP_START) blocks forever.  Once per power-on (state survives off/on). */
-	if (!rtl_tcpip_inited()) {
-		o.timeout_ms = 5000u;
-		rc = wifi_rpc_tcpip_init(&o, &result);
-		if (rc || result != WIFI_RPC_OK) {
-			cli_error(sh, "wifi: tcpip/lwIP init failed (rc %d, result %ld)\r\n",
-			          rc, (long)result);
-			goto fail;
-		}
-		rtl_tcpip_set_inited(true);
-	}
-
-	/* 1) STA mode (wifi_enter_sta above). */
-	if (wifi_enter_sta(sh, &o) != 0)
-		goto fail;
-
-	/*
-	 * 2) associate (module blocks until connected or it gives up).
-	 *
-	 * 22 s, because the module gives ITSELF 20 (rtw_down_timeout_sema(join_sema, 20000)
-	 * inside lib_arduino.a's wifi_connect).  The 15 s this used to wait expired while the
-	 * module was still trying, so its answer came back as a stale frame and its serial
-	 * mutex stayed held for another five seconds -- long enough for the next command to
-	 * queue behind a call that had already been given up on (issue #32).
-	 */
-	cli_print(sh, "wifi: connecting to \"%s\"%s...\r\n", ssid, pass ? "" : " (open)");
-	o.timeout_ms = 22000u;
-	rc = wifi_rpc_connect(&o, ssid, pass, security, &result);
-	if (rc == -4) { cli_print(sh, "wifi: aborted\r\n"); goto fail; }
-	if (rc || result != WIFI_RPC_OK) {
-		cli_error(sh, "wifi: connect failed (rc %d, result %ld)\r\n", rc, (long)result);
-		if (argc < 4)
-			cli_print(sh, "  hint: try an explicit security, e.g. "
-			          "`wifi connect \"%s\" <pw> 0x00600006`\r\n", ssid);
-		goto fail;
-	}
-
-	/*
-	 * ...and that is the whole command (issue #30 B1).  It used to run the MODULE's DHCP
-	 * client here and print the lease, which is why `wifi` (L2) ended up owning an L3
-	 * step; the address it produced belongs to the module's lwIP, and the host stack --
-	 * the only thing that carries traffic since issue #23 U4 -- throws it away
-	 * immediately (arming the bridge stops that DHCP client and zeroes the netif address, because
-	 * the WLAN driver filters received IP against it).  So association is all that
-	 * happens here, and L3 lives entirely in `net`.
-	 */
-	rtl_link_end(sh);
-	cli_print(sh, "wifi: connected\r\n");
-	/*
-	 * Capture the credentials for issue #32.  A no-op unless `wifi autoreconnect on` has
-	 * been run, which is what keeps holding a passphrase in RAM an opt-in rather than
-	 * something every association does behind the operator's back.
-	 */
-	wifi_auto_arm(ssid, pass, security);
-	if (wifi_auto_enabled())
-		cli_print(sh, "  autoreconnect armed for \"%s\"\r\n", ssid);
-	/*
-	 * Bring the bridge up as part of associating (issue #30 B2b), so there is no
-	 * user-visible "which stack owns the network" mode left.
-	 *
-	 * ORDER IS LOAD-BEARING: rtl_link_end() above released the coarse mutex and our
-	 * UART reference FIRST.  nxn_arm() runs on the owner thread and takes exactly those
-	 * two, in that order -- so arming while we still held them could never succeed; it
-	 * would spin until NXN_ARM_CLAIM_MS and report "the link stayed busy".
-	 */
-	return wifi_arm_bridge(sh);
-
-fail:
-	rtl_link_end(sh);
-	wifi_fail_diag(sh, &diag);
-	return 1;
+	return wifi_connect_run(sh, ssid, pass, security, security_explicit, false);
 }
 
 /* wifi disconnect: drop the current association (no power-on -- pure query). */
