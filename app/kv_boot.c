@@ -204,20 +204,16 @@ static void cfg_wifi(void)
 		wifi_auto_set_enabled(true);
 
 	/*
-	 * KNOWN LIMITATION, and NOT one this file introduced: an association issued
-	 * shortly after the module is powered fails with a module error (result -1).
-	 * It predates this sequence -- a `wifi connect` typed right after `wifi ver`
-	 * has usually failed the same way -- and it is why automatic association does
-	 * not currently work end to end, even though every step around it does.
+	 * This used to fail every single time, and issue #40 explains why: the radio's
+	 * associations fail intermittently (about half of them, against the 5 GHz AP it
+	 * was measured on), and this path is the only one that never got a second go.  An
+	 * operator retypes `wifi connect` without thinking of it as a retry; here there is
+	 * nobody to do that.  wifi_connect_run() now retries by itself, which is what makes
+	 * automatic association work -- there is nothing left for this file to wait for.
 	 *
-	 * This path meets it EVERY time rather than sometimes, because it has no human
-	 * typing delay in it: the connect goes out about 1.7 s after CHIP_EN goes high.
-	 * rtl_link_begin()'s 1.5 s wait is for the eRPC link (the version query does
-	 * answer), not for the WLAN driver being ready to join, and nothing here waits
-	 * for the latter -- the module reports rltk_wlan_running() through
-	 * ERPC_CTRL_ETH_INFO, but whether that flag actually marks "ready to associate"
-	 * is unmeasured, so this is deliberately NOT patched with a guessed delay.
-	 * Tracked as issue #40.
+	 * In particular it is NOT a delay problem, so do not "fix" a future recurrence by
+	 * growing rtl_link_begin()'s 1.5 s boot wait: a join issued 20 s after CHIP_EN goes
+	 * high fails just as readily as one at 1.7 s (measured).
 	 */
 	LOG_INF("associating with \"%s\"", ssid);
 	if (wifi_connect_run(&kv_boot_sh, ssid, have_psk ? psk : NULL, security,

@@ -34,6 +34,7 @@
 #define APP_WIFI_RPC_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "erpc.h"        /* struct erpc_diag, erpc_call_ex return codes */
 
 /* RTW mode (Realtek Ameba wifi_constants.h).  Boot leaves the module in MODE_NONE
@@ -55,6 +56,27 @@
 
 /* Module's own success code for the int32 `result` out-parameter (RTW_SUCCESS). */
 #define WIFI_RPC_OK              0
+
+/*
+ * rtw_connect_error_flag_t (Realtek Ameba wifi_constants.h): what the module's
+ * wifi_get_last_error() reports about the LAST association attempt (issue #40).
+ *
+ * This is the only way to tell apart the several reasons an association fails: the SDK's
+ * wifi_connect() collapses all of them into one RTW_ERROR (-1) return.  It reaches that
+ * -1 through exactly one path -- the join semaphore WAS posted (so the driver ran the
+ * attempt and reported back) and wifi_is_connected_to_ap() then said the module is not
+ * associated -- so a -1 always means "the attempt was made and it failed", never "the call
+ * was rejected".  The flag is set by the driver's own event handlers along the way, and
+ * every wifi_connect() clears it on entry, so it has to be read after a failure and
+ * before anything else tries to associate.
+ */
+#define WIFI_RPC_ERR_NONE            0   /* RTW_NO_ERROR */
+#define WIFI_RPC_ERR_NO_NETWORK      1   /* RTW_NONE_NETWORK: target AP not found */
+#define WIFI_RPC_ERR_CONNECT_FAIL    2   /* RTW_CONNECT_FAIL: association refused */
+#define WIFI_RPC_ERR_WRONG_PASSWORD  3   /* RTW_WRONG_PASSWORD */
+#define WIFI_RPC_ERR_HANDSHAKE       4   /* RTW_4WAY_HANDSHAKE_TIMEOUT */
+#define WIFI_RPC_ERR_DHCP_FAIL       5   /* RTW_DHCP_FAIL */
+#define WIFI_RPC_ERR_UNKNOWN         6   /* RTW_UNKNOWN: nothing reported a reason */
 
 /* wifi_rpc-level failure: the round-trip returned but the reply was too short /
  * malformed to decode (distinct from erpc_call_ex's -1/-2/-4 transport codes). */
@@ -84,7 +106,20 @@ int wifi_rpc_connect(const struct wifi_rpc_opts *o, const char *ssid,
                      const char *password /* NULL = open network */,
                      uint32_t security, int32_t *result);
 int wifi_rpc_disconnect(const struct wifi_rpc_opts *o, int32_t *result);
+/* The module's channel plan index: which channels it scans, and how (issue #40). */
+int wifi_rpc_get_channel_plan(const struct wifi_rpc_opts *o, uint8_t *plan,
+                              int32_t *result);
+/* Install one.  ⚠️ NON-VOLATILE -- survives a full power-down, so this is provisioning
+ * and must not run on every boot.  Read it back afterwards; see the definition. */
+int wifi_rpc_set_channel_plan(const struct wifi_rpc_opts *o, uint8_t plan,
+                              int32_t *result);
 int wifi_rpc_is_connected(const struct wifi_rpc_opts *o, int32_t *result);
+/* Why the last association attempt failed: *@err is one of WIFI_RPC_ERR_* above.  Unlike
+ * the other wrappers there is no separate module `result` -- the flag IS the return
+ * value, so a decode failure is the only way this reports nothing (issue #40). */
+int wifi_rpc_get_last_error(const struct wifi_rpc_opts *o, int32_t *err);
+/* Name for a WIFI_RPC_ERR_* value; never NULL (unrecognised values read as "unknown"). */
+const char *wifi_rpc_err_name(int32_t err);
 int wifi_rpc_get_rssi(const struct wifi_rpc_opts *o, int32_t *rssi, int32_t *result);
 int wifi_rpc_get_mac(const struct wifi_rpc_opts *o, char mac[18], int32_t *result);
 int wifi_rpc_tcpip_init(const struct wifi_rpc_opts *o, int32_t *result);

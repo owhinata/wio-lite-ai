@@ -386,6 +386,93 @@ static int cmd_wifi_ver(struct cli_instance *sh, int argc, char **argv)
 	return (rc == 0 && echoed == 0x5Au) ? 0 : 1;
 }
 
+/*
+ * wifi chplan [set <hex> confirm] -- read or install the module's channel plan (#40).
+ *
+ * ⚠️ WRITING IS PROVISIONING, NOT CONFIGURATION.  The plan survives a full board
+ * power-down (measured), so it is written once per module and never on a boot path.  It
+ * is also the module's regulatory domain: the value decides which channels the radio may
+ * use and actively probe, so installing a foreign one makes the board scan where it is
+ * not allowed to transmit.  Board #2 ships as 0x7f (RT_CHANNEL_DOMAIN_REALTEK_DEFINE);
+ * the domain indices are in the module SDK's rtw_mlme_ext.h (0x25 = FCC1_FCC1 is the
+ * United States, 0x27 = MKK1_MKK1 is Japan).
+ *
+ * Hence the `confirm` token, the same shape `wifi flash write` uses for the other
+ * irreversible-ish thing in this subtree.  A bare `wifi chplan` reads and is safe; a
+ * write has to be spelled out in full, because a mistyped one cannot be undone by a
+ * power cycle and may not be undoable at all (the storage may be write-once, and the
+ * shipped 0x7f has more bits set than any real domain index -- so getting back to it
+ * could require clearing bits that a fuse array cannot clear).
+ *
+ * This is deliberately kept rather than deleted with the rest of the issue #40 bring-up:
+ * a non-volatile setting on a device we can otherwise only power-cycle needs a way to be
+ * inspected and put back.  Issue #40 itself did NOT turn out to need it -- installing a
+ * plan that covers 5 GHz did not stop the association failures.
+ */
+static int cmd_wifi_chplan(struct cli_instance *sh, int argc, char **argv)
+{
+	struct wifi_rpc_opts o;
+	struct erpc_diag diag;
+	const char *val = NULL;
+	int32_t result = -1;
+	uint32_t want = 0u;
+	uint8_t plan = 0u;
+	int rc;
+
+	if (argc >= 2) {
+		if (strcmp(argv[1], "set") != 0 || argc != 4 ||
+		    strcmp(argv[3], "confirm") != 0) {
+			cli_error(sh, "usage: wifi chplan [set <hex> confirm]\r\n");
+			cli_print(sh, "  the plan is NON-VOLATILE and is the module's "
+			          "regulatory domain -- it survives a power cycle and decides "
+			          "which channels the radio may transmit on\r\n");
+			return 1;
+		}
+		val = argv[2];
+		if (cli_parse_u32(val, &want) != 0 || want > 0xffu) {
+			cli_error(sh, "wifi: bad channel plan (one byte, e.g. 0x7f)\r\n");
+			return 1;
+		}
+	}
+	if (rtl_link_begin(sh, true) != RTL_LINK_READY)
+		return 1;
+	if (wifi_hold_bridge(sh, "wifi chplan")) {
+		rtl_link_end(sh);
+		return 1;
+	}
+	wifi_opts(&o, sh, &diag);
+
+	if (val != NULL) {
+		cli_print(sh, "wifi: installing channel plan 0x%02x -- NON-VOLATILE "
+		          "(survives a power cycle) and regulatory\r\n", (unsigned)want);
+		o.timeout_ms = 5000u;
+		rc = wifi_rpc_set_channel_plan(&o, (uint8_t)want, &result);
+		if (rc || result != WIFI_RPC_OK) {
+			cli_error(sh, "wifi: channel plan not accepted (rc %d, result %ld)\r\n",
+			          rc, (long)result);
+			rtl_link_end(sh);
+			wifi_fail_diag(sh, &diag);
+			return 1;
+		}
+	}
+
+	/* Always read back, including right after a write: the module accepting the call
+	 * and the driver actually holding the value are different claims. */
+	o.timeout_ms = 3000u;
+	rc = wifi_rpc_get_channel_plan(&o, &plan, &result);
+	rtl_link_end(sh);
+	if (rc || result != WIFI_RPC_OK) {
+		cli_error(sh, "wifi: could not read the channel plan (rc %d, result %ld)\r\n",
+		          rc, (long)result);
+		return 1;
+	}
+	cli_print(sh, "wifi: channel plan 0x%02x\r\n", (unsigned)plan);
+	if (val != NULL && plan != (uint8_t)want)
+		cli_print(sh, "  NOTE: asked for 0x%02x -- the driver kept its own value\r\n",
+		          (unsigned)want);
+	return 0;
+}
+
 /* wifi connect <ssid> [password] [security_hex] (issue #5 inc 3).  The sequence
  * itself moved to app/wifi_connect.c when the boot configuration grew a second
  * caller (issue #37 step 4); what is left here is the argument handling.  Default
@@ -543,6 +630,22 @@ static int cmd_wifi_status(struct cli_instance *sh, int argc, char **argv)
 	if (connected == WIFI_RPC_OK) {
 		if (wifi_rpc_get_rssi(&o, &rssi, &result) == 0 && result == WIFI_RPC_OK)
 			cli_print(sh, "  rssi %ld dBm\r\n", (long)rssi);
+	}
+	/*
+	 * The channel plan (issue #40).  It decides which channels the driver scans and
+	 * whether it may only listen passively on them, so it is the first thing to check
+	 * when a join reports "target AP not found" for an access point `wifi scan` lists.
+	 * Reported raw: the plan-index-to-channel-set table lives in the driver, not here,
+	 * and inventing names for the indices would be guessing.
+	 */
+	{
+		uint8_t plan = 0u;
+		int32_t plan_rc = -1;
+
+		o.timeout_ms = 3000u;
+		if (wifi_rpc_get_channel_plan(&o, &plan, &plan_rc) == 0 &&
+		    plan_rc == WIFI_RPC_OK)
+			cli_print(sh, "  channel plan: 0x%02x\r\n", (unsigned)plan);
 	}
 	rtl_link_end(sh);
 	/* No address here: L3 belongs to `net` (issue #30 B1).  The module's own lwIP no
@@ -877,6 +980,8 @@ CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	            cmd_wifi_autoreconnect, 1, 1),
 	CLI_CMD_ARG(status,     NULL, "show connection state / RSSI / IP / MAC", cmd_wifi_status, 1, 0),
 	CLI_CMD_ARG(scan,       NULL, "list visible APs (ch/band/rssi/security/bssid/ssid)", cmd_wifi_scan, 1, 0),
+	CLI_CMD_ARG(chplan,     NULL, "regulatory domain: chplan [set <hex> confirm] (writes PERSIST)",
+	            cmd_wifi_chplan, 1, 3),
 	CLI_CMD_ARG(link, wifi_link_subcmds,
 	            "the RTL8720 UART link itself (info / baud / bench / dbench)", NULL, 1, 0),
 	CLI_CMD_ARG(flash, wifi_flash_subcmds,

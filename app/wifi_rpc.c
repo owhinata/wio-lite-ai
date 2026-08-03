@@ -42,6 +42,9 @@ uint16_t wifi_rpc_send_chunk(void)
 #define M_WIFI_IS_CONNECTED  4u
 #define M_WIFI_GET_MAC       8u
 #define M_WIFI_GET_RSSI     19u
+#define M_WIFI_LAST_ERROR   49u
+#define M_WIFI_SET_CHPLAN   55u   /* NOT 22 -- see wifi_rpc_set_channel_plan() */
+#define M_WIFI_GET_CHPLAN   56u
 #define M_WIFI_ON           27u
 #define M_WIFI_OFF          28u
 #define M_WIFI_SCAN_START   64u
@@ -139,6 +142,35 @@ int wifi_rpc_off(const struct wifi_rpc_opts *o, int32_t *result)
 	return decode_result(rep, plen, result);
 }
 
+/*
+ * Why the last association failed (issue #40).  The module's own return value IS the
+ * flag here -- rpc_wifi_get_last_error() forwards wifi_get_last_error() straight out --
+ * so this decodes into *@err rather than into a `result` out-parameter.
+ */
+int wifi_rpc_get_last_error(const struct wifi_rpc_opts *o, int32_t *err)
+{
+	uint8_t rep[16];
+	int plen, rc;
+
+	rc = do_call(o, SVC_WIFI_DRV, M_WIFI_LAST_ERROR, NULL, 0u, rep, sizeof(rep), &plen);
+	if (rc)
+		return rc;
+	return decode_result(rep, plen, err);
+}
+
+const char *wifi_rpc_err_name(int32_t err)
+{
+	switch (err) {
+	case WIFI_RPC_ERR_NONE:           return "no error reported";
+	case WIFI_RPC_ERR_NO_NETWORK:     return "target AP not found";
+	case WIFI_RPC_ERR_CONNECT_FAIL:   return "association failed";
+	case WIFI_RPC_ERR_WRONG_PASSWORD: return "wrong password";
+	case WIFI_RPC_ERR_HANDSHAKE:      return "4-way handshake timeout";
+	case WIFI_RPC_ERR_DHCP_FAIL:      return "DHCP failed";
+	default:                          return "unknown";
+	}
+}
+
 int wifi_rpc_connect(const struct wifi_rpc_opts *o, const char *ssid,
                      const char *password, uint32_t security, int32_t *result)
 {
@@ -167,6 +199,63 @@ int wifi_rpc_connect(const struct wifi_rpc_opts *o, const char *ssid,
 	if (rc)
 		return rc;
 	return decode_result(rep, plen, result);
+}
+
+/*
+ * Install a channel plan (issue #40).
+ *
+ * ⚠️ THE PLAN IS NON-VOLATILE.  Measured on board #2: a plan written here survives a
+ * CHIP_EN cycle AND a full board power-down, so this is provisioning, not configuration
+ * -- do NOT call it on every boot.  Where the module keeps it was not determined; if it
+ * is a write-once fuse array then only bit-SETTING writes will take, which matters
+ * because the value it ships with (0x7f, RT_CHANNEL_DOMAIN_REALTEK_DEFINE) has more bits
+ * set than any real domain index.
+ *
+ * The module exposes TWO setters and only this one works.  Method 55 sends the driver's
+ * "set_ch_plan" private command -- the same interface wifi_get_channel_plan() reads back
+ * through.  Method 22 (rpc_wifi_change_channel_plan -> rltk_wlan_change_channel_plan())
+ * returns success and changes nothing: it was tried first, reported RTW_SUCCESS, and the
+ * read-back still gave the old value.  Do not "simplify" this back to method 22.
+ *
+ * Always read the plan back after writing: an accepted call and a driver that kept the
+ * value are different claims, and this pair is the proof that they can differ.
+ */
+int wifi_rpc_set_channel_plan(const struct wifi_rpc_opts *o, uint8_t plan,
+                              int32_t *result)
+{
+	uint8_t req[1], rep[16];
+	int plen, rc;
+
+	req[0] = plan;
+	rc = do_call(o, SVC_WIFI_DRV, M_WIFI_SET_CHPLAN, req, 1u, rep, sizeof(rep), &plen);
+	if (rc)
+		return rc;
+	return decode_result(rep, plen, result);
+}
+
+/*
+ * Read the module's channel plan index (issue #40).  Which channels the driver will scan
+ * -- and whether it may only listen passively on them -- follows from this, so it is the
+ * first thing to look at when a join cannot find an access point that `wifi scan` sees.
+ *
+ * The reply carries the plan BEFORE the return value and eRPC's codec packs both without
+ * padding (a uint8 is one byte on the wire, as with wifi_rpc_scan_is_scanning), so the
+ * int32 sits at offset 1 -- decode_result() would read straight past it.
+ */
+int wifi_rpc_get_channel_plan(const struct wifi_rpc_opts *o, uint8_t *plan,
+                              int32_t *result)
+{
+	uint8_t rep[16];
+	int plen, rc;
+
+	rc = do_call(o, SVC_WIFI_DRV, M_WIFI_GET_CHPLAN, NULL, 0u, rep, sizeof(rep), &plen);
+	if (rc)
+		return rc;
+	if (plen < 5)                        /* reply = uint8 plan + int32 result */
+		return WIFI_RPC_EDECODE;
+	*plan   = rep[0];
+	*result = (int32_t)erpc_get_u32le(rep + 1);
+	return 0;
 }
 
 int wifi_rpc_disconnect(const struct wifi_rpc_opts *o, int32_t *result)

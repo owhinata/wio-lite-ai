@@ -57,6 +57,10 @@ struct cli_instance;
  *                  version query corrupts the heap of pre-N2 firmware.  true (the
  *                  boot path) queries the version itself.
  *
+ * Associating is RETRIED (issue #40): the radio fails intermittently and a repeat is
+ * what recovers it, so a single failure is not reported as one.  See the loop for the
+ * measurements behind that and for the one reason that is never retried.
+ *
  * Returns 0 on success.  Reports everything it does through @p sh.
  */
 int wifi_connect_run(struct cli_instance *sh, const char *ssid, const char *pass,
