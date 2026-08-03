@@ -300,8 +300,20 @@ time as the USB console. 24 commands:
   uninitialised at boot, and the L2 bridge is a tap on the netif that creates), switches
   to STA mode and associates. **That is all it does** — since issue #30 B1 it runs no
   DHCP and prints no address, because L3 belongs entirely to `net` on the host stack.
-  `wifi status` reports connected state, RSSI and MAC; `wifi disconnect` drops the
-  association.
+  It **retries** (issue #40): the radio fails intermittently — 4 of 8 associations to a
+  5 GHz AP at −63 dBm failed, while 11 of 11 to the same router's 2.4 GHz SSID at −83 dBm
+  succeeded — so a single failure means nothing. An operator retyping the command was
+  always the retry loop; the boot configuration (#37) had nobody to do that, got one
+  attempt and so appeared to be broken outright. Three attempts, bounded at 60 s by
+  admitting one only when its whole worst case still fits. On a failure the module is
+  asked **why** (`rpc_wifi_get_last_error`), which is the only way to tell the reasons
+  apart — the SDK's `wifi_connect()` collapses all of them into one `RTW_ERROR`. Beware
+  that `RTW_WRONG_PASSWORD` does **not** mean "wrong key": the SDK classifies a completed
+  join by the AP's own disconnect reason, so a wrong 16-character passphrase reports
+  `RTW_4WAY_HANDSHAKE_TIMEOUT` — the same code a correct one gets on a bad draw. A wrong
+  passphrase therefore costs all three attempts.
+  `wifi status` reports connected state, RSSI, MAC and the channel plan; `wifi disconnect`
+  drops the association.
   `wifi autoreconnect [on|off]` (issue #32) makes the **host** re-associate by itself when
   the AP goes away — the module's own `wifi_set_autoreconnect()` cannot be used, because
   the handler it installs runs the module's DHCP and then AutoIP, and any non-zero address
@@ -320,6 +332,18 @@ time as the USB console. 24 commands:
   and wipes what is held; so do `wifi on|off|reset`, `wifi disconnect` and any flash
   session. Nothing is persisted, so a reset comes back on. Failures back off 8 → 60 s. The address is not re-acquired automatically — `net info` flags the lease as
   possibly stale and `net dhcp` is still the operator's call.
+  `wifi chplan [set <hex> confirm]` reads — and, spelled out in full, installs — the
+  module's **channel plan**, which is its regulatory domain: the value decides which
+  channels the radio may use and actively probe. Writing it is **provisioning, not
+  configuration**: the plan survives a full board power-down (measured), so it is written
+  once per module and never on a boot path, hence the `confirm` token that `wifi flash
+  write` also uses. Board #2 ships as `0x7f` (`RT_CHANNEL_DOMAIN_REALTEK_DEFINE`) because
+  nothing ever sets one — the module SDK's `wifi_set_country_code()` is a weak function
+  with both of its calls commented out. The module exposes two setters and **only one
+  works**: `rpc_wifi_change_channel_plan` returns `RTW_SUCCESS` and changes nothing, so
+  the read-back after a write is not a formality. Whether a plan can be freely rewritten
+  is unresolved (issue #42) — recovering `0x25` → `0x7f` only ever *set* bits, which a
+  write-once fuse array could also do.
   `wifi scan` lists the visible APs — channel, band, RSSI, security mode, BSSID and SSID
   (the module is dual-band). The **band is derived from the channel number**, because the
   scan record's own `band` field came back 0 (`RTW_802_11_BAND_5GHZ`) for every result on
