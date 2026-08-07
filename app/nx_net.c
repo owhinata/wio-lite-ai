@@ -329,14 +329,6 @@ static int nxn_eth_info(uint8_t mac[6], uint8_t *flags)
 
 /* ---- NetX callbacks ---------------------------------------------------------- */
 
-static void nxn_dhcp_state_cb(NX_DHCP *dhcp, UCHAR new_state)
-{
-	(void)dhcp;
-	/* 2=INIT 3=SELECTING(discover sent) 4=REQUESTING(offer seen) 5=BOUND.  A stall at
-	 * SELECTING is "no OFFER came back", which on this board means the bridge. */
-	LOG_INF("dhcp state -> %u", (unsigned)new_state);
-}
-
 /*
  * IP helper thread, under nx_ip_protection.  NetX only calls this because
  * nx_ip_link_status_change_notify_set() registered it -- without a callback,
@@ -1018,7 +1010,13 @@ int nx_net_init(void)
 
 	if (nx_dhcp_create(&nxn_dhcp, &nxn_ip, "nx-link") == NX_SUCCESS) {
 		nx_dhcp_packet_pool_set(&nxn_dhcp, &nxn_pool);
-		nx_dhcp_state_change_notify(&nxn_dhcp, nxn_dhcp_state_cb);
+		/*
+		 * No nx_dhcp_state_change_notify() here.  It used to log every transition
+		 * (2=INIT 3=SELECTING 4=REQUESTING 5=BOUND), which was worth having while the
+		 * bridge was new -- a stall at SELECTING meant "no OFFER came back", i.e. the
+		 * tap.  Four INF lines per lease is noise now that leases are routine; the
+		 * failure it was watching for shows up as `net dhcp` timing out anyway.
+		 */
 		nxn_dhcp_created = true;
 	} else {
 		LOG_WRN("dhcp create failed; use `net ip` for a static address");
