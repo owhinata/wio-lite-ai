@@ -83,6 +83,15 @@
  * nx_net_hold_extend() to cover a long eRPC flow that cannot refresh. */
 #define NXN_HOLD_MAX_MS    60000u
 #define NXN_REFRESH_MS     8000u
+/*
+ * How long nx_net_link_taken() waits for the owner to act on a revoked link (issue #41).
+ * The owner only has to reach the generation check at the top of its UP branch and run
+ * nxn_link_revoked(), which issues no eRPC and takes no lock -- so this is a scheduler
+ * turn, not a transaction, and half a second is already three orders of magnitude of
+ * slack.  It is deliberately NOT sized for the module: nothing here talks to it.
+ */
+#define NXN_TAKEN_WAIT_MS  500u
+#define NXN_TAKEN_POLL_MS  5u
 
 #define NXN_CTRL_TMO_MS    500u
 #define NXN_DCFG_TMO_MS    2500u      /* CFG(off) delays its ack until the module's
@@ -1081,6 +1090,51 @@ void nx_net_down(void)
 		return;
 	nxn_req_stop = 1u;
 	tx_event_flags_set(&nxn_evt, NXN_EVT_CMD, TX_OR);
+}
+
+/*
+ * The link has just been force-quiesced and CHIP_EN is about to move (issue #41).
+ *
+ * The owner ALREADY has the revocation: nxn_entry()'s UP branch compares
+ * rtl_link_uart_gen() against nxn_uart_gen before every refresh, and
+ * rtl_link_force_quiesce() advances that generation.  What it does not have is a
+ * wake-up -- it is asleep in the NXN_REFRESH_MS wait at the bottom of the same branch,
+ * so the revocation landed up to eight seconds late and `wifi connect` meanwhile saw a
+ * stale NX_NET_UP: wifi_hold_bridge() asked a module that had just been power-cycled to
+ * renew the bridge, and refused when it did not answer.  That is the whole of #41 -- the
+ * time between the two, not a missing path.
+ *
+ * NOT nx_net_down(), deliberately.  That posts nxn_req_stop and runs the graceful
+ * nxn_stop(), which takes the coarse mutex for up to NXN_ARM_CLAIM_MS and talks eRPC to
+ * the module (DATA_CFG(off), then a settle it must PROVE) -- against a module that is
+ * about to lose power, and in front of the three commands whose whole job is to work
+ * when everything else is stuck.  cmd_wifi_flash.c can afford that shape because it may
+ * refuse; `wifi reset` may not.  nxn_link_revoked() is the unwind that suits a module
+ * that is disappearing: no eRPC, no lock, driver gate closed before the detach.
+ *
+ * So this writes no state of its own -- half-installed bridges are the owner's to roll
+ * back (see nx_net.h) -- it only pokes and waits.  Best effort: on timeout the caller
+ * says so and carries on, because refusing a recovery command is never the answer.
+ */
+int nx_net_link_taken(void)
+{
+	uint32_t waited = 0u;
+
+	if (!nxn_ready)
+		return 0;
+
+	tx_event_flags_set(&nxn_evt, NXN_EVT_CMD, TX_OR);
+	/*
+	 * Sleep rather than spin.  The owner runs at NXN_OWNER_PRIORITY (13) and the CLI
+	 * threads below it (16), so today it preempts us the moment the flag is set and the
+	 * first poll already sees OFF -- but a busy-wait would turn a future priority change
+	 * into a hang, and this loop is not on any hot path.
+	 */
+	while (nxn_state == NX_NET_UP && waited < NXN_TAKEN_WAIT_MS) {
+		tx_thread_sleep(NXN_TAKEN_POLL_MS);
+		waited += NXN_TAKEN_POLL_MS;
+	}
+	return (nxn_state == NX_NET_UP) ? -1 : 0;
 }
 
 int nx_net_info_get(struct nx_net_info *out)

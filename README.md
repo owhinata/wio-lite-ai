@@ -476,6 +476,18 @@ time as the USB console. 24 commands:
   stay allowed — they are the recovery path, and the owner notices the link being taken
   away and stands down cleanly. **The device firmware is unchanged** (`2.1.3+wio-n7`).
 
+  **Since #41 the owner is told, rather than left to notice.** It always could — it
+  compares the link's uart generation before every refresh — but only when it next woke,
+  which is up to `NXN_REFRESH_MS` (8 s) later. Anything typed inside that window saw a
+  stale `up` and `wifi connect` refused, because renewing the L2 bridge means asking a
+  module that was power-cycled a second ago; with a repro taking 1–2 s, that was about
+  half the time. `wifi on/off/reset` now call `nx_net_link_taken()` right after the
+  force-quiesce and before CHIP_EN moves. It is **not** `nx_net_down()`: that is the
+  graceful stop, which takes the coarse mutex for up to 20 s and speaks eRPC to prove
+  the module went quiet. `wifi flash` can afford that (it may refuse and say so);
+  the recovery commands cannot, and a teardown that talks to the module is the wrong
+  shape for one that is about to lose power anyway. **Two teardowns, on purpose.**
+
 - **`net shell` — the telnet console** (issue #23 U4-2, `app/net_shell.c`).
   `telnet <board-ip>` gets **the same shell as USB CDC, at the same time**: a second
   `cli_instance` (prompt `wio-net> `) on a **NetX Duo TCP socket on this MCU**. It

@@ -119,10 +119,15 @@ static int net_nx_settled(struct cli_instance *sh)
 /*
  * `net up` and `net down` lived here until issue #30 B2d.  They armed and unwound the
  * bridge by hand, which is the "which stack owns the network" mode this issue set out to
- * delete: `wifi connect` arms it now (B2b) and a CHIP_EN move -- `wifi off`, `wifi reset`,
- * any flash session -- takes it away.  nx_net_up()/nx_net_down() are still the API; the
- * callers are cmd_wifi.c (associate, then bring the interface up) and cmd_wifi_flash.c
- * (give the link back before entering download mode).  History: 3413170~1.
+ * delete: `wifi connect` arms it now (B2b) and a CHIP_EN move -- `wifi on`, `wifi off`,
+ * `wifi reset`, any flash session -- takes it away.  nx_net_up()/nx_net_down() are still
+ * the API; the callers are cmd_wifi.c (associate, then bring the interface up) and
+ * cmd_wifi_flash.c (give the link back before entering download mode).  History: 3413170~1.
+ *
+ * The two ways it is taken away are NOT the same call, and issue #41 is what it costs to
+ * confuse them.  A flash session may be refused, so it unwinds gracefully through
+ * nx_net_down() and waits.  The CHIP_EN commands may not, so they hand the owner its own
+ * revocation through nx_net_link_taken() -- no eRPC, no lock, no refusal.
  */
 
 /* ---- subcommands --------------------------------------------------------- */

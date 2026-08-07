@@ -157,8 +157,8 @@ static int cmd_wifi_info(struct cli_instance *sh, int argc, char **argv)
  * These are the RECOVERY commands, so unlike the bridge/flash claims they are allowed
  * even while the eRPC UART is referenced (allow_busy = true) -- "run `wifi reset`" is
  * the answer to a wedged module, and refusing it exactly when the link is stuck in use
- * would leave no way out.  They therefore take the link away first (see the callers'
- * rtl_link_force_quiesce()): in-flight tokens are abandoned, the reference count is
+ * would leave no way out.  They therefore take the link away first (see
+ * wifi_power_take_link() below): in-flight tokens are abandoned, the reference count is
  * forced to zero and the UART is closed BEFORE CHIP_EN moves, which is also what stops
  * the service thread from writing into a module that is being power-cycled.
  */
@@ -180,12 +180,34 @@ static int wifi_power_claim(struct cli_instance *sh, const char *what)
 	return rtl_link_hw_claim(sh, true) != 0 ? 1 : 0;
 }
 
+/*
+ * Take the link away, and TELL THE HOST STACK (issue #41).
+ *
+ * The two belong together, so they are one function -- rtl_link.h keeps force-quiesce and
+ * its siblings in single functions for exactly this reason, "precisely so that set cannot
+ * drift apart".  Dropping the second half is invisible in testing: the owner notices the
+ * revoked generation on its own, just up to NXN_REFRESH_MS (8 s) later, so the interface
+ * does stand down -- eventually.  Everything typed inside that window meanwhile finds a
+ * stale NX_NET_UP, and `wifi connect` refuses because it cannot renew the L2 bridge on a
+ * module that was power-cycled a second ago.  That was #41, hit about half the time.
+ *
+ * All three commands here need it, not just off/reset: what strands the host stack is the
+ * force-quiesce, and `wifi on` calls it too.
+ */
+static void wifi_power_take_link(struct cli_instance *sh)
+{
+	rtl_link_force_quiesce();                  /* recovery path: take the link away */
+	if (nx_net_link_taken() != 0)              /* ... and let the owner give it back */
+		cli_print(sh, "wifi: the host stack has not stood down yet -- `net info`, "
+		          "and retry if the next command is refused\r\n");
+}
+
 static int cmd_wifi_on(struct cli_instance *sh, int argc, char **argv)
 {
 	(void)argc; (void)argv;
 	if (wifi_power_claim(sh, "wifi on"))
 		return 1;
-	rtl_link_force_quiesce();                  /* recovery path: take the link away */
+	wifi_power_take_link(sh);
 	rtl8720_power(true);
 	rtl_link_hw_release(sh);
 	cli_print(sh, "wifi: CHIP_EN high (RTL8720DN powered on)\r\n");
@@ -197,7 +219,7 @@ static int cmd_wifi_off(struct cli_instance *sh, int argc, char **argv)
 	(void)argc; (void)argv;
 	if (wifi_power_claim(sh, "wifi off"))
 		return 1;
-	rtl_link_force_quiesce();                  /* recovery path: take the link away */
+	wifi_power_take_link(sh);
 	rtl8720_power(false);                      /* force_quiesce above already forgot the
 	                                            * module: rate, firmware, lwIP, address */
 	rtl_link_hw_release(sh);
@@ -210,7 +232,7 @@ static int cmd_wifi_reset(struct cli_instance *sh, int argc, char **argv)
 	(void)argc; (void)argv;
 	if (wifi_power_claim(sh, "wifi reset"))
 		return 1;
-	rtl_link_force_quiesce();                  /* recovery path: take the link away */
+	wifi_power_take_link(sh);
 	rtl8720_reset();                           /* force_quiesce above already forgot the
 	                                            * module: rate, firmware, lwIP, address */
 	rtl_link_hw_release(sh);

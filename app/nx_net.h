@@ -163,6 +163,24 @@ const char *nx_net_state_name(enum nx_net_state s);
 int  nx_net_up(const char **why);
 void nx_net_down(void);
 
+/*
+ * "The link has been taken away and CHIP_EN is about to move" -- the epilogue of
+ * rtl_link_force_quiesce() for `wifi on/off/reset` (issue #41).
+ *
+ * The owner detects a revoked link by itself (the uart generation moved), but only when
+ * it next wakes, which is up to NXN_REFRESH_MS later.  This hands it the news now and
+ * waits, briefly, for it to leave NX_NET_UP -- so the very next command does not find a
+ * stale UP and try to renew a bridge on a module that has just been power-cycled.
+ *
+ * NOT nx_net_down(): that is the graceful stop, which needs the coarse mutex and speaks
+ * eRPC to the module, neither of which a recovery command can afford.  See the body.
+ *
+ * Call AFTER rtl_link_force_quiesce() and BEFORE moving CHIP_EN.  Returns 0 once the
+ * interface is no longer up (already-down counts), -1 if it has not stood down in time --
+ * which the caller reports and then carries on with, rather than refusing.
+ */
+int  nx_net_link_taken(void);
+
 int  nx_net_info_get(struct nx_net_info *out);
 int  nx_net_set_static(uint32_t ip, uint32_t mask, uint32_t gw);
 int  nx_net_dhcp_renew(void);
