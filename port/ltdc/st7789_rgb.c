@@ -81,15 +81,39 @@ static void st_data(uint8_t d) { st_write(1u, d); }
  *                          all.  Clearing that bit breaks the RGB data path.
  *
  * So on THIS module MADCTL/MV does not reposition RGB-interface pixels on either
- * of the two RGBCTRL data paths.  That is the scope of the result -- it is not a
- * statement about MV in general, and one knob was left untried (RAMCTRL 0xB0's
- * RM bit, which also selects how RGB input reaches frame memory); the spike was
- * stopped because two flashes had already answered the question the preview
- * design needed, not because the space was exhausted.
+ * of the two RGBCTRL data paths.
  *
- * Landscape preview therefore has to rotate on the host side.  See the issue #8
- * phase 3c notes for the design that replaced it (DCMI into AXI-SRAM bands, then
- * MDMA transposing with the contiguous side on the PSRAM).
+ * THE LAST KNOB IS NOW ALSO TRIED, AND IT DOES NOT WORK EITHER (issues #35/#38).
+ *
+ * Phase 3a stopped two flashes in and left RAMCTRL(0xB0)'s RM bit untried -- the
+ * bit that selects how RGB-interface pixels reach frame memory, i.e. whether
+ * MADCTL's address mapping is in the path at all.  That was the one remaining way
+ * this panel might have rotated for free, and it was worth ten minutes before
+ * committing to a transpose, so a throwaway `lcd rotprobe` command swept it from
+ * the console (one flash, many combinations -- the internal flash is good for
+ * ~10k erase cycles and reflashing per combination would have spent them for
+ * nothing).  Driven at the same 320x240 / 378x256 total / 62.00 Hz as phase 3a:
+ *
+ *     MADCTL  RAMCTRL[0]   result
+ *     0x20    0x11         negative (reproduces phase 3a's first shot)
+ *     0x20    0x01         negative   RM cleared, DM still RGB
+ *     0x20    0x10         negative   RM set, DM cleared
+ *     0x00    0x01         negative   control: MV off, RM cleared
+ *
+ * None of them made the controller accept a 320-pixel line.  The knob is spent;
+ * the probe was deleted with the answer, as bring-up knobs are (issue #8, 3c-2).
+ *
+ * >>> DO NOT RE-OPEN THIS.  Both MADCTL/MV and RAMCTRL/RM have now been measured
+ * >>> on board #2 and neither rotates RGB-interface input on this module.  A
+ * >>> future reader looking for a free rotation is looking at a closed door.
+ *
+ * Landscape therefore has to be produced on the host side, and both consumers of
+ * that conclusion are designed around it: issue #38 gives the drawing layer a
+ * landscape 320x240 coordinate system (the panel-native frame buffer stride stays
+ * 240, exactly as the factory Arduino firmware did it), and issue #35 rotates the
+ * camera by taking DCMI into AXI-SRAM bands and transposing into the PSRAM back
+ * buffer, so the scattered side of the transpose lands on SRAM and the PSRAM side
+ * stays a contiguous run.  The existing ltdc_flip() keeps it tear-free.
  */
 static void st_send_sequence(void)
 {
