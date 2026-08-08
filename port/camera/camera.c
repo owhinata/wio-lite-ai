@@ -1129,13 +1129,17 @@ static int dcmi_snapshot_locked(void)
  * would be tighter, but it is a phase 3 concern: continuous capture will not use
  * this path at all.)
  *
- * NOT claimed: this does not explain the one-off horizontal banding seen in the
- * very first working capture (a step at row 27, R -37% / G -8% / B ~0 with the
- * scene continuous across it at 0.996 correlation).  That artifact has not
- * reproduced since -- not with a lighting transient, not from a cold power cycle,
- * not at warm = 0 -- so the AWB-mid-readout theory it suggested stays an
- * unproven hypothesis.  The `seam:` figure the shell prints exists to catch it if
- * it ever comes back.
+ * NOT the cause of the horizontal banding that was blamed on it for a while.
+ * Phase 2 saw a step at row 27 -- R -37% / G -8% / B ~0, the scene continuous
+ * across it at 0.996 correlation -- and guessed at a gain landing mid-readout.
+ * Issue #44 settled it: that was DCMI_D6 open inside the camera module, sampled
+ * off a floating pin.  The channel ratio was the tell and it was in the numbers
+ * from the start -- R and G hit, B untouched, because D6 carries R bit 3 and G
+ * bit 1 and never touches B.  See the DVP data-line table in
+ * shell/cmds/cmd_camera.c.
+ *
+ * The warm-up stays: it is justified by the exposure measurements above, which
+ * are a separate and still-valid finding.  Do not re-derive one from the other.
  */
 static int camera_capture_locked(int colorbar)
 {

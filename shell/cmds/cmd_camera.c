@@ -22,7 +22,34 @@
  * proves the pixel side; read its channel statistics, not just its exit status.
  * Its `seam:` line reports the largest step between adjacent rows' channel means:
  * a settled frame is well under 1, and anything in the tens is a gain landing
- * mid-readout (see camera_capture_locked() for the one unexplained sighting).
+ * mid-readout.
+ *
+ * READ THE RATIO BETWEEN THE THREE CHANNELS, NOT JUST dR (issue #44).  A gain
+ * landing mid-readout lands once, at a varying size.  A DEAD DVP DATA LINE gives
+ * the same step size in EVERY frame at a random row, and the ratio between the
+ * channels names the line, because a DVP bit sits at a fixed weight in each
+ * channel.  With the byte order this driver uses (IMAGE_MODE bit 0 set, so the
+ * bytes land in arrival order and a pixel reads little-endian):
+ *
+ *     high byte  R4 R3 R2 R1 R0 G5 G4 G3      low byte  G2 G1 G0 B4 B3 B2 B1 B0
+ *
+ *     line   dR    dG    dB          line   dR    dG    dB
+ *     D7     16     4     0          D3      1     0     8
+ *     D6      8     2     0          D2      0    32     4
+ *     D5      4     1     0          D1      0    16     2
+ *     D4      2     0    16          D0      0     8     1
+ *
+ * Issue #44 was `dR 8.00  dG 2.05  dB 0.02` in every single capture: DCMI_D6
+ * (PE5, ball C3 -> FPC-24 pin 11) was open inside the camera module, so that one
+ * bit was sampled off a floating pin.  It read as a constant per row, drifting
+ * between the rails every few rows, which is a horizontal stripe -- and since the
+ * bit is only 8/31 of R and 2/63 of G, the picture still looked broadly right.
+ *
+ * NOTHING ELSE CAN SEE THIS.  `ovr dcmi`, `ovr ring`, `dma fe` and `repoint skip`
+ * all stayed at zero throughout: neither the DCMI nor the DMA has any way to know
+ * that one data bit is lying.  Every counter reading healthy is not evidence that
+ * the pixels arrived intact -- this line is.  Swapping the camera module took
+ * `dR` from 8.00 to 0.05.
  *
  * The frames live in the PSRAM, so `capture`, `save`, `send` and `stream start`
  * all take the SHARED OCTOSPI1 guard -- which keeps out a command that is
