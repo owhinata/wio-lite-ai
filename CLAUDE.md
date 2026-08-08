@@ -103,6 +103,12 @@ merge → push → Issue へ対応コメント → Issue クローズ、の流�
 - **コミット**: conventional commits 形式 `type: short description`。Issue 対応時は
   `type: #N short description` で **subject に Issue 番号**を含める（GitHub のリンク生成＋
   オートクローズ判定のため）
+- 🔴 **コミットメッセージは subject も body も英語で書く。** 会話・Issue・コード内コメント・
+  README は日本語のままでよい（そこは変えない）。**コミットメッセージだけが英語**。
+  > 2026-07-26〜2026-08-08 の 41 件は日本語になっている。言語を規定していなかったので
+  > 漂流した。**これらは書き換えない** — ハッシュが変われば 11 個の Issue のコミットレンジと
+  > 永続メモリの参照が全部 stale になり、コストが利得を上回る（force push 禁止とも衝突する）。
+  > 履歴に日本語の地層があるのは既知であって、直すべき不整合ではない。
 - コミットメッセージ末尾に `Co-Authored-By: Claude ...` を付与
 - 動作確認していない変更を commit / push しない
 
