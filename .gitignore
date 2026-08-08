@@ -25,3 +25,8 @@ __pycache__/
 # #19).  NEVER commit these: a full-chip image contains the factory WiFi settings
 # sector at 0x105000, and the PSK in it is in the clear.  Keep them in _ref/ambd/.
 /rtl8720_*.bin
+
+# Camera frames that land here the same way (`camera send` + `rb`, issue #8).  Not
+# secret like the flash dumps above, just 150 KB of nothing reproducible -- and a
+# `git add -A` while verifying on hardware will sweep one in if it is not listed.
+/frame*.raw
