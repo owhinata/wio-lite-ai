@@ -170,7 +170,7 @@ git branch -d feat/<N>-short-description
 # Configure（初回に ARM ツールチェーンを ./tools へ自動 DL）
 cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake
 
-# ビルド（成果物: build/boot.{elf,bin,hex} と app の *.{elf,bin,hex,uf2}）
+# ビルド（成果物: build/{boot,shell,blink}.{elf,bin,hex}。UF2 は廃止済で出ない）
 cmake --build build
 
 # app を DFU で焼く（PF1 保持リセット → DFU モード → 書込 → 自動 reboot）
