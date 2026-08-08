@@ -8,6 +8,7 @@
  *
  *   wifi info                     show wiring + CHIP_EN state
  *   wifi on | off                 drive CHIP_EN high (power on) / low (power off)
+ *                                 (`on` is a no-op when it is already high -- issue #47)
  *   wifi reset                    power-cycle CHIP_EN (Low 80 ms -> High)
  *   wifi log [reset]              bridge the LOG UART (UART9 @115200) <-> console;
  *                                 `reset` power-cycles first, capturing boot from t=0
@@ -192,7 +193,8 @@ static int wifi_power_claim(struct cli_instance *sh, const char *what)
  * module that was power-cycled a second ago.  That was #41, hit about half the time.
  *
  * All three commands here need it, not just off/reset: what strands the host stack is the
- * force-quiesce, and `wifi on` calls it too.
+ * force-quiesce, and `wifi on` calls it too -- on the path where it really does raise
+ * CHIP_EN.  Since issue #47 that is the only path it has; see cmd_wifi_on().
  */
 static void wifi_power_take_link(struct cli_instance *sh)
 {
@@ -202,9 +204,39 @@ static void wifi_power_take_link(struct cli_instance *sh)
 		          "and retry if the next command is refused\r\n");
 }
 
+/*
+ * `wifi on` is IDEMPOTENT (issue #47).
+ *
+ * The other two recovery commands earn their destruction: they move CHIP_EN, so the module
+ * really does become a different module and everything the host believed about it -- the
+ * eRPC session, the link rate, the firmware generation, the association, the credentials --
+ * is genuinely worthless.  `wifi on` against a module that is ALREADY on moves nothing.
+ * rtl8720_powered() reads PC3's ODR -- the GPIO output-data latch that rtl8720_power()
+ * itself writes (RM0468 §11.4.6), not a cached belief kept beside it and not the pad's
+ * measured level (that would be IDR, which is the wrong question: what matters here is
+ * whether the write below would change what we drive, and it would not).  Running the recovery
+ * preamble anyway threw all of that state away for a write that changes nothing -- the
+ * module kept running, associated, while the host forgot how to talk to it, and the next
+ * `wifi scan` / `net info` failed with rc -2 until a `wifi reset` made the two agree again.
+ *
+ * So: check FIRST, before wifi_power_claim(), because that call's own preamble
+ * (wifi_auto_disarm) is already destructive -- it drops the stored credentials, which is
+ * right when CHIP_EN moves and wrong when it does not.  Reading the ODR outside the coarse
+ * mutex is fine: everything that moves CHIP_EN holds the console, and the only outcomes of
+ * losing the race are "say already-on about a module powered off a microsecond ago" (the
+ * user types it again) and "take the full path" (exactly today's behaviour).
+ *
+ * Nothing is lost by refusing to act: the way to re-power a module that is on but wedged is
+ * `wifi reset`, which is what the message points at.
+ */
 static int cmd_wifi_on(struct cli_instance *sh, int argc, char **argv)
 {
 	(void)argc; (void)argv;
+	if (rtl8720_powered()) {
+		cli_print(sh, "wifi: already on (CHIP_EN high) -- nothing to do; "
+		          "`wifi reset` power-cycles it\r\n");
+		return 0;
+	}
 	if (wifi_power_claim(sh, "wifi on"))
 		return 1;
 	wifi_power_take_link(sh);
@@ -989,7 +1021,8 @@ fail:
 
 CLI_SUBCMD_SET_CREATE(wifi_subcmds,
 	CLI_CMD_ARG(info,  NULL, "show RTL8720 wiring + CHIP_EN state",       cmd_wifi_info,  1, 0),
-	CLI_CMD_ARG(on,    NULL, "CHIP_EN high (power on RTL8720)",           cmd_wifi_on,    1, 0),
+	CLI_CMD_ARG(on,    NULL, "CHIP_EN high (power on RTL8720); no-op if already on",
+	            cmd_wifi_on,    1, 0),
 	CLI_CMD_ARG(off,   NULL, "CHIP_EN low (power off)",                   cmd_wifi_off,   1, 0),
 	CLI_CMD_ARG(reset, NULL, "power-cycle CHIP_EN (low 80ms -> high)",    cmd_wifi_reset, 1, 0),
 	CLI_CMD_ARG(log,   NULL, "bridge LOG UART (UART9 @115200); `log reset` captures boot from t=0",

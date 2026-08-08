@@ -322,7 +322,14 @@ time as the USB console. 24 commands:
 - **`wifi`** — the on-board **RTL8720DN** Wi-Fi/BLE companion (issues #17/#5/#23).
   The host reaches it over `CHIP_EN` (PC3), a **LOG UART** (UART9 PD14/PD15) and an
   **AT/HS UART** (USART1 PA10/PB14); the module is held powered-off (PC3 low) at boot.
-  `wifi on`/`off`/`reset` control power; `wifi log` opens a live console bridge onto the
+  `wifi on`/`off`/`reset` control power. All three are *recovery* commands: they take the
+  eRPC link away from whoever holds it before moving `CHIP_EN` (see below). `wifi on`
+  therefore **does nothing at all when `CHIP_EN` is already high** (issue #47) — the pin
+  write would be a no-op, but the teardown around it was not, so `wifi on` on an already
+  associated board used to leave the module running while the host forgot how to talk to
+  it, and the next `wifi scan` / `net info` failed with `rc -2` until a `wifi reset`.
+  Power-cycling a module that is on but wedged is `wifi reset`'s job.
+  `wifi log` opens a live console bridge onto the
   LOG UART, and `wifi log reset` power-cycles the module *after* the bridge is
   listening, so the boot banner is captured from `t=0` (a separate `wifi reset; wifi
   log` cannot do that — the banner is gone before the second command starts).
