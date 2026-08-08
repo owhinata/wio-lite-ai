@@ -66,6 +66,7 @@
 #include "tx_api.h"
 
 #include <string.h>
+#include "mem_sections.h"  /* DTCM_BSS: CPU-only data out of AXI-SRAM (issue #46) */
 
 #define KV_BOOT_PRIORITY    15u
 
@@ -81,7 +82,7 @@
 #define KV_BOOT_POLL_MS       250u
 
 static TX_THREAD kv_boot_thread;
-static UCHAR     kv_boot_stack[KV_BOOT_STACK_SIZE] __attribute__((aligned(8)));
+static UCHAR     kv_boot_stack[KV_BOOT_STACK_SIZE] DTCM_BSS __attribute__((aligned(8)));
 
 /* The console this sequence reports through: every line ends up in `dmesg`. */
 CLI_BACKEND_LOG_DEFINE(kv_boot_tr, "cfg");

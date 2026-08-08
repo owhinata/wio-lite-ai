@@ -48,6 +48,7 @@
 #include "link_data.h"    /* the DATA channel this thread also multiplexes (U1) */
 
 #include <string.h>
+#include "mem_sections.h"  /* DTCM_BSS: CPU-only data out of AXI-SRAM (issue #46) */
 
 /* BasicCodec / message constants (erpc_basic_codec.cpp, erpc_codec.h). */
 #define ERPC_CODEC_VERSION   1u
@@ -298,7 +299,7 @@ static void erpc_diag_delta(struct erpc_diag *diag, const struct erpc_counters *
 static TX_MUTEX             erpc_lock;
 static TX_EVENT_FLAGS_GROUP erpc_flags;
 static TX_THREAD            erpc_svc_thread;
-static UCHAR                erpc_svc_stack[ERPC_SVC_STACK] __attribute__((aligned(8)));
+static UCHAR                erpc_svc_stack[ERPC_SVC_STACK] DTCM_BSS __attribute__((aligned(8)));
 static uint8_t              erpc_ready;   /* service thread + objects exist */
 
 /*

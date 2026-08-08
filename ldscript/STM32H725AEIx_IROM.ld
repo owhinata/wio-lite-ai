@@ -5,9 +5,14 @@
  *   FLASH : 384 KB @ 0x08020000 -- internal flash sectors 1-3 (issue #25).  The
  *                                  bootloader owns sector 0 (0x08000000, 128 KB)
  *                                  and jumps to the vector table it finds here.
- *   RAM   : 320 KB @ 0x24000000 -- AXI-SRAM (D1).  _estack = 0x24050000, exactly
- *                                  the MSP the bootloader loads from vector[0].
- *   DTCM  : 128 KB @ 0x20000000 -- tightly-coupled RAM (reset-persistent log).
+ *   RAM   : 320 KB @ 0x24000000 -- AXI-SRAM (D1).  Reserved for what a BUS MASTER
+ *                                  has to reach: DMA1/DMA2 and the SDMMC1 IDMA
+ *                                  cannot see either TCM (issue #46).
+ *   DTCM  : 128 KB @ 0x20000000 -- tightly-coupled RAM: reset-persistent log, the
+ *                                  NetX packet pool, every thread stack, and the
+ *                                  main (ISR) stack at its top -- _estack =
+ *                                  0x20020000, the MSP the bootloader loads from
+ *                                  vector[0] and accepts as on-chip RAM.
  *   ITCM  :  64 KB @ 0x00000000 -- tightly-coupled instruction RAM; holds the ISR
  *                                  paths (.itcm, issue #24), which are zero-wait
  *                                  and outside both caches.
@@ -34,11 +39,49 @@
 
 ENTRY(Reset_Handler)
 
-/* Top of AXI-SRAM -> initial stack pointer (matches the bootloader's MSP load) */
-_estack = ORIGIN(RAM) + LENGTH(RAM);
+/*
+ * The main stack -- the one every exception and every ISR runs on -- lives at the
+ * TOP OF DTCM, not at the top of AXI-SRAM (issue #46).
+ *
+ * Two reasons, and the second is the one that forced it:
+ *
+ *  1. It is the hottest data in the system and the CPU is its only user, so DTCM is
+ *     where it belongs: zero wait states, and it stops evicting D-cache lines that
+ *     belong to real work.  It pairs with the ISR code already in ITCM (issue #24).
+ *
+ *  2. Sitting at ORIGIN(RAM)+LENGTH(RAM) it grew DOWNWARD through whatever AXI-SRAM
+ *     was still free -- and nothing accounted for it.  The linker does not know the
+ *     stack exists, and a Cortex-M7 has no MSPLIM to catch the collision (that is
+ *     ARMv8-M).  So "free AXI-SRAM" was simultaneously the stack's headroom and the
+ *     space issue #35 wants for the camera's DMA band: placing the band would have
+ *     silently handed it to both.  Moving the stack out makes the free space real.
+ *
+ * The bootloader accepts this: it validates the app's vector[0] against the on-chip
+ * RAM regions and 0x20000000 (DTCM) is one of them -- boot/main.c app_image_valid()
+ * and boot/dfu_callbacks.c msp_plausible().  boot itself is unchanged.
+ *
+ * The CMSIS startup reaches _estack twice, as `.word _estack` in the vector table
+ * and as `ldr sp, =_estack` in Reset_Handler, so redefining the symbol moves both
+ * and lib/cmsis_device_h7 stays unedited.
+ */
+_estack     = ORIGIN(DTCM) + LENGTH(DTCM);
+_msp_size   = 0x2000;                    /* 8 KB; see the ASSERT and `free` below */
+_smsp_stack = _estack - _msp_size;       /* bottom of the main stack */
+
+/*
+ * Top of AXI-SRAM, for the code that used to ask _estack for it.  Two distinct facts
+ * shared one symbol until now -- "where the stack starts" and "where AXI-SRAM ends" --
+ * and separating them is not cosmetic: app/retarget.c bounds the newlib heap with it,
+ * so leaving _estack in place there would have set the heap ceiling to a DTCM address
+ * below the heap itself and made every malloc fail, in a build that links cleanly.
+ */
+__ram_end = ORIGIN(RAM) + LENGTH(RAM);
 
 _Min_Heap_Size  = 0x200;   /* required heap  */
-_Min_Stack_Size = 0x400;   /* required stack */
+/* Vestigial: the real main stack is _msp_size at the top of DTCM (above).  This only
+ * reserves a slot inside ._user_heap_stack and is kept so the section keeps the shape
+ * the CMSIS template gives it. */
+_Min_Stack_Size = 0x400;
 
 MEMORY
 {
@@ -299,6 +342,128 @@ SECTIONS
     _edata = .;
   } >RAM AT> FLASH
 
+  /* ==== DTCM residents ====================================================
+   *
+   * These four sit HERE, ahead of .bss, and the position is load-bearing: input
+   * sections are matched in the order the OUTPUT sections are written, first
+   * match wins, and .bss's `*(.bss*)` below is a catch-all.  .dtcm_bss selects
+   * an upstream symbol by its `.bss.<name>` section name, so placed after .bss
+   * it would match nothing -- silently, with the stack simply staying in
+   * AXI-SRAM.  Exactly the trap the .itcm block documents (it must precede .text
+   * for the same reason).
+   *
+   * Their DTCM addresses are unaffected by the move: ld keeps a location counter
+   * per memory region, so what fixes an address here is the order of the DTCM
+   * sections relative to each OTHER, and that is unchanged.  .log_noinit stays at
+   * ORIGIN(DTCM), which matters -- it is the reset-persistent log, and moving it
+   * would throw away the previous boot's `dmesg` on the first run after a flash.
+   */
+
+  /* Reset-persistent RAM log ring (svc/log.c).  Placed in DTCM and marked NOLOAD
+   * so the CMSIS startup -- which only copies .data and zeroes .bss -- never
+   * touches it: the bytes carry over every *system* reset (reboot / fault /
+   * NRST), letting `dmesg` replay a crash after the board comes back.  A *power*
+   * reset (POR/BOR) loses them, which log_init() detects via its magic word.
+   * DTCM (not AXI-SRAM) so a write bypasses the D-cache; but a bare store does NOT
+   * durably land until it is read back (svc/log.c persist_*, issue #13).  Kept out
+   * of .bss so it is not zero-filled at boot -- and out of .dtcm_bss below, which
+   * SystemInit() does zero. */
+  .log_noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.log_noinit)
+    *(.log_noinit*)
+    . = ALIGN(4);
+  } >DTCM
+
+  /* NetX Duo packet pool (issue #23 U3), in DTCM after the log ring.  Frames are
+   * memcpy'd in and out by the CPU alone -- the module relays them over a UART, there
+   * is no DMA anywhere in this firmware -- so DTCM is not merely allowed here, it is
+   * the better home: zero wait states, no D-cache line to evict, and 32 KB of 1.5 KB
+   * frames kept out of the AXI-SRAM budget.  NOLOAD because nx_packet_pool_create()
+   * builds every block header itself; zero-filling it at boot would be wasted work.
+   * The reset-persistent read-back rule (issue #13) applies to surviving a reset, not
+   * to ordinary runtime access, and nothing here outlives one. */
+  .nx_pool (NOLOAD) :
+  {
+    . = ALIGN(32);
+    *(.nx_pool)
+    *(.nx_pool*)
+    . = ALIGN(4);
+  } >DTCM
+
+  /* Scratch working buffer for the `membench` command (cmd_membench.c), in DTCM
+   * after the log ring and the packet pool.  NOLOAD: uninitialized diagnostic
+   * scratch, never loaded or zeroed at boot. */
+  .dtcm_bench (NOLOAD) :
+  {
+    . = ALIGN(32);
+    *(.dtcm_bench)
+    *(.dtcm_bench*)
+    . = ALIGN(4);
+  } >DTCM
+
+  /*
+   * CPU-only hot data moved out of AXI-SRAM (issue #46): every ThreadX thread
+   * stack and the RTL8720 UART rings.
+   *
+   * WHY.  AXI-SRAM is the only RAM a bus master can reach -- DMA1/DMA2 and the
+   * SDMMC1 IDMA cannot see either TCM (RM0468 sec 2.1.2 / 2.1.5 / 2.1.6), which is
+   * why port/sd/sd_card.c has to bounce through .axi_dma above.  Of the 221 KB this
+   * firmware had in AXI-SRAM, exactly 4 KB actually needed to be there; the rest was
+   * CPU-only data occupying the one memory the camera's DCMI band (issue #35) has no
+   * substitute for.  Stacks are also the hottest data in the system, so DTCM is not
+   * a consolation prize: zero wait states and no D-cache line to evict.
+   *
+   * NOT here: anything a bus master touches, ever.  A DTCM buffer handed to a DMA
+   * engine does not fault -- it silently transfers nothing.
+   *
+   * INITIALISATION.  NOLOAD, so the CMSIS startup's .bss zero-fill does not reach
+   * it; SystemInit() zeroes [_sdtcm_bss, _edtcm_bss) instead, which keeps the .bss
+   * contract these variables were written against (ThreadX initialises thread stacks
+   * itself, but the UART rings are ordinary statics that assume zero).  The word
+   * stores also initialise the DTCM ECC over this range.
+   *
+   * SELECTION.  Two mechanisms, on purpose:
+   *   - app-owned variables carry __attribute__((section(".dtcm_bss"))) at their
+   *     definition (see DTCM_BSS in include/mem_sections.h).  An attribute names the
+   *     output section directly, so LTO renaming the symbol cannot break it.
+   *   - three stacks are picked by section name here, because their definitions are
+   *     not ours to annotate.  -fdata-sections gives each one `.bss.<name>`, and LTO
+   *     may add a clone suffix -- hence the `.bss.NAME .bss.NAME.*` PAIR.  Not
+   *     `.bss.NAME*`: every suffix starts with a dot, and the loose form would also
+   *     swallow a different variable whose name merely starts the same way.
+   *
+   *     _tx_timer_thread_stack_area is upstream (lib/threadx is a read-only mirror).
+   *     cdc_sh_stack / net_sh_stack are emitted by CLI_INSTANCE_DEFINE in
+   *     shell/include/cli_instance.h, and that macro is portable shell code shared in
+   *     spirit with the f746 firmware -- baking a board-specific section name into it
+   *     would push a placement decision down a layer, against the dependency rule in
+   *     CLAUDE.md.  Naming the two instances here keeps the choice in the port.
+   *
+   * cmake/check_dtcm_residency.py verifies after the link that all of it really
+   * landed here.  A selector that stops matching is not a link error -- the data
+   * just moves back to AXI-SRAM and the budget quietly regresses.
+   */
+  .dtcm_bss (NOLOAD) :
+  {
+    . = ALIGN(8);
+    _sdtcm_bss = .;
+    *(.dtcm_bss)
+    *(.dtcm_bss.*)
+    *(.bss._tx_timer_thread_stack_area .bss._tx_timer_thread_stack_area.*)
+    *(.bss.cdc_sh_stack .bss.cdc_sh_stack.*)
+    *(.bss.net_sh_stack .bss.net_sh_stack.*)
+    . = ALIGN(8);
+    _edtcm_bss = .;
+    _dtcm_used_end = .;   /* DTCM high-water mark for the `free` command; keep
+                           * .dtcm_bss the last DTCM section so this stays the top
+                           * of the resident block (issue #11).  Passive symbol --
+                           * no bytes emitted, no section moves. */
+  } >DTCM
+
+  /* ==== end DTCM residents ================================================ */
+
   /* Zero-initialized data */
   . = ALIGN(4);
   .bss :
@@ -341,53 +506,6 @@ SECTIONS
     . = . + _Min_Stack_Size;
     . = ALIGN(8);
   } >RAM
-
-  /* Reset-persistent RAM log ring (svc/log.c).  Placed in DTCM and marked NOLOAD
-   * so the CMSIS startup -- which only copies .data and zeroes .bss -- never
-   * touches it: the bytes carry over every *system* reset (reboot / fault /
-   * NRST), letting `dmesg` replay a crash after the board comes back.  A *power*
-   * reset (POR/BOR) loses them, which log_init() detects via its magic word.
-   * DTCM (not AXI-SRAM) so a write bypasses the D-cache; but a bare store does NOT
-   * durably land until it is read back (svc/log.c persist_*, issue #13).  Kept out
-   * of .bss so it is not zero-filled at boot. */
-  .log_noinit (NOLOAD) :
-  {
-    . = ALIGN(4);
-    *(.log_noinit)
-    *(.log_noinit*)
-    . = ALIGN(4);
-  } >DTCM
-
-  /* NetX Duo packet pool (issue #23 U3), in DTCM after the log ring.  Frames are
-   * memcpy'd in and out by the CPU alone -- the module relays them over a UART, there
-   * is no DMA anywhere in this firmware -- so DTCM is not merely allowed here, it is
-   * the better home: zero wait states, no D-cache line to evict, and 32 KB of 1.5 KB
-   * frames kept out of the AXI-SRAM budget.  NOLOAD because nx_packet_pool_create()
-   * builds every block header itself; zero-filling it at boot would be wasted work.
-   * The reset-persistent read-back rule (issue #13) applies to surviving a reset, not
-   * to ordinary runtime access, and nothing here outlives one. */
-  .nx_pool (NOLOAD) :
-  {
-    . = ALIGN(32);
-    *(.nx_pool)
-    *(.nx_pool*)
-    . = ALIGN(4);
-  } >DTCM
-
-  /* Scratch working buffer for the `membench` command (cmd_membench.c), in DTCM
-   * after the log ring and the packet pool.  NOLOAD: uninitialized diagnostic
-   * scratch, never loaded or zeroed at boot. */
-  .dtcm_bench (NOLOAD) :
-  {
-    . = ALIGN(32);
-    *(.dtcm_bench)
-    *(.dtcm_bench*)
-    . = ALIGN(4);
-    _dtcm_used_end = .;   /* DTCM high-water mark for the `free` command; keep
-                           * .dtcm_bench the last DTCM section so this stays the top
-                           * of the resident block (issue #11).  Passive symbol -- no
-                           * bytes emitted, no section moves. */
-  } >DTCM
 
   /* Scratch working buffer for `membench`'s ITCM read row (cmd_membench.c).  ITCM
    * continues from the end of .itcm above -- ld keeps a location counter per memory
@@ -433,12 +551,16 @@ SECTIONS
   ASSERT(_psram_end <= ORIGIN(PSRAM) + LENGTH(PSRAM),
          ".psram_noinit overflows the 8 MB OCTOSPI1 PSRAM window")
 
-  /* The DTCM residents (.log_noinit + .nx_pool + .dtcm_bench) must fit in 128 KB.
-   * ld does not diagnose an overflowing NOLOAD region on its own, and the first two
-   * are a crash log and a network packet pool -- both would fail silently and
-   * confusingly. */
-  ASSERT(_dtcm_used_end <= ORIGIN(DTCM) + LENGTH(DTCM),
-         "DTCM residents overflow the 128 KB DTCM")
+  /* The DTCM residents must fit UNDER the main stack, not merely inside DTCM.  ld
+   * does not diagnose an overflowing NOLOAD region on its own, and it has no idea
+   * the stack is there at all -- so without this, growing .nx_pool or .dtcm_bss past
+   * _smsp_stack links cleanly and then corrupts whichever of them the stack reaches
+   * first at run time.  There is no hardware backstop: ARMv7-M has no MSPLIM, and an
+   * MPU guard page would turn the overflow into a lockup rather than a diagnosable
+   * fault (the exception stacking itself would fail -- PM0253 sec 2.5.1/2.5.2/2.5.5),
+   * which is why the runtime defence is the high-water report in `free` instead. */
+  ASSERT(_dtcm_used_end <= _smsp_stack,
+         "DTCM residents collide with the main stack: shrink them or _msp_size")
 
   /* ---- .itcm residency guards (issue #24) ---------------------------------
    * An input-section pattern that stops matching does NOT fail the link -- the

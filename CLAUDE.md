@@ -190,9 +190,22 @@ dfu-util -d 0483:df11 -a 0 -D build/<app>.bin
     **セクタ0 `0x08000000` = DFU ブートローダ専用**、**セクタ1-3 `0x08020000` 384 KB = app**。
     消去単位がセクタ境界と一致するので、app 書込経路はセクタ0 に物理的に到達できない。
     app のベクタ table 先頭に MSP / Reset。
-  - RAM: **AXI-SRAM (D1) 320 KB @ 0x24000000**、`_estack = 0x24050000`（ブートローダが
-    vector[0] からロードする MSP と一致）。
-  - DTCM: 128 KB @ 0x20000000。ITCM 64 KB @ 0x00000000。
+  - 🔴 **RAM 配置ポリシー（#46）**: **AXI-SRAM = バスマスタから見える必要があるものだけ /
+    DTCM = CPU 専用のホットなもの / PSRAM = bulk・cold / ITCM = ISR コード**。
+    DMA1/DMA2 と SDMMC1 IDMA は **TCM に届かない**（RM0468 §2.1.2/§2.1.5/§2.1.6）ので
+    AXI-SRAM は唯一 DMA から見える RAM ＝希少資源。**DTCM に DMA バッファを置くと fault せず
+    無言で「何も転送されない」**。新しいバッファを足すときは必ずこの表で行き先を決める。
+  - RAM: **AXI-SRAM (D1) 320 KB @ 0x24000000**。`.data`/`.bss`/`.axi_dma`(SDMMC1 bounce)/heap。
+    上端は `__ram_end`（heap の天井。`_estack` ではない）。
+  - DTCM: 128 KB @ 0x20000000。`.log_noinit`(dmesg) / `.nx_pool` / `.dtcm_bench` /
+    `.dtcm_bss`（**全スレッドスタック + RTL8720 UART リング**）、そして**最上端が
+    メインスタック** = `_estack = 0x20020000`（ブートローダが vector[0] からロードする MSP。
+    `boot/main.c` が `0x20000000` を valid RAM として受け入れる）。
+    ARMv7-M に MSPLIM は無く MPU ガードは lockup を招くので、防御は `free` の high-water 表示。
+  - ITCM 64 KB @ 0x00000000。
+  - **配置は 2 つのポストリンクゲートが守る**（リンカ ASSERT は LTO 下で空振りする）:
+    `cmake/check_itcm_residency.py` と `cmake/check_dtcm_residency.py`。後者は
+    「スタックが AXI に戻った」と「DMA バッファが DTCM に紛れた」の**両方向**を検査する。
   - 外部 OCTOSPI2 `0x70000000`（W25Q128 16 MB）は **#25 以降どこからも mmap されない**。
     `app/mpu.c` が 256 MB を no-access + XN で塞いでいる（未初期化 mmap read は AXI 無期限
     ストールになるため）。ストレージとして使うなら app 側 bring-up から＝ #10 の範疇。

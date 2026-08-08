@@ -148,8 +148,9 @@ static int flash_session_open(struct cli_instance *sh)
 static uint32_t flash_report_size(struct cli_instance *sh, const struct rtl_dl_size *sz, int rc)
 {
 	if (rc == -3) {
-		cli_warn(sh, "  capacity: UNKNOWN -- the first 8 KB reads all 0xFF, so there is "
-		          "no data to detect the address wrap against\r\n");
+		cli_warn(sh, "  capacity: UNKNOWN -- the first %lu KB reads all 0xFF, so there "
+		          "is no data to detect the address wrap against\r\n",
+		          (unsigned long)(RTL_DL_SIZE_PROBE_LEN / 1024u));
 		return 0u;
 	}
 	if (rc != 0) {
@@ -161,9 +162,13 @@ static uint32_t flash_report_size(struct cli_instance *sh, const struct rtl_dl_s
 		          "(chip is >= 16 MB, or does not wrap)\r\n");
 		return 0u;
 	}
+	/* The span comes from the constant, not a literal: it was 8 KB until issue #46
+	   halved it, and a hardcoded number here would have gone on claiming 8 KB while
+	   comparing 4 -- a report that lies is worse than no report. */
 	cli_print(sh, "  capacity: %lu MB (0x%lX) -- address wrap at that offset, "
-	          "8 KB compared byte-for-byte\r\n",
-	          (unsigned long)(sz->size >> 20), (unsigned long)sz->size);
+	          "%lu KB compared byte-for-byte\r\n",
+	          (unsigned long)(sz->size >> 20), (unsigned long)sz->size,
+	          (unsigned long)(RTL_DL_SIZE_PROBE_LEN / 1024u));
 	return sz->size;
 }
 /* wifi flash read <offset> [nsectors] (issue #19, M3): NON-DESTRUCTIVE flash survey --
@@ -296,9 +301,14 @@ recover:
  * YMODEM byte source over the RTL8720 flash (issue #19 M4).
  *
  * ymodem_send() pulls; rtl_dl_read_flash() streams whole sectors, so we refill a
- * chunk-sized staging buffer and serve slices out of it.  A 32 KB chunk = 8 sectors =
- * one read command per 32 blocks, which keeps the per-command overhead off the wire;
- * drop RTL_BACKUP_CHUNK to 4096 to fall back to the single-sector reads proven in M2.
+ * chunk-sized staging buffer and serve slices out of it.
+ *
+ * 4 KB = one sector = the single-sector reads proven in M2.  It used to be 32 KB
+ * (8 sectors), which cut the per-command overhead on the wire by 8x -- but that
+ * bought throughput for a manual, non-destructive backup at the price of 28 KB of
+ * AXI-SRAM held permanently, and AXI-SRAM is the only memory a bus master can
+ * reach (issue #46).  `wifi flash backup` is now 8x more read commands over a
+ * 6 Mbaud link and nobody will notice; the camera needed the bytes.
  *
  * NOTE the NULL abort hook in bak_src_read(): while ymodem_send() runs, its io_getc()
  * is the ONLY permitted reader of the console RX ring.  rtl_abort_cb() would call
@@ -306,7 +316,7 @@ recover:
  * would eat the receiver's ACK/'C'/CAN and break the transfer.  Ctrl+C during the
  * transfer is handled by io_getc() instead (cmd_xfer.c).
  */
-#define RTL_BACKUP_CHUNK  (8u * 4096u)
+#define RTL_BACKUP_CHUNK  4096u
 
 static uint8_t s_bak_chunk[RTL_BACKUP_CHUNK];   /* static: off the 4 KB shell stack */
 

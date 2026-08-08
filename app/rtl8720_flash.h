@@ -146,8 +146,16 @@ int rtl_dl_read_flash(uint32_t offset, uint32_t nsectors, uint8_t *buf, uint32_t
 
 /* ---- M4: capacity detection + device checksum + SPI status/ID (READ-ONLY) ---- */
 
-/* Bytes compared at each candidate offset by rtl_dl_detect_size (2 sectors, one command). */
-#define RTL_DL_SIZE_PROBE_LEN  8192u
+/* Bytes compared at each candidate offset by rtl_dl_detect_size.  One sector, which is
+ * the floor: rtl_dl_read_flash() reads whole sectors and the probe derives its sector
+ * count as RTL_DL_SIZE_PROBE_LEN / 4096.
+ *
+ * It was 2 sectors.  The comparison is a full memcmp rather than a hash precisely so
+ * there is no collision argument to make, and halving the span does not weaken that --
+ * 4096 bytes of km0_boot still either wrap or they do not.  What it does buy is 8 KB of
+ * AXI-SRAM (the probe holds two of these buffers, live only during `wifi flash`), and
+ * AXI-SRAM is the only memory a bus master can reach (issue #46). */
+#define RTL_DL_SIZE_PROBE_LEN  4096u
 
 /* Highest flash offset the download protocol can express: its read / erase / checksum
  * commands all carry a 24-bit offset.  Exposed so callers can reject an out-of-range
@@ -158,7 +166,7 @@ int rtl_dl_read_flash(uint32_t offset, uint32_t nsectors, uint8_t *buf, uint32_t
 struct rtl_dl_size {
 	uint32_t size;    /* detected capacity in bytes, or 0 = not determined */
 	uint32_t probed;  /* how many candidate offsets were tried (diagnostic) */
-	int      blank;   /* 1 = the first 8 KB read all 0xFF, so wrap detection is impossible */
+	int      blank;   /* 1 = the reference span read all 0xFF, so wrap detection is impossible */
 };
 
 /* Result of rtl_dl_flash_jedec() -- EXPERIMENTAL, see that function. */
@@ -171,13 +179,14 @@ struct rtl_dl_jedec {
 /*
  * Determine the real flash capacity by ADDRESS WRAP, using only the proven block-read
  * path: a serial flash ignores address bits above its capacity, so a read at `cap`
- * returns offset 0 again.  Reads 8 KB at offset 0 and compares it byte-for-byte against
- * 8 KB at 1/2/4/8 MB, smallest first; the first full match is the capacity.  Read-only.
+ * returns offset 0 again.  Reads RTL_DL_SIZE_PROBE_LEN at offset 0 and compares it
+ * byte-for-byte against the same span at 1/2/4/8 MB, smallest first; the first full
+ * match is the capacity.  Read-only.
  *
  * This is the AUTHORITATIVE capacity source -- rtl_dl_flash_jedec()'s JEDEC ID is only a
  * cross-check, because the 0x21 command shape it relies on is not established by the
  * reference tool.  Returns 0 when the probe completed (@s->size == 0 means no wrap was
- * seen up to 8 MB, i.e. unknown), -2 on a read failure, -3 if the first 8 KB is blank
+ * seen up to 8 MB, i.e. unknown), -2 on a read failure, -3 if the reference span is blank
  * (nothing to match against; @s->blank set).  Call after rtl_dl_load_flashloader().
  */
 int rtl_dl_detect_size(struct rtl_dl_size *s, int (*should_abort)(void *ctx), void *abort_ctx);

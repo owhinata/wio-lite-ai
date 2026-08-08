@@ -41,6 +41,7 @@
 
 #define LOG_TAG "nshell"
 #include "log.h"
+#include "mem_sections.h"  /* DTCM_BSS: CPU-only data out of AXI-SRAM (issue #46) */
 
 /* ---- tunables ------------------------------------------------------------ */
 
@@ -101,7 +102,7 @@ struct nsh_ctx {
 static struct nsh_ctx       g_ctx;
 static TX_THREAD            g_thread;
 static TX_EVENT_FLAGS_GROUP g_evt;
-static UCHAR                g_stack[NSH_STACK] __attribute__((aligned(8)));
+static UCHAR                g_stack[NSH_STACK] DTCM_BSS __attribute__((aligned(8)));
 static uint8_t              g_ready;
 
 static NX_TCP_SOCKET        g_sock;

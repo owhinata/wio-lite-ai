@@ -112,6 +112,7 @@
 #include "tx_glue.h"      /* tx_glue_isr_enter/exit: EPK (issue #2) ISR accounting */
 #include "timebase.h"     /* udelay: DWT busy-wait for the CHIP_EN reset pulse */
 #include "rtl8720.h"
+#include "mem_sections.h"  /* DTCM_BSS: CPU-only data out of AXI-SRAM (issue #46) */
 
 /* CHIP_EN = PC3 (schematic: WIFI_CHIP_EN, no board pull -> host drives it). */
 #define RTL_EN_PORT   GPIOC
@@ -120,7 +121,8 @@
 /* UART9/USART1 kernel clock = PCLK2 (see file header for the derivation). */
 #define RTL_UART_PCLK2   137500000u
 
-/* RX ring: power-of-two so head/tail wrap with a mask.  16 KB in AXI-SRAM BSS is
+/* RX ring: power-of-two so head/tail wrap with a mask.  16 KB in DTCM (issue #46,
+ * .dtcm_bss -- CPU-only, and the ISR fills it a byte at a time at ~75 k/s) is
  * 27 ms of inflow at 6 Mbaud (600 kB/s) -- the consumer is the eRPC service thread,
  * which polls on 1 ms slices, so this absorbs a long scheduling hole. */
 #define RTL_RING_SIZE    16384u
@@ -137,9 +139,9 @@
  * interrupt-latency budget is actually being used. */
 #define RTL_ISR_GRACE    10u
 
-/* TX ring (issue #23 U1): 4 KB in AXI-SRAM BSS holds two and a half maximum-size link
- * frames, so a sender never waits for one frame to leave before staging the next.
- * Power-of-two for the mask. */
+/* TX ring (issue #23 U1): 4 KB in DTCM (issue #46, .dtcm_bss) holds two and a half
+ * maximum-size link frames, so a sender never waits for one frame to leave before
+ * staging the next.  Power-of-two for the mask. */
 #define RTL_TX_RING_SIZE 4096u
 #define RTL_TX_RING_MASK (RTL_TX_RING_SIZE - 1u)
 
@@ -157,7 +159,7 @@
  * at 6 Mbaud the ring empties in 7 ms, at 115200 baud in 355 ms. */
 #define RTL_TX_WAIT_MS   2000u
 
-static volatile uint8_t  rtl_ring[RTL_RING_SIZE];
+static volatile uint8_t  rtl_ring[RTL_RING_SIZE] DTCM_BSS;
 static volatile uint32_t rtl_ring_head;    /* producer: RX ISR only */
 static volatile uint32_t rtl_ring_tail;    /* consumer: rtl8720_uart_read only */
 static volatile uint32_t rtl_ring_drops;   /* RX bytes lost to overflow */
@@ -166,7 +168,7 @@ static volatile uint32_t rtl_ring_drops;   /* RX bytes lost to overflow */
  * calling thread (single, by the link ownership rules -- see rtl8720_uart_write()) and
  * the CONSUMER is the ISR.  So the thread only ever advances head and the ISR only ever
  * advances tail; neither writes the other's index. */
-static volatile uint8_t  rtl_tx_ring[RTL_TX_RING_SIZE];
+static volatile uint8_t  rtl_tx_ring[RTL_TX_RING_SIZE] DTCM_BSS;
 static volatile uint32_t rtl_tx_head;      /* producer: rtl8720_uart_write only */
 static volatile uint32_t rtl_tx_tail;      /* consumer: TX ISR only */
 

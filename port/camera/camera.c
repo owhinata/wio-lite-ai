@@ -68,6 +68,7 @@
 #include "log.h"
 
 #include <string.h>
+#include "mem_sections.h"  /* DTCM_BSS: CPU-only data out of AXI-SRAM (issue #46) */
 
 /* ---- pins ---------------------------------------------------------------- */
 
@@ -256,7 +257,8 @@ static TX_MUTEX     cam_pipe_lock;      /* the pipeline's injected mutex       *
 static TX_SEMAPHORE cam_stream_sem;     /* DMA TC ISR -> producer              */
 static TX_SEMAPHORE cam_start_sem;      /* start -> producer idle wakeup       */
 static TX_THREAD    cam_producer;
-static UCHAR        cam_producer_stack[CAM_PRODUCER_STACK];
+static UCHAR        cam_producer_stack[CAM_PRODUCER_STACK] DTCM_BSS
+                        __attribute__((aligned(8)));
 
 static struct frame_pipeline cam_pipe;
 static struct frame_sink     cam_stat_sink;

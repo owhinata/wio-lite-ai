@@ -27,6 +27,7 @@
 #include "rtl8720.h"
 #include "wifi_auto.h"
 #include "wifi_rpc.h"
+#include "mem_sections.h"  /* DTCM_BSS: CPU-only data out of AXI-SRAM (issue #46) */
 
 /* ---- tunables --------------------------------------------------------------- */
 
@@ -153,7 +154,7 @@ static UCHAR nxn_pool_mem[NXN_POOL_BYTES]
 static NX_PACKET_POOL nxn_pool;
 static NX_IP          nxn_ip;
 static NX_DHCP        nxn_dhcp;
-static ULONG          nxn_ip_stack[NXN_IP_STACK / sizeof(ULONG)];
+static ULONG          nxn_ip_stack[NXN_IP_STACK / sizeof(ULONG)] DTCM_BSS;
 static ULONG          nxn_arp_cache[NXN_ARP_CACHE / sizeof(ULONG)];
 
 static bool nxn_ready;                /* the NetX objects exist                      */
@@ -193,7 +194,7 @@ static void nxn_addr_give(void)
 /* Owner thread. */
 static TX_THREAD             nxn_thread;
 static TX_EVENT_FLAGS_GROUP  nxn_evt;
-static UCHAR                 nxn_stack[NXN_OWNER_STACK] __attribute__((aligned(8)));
+static UCHAR                 nxn_stack[NXN_OWNER_STACK] DTCM_BSS __attribute__((aligned(8)));
 
 /*
  * State is written by the owner thread and, for the ARMING/STOPPING transitions, by the

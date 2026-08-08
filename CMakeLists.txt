@@ -613,3 +613,15 @@ add_custom_command(TARGET shell POST_BUILD
             $<TARGET_FILE:shell>
     COMMENT "check .itcm residency of the interrupt paths (issue #39)"
     VERBATIM)
+
+# The same kind of gate for the AXI-SRAM / DTCM split (issue #46), and it guards both
+# directions: a stack that quietly returned to AXI-SRAM (budget regression, no error)
+# and a DMA buffer that quietly moved to DTCM (the transfer moves nothing, no error).
+# `shell` only, like the check above: blink has none of these objects.
+add_custom_command(TARGET shell POST_BUILD
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/cmake/check_dtcm_residency.py"
+            --nm "${CMAKE_NM}"
+            $<TARGET_FILE:shell>
+    COMMENT "check .dtcm_bss residency and DMA reachability (issue #46)"
+    VERBATIM)

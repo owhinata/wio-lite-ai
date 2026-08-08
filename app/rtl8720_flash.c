@@ -809,8 +809,9 @@ int rtl_dl_flash_jedec(struct rtl_dl_jedec *j, int (*ab)(void *), void *ctx)
 
 int rtl_dl_detect_size(struct rtl_dl_size *s, int (*ab)(void *), void *ctx)
 {
-	/* Two reference sectors (8 KB) read in ONE command, plus the candidate's 8 KB.
-	 * Function-static: off the 4 KB shell stack. */
+	/* One reference span read in ONE command, plus the candidate's -- RTL_DL_SIZE_PROBE_LEN
+	 * each, halved from two sectors to one by issue #46 to give the bytes back to
+	 * AXI-SRAM.  Function-static: off the 4 KB shell stack. */
 	static uint8_t ref[RTL_DL_SIZE_PROBE_LEN];
 	static uint8_t cand[RTL_DL_SIZE_PROBE_LEN];
 	static const uint32_t cands[] = {
@@ -823,9 +824,10 @@ int rtl_dl_detect_size(struct rtl_dl_size *s, int (*ab)(void *), void *ctx)
 		return -1;
 	memset(s, 0, sizeof(s[0]));
 
-	/* Reference: the first 8 KB.  It must NOT be blank, or every candidate on a blank
-	 * chip would "match" and we would report the smallest size.  The module's km0_boot
-	 * lives here (verified on hardware in M2), so this is data in practice. */
+	/* Reference: the first RTL_DL_SIZE_PROBE_LEN bytes.  Must NOT be blank, or every
+	 * candidate on a blank chip would "match" and we would report the smallest size.
+	 * The module's km0_boot lives here (verified on hardware in M2), so this is data
+	 * in practice. */
 	rc = rtl_dl_read_flash(0u, RTL_DL_SIZE_PROBE_LEN / 4096u, ref, sizeof(ref), ab, ctx);
 	if (rc < (int)sizeof(ref))
 		return -2;
@@ -840,7 +842,7 @@ int rtl_dl_detect_size(struct rtl_dl_size *s, int (*ab)(void *), void *ctx)
 	/*
 	 * Wrap detection: a serial flash ignores the address bits above its capacity, so
 	 * reading at `cap` returns offset 0 again.  Walk the candidates smallest-first and
-	 * take the first full 8 KB match -- full compare, not a hash, so there is no
+	 * take the first full-span match -- full compare, not a hash, so there is no
 	 * collision argument to make.  Reading a candidate beyond the die is harmless.
 	 */
 	for (i = 0u; i < sizeof(cands) / sizeof(cands[0]); i++) {
@@ -977,7 +979,7 @@ int rtl_dl_flash_program(uint32_t offset, const uint8_t *data, uint32_t len,
 	 * The two "capacity not determined" outcomes are allowed through, because gate 1 has
 	 * already bounded the write to 2 MB -- the capacity M4 measured on this board -- and
 	 * refusing them would break the recovery path:
-	 *   rc == -3  the first 8 KB is blank, so there is nothing to detect a wrap against.
+	 *   rc == -3  the reference span is blank, so there is nothing to detect a wrap against.
 	 *             THIS IS EXACTLY THE STATE A FAILED PROGRAM LEAVES BEHIND, and re-running
 	 *             this function is how it is repaired.  Rejecting it would mean a botched
 	 *             write could never be fixed.

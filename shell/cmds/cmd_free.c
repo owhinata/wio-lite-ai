@@ -8,8 +8,10 @@
  *
  * A runtime, dynamic counterpart to the build-time `size` output.  Ported to the
  * Wio Lite AI (STM32H725) memory map: the app runs from the internal flash app
- * partition with RAM in AXI-SRAM (D1); DTCM holds the reset-persistent
- * log ring (.log_noinit) and the membench scratch (.dtcm_bench).  Pure
+ * partition; AXI-SRAM (D1) is reserved for what a bus master has to reach, and
+ * DTCM holds the reset-persistent log ring (.log_noinit), the NetX packet pool
+ * (.nx_pool), the membench scratch (.dtcm_bench), every thread stack and the
+ * RTL8720 UART rings (.dtcm_bss), plus the main stack on top (issue #46).  Pure
  * introspection -- it reads linker-provided boundary symbols and the C library's
  * malloc accounting; it changes no state and touches only the shell instance
  * passed to it, so it stays reentrant across instances (req §10).
@@ -20,13 +22,18 @@
  *          footprint (== `size`'s text+data).  The region bounds come from the
  *          linker too (__app_flash_start/_size), so `free` cannot disagree with
  *          the link.
- *   RAM    static = _end - ORIGIN(RAM) (.data + .bss + ThreadX stacks/objects);
- *          the heap grows up from _end and the MSP/ISR stack grows down from
- *          _estack, so used = (heap break) - ORIGIN(RAM), free = _estack - break.
- *   DTCM   used = _dtcm_used_end - ORIGIN(DTCM).  The resident block (.log_noinit
- *          then .dtcm_bench) is bump-placed from ORIGIN, so its high-water mark
+ *   RAM    static = _end - ORIGIN(RAM) (.data + .bss + the DMA scratch); the heap
+ *          grows up from _end and nothing grows down to meet it, so
+ *          used = (heap break) - ORIGIN(RAM).  Since issue #46 the main stack is
+ *          NOT here -- it moved to DTCM, which is what makes this number honest:
+ *          the free bytes reported are genuinely available, rather than doubling
+ *          as the main stack's unaccounted headroom.
+ *   DTCM   used = _dtcm_used_end - ORIGIN(DTCM).  The resident block (.log_noinit,
+ *          .nx_pool, .dtcm_bench, then .dtcm_bss = every thread stack + the RTL8720
+ *          UART rings) is bump-placed from ORIGIN, so its high-water mark
  *          _dtcm_used_end (emitted at the end of the last DTCM section) is the used
- *          count -- read from the linker, not the log/membench internals.
+ *          count -- read from the linker, not the log/membench internals.  The main
+ *          stack sits at the TOP of the same region and is reported separately.
  *   ITCM   used = _itcm_used_end - ORIGIN(ITCM), i.e. the .itcm interrupt-path
  *          residents (issue #24) plus the .itcm_bench membench buffer, bump-placed
  *          from ORIGIN exactly like the DTCM block above.  The trailing "itcm:" line
@@ -47,6 +54,8 @@
  */
 #include "cli.h"
 
+#include "mem_sections.h"   /* MSP_FILL_PATTERN: written by SystemInit (issue #46) */
+
 #include <malloc.h>   /* mallinfo / struct mallinfo */
 #include <stdint.h>
 
@@ -65,15 +74,16 @@
 #define PSRAM_LENGTH  (8u * 1024u * 1024u)
 
 /*
- * Linker boundary symbols.  Their *addresses* carry the values; _Min_Stack_Size
- * is an ABSOLUTE symbol whose address IS the byte count.  Declared as arrays so a
- * bare reference already yields the address without &.
+ * Linker boundary symbols.  Their *addresses* carry the values -- declared as
+ * arrays so a bare reference already yields the address without &.  (The flash
+ * pair below are ABSOLUTE symbols, where the address IS the byte count.)
  */
 extern uint8_t _sdata[], _edata[];   /* .data run image in RAM   */
 extern uint8_t _sidata[];            /* .data load image in FLASH */
 extern uint8_t _end[];               /* top of static RAM = heap base */
-extern uint8_t _estack[];            /* top of RAM (initial MSP)      */
-extern uint8_t _Min_Stack_Size[];    /* reserved main-stack bytes     */
+extern uint8_t __ram_end[];          /* top of AXI-SRAM (heap ceiling) */
+extern uint8_t _estack[];            /* top of DTCM = initial MSP (issue #46) */
+extern uint8_t _smsp_stack[];        /* bottom of the main stack */
 extern uint8_t _dtcm_used_end[];     /* top of the DTCM resident block */
 extern uint8_t _psram_end[];         /* top of PSRAM residents (.psram_noinit) */
 extern uint8_t _sitcm[], _eitcm[];   /* .itcm run image in ITCM (issue #24) */
@@ -85,6 +95,39 @@ extern uint8_t _itcm_used_end[];     /* top of the ITCM resident block */
 static uint32_t sym(const uint8_t s[])
 {
 	return (uint32_t)(uintptr_t)s;
+}
+
+/*
+ * Bytes of main stack ever used, from the fill pattern SystemInit() stamped over
+ * the unused part (issue #46).  Scans up from the bottom for the first word the
+ * pattern no longer covers; everything above it has been touched at some point.
+ *
+ * This is the main stack's whole safety net, so read a surprising number as real:
+ * there is no MSPLIM on ARMv7-M and no MPU guard page below the stack (a guard
+ * would fault while stacking the exception meant to report it and lock up instead
+ * -- PM0253 sec 2.5.1 / 2.5.2 / 2.5.5).  Reporting "used == reserved" means the
+ * stack has already reached the bottom of its reservation and the DTCM residents
+ * underneath it are no longer trustworthy.
+ *
+ * The reading is PESSIMISTIC by a fixed amount and optimistic by an unlikely one:
+ *
+ *   - SystemInit() stops stamping MSP_FILL_MARGIN (1 KiB) below its own stack
+ *     pointer, because it is filling the stack it is standing on.  Those words are
+ *     never written, so they always count as "used": expect roughly 1 KiB even on a
+ *     board that has done nothing.  The number is therefore an UPPER bound, which is
+ *     the safe direction for the one warning this stack has.
+ *   - A deep excursion that happened to leave MSP_FILL_PATTERN behind is
+ *     indistinguishable from untouched, so in principle it can read low.  It takes
+ *     the stack to contain exactly 0xA5A5A5A5 at the deepest word it reached.
+ */
+static uint32_t msp_high_water(void)
+{
+	const uint32_t *p   = (const uint32_t *)(uintptr_t)_smsp_stack;
+	const uint32_t *top = (const uint32_t *)(uintptr_t)_estack;
+
+	while (p < top && *p == MSP_FILL_PATTERN)
+		p++;
+	return (uint32_t)((const uint8_t *)top - (const uint8_t *)p);
 }
 
 /* One region row: name, start, total, used; free = total - used, use% = used/total. */
@@ -114,10 +157,15 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 	uint32_t heap_break = heap_base + heap_arena;
 	uint32_t ram_used   = heap_break - RAM_ORIGIN;        /* static + heap */
 
-	uint32_t dtcm_used  = sym(_dtcm_used_end) - DTCM_ORIGIN;  /* .log_noinit + .dtcm_bench */
+	/* .log_noinit + .nx_pool + .dtcm_bench + .dtcm_bss; NOT the main stack, which
+	   sits above them at the top of DTCM and is reported on its own line. */
+	uint32_t dtcm_used  = sym(_dtcm_used_end) - DTCM_ORIGIN;
 	uint32_t itcm_used  = sym(_itcm_used_end) - ITCM_ORIGIN;   /* .itcm + .itcm_bench */
 	uint32_t itcm_isr   = sym(_eitcm) - sym(_sitcm);           /* .itcm residents alone */
 	uint32_t itcmcr     = SCB->ITCMCR;
+
+	uint32_t msp_reserved = sym(_estack) - sym(_smsp_stack);
+	uint32_t msp_used     = msp_high_water();
 
 	(void)argc;
 	(void)argv;
@@ -131,9 +179,9 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 	print_region(sh, "ITCM",  ITCM_ORIGIN,  ITCM_LENGTH,  itcm_used,
 	             ".itcm ISR paths + .itcm_bench (membench)");
 	print_region(sh, "DTCM",  DTCM_ORIGIN,  DTCM_LENGTH,  dtcm_used,
-	             ".log_noinit (dmesg) + .dtcm_bench (membench)");
+	             "dmesg + nx pool + membench + stacks/rings; main stack on top");
 	print_region(sh, "RAM",   RAM_ORIGIN,   RAM_LENGTH,   ram_used,
-	             ".data/.bss + ThreadX stacks + heap");
+	             ".data/.bss + DMA scratch + heap (bus-master reachable)");
 	print_region(sh, "Flash", flash_origin, flash_length, flash_used,
 	             ".isr/.text/.rodata/.data (internal)");
 	print_region(sh, "PSRAM", PSRAM_ORIGIN, PSRAM_LENGTH,
@@ -144,8 +192,15 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 	cli_print(sh, "heap:  base 0x%08lX  arena %lu  in-use %lu  free-pool %lu\r\n",
 	          (unsigned long)heap_base, (unsigned long)heap_arena,
 	          (unsigned long)(unsigned)mi.uordblks, (unsigned long)(unsigned)mi.fordblks);
-	cli_print(sh, "stack: top  0x%08lX  main-reserve %lu B (MSP/ISR grow down into RAM free)\r\n",
-	          (unsigned long)sym(_estack), (unsigned long)sym(_Min_Stack_Size));
+	/* The main (MSP/ISR) stack, at the top of DTCM since issue #46.  `used` is the
+	   high-water mark recovered from the fill pattern, not a live SP reading: this
+	   is the only warning available before an overflow starts eating the DTCM
+	   residents below (see msp_high_water()). */
+	cli_print(sh, "stack: main 0x%08lX..0x%08lX  %lu B reserved, %lu B high-water "
+	              "incl. 1 KiB boot margin (%lu%%)\r\n",
+	          (unsigned long)sym(_smsp_stack), (unsigned long)sym(_estack),
+	          (unsigned long)msp_reserved, (unsigned long)msp_used,
+	          (unsigned long)(msp_reserved ? (msp_used * 100u) / msp_reserved : 0u));
 	/* ITCMCR as the hardware reports it, decoded.  EN must be 1 for the .itcm
 	 * residents to be reachable at all, and RMW is what makes the 32-bit copy in
 	 * SystemInit safe against the 64-bit ECC granule (PM0253 sec 4.9.1).  SZ is the

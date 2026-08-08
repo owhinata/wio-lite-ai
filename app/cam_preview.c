@@ -44,6 +44,7 @@
 
 #define LOG_TAG "campv"
 #include "log.h"
+#include "mem_sections.h"  /* DTCM_BSS: CPU-only data out of AXI-SRAM (issue #46) */
 
 /* Below the camera producer (10) -- a late preview frame costs a frame of
    display, a late producer costs the DBM repoint margin.  Above the shell (16)
@@ -60,7 +61,7 @@
 #define PREVIEW_Y_POS  ((320u - 240u) / 2u)                 /* 40 rows */
 
 static TX_THREAD preview_thread;
-static UCHAR     preview_stack[PREVIEW_STACK];
+static UCHAR     preview_stack[PREVIEW_STACK] DTCM_BSS __attribute__((aligned(8)));
 
 static volatile int preview_on;
 static uint32_t     preview_shown;

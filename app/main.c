@@ -46,6 +46,7 @@
 #include "camera.h"     /* FPC-24 DVP camera: XCLK + SCCB bring-up (issue #8) */
 #if BSP_ENABLE_LCD
 #include "cam_preview.h" /* live camera preview on the LCD (issue #8 phase 3c) */
+#include "mem_sections.h"  /* DTCM_BSS: CPU-only data out of AXI-SRAM (issue #46) */
 #endif
 #endif
 
@@ -71,7 +72,7 @@ static void led_init_off(void);
 /* Static ThreadX objects + stacks (no byte pool; each thread owns its stack).
  * The shell instance's own thread/stack come from CLI_INSTANCE_DEFINE. */
 static TX_THREAD usb_thread;
-static UCHAR     usb_stack[4096] __attribute__((aligned(8)));  /* tud_task + printf headroom */
+static UCHAR     usb_stack[4096] DTCM_BSS __attribute__((aligned(8)));  /* tud_task + printf headroom */
 
 #if BSP_ENABLE_IWDG
 /* IWDG petter (issue #4).  Static objects; the thread only refreshes -- the watchdog
@@ -84,7 +85,7 @@ static UCHAR     usb_stack[4096] __attribute__((aligned(8)));  /* tud_task + pri
  * (scheduler/tick death, IRQ-off lockup, a stalled external-memory access) -> the IWDG then
  * resets the board. */
 static TX_THREAD iwdg_thread;
-static UCHAR     iwdg_stack[IWDG_PETTER_STACK_SIZE] __attribute__((aligned(8)));
+static UCHAR     iwdg_stack[IWDG_PETTER_STACK_SIZE] DTCM_BSS __attribute__((aligned(8)));
 
 static void iwdg_entry(ULONG arg)
 {

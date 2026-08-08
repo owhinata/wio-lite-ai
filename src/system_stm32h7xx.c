@@ -24,6 +24,7 @@
  */
 
 #include "stm32h7xx.h"
+#include "mem_sections.h"   /* MSP_FILL_PATTERN, shared with `free` (issue #46) */
 
 /* The vector table, as the linker actually placed it: the CMSIS startup file
  * defines g_pfnVectors at the head of .isr_vector, which the linker script puts at
@@ -43,6 +44,9 @@ extern uint32_t g_pfnVectors[];
  * in the app's flash partition.  Declared as arrays so a bare reference yields the
  * address. */
 extern uint32_t _sitcm[], _eitcm[], _sitcm_load[];
+/* DTCM residents moved out of AXI-SRAM (issue #46): the .dtcm_bss span this file
+ * zero-fills, and the main-stack span it fills with a pattern. */
+extern uint32_t _sdtcm_bss[], _edtcm_bss[], _smsp_stack[];
 
 /*
  * Move the interrupt paths into ITCM (issue #24).
@@ -125,6 +129,80 @@ static void itcm_init(void)
   __ISB();
 }
 
+/*
+ * DTCM bring-up (issue #46): the ECC controls, the .dtcm_bss zero-fill and the
+ * main-stack fill pattern.
+ *
+ * WHY THIS EXISTS NOW.  DTCM used to hold only NOLOAD data that its owners always
+ * wrote before reading (the log ring, the NetX packet pool, a membench buffer), so
+ * neither its ECC configuration nor its initial contents ever mattered.  Issue #46
+ * moved every thread stack, the RTL8720 UART rings and the MAIN STACK here, and all
+ * three of those assumptions change:
+ *
+ *  - the rings are ordinary statics that were written expecting .bss zeroing, which
+ *    a NOLOAD section does not get (the CMSIS startup zeroes .bss only);
+ *  - C code puts byte- and halfword-sized locals on the stack, and a partial write
+ *    to an ECC-protected word is a read-modify-write (RM0468 sec 3.2) -- which the
+ *    hardware only performs if DTCMCR.RMW says so;
+ *  - and there is now something worth measuring: how much main stack is actually
+ *    used, since it no longer has the whole of free AXI-SRAM beneath it.
+ *
+ * ORDERING, stated because it cannot be avoided: Reset_Handler sets SP from _estack
+ * (already a DTCM address) before it calls ExitRun0Mode and then SystemInit, so THIS
+ * CODE IS ALREADY RUNNING ON THE DTCM STACK when it programs DTCMCR.  That is safe
+ * here because EN is only ever set, never cleared, and RMW/RETEN change how accesses
+ * are checked, not what the TCM holds or whether it responds -- PM0253 sec 4.9.1
+ * documents exactly this software OR + DSB/ISB.  Clearing EN from this stack would
+ * not be safe, and nothing here does.
+ *
+ * Reads and writes only DTCMCR and DTCM.  No RCC / PWR / FLASH ACR (file header).
+ */
+/* Bytes of headroom left unwritten below the current stack pointer.  SystemInit()
+ * is filling the stack it is standing on, so the top of the fill has to stay clear
+ * of its own frame, its callees and any exception frame.  1 KB is deliberately
+ * generous for ~20 instructions of straight-line code: it costs nothing but a
+ * slightly pessimistic high-water reading, and the premise it rests on -- that
+ * interrupts are not enabled yet at this point in Reset_Handler -- is the sort of
+ * thing that changes without anyone rechecking a tight margin. */
+#define MSP_FILL_MARGIN    1024u
+
+static void dtcm_init(void)
+{
+  uint32_t dtcmcr;
+  uint32_t volatile *p;
+  uint32_t sp_now;
+
+  /* Same treatment ITCM gets above, and for the same reason: ECC wants RMW + retry
+   * (PM0253 sec 4.9.1).  Set EN only if clear -- ST leaves the TCMs enabled out of
+   * reset and we are standing on this one. */
+  dtcmcr = SCB->DTCMCR;
+  if ((dtcmcr & SCB_DTCMCR_EN_Msk) == 0u)
+    dtcmcr |= SCB_DTCMCR_EN_Msk;
+  dtcmcr |= SCB_DTCMCR_RMW_Msk | SCB_DTCMCR_RETEN_Msk;
+  SCB->DTCMCR = dtcmcr;
+  __DSB();
+  __ISB();
+
+  /* Give .dtcm_bss the .bss contract its contents were written against.  Word
+   * stores, which also initialise the ECC across the span. */
+  for (p = (uint32_t volatile *)_sdtcm_bss;
+       p < (uint32_t volatile *)_edtcm_bss; p++)
+    *p = 0u;
+
+  /* Stamp the unused part of the main stack so `free` can report a high-water mark.
+   * This is the primary defence against silently outgrowing the 8 KB reservation:
+   * an MPU guard page below the stack would be the obvious alternative, but ARMv7-M
+   * has no MSPLIM and a guard turns an overflow into a failure to stack the very
+   * exception meant to report it -- MemManage escalating to HardFault to lockup
+   * (PM0253 sec 2.5.1 / 2.5.2 / 2.5.5).  Measuring beats a trap that cannot talk. */
+  sp_now = __get_MSP();
+  for (p = (uint32_t volatile *)_smsp_stack;
+       (uint32_t)(uintptr_t)p < sp_now - MSP_FILL_MARGIN; p++)
+    *p = MSP_FILL_PATTERN;
+
+  __DSB();
+}
+
 /* Inherited from the bootloader: SYSCLK = HSE(25 MHz) * 22 = 550 MHz (CPU/FCLK). */
 uint32_t SystemCoreClock = 550000000UL;
 
@@ -176,6 +254,12 @@ void SystemInit(void)
   /* Load the ITCM-resident interrupt paths (issue #24).  Must happen before any
    * exception can be dispatched, and before main() enables the caches / MPU. */
   itcm_init();
+
+  /* DTCM ECC controls + .dtcm_bss zero-fill + main-stack fill pattern (issue #46).
+   * After itcm_init(), so a fault taken during the DTCM work already has its ITCM
+   * handler in place; before the CMSIS startup's .data/.bss work and main(), which
+   * is where the zeroed statics start being read. */
+  dtcm_init();
 }
 
 /* The CMSIS startup calls this before SystemInit to configure the power supply.
