@@ -246,15 +246,20 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 	          (unsigned long)(ci.i2c_ker_hz / 1000000u),
 	          (unsigned long)(ci.i2c_ker_hz % 1000000u / 100000u));
 	cli_print(sh, "lines:   PWDN PE7 active high, RESETB PH12 active low\r\n");
-	cli_print(sh, "dcmi:    8-bit, PCK rising, VS/HS low, DMA2_Stream1 -> PSRAM\r\n");
+	cli_print(sh, "dcmi:    8-bit, PCK rising, VS/HS low, DMA2_Stream1 -> "
+	              "PSRAM ring (stream) / AXI-SRAM bands (preview)\r\n");
 #if BSP_ENABLE_LCD
 	{
 		uint32_t shown, dropped, blit_us;
 
 		cam_preview_stats(&shown, &dropped, &blit_us);
-		cli_print(sh, "preview: %s (full frame, rotated to 320x240 landscape), "
-		              "shown %lu dropped %lu, last blit %lu us\r\n",
-		          cam_preview_enabled() ? "on" : "off",
+		cli_print(sh, "preview: %s (%u AXI-SRAM bands of %u rows, rotated to "
+		              "320x240 landscape), shown %lu dropped %lu, "
+		              "last blit %lu us\r\n",
+		          cam_preview_enabled()
+		                  ? (camera_band_streaming() ? "on" : "on, stream stopped")
+		                  : "off",
+		          (unsigned)CAMERA_BANDS_PER_FRAME, (unsigned)CAMERA_BAND_ROWS,
 		          (unsigned long)shown, (unsigned long)dropped,
 		          (unsigned long)blit_us);
 	}
@@ -727,6 +732,11 @@ static int cmd_stream_start(struct cli_instance *sh, int argc, char **argv)
 		}
 	}
 
+	if (camera_band_streaming()) {
+		cli_error(sh, "camera: the preview owns the DCMI -- "
+		              "`camera preview off` first\r\n");
+		return 1;
+	}
 	if (!cam_psram_take(sh))
 		return 1;
 	rc = camera_stream_start(colorbar, frames, secs);
@@ -774,7 +784,15 @@ static int cmd_stream_stats(struct cli_instance *sh, int argc, char **argv)
 		report(sh, rc);
 		return 1;
 	}
+	if (st.mode == CAM_STREAM_NONE) {
+		cli_print(sh, "state:     never started\r\n");
+		return 0;
+	}
 	cli_print(sh, "state:     %s\r\n", st.active ? "streaming" : "stopped");
+	cli_print(sh, "mode:      %s\r\n",
+	          st.mode == CAM_STREAM_BAND
+	                  ? "band (preview: 60-row slices in AXI-SRAM)"
+	                  : "frame (whole frames in the PSRAM ring)");
 	cli_print(sh, "frames:    %lu\r\n", (unsigned long)st.frames);
 	cli_print(sh, "elapsed:   %lu ms\r\n", (unsigned long)st.elapsed_ms);
 	if (st.elapsed_ms != 0u) {
@@ -784,11 +802,11 @@ static int cmd_stream_stats(struct cli_instance *sh, int argc, char **argv)
 		          (unsigned long)(f10 % 10u));
 	}
 	cli_print(sh, "ovr dcmi:  %lu\r\n", (unsigned long)st.dcmi_ovr);
-	cli_print(sh, "ovr ring:  %lu\r\n", (unsigned long)st.ring_ovr);
 	/* The figure of merit for the OCTOSPI1 contention work: DMA FIFO errors are
 	   tolerated (they do not stop the stream) but their RATE says how close the
 	   bus is to not keeping up -- which is what decides whether the LTDC can
-	   scan out at the same time (phase 3c). */
+	   scan out at the same time (phase 3c).  Issue #35 expects zero in band mode:
+	   the DCMI writes AXI-SRAM there and never touches OCTOSPI1 at all. */
 	cli_print(sh, "dma fe:    %lu\r\n", (unsigned long)st.dma_fe);
 	if (st.elapsed_ms != 0u) {
 		uint32_t e10 = (uint32_t)((uint64_t)st.dma_fe * 10000u / st.elapsed_ms);
@@ -796,6 +814,20 @@ static int cmd_stream_stats(struct cli_instance *sh, int argc, char **argv)
 		cli_print(sh, "dma fe/s:  %lu.%lu\r\n", (unsigned long)(e10 / 10u),
 		          (unsigned long)(e10 % 10u));
 	}
+	/* Only the counters this mode actually keeps.  The others are not zero, they
+	   are absent -- there is no ring in band mode and no band grid in frame mode --
+	   and printing an absent counter as 0 reads as "nothing went wrong". */
+	if (st.mode == CAM_STREAM_BAND) {
+		cli_print(sh, "band late: %lu\r\n", (unsigned long)st.band_late);
+		cli_print(sh, "band torn: %lu\r\n", (unsigned long)st.band_torn);
+		cli_print(sh, "band sync: %lu frame ends off a band boundary\r\n",
+		          (unsigned long)st.band_desync);
+		cli_print(sh, "bands:     2 x %lu B in AXI-SRAM (%lu rows each)\r\n",
+		          (unsigned long)CAMERA_BAND_BYTES,
+		          (unsigned long)CAMERA_BAND_ROWS);
+		return 0;
+	}
+	cli_print(sh, "ovr ring:  %lu\r\n", (unsigned long)st.ring_ovr);
 	cli_print(sh, "repoint skip: %lu\r\n", (unsigned long)st.repoint_skip);
 	cli_print(sh, "ring:      %lu slots x %lu B\r\n", (unsigned long)st.slots,
 	          (unsigned long)CAMERA_FRAME_BYTES);
@@ -823,27 +855,56 @@ CLI_SUBCMD_SET_CREATE(camera_stream_subcmds,
 /* ---- preview ------------------------------------------------------------- */
 
 #if BSP_ENABLE_LCD
+/*
+ * `camera preview on` starts its own stream (issue #35): a BAND stream, in which
+ * the DCMI lands 60-row slices in AXI-SRAM instead of whole frames in the PSRAM
+ * ring.  That is the whole point of #35 -- the rotation's strided reads then come
+ * off internal RAM and the camera leaves OCTOSPI1 to the display.
+ *
+ * `camera stream start` is untouched and still does whole frames into the ring,
+ * for the pipeline counters and for anything later that wants frames rather than
+ * a picture.  The two are exclusive because there is one DCMI.
+ */
 static int cmd_camera_preview(struct cli_instance *sh, int argc, char **argv)
 {
-	int on;
+	int on, colorbar = 0;
 
-	(void)argc;
 	if (strcmp(argv[1], "on") == 0)
 		on = 1;
 	else if (strcmp(argv[1], "off") == 0)
 		on = 0;
 	else {
-		cli_error(sh, "camera: preview takes on|off\r\n");
+		cli_error(sh, "camera: preview takes on|off [test]\r\n");
 		return 1;
 	}
-	if (cam_preview_enable(on) != 0) {
+	if (argc > 2) {
+		if (!on || strcmp(argv[2], "test") != 0) {
+			cli_error(sh, "camera: usage: preview on|off [test]\r\n");
+			return 1;
+		}
+		colorbar = 1;
+	}
+	if (on && camera_streaming() && !camera_band_streaming()) {
+		cli_error(sh, "camera: a frame stream owns the DCMI -- "
+		              "`camera stream stop` first\r\n");
+		return 1;
+	}
+	/* Same OCTOSPI1 interlock as `stream start`, and for the same reason: held
+	   only across the arm, then handed over to camera_streaming(). */
+	if (on && !cam_psram_take(sh))
+		return 1;
+	if (cam_preview_enable(on, colorbar) != 0) {
+		if (on)
+			cam_psram_give();
 		cli_error(sh, "camera: the display is down or its scanout is off "
-		              "(run 'lcd on')\r\n");
+		              "('lcd on'), or the camera would not start "
+		              "(see `dmesg`)\r\n");
 		return 1;
 	}
+	if (on)
+		cam_psram_give();
 	cli_print(sh, "camera: preview %s%s\r\n", on ? "on" : "off",
-	          (on && !camera_streaming())
-	                  ? " -- nothing to show until `camera stream start`" : "");
+	          (on && colorbar) ? " (colorbar)" : "");
 	return 0;
 }
 #endif /* BSP_ENABLE_LCD */
@@ -868,8 +929,8 @@ CLI_SUBCMD_SET_CREATE(camera_subcmds,
 	CLI_CMD_ARG(stream, camera_stream_subcmds,
 	            "continuous capture (start/stop/stats)", cmd_camera_stream, 1, 1),
 #if BSP_ENABLE_LCD
-	CLI_CMD_ARG(preview, NULL, "show the running stream on the LCD <on|off>",
-	            cmd_camera_preview, 2, 0),
+	CLI_CMD_ARG(preview, NULL, "live camera on the LCD <on|off> [test]",
+	            cmd_camera_preview, 2, 1),
 #endif
 	CLI_CMD_ARG(reg, NULL, "raw SCCB access <addr> <reg> [value] [-16]",
 	            cmd_camera_reg, 3, 2),

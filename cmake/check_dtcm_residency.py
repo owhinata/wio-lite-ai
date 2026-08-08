@@ -78,11 +78,16 @@ REQUIRED_DTCM = (
 #   sd_bounce  SDMMC1 IDMA (port/sd/sd_card.c).  An AHB master -- it cannot see the
 #              TCMs at all, and moving this buffer would make every SD transfer a
 #              silent no-op rather than an error.
+#   cam_band   DCMI via DMA2_Stream1 (port/camera/camera.c, issue #35).  Same
+#              reachability rule, and the same silent failure: in DTCM the camera
+#              would keep running and the panel would show whatever was in the
+#              buffer at boot.
 #
 # cam_frame / cam_ring / ltdc_fb are the other master-touched buffers, but they live
 # in PSRAM and are covered by the .psram_noinit ASSERT in the linker script.
 REQUIRED_AXI = (
     "sd_bounce",
+    "cam_band",
 )
 
 # GCC clone/localisation suffixes; they stack, so stripping repeats.  Same set as

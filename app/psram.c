@@ -697,7 +697,12 @@ int psram_acquire(void)
 	}
 #endif
 #if BSP_ENABLE_CAMERA
-	if (camera_streaming()) {       /* the DCMI's DMA is writing the ring */
+	/* A frame stream has the DCMI's DMA writing the PSRAM ring; a band stream
+	   (issue #35) does not touch this bus from the DMA at all, but its preview
+	   transposes into the LTDC frame buffer, which does.  Either way something is
+	   mid-write here, so the test stays on camera_streaming() rather than
+	   narrowing to frame mode. */
+	if (camera_streaming()) {
 		psram_release();
 		return 0;
 	}

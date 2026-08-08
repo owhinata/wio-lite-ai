@@ -89,6 +89,21 @@ enum camera_sensor {
 #define CAMERA_FRAME_HEIGHT  240u
 #define CAMERA_FRAME_BYTES   (CAMERA_FRAME_WIDTH * CAMERA_FRAME_HEIGHT * 2u)
 
+/**
+ * Band geometry for the staged stream (issue #35).
+ *
+ * A band is a horizontal slice of the frame that the DMA delivers on its own.
+ * 60 rows divides 240 exactly, which is what makes band boundaries coincide with
+ * frame boundaries: the DCMI transfers active pixels only (RM0468 sec 36.3.6 /
+ * 36.3.7), so a frame is exactly CAMERA_BANDS_PER_FRAME transfers and the fourth
+ * one always ends where the frame does.  60 rows is also 38,400 B -- small enough
+ * that two of them fit in AXI-SRAM beside everything else, and a multiple of 32 so
+ * a cache maintenance operation on one band cannot touch the other.
+ */
+#define CAMERA_BAND_ROWS        60u
+#define CAMERA_BANDS_PER_FRAME  (CAMERA_FRAME_HEIGHT / CAMERA_BAND_ROWS)
+#define CAMERA_BAND_BYTES       (CAMERA_FRAME_WIDTH * CAMERA_BAND_ROWS * 2u)
+
 /** Frames a snapshot discards before the one it keeps, so the sensor's own
  *  exposure and gain loops have converged.  Measured, not guessed: see
  *  camera_capture_locked() in camera.c.  Public because it is what makes a
@@ -163,18 +178,35 @@ int camera_get_info(struct camera_info *out);
 /** Capture geometry / pixel format.  Constant in phase 2. */
 int camera_get_mode(struct camera_mode *out);
 
-/** Streaming counters (camera_stream_stats). */
+/** Which shape of stream owns the DCMI (camera_stream_stats.mode). */
+enum camera_stream_mode {
+	CAM_STREAM_NONE = 0,   /**< nothing running                               */
+	CAM_STREAM_FRAME,      /**< whole frames into the PSRAM ring + pipeline   */
+	CAM_STREAM_BAND,       /**< 60-row bands into AXI-SRAM, pushed to a sink  */
+};
+
+/** Streaming counters (camera_stream_stats).
+ *
+ *  @p mode says which of the fields below mean anything: the ring, the repoint
+ *  and the sink counters exist only in CAM_STREAM_FRAME.  A band-mode reader must
+ *  not print them as zero -- zero would read as "no overruns" when the truth is
+ *  "there is no ring here at all". */
 struct camera_stream_stats {
 	uint8_t  active;       /**< a stream is running right now                 */
-	uint32_t frames;       /**< frames published into the pipeline            */
+	uint8_t  mode;         /**< enum camera_stream_mode; the LAST run's, once
+	                        *   stopped, so a post-mortem `stats` still parses */
+	uint32_t frames;       /**< frames published (frame mode) / completed (band) */
 	uint32_t elapsed_ms;   /**< run time (frozen at teardown for a post-stop read) */
 	uint32_t dcmi_ovr;     /**< DCMI overrun / sync errors (terminal)         */
-	uint32_t ring_ovr;     /**< completions with no free slot -> frame dropped */
+	uint32_t ring_ovr;     /**< frame mode: completions with no free slot     */
 	uint32_t dma_fe;       /**< DMA FIFO/direct-mode errors tolerated          */
-	uint32_t repoint_skip; /**< DBM repoints skipped because CT moved (see .c) */
-	uint32_t delivered;    /**< stat sink: frames consumed                    */
-	uint32_t dropped;      /**< stat sink: frames dropped by policy           */
-	uint32_t slots;        /**< ring depth                                    */
+	uint32_t repoint_skip; /**< frame mode: DBM repoints skipped (see .c)     */
+	uint32_t delivered;    /**< frame mode, stat sink: frames consumed        */
+	uint32_t dropped;      /**< frame mode, stat sink: frames dropped         */
+	uint32_t slots;        /**< frame mode: ring depth                        */
+	uint32_t band_late;    /**< band mode: bands the consumer did not reach   */
+	uint32_t band_torn;    /**< band mode: bands the DMA caught up with       */
+	uint32_t band_desync;  /**< band mode: frame ends off a band boundary     */
 };
 
 /**
@@ -196,6 +228,51 @@ struct camera_stream_stats {
 int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs);
 int camera_stream_stop(void);
 
+/**
+ * Band consumer, called from the producer thread once per delivered band.
+ *
+ * @param band  0 .. CAMERA_BANDS_PER_FRAME-1, always in that order: the driver
+ *              drops the remainder of a frame rather than hand out a gap, so a
+ *              consumer that starts a frame at band 0 gets all of it or nothing.
+ * @param px    CAMERA_BAND_ROWS rows of RGB565, CAMERA_FRAME_WIDTH wide, in
+ *              AXI-SRAM.  Valid only for the duration of the call, and READ-ONLY:
+ *              the DMA owns this memory and the driver has just invalidated it.
+ *
+ * Thread context (never an ISR), but on the DRIVER'S producer thread -- what runs
+ * here delays the next band, so it must finish well inside a band period (~18 ms
+ * at the sensor's ~13.5 fps).  Do not block on anything slow here; the display
+ * flip in app/cam_preview.c is deliberately handed to another thread.
+ */
+typedef void (*camera_band_fn)(void *ctx, unsigned band, const uint16_t *px,
+                               unsigned rows);
+
+/**
+ * Start a BAND stream: the DCMI lands in AXI-SRAM, not in the PSRAM ring.
+ *
+ * WHY THIS MODE EXISTS (issue #35).  The panel is portrait and the camera
+ * landscape, so every displayed frame is transposed, and a transpose reads one
+ * side with a stride.  With whole frames in PSRAM that strided side was the
+ * external OCTOSPI1 -- 25 ms of CPU per frame, and enough extra bus arbitration
+ * to make the DCMI's FIFO complain.  Staging 60-row bands in AXI-SRAM puts the
+ * strided reads on internal RAM and takes the DCMI off OCTOSPI1 altogether.
+ *
+ * The DMA runs in double-buffer mode over two fixed band buffers and the memory
+ * registers are never rewritten, so the whole on-the-fly repoint dance that frame
+ * mode needs (RM0468 sec 15.3.11) does not exist here.
+ *
+ * Band mode publishes nothing into svc/frame_pipeline and fills no ring, so
+ * camera_stream_pin_latest() finds nothing and `camera save` / `send` keep
+ * showing the last camera_capture().  It is exclusive with camera_stream_start()
+ * and with camera_capture(); stop it with camera_stream_stop() like any stream.
+ *
+ * @return CAM_OK, CAM_ERR_PARAM (@p fn NULL), CAM_ERR_BUSY, CAM_ERR_HAL, ...
+ */
+int camera_band_start(int colorbar, camera_band_fn fn, void *ctx);
+
+/** Nonzero while a BAND stream specifically is running (camera_streaming() is
+ *  true for either mode -- that one gates the OCTOSPI1 retune). */
+int camera_band_streaming(void);
+
 /** Nonzero while a stream owns the DCMI and is writing the PSRAM ring.
  *  Read by app/psram.c to refuse OCTOSPI1 retunes -- see psram_acquire(). */
 int camera_streaming(void);
@@ -204,6 +281,9 @@ int camera_stream_stats(struct camera_stream_stats *out);
 
 /**
  * Pin the newest streamed frame for read-only access, or NULL if none.
+ *
+ * Frame mode only: a band stream fills no ring, so this returns NULL throughout
+ * one rather than handing back whatever the previous frame-mode run left behind.
  *
  * For a consumer that wants to look at live frames without going through a
  * push sink -- the LCD preview in app/cam_preview.c.  The returned pointer stays

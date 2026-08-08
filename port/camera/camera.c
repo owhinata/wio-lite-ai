@@ -48,6 +48,17 @@
  * unfalsifiable dead end; the split form worked on the first try and is now the
  * only one (CAM_SCCB_READ_SPLIT).
  *
+ * Two shapes of continuous capture share all of that hardware and differ only in
+ * where the DMA puts the pixels:
+ *
+ *   - FRAME mode (issue #8 phase 3b, camera_stream_start): whole 150 KB frames
+ *     into a ring of PSRAM slots, published through svc/frame_pipeline.  The DMA's
+ *     memory registers are repointed on the fly as slots recycle.
+ *   - BAND mode (issue #35, camera_band_start): 60-row slices into two FIXED
+ *     buffers in AXI-SRAM, pushed straight to one consumer.  Nothing is repointed
+ *     and nothing lands in the PSRAM, which is what makes the display's rotating
+ *     blit cheap and takes the DCMI off OCTOSPI1 entirely.
+ *
  * Concurrency: one TX_MUTEX serializes every public call for the whole
  * operation; the work lives in *_locked() helpers so a public entry never
  * re-takes the mutex it already holds.  No interrupt is enabled by this phase.
@@ -253,6 +264,41 @@ static int cam_colorbar = -1;          /* live/colorbar state, -1 = unknown   */
 static uint8_t cam_ring[CAM_RING_SLOTS][CAMERA_FRAME_BYTES]
 	__attribute__((aligned(32), section(".psram_noinit.camera")));
 
+/*
+ * The two band buffers of the staged stream (issue #35).
+ *
+ * 🔴 THIS IS THE SECOND BUFFER IN THIS FIRMWARE THAT A BUS MASTER WRITES AND THE
+ * CPU READS -- port/sd/sd_card.c's sd_bounce was the first, and this follows it
+ * exactly:
+ *
+ *   - AXI-SRAM (.axi_dma), because DMA2 cannot see either TCM at all (RM0468 sec
+ *     2.1.2 / 2.1.5 / 2.1.6).  In DTCM the transfer would not fault, it would
+ *     simply move nothing -- see include/mem_sections.h.  cmake/check_dtcm_
+ *     residency.py holds the line; cam_band is in its REQUIRED_AXI list.
+ *   - Its own 32 B-aligned section at both ends, so no neighbouring variable
+ *     shares a cache line with it and an invalidate here cannot discard someone
+ *     else's dirty data.
+ *   - Explicit maintenance: the driver invalidates both bands before arming and
+ *     the finished band before reading it, and the CPU never writes either.
+ *     CAMERA_BAND_BYTES is a multiple of 32, so band 1 starts on a line boundary
+ *     and maintaining one band cannot reach the other.
+ *
+ * 76,800 B is the whole cost of issue #35 in the scarce memory, and it was
+ * budgeted in issue #46: AXI-SRAM had 193,664 B free, leaving ~117 KB for the
+ * on-device AI work in issue #9.
+ */
+static uint8_t cam_band[2][CAMERA_BAND_BYTES]
+	__attribute__((aligned(32), section(".axi_dma.cam_band")));
+
+/* Everything about band mode rests on these three, so state them where they can
+   fail the build rather than the picture. */
+_Static_assert(CAMERA_FRAME_HEIGHT % CAMERA_BAND_ROWS == 0u,
+               "band rows must divide the frame, or bands drift across frames");
+_Static_assert(CAMERA_BAND_BYTES % 32u == 0u,
+               "a band must be whole cache lines, or maintaining one touches the other");
+_Static_assert(CAMERA_BAND_BYTES / 4u <= 0xFFFFu,
+               "a band must fit one DMA transfer (NDTR is 16-bit)");
+
 static TX_MUTEX     cam_pipe_lock;      /* the pipeline's injected mutex       */
 static TX_SEMAPHORE cam_stream_sem;     /* DMA TC ISR -> producer              */
 static TX_SEMAPHORE cam_start_sem;      /* start -> producer idle wakeup       */
@@ -267,6 +313,36 @@ static struct frame_sink     cam_stat_sink;
 static struct frame_desc *cam_m0;
 static struct frame_desc *cam_m1;
 static uint32_t cam_last_ct;
+
+/* ---- band-mode state (issue #35) ----------------------------------------- */
+
+/*
+ * Band mode needs no ring, no pipeline and no repoint.  What it does need is a
+ * band INDEX, and the honest source for that is a counter kept by the DMA's own
+ * completion ISR: cam_band_seq counts transfers since the stream armed, so the
+ * band that finished with transfer number s is s-1, its index in the frame is
+ * (s-1) % CAMERA_BANDS_PER_FRAME and the buffer holding it is (s-1) % 2.
+ *
+ * Deriving the buffer from the sequence rather than re-reading the DMA's CT bit
+ * per completion is what makes the pairing race-free: CT and the counter are
+ * updated by different agents (hardware / this ISR) and a thread that sampled them
+ * separately could catch them disagreeing.  CT is read exactly once, right after
+ * the stream arms, into cam_band_ct0 -- because HAL_DMAEx_MultiBufferStart_IT
+ * leaves CT wherever the previous run put it, which is the same trap the frame
+ * path documents at its own cam_last_ct seeding.
+ */
+static volatile uint32_t cam_band_seq;       /* DMA transfers completed          */
+static uint32_t cam_band_next;               /* sequence number expected next    */
+static int      cam_band_sync;               /* mid-frame delivery is coherent   */
+static camera_band_fn cam_band_cb;
+static void          *cam_band_ctx;
+static uint32_t  cam_band_ct0;               /* buffer the first transfer fills  */
+static uint32_t  cam_band_frames;            /* frames delivered whole           */
+static uint32_t  cam_band_late;              /* bands the consumer never saw     */
+static uint32_t  cam_band_torn;              /* bands the DMA overtook mid-read  */
+static volatile uint32_t cam_band_desync;    /* frame end off a band boundary    */
+static volatile int      cam_band_mode;      /* the running stream is band mode  */
+static uint8_t   cam_last_mode = CAM_STREAM_NONE;  /* survives the stop, for `stats` */
 
 static volatile int      cam_stream_active;  /* owns the DCMI and the PSRAM ring */
 static volatile int      cam_stream_err;     /* terminal: TE / DCMI OVR          */
@@ -1007,6 +1083,33 @@ void DMA2_Stream1_IRQHandler(void)
 void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *h)
 {
 	(void)h;
+	/*
+	 * Band mode: an integrity check, not a synchronisation source.
+	 *
+	 * What actually aligns bands with frames is arithmetic -- the DCMI transfers
+	 * active pixels only (RM0468 sec 36.3.6 / 36.3.7) and 240 = 4 x 60, so the
+	 * fourth band of every frame ends exactly where the frame does.  This
+	 * interrupt just says out loud when that stops being true, which is the sort
+	 * of assumption that fails silently into a rolling picture otherwise.
+	 *
+	 * Re-arming is mandatory, not tidiness: HAL_DCMI_IRQHandler disables
+	 * DCMI_IT_FRAME unconditionally on its way here (stm32h7xx_hal_dcmi.c, the
+	 * disable sits OUTSIDE the snapshot-only branch above it), so without this the
+	 * check would run once per stream and then go quiet.
+	 *
+	 * A count that is off by one band is tolerated on purpose: this interrupt and
+	 * the DMA's transfer-complete for the last band are two sources at the same
+	 * NVIC priority, so which one is taken first is not ordered.  Only a drift of
+	 * two or more means the band grid has really slipped.
+	 */
+	if (cam_band_mode) {
+		uint32_t phase = cam_band_seq % CAMERA_BANDS_PER_FRAME;
+
+		if (phase != 0u && phase != CAMERA_BANDS_PER_FRAME - 1u)
+			cam_band_desync++;
+		__HAL_DCMI_ENABLE_IT(h, DCMI_IT_FRAME);
+		return;
+	}
 	if (!cam_xfer_active)
 		return;                        /* stale completion after an abort */
 	(void)tx_semaphore_put(&cam_done);
@@ -1204,13 +1307,18 @@ static int cam_stat_consume(void *ctx, const struct frame_desc *f)
 	return 0;
 }
 
-/* DMA transfer-complete, ISR context: one ring slot just filled.  Wakes the
-   producer and nothing else -- it touches no ring, no pipeline, no CT. */
+/* DMA transfer-complete, ISR context: one ring slot -- or, in band mode, one
+   band -- just filled.  Wakes the producer and nothing else: it touches no ring,
+   no pipeline and no CT.  The band counter is the single exception, and it is
+   here rather than in the producer because only the ISR sees every completion;
+   a producer that fell a band behind would otherwise lose count silently. */
 static void cam_stream_dma_cb(DMA_HandleTypeDef *h)
 {
 	(void)h;
 	if (!cam_stream_active)
 		return;
+	if (cam_band_mode)
+		cam_band_seq++;
 	(void)tx_semaphore_put(&cam_stream_sem);
 }
 
@@ -1276,6 +1384,24 @@ static void cam_stream_teardown(void)
 	cam_elapsed_ms = HAL_GetTick() - cam_start_tick;
 	drain_stream_sem();
 
+	if (cam_band_mode) {
+		/* Nothing to hand over: a band stream never filled cam_ring, and copying
+		   a stale frame out of it into cam_frame would make `camera save` claim a
+		   picture the preview never showed.  The band buffers are the DMA's, and
+		   it has stopped. */
+		cam_band_mode = 0;
+		cam_band_cb   = NULL;
+		cam_band_ctx  = NULL;
+		cam_stream_active = 0;      /* last: releases the OCTOSPI1 gate */
+		LOG_INF("band stop: %lu frames, %lu ms, ovr %lu, fe %lu, late %lu, "
+		        "torn %lu, desync %lu",
+		        (unsigned long)cam_band_frames, (unsigned long)cam_elapsed_ms,
+		        (unsigned long)cam_dcmi_ovr, (unsigned long)cam_stream_fe,
+		        (unsigned long)cam_band_late, (unsigned long)cam_band_torn,
+		        (unsigned long)cam_band_desync);
+		return;
+	}
+
 	/* Hand the last streamed frame to the snapshot buffer so `camera save` /
 	   `send` work on what was just captured.  Reading the ring is safe now (the
 	   DMA is stopped), but cam_frame and info are shell-visible state, so this
@@ -1301,6 +1427,75 @@ static void cam_stream_teardown(void)
 	        (unsigned long)cam_pipe.stats.published,
 	        (unsigned long)cam_elapsed_ms, (unsigned long)cam_dcmi_ovr,
 	        (unsigned long)cam_ring_ovr, (unsigned long)cam_stream_fe);
+}
+
+/*
+ * Service one completed BAND (issue #35).
+ *
+ * Simpler than the frame path by construction: the memory registers are fixed for
+ * the life of the stream, so there is no repoint, no CT race and no ring.  What is
+ * left is bookkeeping -- which band did we just get, is it still intact, and does
+ * it continue the frame the consumer is already drawing?
+ *
+ * THE DEADLINE, derived once here because it is easy to get wrong by a factor of
+ * two.  cam_band_seq counts COMPLETIONS, so a sample of S means transfers 0..S-1
+ * are done and the DMA is part way through transfer S.  The band we hand out is
+ * S-1, in buffer (ct0 + S-1) % 2; the DMA is filling the other one.  It comes back
+ * to ours at transfer S+1 -- which starts the instant transfer S completes, i.e.
+ * the instant the ISR makes the counter S+1.  So the consumer has ONE band period
+ * from the completion that woke us, ~18.5 ms at the sensor's ~13.5 fps, not two.
+ * A transpose is ~0.4 ms, so the margin is large, but it is a single band period
+ * and contention on the display lock spends it.
+ *
+ * That makes the check after the callback exact rather than conservative: any
+ * advance of the counter at all means the DMA is already writing the buffer that
+ * was just read.  The consumer only ever gets whole frames, so a torn band --
+ * like a missed one -- abandons the rest of that frame instead of delivering a
+ * hole, which would leave one stale stripe on the panel that no later frame
+ * explains.
+ */
+static void cam_band_service(void)
+{
+	uint32_t seq = cam_band_seq;   /* completions so far; ~2.5 years to wrap */
+	uint32_t newest, band, buf;
+
+	if (seq == 0u)
+		return;                    /* armed, nothing has completed yet */
+	newest = seq - 1u;
+	if (newest < cam_band_next)
+		return;                    /* already delivered -- a bounded-wait tick */
+	if (newest > cam_band_next) {
+		cam_band_late += newest - cam_band_next;
+		cam_band_sync = 0;         /* the frame in progress now has a hole */
+	}
+	cam_band_next = newest + 1u;
+
+	band = newest % CAMERA_BANDS_PER_FRAME;
+	if (!cam_band_sync) {
+		if (band != 0u)
+			return;                /* resume only on a frame boundary */
+		cam_band_sync = 1;
+	}
+
+	buf = (cam_band_ct0 + newest) % 2u;
+	/* Discard any line the CPU still holds over this band before reading what the
+	   DMA wrote -- the same contract port/sd/sd_card.c has with the SDMMC IDMA.
+	   Cheap despite the size: 38,400 B is 1,200 lines, and the strided read that
+	   follows re-fetches each of them exactly once (a 640 B row stride over 60
+	   rows is 1,920 B of working set, which stays resident across all 320
+	   columns). */
+	SCB_InvalidateDCache_by_Addr(cam_band[buf], (int32_t)CAMERA_BAND_BYTES);
+	if (cam_band_cb != NULL)
+		cam_band_cb(cam_band_ctx, (unsigned)band,
+		            (const uint16_t *)(const void *)cam_band[buf],
+		            (unsigned)CAMERA_BAND_ROWS);
+
+	if (cam_band_seq != seq) {     /* exact, not conservative -- see the header */
+		cam_band_torn++;
+		cam_band_sync = 0;
+	} else if (band == CAMERA_BANDS_PER_FRAME - 1u) {
+		cam_band_frames++;
+	}
 }
 
 /*
@@ -1336,6 +1531,10 @@ static void cam_stream_service(int had_sem)
 	    (cam_target_secs &&
 	     (HAL_GetTick() - cam_start_tick) >= cam_target_secs * 1000u)) {
 		cam_stream_teardown();
+		return;
+	}
+	if (cam_band_mode) {
+		cam_band_service();
 		return;
 	}
 
@@ -1491,6 +1690,8 @@ static int cam_stream_start_locked(int colorbar, uint32_t frames, uint32_t secs)
 	HAL_NVIC_EnableIRQ(DCMI_IRQn);
 
 	cam_start_tick    = HAL_GetTick();
+	cam_last_mode     = CAM_STREAM_FRAME;   /* before active: another console's
+	                                           `stats` must not see the two disagree */
 	cam_stream_active = 1;
 
 	/* Manual double buffering: HAL's own >64 KB path bands a single frame
@@ -1524,6 +1725,111 @@ static int cam_stream_start_locked(int colorbar, uint32_t frames, uint32_t secs)
 	(void)tx_semaphore_put(&cam_start_sem);     /* wake the idle producer */
 	LOG_INF("stream start (frames=%lu secs=%lu)", (unsigned long)frames,
 	        (unsigned long)secs);
+	return CAM_OK;
+}
+
+/*
+ * Arm the band stream (issue #35).
+ *
+ * Deliberately parallel to cam_stream_start_locked() above, and deliberately
+ * shorter: there is no pipeline to re-initialise, no ring slots to acquire and no
+ * external pin to drain, because nothing outside the driver ever holds a band.
+ * The pieces that DO carry over are the ones that were paid for in bugs -- the
+ * error-code reset, the stale-flag clear, and enabling the interrupts here rather
+ * than in camera_init() (issue #12: an interrupt source is armed only once the
+ * ThreadX objects its ISR posts to exist).
+ */
+static int cam_band_start_locked(int colorbar, camera_band_fn fn, void *ctx)
+{
+	int rc;
+
+	if (fn == NULL)
+		return CAM_ERR_PARAM;
+	if (cam_stream_active || cam_xfer_active)
+		return CAM_ERR_BUSY;
+	if (!info.powered || info.sensor != CAM_SENSOR_OV2640) {
+		rc = camera_probe_locked();
+		if (rc != CAM_OK)
+			return rc;
+	}
+	rc = camera_configure_locked(colorbar);
+	if (rc != CAM_OK)
+		return rc;
+
+	cam_stream_err   = 0;
+	cam_stop_req     = 0;
+	cam_stream_fe    = 0;
+	cam_dcmi_ovr     = 0;
+	cam_ring_ovr     = 0;
+	cam_repoint_skip = 0;
+	cam_elapsed_ms   = 0;
+	/* A band stream runs until it is told to stop: there is no --frames/--secs
+	   here, because the consumer is a display and it stops when the user says. */
+	cam_target_frames = 0u;
+	cam_target_secs   = 0u;
+	cam_band_seq     = 0u;
+	cam_band_next    = 0u;
+	cam_band_sync    = 0;
+	cam_band_frames  = 0u;
+	cam_band_late    = 0u;
+	cam_band_torn    = 0u;
+	cam_band_desync  = 0u;
+	cam_band_cb      = fn;
+	cam_band_ctx     = ctx;
+	drain_stream_sem();
+
+	hdma_dcmi.XferCpltCallback   = cam_stream_dma_cb;
+	hdma_dcmi.XferM1CpltCallback = cam_stream_dma_cb;
+	hdma_dcmi.XferErrorCallback  = cam_stream_dma_err_cb;
+	hdcmi.ErrorCode              = HAL_DCMI_ERROR_NONE;
+	hdma_dcmi.ErrorCode          = HAL_DMA_ERROR_NONE;
+	__HAL_DCMI_CLEAR_FLAG(&hdcmi, DCMI_FLAG_ERRRI | DCMI_FLAG_OVRRI |
+	                              DCMI_FLAG_FRAMERI | DCMI_FLAG_LINERI |
+	                              DCMI_FLAG_VSYNCRI);
+
+	/* Hand both bands to the DMA with no line of ours left over them.  Nothing
+	   here writes them again: the CPU is a reader for the life of the stream. */
+	SCB_InvalidateDCache_by_Addr(cam_band, (int32_t)sizeof cam_band);
+
+	HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
+	HAL_NVIC_EnableIRQ(DCMI_IRQn);
+
+	cam_start_tick    = HAL_GetTick();
+	cam_band_mode     = 1;          /* before active: the ISR reads it */
+	cam_last_mode     = CAM_STREAM_BAND;
+	cam_stream_active = 1;
+
+	if (HAL_DMAEx_MultiBufferStart_IT(&hdma_dcmi,
+	        (uint32_t)(uintptr_t)&hdcmi.Instance->DR,
+	        (uint32_t)(uintptr_t)cam_band[0],
+	        (uint32_t)(uintptr_t)cam_band[1],
+	        CAMERA_BAND_BYTES / 4u) != HAL_OK) {
+		cam_stream_active = 0;
+		cam_band_mode     = 0;
+		cam_band_cb       = NULL;
+		cam_band_ctx      = NULL;
+		HAL_NVIC_DisableIRQ(DMA2_Stream1_IRQn);
+		HAL_NVIC_DisableIRQ(DCMI_IRQn);
+		LOG_ERR("band DMA start failed");
+		return CAM_ERR_HAL;
+	}
+	/* Which band buffer the first transfer fills -- read, not assumed.  See the
+	   comment on cam_band_seq: everything downstream pairs a completion with a
+	   buffer from this one sample. */
+	cam_band_ct0 = (DMA2_Stream1->CR & DMA_SxCR_CT) ? 1u : 0u;
+
+	hdcmi.Instance->CR &= ~DCMI_CR_CM;          /* continuous, not snapshot */
+	__HAL_DCMI_ENABLE(&hdcmi);
+	/* FRAME as well as ERR/OVR: it is the integrity check on the band grid.  See
+	   HAL_DCMI_FrameEventCallback() for why it has to be re-armed there. */
+	__HAL_DCMI_ENABLE_IT(&hdcmi, DCMI_IT_ERR | DCMI_IT_OVR | DCMI_IT_FRAME);
+	hdcmi.Instance->CR |= DCMI_CR_CAPTURE;
+	hdcmi.State = HAL_DCMI_STATE_BUSY;
+
+	(void)tx_semaphore_put(&cam_start_sem);     /* wake the idle producer */
+	LOG_INF("band stream start (%u rows x %u bands, %lu B x2 in AXI-SRAM)",
+	        (unsigned)CAMERA_BAND_ROWS, (unsigned)CAMERA_BANDS_PER_FRAME,
+	        (unsigned long)CAMERA_BAND_BYTES);
 	return CAM_OK;
 }
 
@@ -1681,6 +1987,22 @@ int camera_stream_start(int colorbar, uint32_t frames, uint32_t secs)
 	return rc;
 }
 
+int camera_band_start(int colorbar, camera_band_fn fn, void *ctx)
+{
+	int rc = op_lock();
+
+	if (rc != CAM_OK)
+		return rc;
+	rc = cam_band_start_locked(colorbar, fn, ctx);
+	op_unlock();
+	return rc;
+}
+
+int camera_band_streaming(void)
+{
+	return cam_stream_active && cam_band_mode;
+}
+
 /*
  * Ask the producer to stop and wait for it to finish the teardown.  The stop is
  * not done here: the producer owns the DCMI/DMA state machine, and having two
@@ -1718,14 +2040,26 @@ int camera_stream_stats(struct camera_stream_stats *out)
 		return CAM_ERR_PARAM;
 	if (!info.ready)
 		return CAM_ERR_STATE;
-	frame_pipeline_stats(&cam_pipe, &fs);
+	memset(out, 0, sizeof *out);
 	out->active     = (uint8_t)(cam_stream_active ? 1 : 0);
-	out->frames     = fs.published;
+	out->mode       = cam_last_mode;
 	out->elapsed_ms = cam_stream_active ? (HAL_GetTick() - cam_start_tick)
 	                                    : cam_elapsed_ms;
 	out->dcmi_ovr   = cam_dcmi_ovr;
-	out->ring_ovr   = cam_ring_ovr + fs.overruns;
 	out->dma_fe     = cam_stream_fe;
+	if (cam_last_mode == CAM_STREAM_BAND) {
+		/* Nothing from the pipeline here -- the ring is not merely empty, it is
+		   not part of this path, and reporting its zeroes beside real counters
+		   would read as "no overruns" rather than "no ring". */
+		out->frames     = cam_band_frames;
+		out->band_late  = cam_band_late;
+		out->band_torn  = cam_band_torn;
+		out->band_desync = cam_band_desync;
+		return CAM_OK;
+	}
+	frame_pipeline_stats(&cam_pipe, &fs);
+	out->frames     = fs.published;
+	out->ring_ovr   = cam_ring_ovr + fs.overruns;
 	out->repoint_skip = cam_repoint_skip;
 	out->delivered  = cam_stat_sink.delivered;
 	out->dropped    = cam_stat_sink.dropped;
@@ -1750,7 +2084,10 @@ const struct frame_desc *camera_stream_pin_latest(void)
 		return NULL;
 	if (tx_mutex_get(&cam_lock, TX_WAIT_FOREVER) != TX_SUCCESS)
 		return NULL;
-	if (!cam_stream_active) {
+	/* Band mode fills no ring: the pipeline still holds whatever the last frame
+	   stream published, and handing that out would show a consumer a stale
+	   picture it has no way to recognise as stale. */
+	if (!cam_stream_active || cam_band_mode) {
 		(void)tx_mutex_put(&cam_lock);
 		return NULL;
 	}

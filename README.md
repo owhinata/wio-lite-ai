@@ -221,19 +221,40 @@ time as the USB console. 24 commands:
     overrun/FIFO-error counters; **`dma fe/s` is the figure of merit** for whether
     the LTDC can scan out at the same time (phase 3c). Stopping copies the last
     streamed frame into the snapshot buffer, so `save`/`send` still work afterwards.
-  - *live preview* (`camera preview on|off`, needs `lcd on` + a running stream):
-    a thread in `app/cam_preview.c` pins the newest published frame, blits **the
-    whole frame, rotated** into the LTDC back buffer and presents it. It **pulls**
-    rather than registering a `frame_sink`, because a sink's `consume()` runs on
-    the producer thread and the blit + vertical-blanking wait would eat the very
-    margin that keeps the DBM repoint safe. Since issue #38 the drawing API is
-    landscape 320x240, so the camera frame *is* the surface — it used to show the
-    centre 240x240 and throw away 80 columns, because nothing here can rotate for
-    free (the panel will not: see [LCD](#lcd)). 🔴 The rotation currently
-    transposes straight out of a PSRAM ring slot, which measures **25.7 ms per
-    frame (35% CPU)** and pushes the DCMI DMA into occasional FIFO errors — that
-    is what issue #35 fixes, by staging DCMI frames through an AXI-SRAM band so
-    the strided side of the transpose lands on SRAM.
+  - *live preview* (`camera preview on|off [test]`, needs `lcd on`): since issue
+    #35 the preview **owns its own stream** — a *band* stream, in which the DCMI
+    lands **60-row slices in two fixed AXI-SRAM buffers** (`.axi_dma`, 2 × 38,400 B)
+    instead of whole frames in the PSRAM ring. `app/cam_preview.c` transposes each
+    band into the LTDC back buffer as it arrives and presents once the fourth one
+    is in. `camera stream start` is untouched and still does whole frames into the
+    ring; the two are exclusive because there is one DCMI.
+    - *why*: since issue #38 the drawing API is landscape 320x240, so the camera
+      frame *is* the surface — but nothing here can rotate for free (the panel
+      will not: see [LCD](#lcd)), so every frame is transposed in software, and a
+      transpose reads one side with a **stride**. Out of a PSRAM ring slot that
+      measured **25.0 ms per frame (35% CPU)** plus ~10 DCMI FIFO errors per 30 s
+      from the DCMI and the LTDC both wanting OCTOSPI1. Staging in AXI-SRAM puts
+      the strided reads on internal RAM **and takes the DCMI off that bus
+      entirely**, which is why both numbers move together. Measured on board #2
+      after the change: **1.29 ms per frame, 1.9 % CPU, and zero FIFO errors in
+      38.7 s** at 13.6 fps, with `band late`/`torn`/`sync` all zero. Note what
+      the ×19 says — quartering the *store* count in `gfx_rot` had bought 0.65 ms,
+      so essentially all of the original 25 ms was the strided **reads**, and
+      moving them was the whole fix.
+    - *what makes bands work*: 240 = 4 × 60 and the DCMI transfers active pixels
+      only (RM0468 sec 36.3.6/36.3.7), so a frame is exactly four transfers and
+      the fourth always ends where the frame does. `DCMI_IT_FRAME` is demoted to
+      an integrity check on that (`band sync` in `stream stats`). The memory
+      registers are **never rewritten**, so the whole on-the-fly repoint dance
+      above does not exist here.
+    - *the flip stays on its own thread*: `ltdc_flip()` waits for vertical
+      blanking, and the band transposes run on the *camera's* producer thread,
+      where anything slow delays the next band. The producer asks for a flip and
+      returns; it will not start the next frame until that flip has landed, or the
+      frame would split across both buffers (counted as `dropped`).
+    - `camera stream stats` prints `mode:` and then only the counters that mode
+      keeps — `band late` / `band torn` / `band sync` here, the ring counters
+      there. An absent counter is not printed as 0.
   - *the display and the camera share OCTOSPI1*: `psram_acquire()` refuses while
     either is live, but `psram_acquire_shared()` — what `lcd on` and the camera
     commands take — only refuses a command that is **reconfiguring** the bus. So
@@ -269,7 +290,10 @@ time as the USB console. 24 commands:
     exchange) looked like a free way out, so it was **measured on the board and it
     does not work** — see the comment above `st_send_sequence()` in
     `port/ltdc/st7789_rgb.c` for exactly what was tried and what the panel did.
-    Rotation therefore has to happen host-side (issue #8 phase 3c).
+    `RAMCTRL(0xB0)`'s `RM` bit was the last free candidate and it fails too (issue
+    #38's spike, all four combinations). Rotation therefore has to happen
+    host-side — and since it does, **what it costs is decided by which memory the
+    strided side lands in**, which is the whole content of issue #35 above.
   - *the host must generate XCLK*. Schematic sheet 7 leaves the 24 MHz oscillator
     OSC1 and its series R15 **DNP**; the only populated path to the module's clock
     pin is R11 (0R) from `DCMI_XCLK` = **PA2**, driven by **TIM5_CH3** (AF2) at
@@ -962,7 +986,7 @@ Listed in memory-hierarchy order — the same order `free` and `membench` print
 |---|---|---|
 | ITCM | `0x00000000` | 64 KB; holds the **interrupt paths** (`.itcm`, 2,784 B): ThreadX PendSV + SysTick, the RTL8720 UART RX ISR **and the whole wake-up it signals** (`tx_event_flags_set` + `_tx_thread_system_resume`, issue #23 U0-3 — that call alone had put the ISR back to 4.3 µs warm / 12.9 µs cold — plus their two tails `_tx_thread_system_preempt_check` + `_tx_timer_system_deactivate`, issue #29), and the fault handlers, plus the 4 KB `.itcm_bench` scratch. Zero-wait-state and outside both caches, so an ISR never pays a cold fetch through the 16 KB I-cache: measured against the external-XIP build the same UART ISR went from **8.7 µs cold / 3.3 µs warm to a flat 0.7 µs** (issue #24). The tails matter because they only run when a thread is *really* woken — with them still in the flash, request/reply commands (`wifi ver`, `wifi scan`) measured 3.5 µs against 0.1 µs for an ISR that wakes nobody; 106 bytes of ITCM took that to **1.5 µs**, and `wifi link bench` improved 2.1 → 1.5 µs too. Those figures were taken while the app ran from the external flash; issue #25 shrank the gap without closing it (ITCM is still zero-wait and never evicted). Loaded from its load image by `SystemInit()`, which also zero-fills all 64 KB to initialise the TCM ECC; kept read-only by the MPU so a NULL write raises MemManage instead of corrupting ISR code. |
 | DTCM | `0x20000000` | 128 KB, and since issue #46 it holds **all the CPU-only hot data**: the reset-persistent `.log_noinit` crash-log ring, the **32 KB NetX Duo packet pool** (`.nx_pool`, issue #23 U3), `membench` scratch, `.dtcm_bss` = **every ThreadX thread stack and the two RTL8720 UART rings** (48,640 B), and at the very top the **main (MSP/ISR) stack**, 8 KB ending at `_estack = 0x20020000`. All of it bypasses the D-cache — which for stacks is the point, not a side effect. The bootloader accepts a DTCM MSP: it validates the app's `vector[0]` against the on-chip RAM regions and `0x20000000` is one of them (`boot/main.c`), so `boot/` is unchanged. There is **no MPU guard page** below the main stack: ARMv7-M has no MSPLIM, so a guard faults while stacking the very exception meant to report it and locks up (PM0253 sec 2.5.1/2.5.2/2.5.5). `SystemInit()` stamps the unused stack with a pattern instead and `free` reports the high-water mark. |
-| AXI-SRAM (D1) | `0x24000000` | 320 KB, **reserved for what a bus master has to reach** (issue #46): `.data`/`.bss`, the heap (up to `__ram_end`), and `.axi_dma` — the 4 KB SDMMC1 bounce buffer (issue #6) in its **own output section, 32 B-aligned at both ends**, so the driver's per-transfer clean/invalidate cannot disturb a neighbouring variable's cache line. DMA1/DMA2 and the SDMMC1 IDMA **cannot address either TCM** (RM0468 sec 2.1.2/2.1.5/2.1.6), which makes this the scarce memory: a survey of every `*_DMA()` call found only three master-touched buffers in the whole firmware, so the other 217 KB sitting here was CPU-only data occupying the one region the camera's DCMI band (issue #35) has no substitute for. Moving it out took usage from **221,024 B to 135,520 B**. 🔴 Putting a DMA buffer in DTCM does not fault — the transfer silently moves nothing — so both directions are checked after every link by `cmake/check_dtcm_residency.py`. |
+| AXI-SRAM (D1) | `0x24000000` | 320 KB, **reserved for what a bus master has to reach** (issue #46): `.data`/`.bss`, the heap (up to `__ram_end`), and `.axi_dma` — the 4 KB SDMMC1 bounce buffer (issue #6) and the 2 × 38,400 B camera band buffers (issue #35), in their **own output section, 32 B-aligned at both ends**, so a driver's per-transfer clean/invalidate cannot disturb a neighbouring variable's cache line. DMA1/DMA2 and the SDMMC1 IDMA **cannot address either TCM** (RM0468 sec 2.1.2/2.1.5/2.1.6), which makes this the scarce memory: a survey of every `*_DMA()` call found only three master-touched buffers in the whole firmware, so the other 217 KB sitting here was CPU-only data occupying the one region the camera's DCMI band (issue #35) has no substitute for. Moving it out took usage from **221,024 B to 135,520 B**; issue #35 then spent 76,800 B of that on the band buffers, leaving **115,264 B** free. 🔴 Putting a DMA buffer in DTCM does not fault — the transfer silently moves nothing — so both directions are checked after every link by `cmake/check_dtcm_residency.py`. |
 | FLASH | `0x08020000` | internal flash **sectors 1-3 = 384 KB** (issue #25). Sector 0 (`0x08000000`, 128 KB) is the DFU bootloader; the 128 KB erase granule is what keeps the two apart, so no programming path can reach it. ~905 MB/s read (`membench`). The image currently uses **272,112 B = 69.2%**; see [Build](#build) for why it is built `-Os` + LTO. |
 | PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). Since issue #7 the first 300 KB are the **LTDC double frame buffer**, which the display controller reads continuously while scanout is on — hence the `lcd off` interlock on every path that retunes OCTOSPI1. |
 | *(bootloader)* | `0x08000000` | internal flash **sector 0, 128 KB** — the DFU bootloader. The app does not own it and no app-side path can erase it (the 128 KB erase granule is the sector granule). |
