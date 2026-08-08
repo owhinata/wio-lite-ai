@@ -8,7 +8,7 @@
  *
  *   lcd info            panel / clock / frame buffer / LTDC error flags
  *   lcd fill <color>    flood the screen (colour name or 0xRGB565 / decimal)
- *   lcd bar             eight vertical colour bars (RGB channel / bit-order check)
+ *   lcd bar             eight colour bars along the long axis (RGB / bit-order check)
  *   lcd grad            horizontal black->white gradient (pixel-clock check)
  *   lcd clear           fill black
  *   lcd anim            bouncing rectangle (tear-free double-buffer demo)
@@ -23,6 +23,10 @@
  *
  * `lcd bar` is the most informative single image: it proves the RGB channel
  * wiring and the RGB565 bit order in one shot.
+ *
+ * Coordinates here are the LANDSCAPE 320x240 drawing surface, not the panel's
+ * 240x320 (issue #38) -- see the header of ltdc_display.h for the mapping and for
+ * why the panel cannot do the rotation itself.
  *
  * `lcd off` is also the prerequisite for any `psram` subcommand that retunes
  * OCTOSPI1: scanout reads the frame buffer out of that bus continuously, so
@@ -99,6 +103,12 @@ static int cmd_lcd_info(struct cli_instance *sh, int argc, char **argv)
 
 	cli_print(sh, "panel:   ST7789 %ux%u RGB565 (FPC-40, LTDC layer 0)\r\n",
 	          (unsigned)p.w, (unsigned)p.h);
+	/* The two differ on purpose (issue #38): the panel is portrait, everything
+	   drawn on it is addressed landscape, and the rotation is a fixed coordinate
+	   transform in ltdc_display.c -- not anything the panel does. */
+	cli_print(sh, "surface: %ux%u landscape (drawing coordinates; fb stride stays %u)\r\n",
+	          (unsigned)ltdc_surface_w(), (unsigned)ltdc_surface_h(),
+	          (unsigned)p.w);
 	cli_print(sh, "timing:  hs=%u hbp=%u hfp=%u  vs=%u vbp=%u vfp=%u"
 	              "  (total %ux%u)\r\n",
 	          (unsigned)p.hs, (unsigned)p.hbp, (unsigned)p.hfp,
@@ -205,7 +215,6 @@ static int cmd_lcd_anim(struct cli_instance *sh, int argc, char **argv)
 	   the vertical-blanking reload commits, so the loop is naturally paced to the
 	   panel's frame rate -- no explicit sleep needed; Ctrl+C is polled once per
 	   frame for prompt cancellation. */
-	struct ltdc_panel p;
 	int x = 0, y = 0, dx = 5, dy = 3;
 	const int w = 40, h = 40;
 	int maxx, maxy;
@@ -214,9 +223,11 @@ static int cmd_lcd_anim(struct cli_instance *sh, int argc, char **argv)
 	(void)argv;
 	if (!lcd_ready(sh))
 		return 1;
-	ltdc_panel_get(&p);
-	maxx = (int)p.w - w;
-	maxy = (int)p.h - h;
+	/* The drawing surface, not ltdc_panel_get()'s panel geometry: the API is
+	   landscape 320x240 since issue #38, so a rectangle bounced inside 240x320
+	   would spend half its travel clipped off the long edge. */
+	maxx = (int)ltdc_surface_w() - w;
+	maxy = (int)ltdc_surface_h() - h;
 
 	for (;;) {
 		int rc;

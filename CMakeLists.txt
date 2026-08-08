@@ -267,6 +267,7 @@ set(SHELL_SOURCES
     # its host tests land before the hardware work that depends on them.
     # --gc-sections drops it from the image until it has a caller.
     "${CMAKE_SOURCE_DIR}/svc/frame_pipeline.c"
+    "${CMAKE_SOURCE_DIR}/svc/gfx_rot.c"
     "${CMAKE_SOURCE_DIR}/svc/log.c")
 
 # --- CoreMark object library (run as the shell `coremark` command) ----------

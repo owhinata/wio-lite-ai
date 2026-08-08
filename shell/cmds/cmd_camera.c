@@ -249,13 +249,14 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 	cli_print(sh, "dcmi:    8-bit, PCK rising, VS/HS low, DMA2_Stream1 -> PSRAM\r\n");
 #if BSP_ENABLE_LCD
 	{
-		uint32_t shown, dropped;
+		uint32_t shown, dropped, blit_us;
 
-		cam_preview_stats(&shown, &dropped);
-		cli_print(sh, "preview: %s (centre 240x240 on the panel), "
-		              "shown %lu dropped %lu\r\n",
+		cam_preview_stats(&shown, &dropped, &blit_us);
+		cli_print(sh, "preview: %s (full frame, rotated to 320x240 landscape), "
+		              "shown %lu dropped %lu, last blit %lu us\r\n",
 		          cam_preview_enabled() ? "on" : "off",
-		          (unsigned long)shown, (unsigned long)dropped);
+		          (unsigned long)shown, (unsigned long)dropped,
+		          (unsigned long)blit_us);
 	}
 #endif
 	cli_print(sh, "sensor cfg: %s, DVP byte swap on\r\n",

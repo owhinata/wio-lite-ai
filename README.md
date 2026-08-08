@@ -222,13 +222,18 @@ time as the USB console. 24 commands:
     the LTDC can scan out at the same time (phase 3c). Stopping copies the last
     streamed frame into the snapshot buffer, so `save`/`send` still work afterwards.
   - *live preview* (`camera preview on|off`, needs `lcd on` + a running stream):
-    a thread in `app/cam_preview.c` pins the newest published frame, blits the
-    **centre 240x240** into the LTDC back buffer and presents it. It **pulls**
+    a thread in `app/cam_preview.c` pins the newest published frame, blits **the
+    whole frame, rotated** into the LTDC back buffer and presents it. It **pulls**
     rather than registering a `frame_sink`, because a sink's `consume()` runs on
-    the producer thread and the ~20 ms of blit + vertical-blanking wait would eat
-    the very margin that keeps the DBM repoint safe. The crop is free: passing the
-    *source* width to `ltdc_blit()` makes its existing clipping copy 240 columns
-    and step the source by 320.
+    the producer thread and the blit + vertical-blanking wait would eat the very
+    margin that keeps the DBM repoint safe. Since issue #38 the drawing API is
+    landscape 320x240, so the camera frame *is* the surface — it used to show the
+    centre 240x240 and throw away 80 columns, because nothing here can rotate for
+    free (the panel will not: see [LCD](#lcd)). 🔴 The rotation currently
+    transposes straight out of a PSRAM ring slot, which measures **25.7 ms per
+    frame (35% CPU)** and pushes the DCMI DMA into occasional FIFO errors — that
+    is what issue #35 fixes, by staging DCMI frames through an AXI-SRAM band so
+    the strided side of the transpose lands on SRAM.
   - *the display and the camera share OCTOSPI1*: `psram_acquire()` refuses while
     either is live, but `psram_acquire_shared()` — what `lcd on` and the camera
     commands take — only refuses a command that is **reconfiguring** the bus. So

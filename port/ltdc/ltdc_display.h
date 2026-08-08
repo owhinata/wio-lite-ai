@@ -335,8 +335,33 @@ int ltdc_flip(void);
 /* ---- Drawing into the back buffer (DMA2D-accelerated where noted) ----------
  * These draw into the back buffer only; they do NOT present.  Call ltdc_flip()
  * afterwards.  All are no-ops when the display is down.  Coordinates are clipped
- * to the panel.
+ * to the surface.
+ *
+ * 🔴 COORDINATES ARE LANDSCAPE 320x240, NOT THE PANEL'S 240x320 (issue #38).
+ * x is the long axis (0..319), y the short one (0..239).  The frame buffer keeps
+ * a 240-pixel stride and the rotation happens in ltdc_display.c, using the
+ * mapping the board's factory firmware used:
+ *
+ *     landscape (x, y)  ->  fb[240 * (319 - x) + y]
+ *
+ * There is deliberately no runtime rotation control: the angle is fixed at build
+ * time, so ltdc_blit()'s source coordinates always mean one thing.  The panel
+ * cannot rotate for us either -- MADCTL/MV and RAMCTRL/RM were both measured dead
+ * on the RGB interface (st7789_rgb.c); do not go looking again.
+ *
+ * Rotation is FREE for every fill: a 90-degree rotation maps a rectangle to a
+ * rectangle, so the DMA2D work is unchanged and only the arguments are permuted.
+ * ltdc_blit() is the one primitive that transposes pixels (svc/gfx_rot).
  */
+
+/* The drawing surface, i.e. the panel with its axes swapped. */
+#define LTDC_SURFACE_W  LTDC_DEF_H   /* 320, the long axis */
+#define LTDC_SURFACE_H  LTDC_DEF_W   /* 240 */
+
+/** Drawing-surface size (landscape).  ltdc_panel_get() still reports the panel's
+ *  own 240x320 geometry and timings -- these two answer different questions. */
+uint16_t ltdc_surface_w(void);
+uint16_t ltdc_surface_h(void);
 
 /** Fill the whole back buffer with one RGB565 colour (DMA2D R2M). */
 void ltdc_fill(uint16_t rgb565);
@@ -349,7 +374,8 @@ void ltdc_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
 void ltdc_blit(const uint16_t *src, uint16_t x, uint16_t y,
                uint16_t w, uint16_t h);
 
-/** Eight vertical colour bars -- verifies the RGB channel wiring and the RGB565
+/** Eight colour bars across the long axis -- verifies the RGB channel wiring and
+ *  the RGB565
  *  bit order, which is the single most useful first image on a new panel. */
 void ltdc_colorbar(void);
 

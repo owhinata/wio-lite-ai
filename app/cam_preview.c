@@ -26,20 +26,29 @@
  * carry their own lifetime rules, and the camera side blocks a stream restart
  * while an outside pin is held.
  *
- * WHY THE MIDDLE.  The camera is 320x240 landscape and the panel 240x320
- * portrait, and this SoC cannot rotate: it has no GFXMMU and no GPU2D, and both
- * DMA2D and MDMA can only transpose by turning one side of the copy into ~77k
- * scattered 2-byte accesses -- the worst possible shape for a serial PSRAM.  The
- * panel's own MADCTL row/column exchange was measured and does not apply to
- * RGB-interface pixels (see port/ltdc/st7789_rgb.c).  So the preview shows the
- * centre 240x240 with a black band above and below, and ltdc_blit()'s existing
- * clipping does the crop for free: passing the SOURCE width as w makes it copy
- * 240 columns per row and step the source by the full 320.
+ * FULL FRAME, ROTATED (issue #38).  The camera is 320x240 landscape and the panel
+ * 240x320 portrait.  This used to show the centre 240x240 with black bands above
+ * and below, throwing away 80 columns, because nothing here could rotate: the SoC
+ * has no GFXMMU and no GPU2D, and the panel's own MADCTL/MV -- and, as of the
+ * issue #35/#38 spike, RAMCTRL's RM bit too -- do not apply to RGB-interface
+ * pixels (port/ltdc/st7789_rgb.c).  Since the display API took on a landscape
+ * 320x240 coordinate system, the camera frame simply IS the surface, so the blit
+ * below is the whole frame at (0,0) and the transpose happens inside ltdc_blit().
+ *
+ * 🔴 THAT TRANSPOSE IS ON THE EXPENSIVE PATH, DELIBERATELY, FOR NOW.  gfx_blit_rot
+ * reads its source with a stride, and this source is a camera ring slot in the
+ * external PSRAM -- the shape issue #8 phase 3a called the worst case for a serial
+ * PSRAM.  Issue #35 exists to stage DCMI frames through an AXI-SRAM band so the
+ * strided side lands on SRAM.  Doing the naive version first is the point: it puts
+ * the correct picture on the panel and produces the measurement (`camera preview
+ * stats` prints the per-frame blit time) that says how much #35 actually buys.
+ * Build the band when a number asks for it, not before.
  */
 #include "cam_preview.h"
 
 #include "camera.h"
 #include "ltdc_display.h"
+#include "stm32h7xx.h"   /* DWT->CYCCNT: time the rotating blit */
 #include "tx_api.h"
 
 #define LOG_TAG "campv"
@@ -56,9 +65,10 @@
    wake-ups a second when idle. */
 #define PREVIEW_IDLE_MS 10u
 
-/* Centre crop: 240 of the camera's 320 columns, placed 40 rows down the panel. */
-#define PREVIEW_X_OFF  ((CAMERA_FRAME_WIDTH - 240u) / 2u)   /* 40 px */
-#define PREVIEW_Y_POS  ((320u - 240u) / 2u)                 /* 40 rows */
+/* The camera frame and the landscape drawing surface are the same size, so the
+ * preview is a full-surface blit at the origin -- no crop, no offsets. */
+_Static_assert(CAMERA_FRAME_WIDTH == 320u && CAMERA_FRAME_HEIGHT == 240u,
+               "preview assumes the camera matches the 320x240 landscape surface");
 
 static TX_THREAD preview_thread;
 static UCHAR     preview_stack[PREVIEW_STACK] DTCM_BSS __attribute__((aligned(8)));
@@ -66,6 +76,9 @@ static UCHAR     preview_stack[PREVIEW_STACK] DTCM_BSS __attribute__((aligned(8)
 static volatile int preview_on;
 static uint32_t     preview_shown;
 static uint32_t     preview_dropped;
+/* Cycles the rotating blit took on the most recent frame (DWT, 550 MHz).
+   This is the number issue #35 has to beat to justify its AXI-SRAM band. */
+static uint32_t     preview_blit_cyc;
 
 static void preview_entry(ULONG arg)
 {
@@ -105,12 +118,14 @@ static void preview_entry(ULONG arg)
 			continue;
 		}
 		if (!have_last || f->gen != last_gen) {
-			/* w is the SOURCE width, not the destination's: ltdc_blit() clips to
-			   the panel (240) and advances the source by w - 240 = 80 px per row,
-			   which is exactly the centre crop.  See the header comment. */
-			ltdc_blit((const uint16_t *)f->data + PREVIEW_X_OFF,
-			          0, (uint16_t)PREVIEW_Y_POS,
+			uint32_t t0 = DWT->CYCCNT;
+
+			/* The whole frame, rotated into the panel.  See the header on why
+			   this is knowingly the slow shape until issue #35 stages the frame
+			   through AXI-SRAM -- and why the timing below is the deliverable. */
+			ltdc_blit((const uint16_t *)f->data, 0, 0,
 			          (uint16_t)CAMERA_FRAME_WIDTH, (uint16_t)CAMERA_FRAME_HEIGHT);
+			preview_blit_cyc = DWT->CYCCNT - t0;
 			if (ltdc_flip() == LTDC_OK)
 				preview_shown++;
 			else
@@ -158,10 +173,14 @@ int cam_preview_enabled(void)
 	return preview_on;
 }
 
-void cam_preview_stats(uint32_t *shown, uint32_t *dropped)
+void cam_preview_stats(uint32_t *shown, uint32_t *dropped, uint32_t *blit_us)
 {
 	if (shown != NULL)
 		*shown = preview_shown;
 	if (dropped != NULL)
 		*dropped = preview_dropped;
+	/* DWT counts CPU cycles and the app inherits a 550 MHz core (SystemCoreClock),
+	   which is where the divisor comes from -- not a hardcoded 550. */
+	if (blit_us != NULL)
+		*blit_us = preview_blit_cyc / (SystemCoreClock / 1000000u);
 }

@@ -40,6 +40,7 @@
  */
 #include "ltdc_display.h"
 #include "st7789_rgb.h"
+#include "gfx_rot.h"   /* the transposing blit (issue #38) */
 
 #include "stm32h7xx_hal.h"
 #include "tx_api.h"
@@ -927,8 +928,81 @@ int ltdc_panel_recover(void)
 }
 
 /* ==========================================================================
- *  Drawing
- * ========================================================================== */
+ *  Drawing -- LANDSCAPE 320x240 coordinates (issue #38)
+ * ==========================================================================
+ *
+ * The public drawing API speaks a 320x240 landscape coordinate system even
+ * though the panel is 240x320 portrait and the frame buffer keeps a stride of
+ * 240.  Everything worth showing here is landscape -- the camera is 320x240 and
+ * so was the board's factory firmware -- and this SoC cannot rotate: no GFXMMU,
+ * no GPU2D, nothing in the LTDC.  Neither will the panel; MADCTL/MV and
+ * RAMCTRL/RM have both been measured dead on the RGB interface (see
+ * st7789_rgb.c, and do not re-open it).  So the rotation is a coordinate
+ * transform, applied here, once.
+ *
+ * THE MAPPING is the one the factory firmware called rotation 2, recovered by
+ * disassembling its image (issue #38):
+ *
+ *     landscape (x, y)  ->  fb[240 * (319 - x) + y]
+ *
+ * x is the long axis (0..319), y the short one (0..239).
+ *
+ * WHY THIS IS CHEAP, mostly.  A 90-degree rotation maps an axis-aligned
+ * rectangle to an axis-aligned rectangle, so every fill -- ltdc_fill,
+ * ltdc_fill_rect, the colour bars, the gradient -- is the same DMA2D work it
+ * always was with its arguments permuted.  Rotation costs nothing there.  Only
+ * ltdc_blit() has to transpose pixels, and it hands that to svc/gfx_rot.
+ *
+ * BUILD-TIME FIXED, not a runtime `lcd rotate`.  A runtime angle would change
+ * what ltdc_blit()'s source coordinates MEAN from call to call, and would need
+ * four transpose loops instead of one; the panel is bolted to a board that has
+ * one sensible orientation, so the flexibility would buy nothing and cost a
+ * test matrix.
+ *
+ * Panel-native coordinates survive only as the fb_* helpers below, which assume
+ * the frame lock is held and the back buffer is non-NULL.
+ */
+
+/* Landscape rect -> frame-buffer rect.  Derived straight from the mapping above:
+ * landscape x becomes the frame-buffer ROW (reversed), landscape y the column, so
+ * a rect's width and height swap and its x origin measures from the far edge. */
+static void surf_to_fb(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                       uint32_t *fx, uint32_t *fy, uint32_t *fw, uint32_t *fh)
+{
+	*fx = y;
+	*fy = LTDC_SURFACE_W - x - w;
+	*fw = h;
+	*fh = w;
+}
+
+/* Clip a landscape rect to the surface; 0 = nothing left to draw. */
+static int surf_clip(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
+{
+	uint32_t x1, y1;
+
+	if (*x >= LTDC_SURFACE_W || *y >= LTDC_SURFACE_H)
+		return 0;
+	x1 = *x + *w;
+	y1 = *y + *h;
+	if (x1 > LTDC_SURFACE_W)
+		x1 = LTDC_SURFACE_W;
+	if (y1 > LTDC_SURFACE_H)
+		y1 = LTDC_SURFACE_H;
+	*w = x1 - *x;
+	*h = y1 - *y;
+	return (*w != 0u && *h != 0u);
+}
+
+/* Panel-native rectangle fill.  Frame lock held, @back non-NULL, rect in range. */
+static void fb_fill_rect(uint16_t *back, uint32_t fx, uint32_t fy,
+                         uint32_t fw, uint32_t fh, uint16_t rgb565)
+{
+	ltdc_dma2d_fill(back + fy * LTDC_DEF_W + fx, rgb565, fw, fh,
+	                (uint32_t)LTDC_DEF_W - fw);
+}
+
+uint16_t ltdc_surface_w(void) { return LTDC_SURFACE_W; }
+uint16_t ltdc_surface_h(void) { return LTDC_SURFACE_H; }
 
 void ltdc_fill(uint16_t rgb565)
 {
@@ -938,62 +1012,48 @@ void ltdc_fill(uint16_t rgb565)
 		return;
 	ltdc_lock_frame();
 	back = ltdc_back_buffer();
-	if (back != NULL)
-		ltdc_dma2d_fill(back, rgb565, ltdc_cfg.w, ltdc_cfg.h, 0);
+	if (back != NULL)   /* the whole buffer, so no transform to make */
+		ltdc_dma2d_fill(back, rgb565, LTDC_DEF_W, LTDC_DEF_H, 0);
 	ltdc_unlock_frame();
 }
 
 void ltdc_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                     uint16_t rgb565)
 {
+	uint32_t cx = x, cy = y, cw = w, ch = h;
+	uint32_t fx, fy, fw, fh;
 	uint16_t *back;
-	uint32_t x1, y1;
 
 	if (!ltdc_is_up())
 		return;
 	ltdc_lock_frame();
 	back = ltdc_back_buffer();
-	if (back == NULL || x >= ltdc_cfg.w || y >= ltdc_cfg.h) {
-		ltdc_unlock_frame();
-		return;
+	if (back != NULL && surf_clip(&cx, &cy, &cw, &ch)) {
+		surf_to_fb(cx, cy, cw, ch, &fx, &fy, &fw, &fh);
+		fb_fill_rect(back, fx, fy, fw, fh, rgb565);
 	}
-	x1 = (uint32_t)x + w;
-	y1 = (uint32_t)y + h;
-	if (x1 > ltdc_cfg.w)
-		x1 = ltdc_cfg.w;
-	if (y1 > ltdc_cfg.h)
-		y1 = ltdc_cfg.h;
-	w = (uint16_t)(x1 - x);
-	h = (uint16_t)(y1 - y);
-	ltdc_dma2d_fill(back + (uint32_t)y * ltdc_cfg.w + x, rgb565, w, h,
-	                (uint32_t)ltdc_cfg.w - w);
 	ltdc_unlock_frame();
 }
 
 void ltdc_blit(const uint16_t *src, uint16_t x, uint16_t y,
                uint16_t w, uint16_t h)
 {
+	uint32_t cx = x, cy = y, cw = w, ch = h;
 	uint16_t *back;
-	uint32_t x1, y1;
 
 	if (!ltdc_is_up())
 		return;
 	ltdc_lock_frame();
 	back = ltdc_back_buffer();
-	if (back == NULL || src == NULL || x >= ltdc_cfg.w || y >= ltdc_cfg.h) {
-		ltdc_unlock_frame();
-		return;
+	if (back != NULL && src != NULL && surf_clip(&cx, &cy, &cw, &ch)) {
+		/* The only primitive rotation actually costs anything for.  The source
+		   stride stays the caller's full w even when clipping narrowed the copy.
+		   gfx_blit_rot() reads the source with a stride and writes the frame
+		   buffer in contiguous runs, which is the right way round for PSRAM --
+		   but it also means a source IN PSRAM is the expensive case.  That is
+		   what issue #35 stages through an AXI-SRAM band to avoid. */
+		gfx_blit_rot(src, w, back, LTDC_DEF_W, LTDC_DEF_H, cx, cy, cw, ch);
 	}
-	x1 = (uint32_t)x + w;
-	y1 = (uint32_t)y + h;
-	if (x1 > ltdc_cfg.w)
-		x1 = ltdc_cfg.w;
-	if (y1 > ltdc_cfg.h)
-		y1 = ltdc_cfg.h;
-	/* src stride stays the full requested w; the clipped width is x1-x. */
-	ltdc_dma2d_blit(back + (uint32_t)y * ltdc_cfg.w + x, src,
-	                x1 - x, y1 - y,
-	                (uint32_t)ltdc_cfg.w - (x1 - x), w - (x1 - x));
 	ltdc_unlock_frame();
 }
 
@@ -1015,15 +1075,17 @@ void ltdc_colorbar(void)
 		ltdc_unlock_frame();
 		return;
 	}
-	bar_w = (uint32_t)ltdc_cfg.w / 8u;
-	/* One DMA2D R2M fill per bar; the last bar absorbs the remainder so the
-	   eight bars cover the full width exactly. */
+	bar_w = (uint32_t)LTDC_SURFACE_W / 8u;
+	/* Eight bars across the long axis, full height.  Each is a landscape rect, so
+	   it is still one DMA2D R2M fill after the transform -- rotation is free here.
+	   The last bar absorbs the remainder so the eight cover the width exactly. */
 	for (uint32_t i = 0; i < 8u; i++) {
 		uint32_t x0 = i * bar_w;
-		uint32_t w  = (i == 7u) ? ((uint32_t)ltdc_cfg.w - x0) : bar_w;
+		uint32_t w  = (i == 7u) ? ((uint32_t)LTDC_SURFACE_W - x0) : bar_w;
+		uint32_t fx, fy, fw, fh;
 
-		ltdc_dma2d_fill(back + x0, bars[i], w, ltdc_cfg.h,
-		                (uint32_t)ltdc_cfg.w - w);
+		surf_to_fb(x0, 0u, w, LTDC_SURFACE_H, &fx, &fy, &fw, &fh);
+		fb_fill_rect(back, fx, fy, fw, fh, bars[i]);
 	}
 	ltdc_unlock_frame();
 }
@@ -1041,13 +1103,14 @@ void ltdc_blit_demo(void)
 		ltdc_unlock_frame();
 		return;
 	}
-	half = (uint32_t)ltdc_cfg.w / 2u;
-	/* M2M copy of the left half (src) over the right half (dst), both within
-	   the same back buffer.  Each half is `half` px wide but lives in a
-	   full-width frame buffer, so both src and dst skip w-half u16 per row --
-	   exactly the strided case ltdc_blit() cannot express. */
-	ltdc_dma2d_blit(back + half, back, half, ltdc_cfg.h,
-	                (uint32_t)ltdc_cfg.w - half, (uint32_t)ltdc_cfg.w - half);
+	half = (uint32_t)LTDC_SURFACE_W / 2u;
+	/* M2M copy of the left landscape half over the right one, within the back
+	   buffer.  Under the transform each half is a RUN OF WHOLE FRAME-BUFFER ROWS,
+	   so unlike the portrait version this needs no strides at all: rows
+	   [half, 2*half) copied down over rows [0, half).  (Left maps to the high
+	   rows because landscape x counts from the far edge.) */
+	ltdc_dma2d_blit(back, back + half * LTDC_DEF_W,
+	                LTDC_DEF_W, half, 0u, 0u);
 	ltdc_unlock_frame();
 }
 
@@ -1063,17 +1126,19 @@ void ltdc_gradient(void)
 		ltdc_unlock_frame();
 		return;
 	}
-	/* Per-column colour, so the CPU draws this one straight into the
-	   non-cacheable back buffer (no DMA2D acceleration possible). */
-	for (uint32_t col = 0; col < ltdc_cfg.w; col++) {
-		uint32_t lum = (ltdc_cfg.w > 1u)
-		             ? col * 255u / ((uint32_t)ltdc_cfg.w - 1u) : 0u;
-		uint16_t px = (uint16_t)(((lum >> 3) << 11) |   /* R5 */
-		                         ((lum >> 2) << 5) |    /* G6 */
-		                          (lum >> 3));          /* B5 */
+	/* One luminance per landscape column, and a landscape column is a whole
+	   frame-buffer row -- so each step writes 240 CONTIGUOUS pixels.  The
+	   portrait version wrote the same pixels with a 240-pixel stride; the
+	   transform made this one strictly cheaper, not more expensive. */
+	for (uint32_t x = 0; x < LTDC_SURFACE_W; x++) {
+		uint32_t  lum = x * 255u / ((uint32_t)LTDC_SURFACE_W - 1u);
+		uint16_t  px  = (uint16_t)(((lum >> 3) << 11) |   /* R5 */
+		                           ((lum >> 2) << 5) |    /* G6 */
+		                            (lum >> 3));          /* B5 */
+		uint16_t *row = back + ((uint32_t)LTDC_SURFACE_W - 1u - x) * LTDC_DEF_W;
 
-		for (uint32_t row = 0; row < ltdc_cfg.h; row++)
-			back[row * ltdc_cfg.w + col] = px;
+		for (uint32_t i = 0; i < LTDC_DEF_W; i++)
+			row[i] = px;
 	}
 	ltdc_unlock_frame();
 }
