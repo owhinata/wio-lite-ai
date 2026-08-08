@@ -42,6 +42,11 @@ project(wio-lite-ai C ASM)
 
 set(CMAKE_EXECUTABLE_SUFFIX ".elf")
 
+# REQUIRED, not optional: cmake/check_itcm_residency.py is a correctness gate (issue
+# #39), and a gate that quietly skips itself when its interpreter is missing is worse
+# than no gate at all -- it reports the same "nothing to see here" as a passing run.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
 # ============================================================================
 #  Common build setup (shared by the bootloader and the apps)
 # ============================================================================
@@ -331,6 +336,21 @@ file(WRITE "${GEN_DIR}/rtl8720_flashloader_data.c"
 # "disabled (build)").  Turn OFF for SWD sessions that must hold a breakpoint longer
 # than the ~3 s IWDG timeout (the app does not touch DBGMCU to freeze it under debug).
 option(BSP_ENABLE_IWDG "Enable the IWDG watchdog and wdt shell command" ON)
+# issue #39: the shell firmware is built for SIZE, not speed.  The app partition is
+# 384 KB and the image had reached 82.5% of it with issue #9 (on-device AI) not even
+# started; -Os plus link-time optimisation gives back ~54 KB without touching the
+# memory map, the MPU or the DFU update path -- the three things every other option in
+# issue #39 (strings to the external NOR, XIP, feature toggles) would have had to.
+# The hot paths are protected elsewhere and stay untouched: the interrupt paths live
+# in ITCM (issue #24/#29, and cmake/check_itcm_residency.py below keeps them there),
+# and CoreMark keeps its own -O3 -funroll-loops because the score IS the deliverable.
+#
+# Both knobs exist because -Os -flto makes single-stepping over SWD much worse.  For a
+# debugging session build with -DBSP_OPT_LEVEL=-O2 -DBSP_ENABLE_LTO=OFF; the residency
+# check runs in that configuration too.  BSP_OPT_LEVEL is a STRING, not a boolean --
+# option() would silently turn it into ON/OFF.
+set(BSP_OPT_LEVEL "-Os" CACHE STRING "Optimisation level for the shell firmware")
+option(BSP_ENABLE_LTO "Build the shell firmware with link-time optimisation" ON)
 # issue #2: ThreadX idle WFI sleep (TX_ENABLE_WFI in tx_user.h).  Default ON; build
 # with -DBSP_ENABLE_WFI=OFF for a busy-idle (no-sleep) variant that is easier to
 # attach over SWD (a WFI-sleeping core needs connect-under-reset).
@@ -540,6 +560,56 @@ target_compile_definitions(shell PRIVATE
     BSP_ENABLE_LCD=$<BOOL:${BSP_ENABLE_LCD}>                # issue #7: LTDC LCD + lcd cmd
     BSP_ENABLE_CAMERA=$<BOOL:${BSP_ENABLE_CAMERA}>          # issue #8: DVP camera + camera cmd
     BSP_ENABLE_KV=$<BOOL:${BSP_ENABLE_KV}>)                 # issue #37: OCTOSPI2 NOR + KV store
-target_compile_options(shell PRIVATE -O2)
+# issue #39: -Os + LTO, plus two flags that disable optimisations which are legal C
+# but wrong for THIS firmware.  Both are cheap (measured: 1,008 B and 224 B) and both
+# only start to matter under LTO, which propagates these inferences ACROSS
+# translation units for the first time:
+#
+#  -fno-strict-aliasing            NetX Duo and FileX cast packet buffers to protocol
+#                                  headers constantly.  Whole-program alias analysis is
+#                                  exactly the condition under which those type-punning
+#                                  violations stop being harmless.
+#  -fno-delete-null-pointer-checks ITCM lives at 0x00000000 on this part, so address 0
+#                                  is a real, deliberately accessed location -- our
+#                                  SystemInit writes and reads back the whole 64 KB
+#                                  (src/system_stm32h7xx.c).  Without this, "code
+#                                  dereferenced this pointer, so it cannot be NULL" is
+#                                  free to travel between translation units.
+set(SHELL_OPT_FLAGS ${BSP_OPT_LEVEL} -fno-strict-aliasing -fno-delete-null-pointer-checks)
+if(BSP_ENABLE_LTO)
+    list(APPEND SHELL_OPT_FLAGS -flto=auto)
+endif()
+target_compile_options(shell PRIVATE ${SHELL_OPT_FLAGS})
+# ...except membench, which is an INSTRUMENT and must keep its calibration (issue #39).
+# Its bandwidth loops are the yardstick issue #3 tuned the PSRAM against and issue #25
+# used to justify moving execution to the internal flash (54 vs 905 MB/s), so a reading
+# has to mean the same thing across builds.  -Os disables loop unrolling, which turns
+# the read loop from 73 instructions into 47 and makes it LOOP-bound rather than
+# memory-bound: measured that way, ITCM, DTCM and cached SRAM all report an identical
+# 1453 MB/s and the internal flash reads "859 MB/s" instead of 905 -- numbers about the
+# benchmark, not about the memory.  Same reasoning as coremark_obj above; -fno-lto
+# keeps the whole-program optimiser from reintroducing the dependency at link time.
+set_source_files_properties("${CMAKE_SOURCE_DIR}/shell/cmds/cmd_membench.c"
+    PROPERTIES COMPILE_OPTIONS "-O2;-fno-lto")
+# The SAME flags again at link time: with LTO the final code generation happens in the
+# linker, so compile-only flags are advisory at best.  -ffunction-sections /
+# -fdata-sections in particular MUST be repeated here -- without them LTO emits one
+# monolithic .text, which defeats --gc-sections AND makes every .itcm input-section
+# pattern in the linker script stop matching.
+target_link_options(shell PRIVATE ${SHELL_OPT_FLAGS} -ffunction-sections -fdata-sections)
 
 firmware_finalize(shell)
+
+# issue #39: the last line of defence for the ITCM residency of the interrupt paths
+# (issue #24/#29).  The linker-script ASSERTs cannot do this job under LTO -- see the
+# comment on them in ldscript/STM32H725AEIx_IROM.ld -- because LTO renames the very
+# symbols they are written against.  This checks the linked image instead, and is
+# deliberately attached to `shell` only: blink shares the linker script but has no
+# ThreadX and no RTL8720 UART, so the required-symbol list does not apply to it.
+add_custom_command(TARGET shell POST_BUILD
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/cmake/check_itcm_residency.py"
+            --nm "${CMAKE_NM}" --objdump "${CMAKE_OBJDUMP}"
+            $<TARGET_FILE:shell>
+    COMMENT "check .itcm residency of the interrupt paths (issue #39)"
+    VERBATIM)

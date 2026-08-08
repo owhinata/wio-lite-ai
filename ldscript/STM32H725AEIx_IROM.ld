@@ -113,10 +113,20 @@ SECTIONS
    *     can only be picked by OBJECT FILE name, while C functions get their own
    *     `.text.<name>` and are picked by section name.
    *
+   *  3. Every C function is selected as the PAIR `.text.NAME .text.NAME.*`
+   *     (issue #39).  Under LTO the compiler clones and renames functions --
+   *     `_tx_event_flags_set` becomes `_tx_event_flags_set.isra.0`, and the
+   *     suffixes stack (`__NVIC_SystemReset.lto_priv.0.lto_priv.0` was observed) --
+   *     so a bare `.text.NAME` stops matching and the function silently returns to
+   *     the flash.  Every clone suffix starts with a dot, which is why the pattern
+   *     is `.text.NAME.*` and NOT `.text.NAME*`: the latter would also drag in
+   *     genuinely different functions such as _tx_thread_time_slice_change.
+   *
    * The ASSERTs at the end of this file catch a pattern that silently stops
    * matching (e.g. after a submodule bump renames a file) -- otherwise the code
    * just quietly moves back to the flash and the win disappears with no build
-   * error.
+   * error.  They are an EARLY warning, not the real guard: see the comment on
+   * them, and cmake/check_itcm_residency.py.
    *
    * NOT here, deliberately: the vector table itself (the bootloader reads MSP from
    * the partition base, so VTOR stays there) and the dwc2 USB ISR (~1.5 KB with a
@@ -137,28 +147,28 @@ SECTIONS
     /* The two C functions the timer ISR tail-calls when a timer actually expires
      * or a time slice runs out.  Their own callees (timer thread wakeup, thread
      * resume) stay in the flash: this closes the tick path, not the whole scheduler. */
-    *(.text._tx_timer_expiration_process)
-    *(.text._tx_thread_time_slice)
+    *(.text._tx_timer_expiration_process .text._tx_timer_expiration_process.*)
+    *(.text._tx_thread_time_slice .text._tx_thread_time_slice.*)
 
     /* Execution Profile Kit (issue #2, `thread` cpu%): called from every ISR entry
      * and every context switch, so it is on both hot paths above.  The setup and
      * *_time_get query helpers stay in the flash -- they run from thread context. */
-    *(.text._tx_execution_isr_enter)
-    *(.text._tx_execution_isr_exit)
-    *(.text._tx_execution_thread_enter)
-    *(.text._tx_execution_thread_exit)
+    *(.text._tx_execution_isr_enter .text._tx_execution_isr_enter.*)
+    *(.text._tx_execution_isr_exit .text._tx_execution_isr_exit.*)
+    *(.text._tx_execution_thread_enter .text._tx_execution_thread_enter.*)
+    *(.text._tx_execution_thread_exit .text._tx_execution_thread_exit.*)
 
     /* SysTick vector -> HAL tick + the ThreadX timer gate (port/threadx/tx_glue.c). */
-    *(.text.SysTick_Handler)
-    *(.text.HAL_IncTick)
-    *(.text.tx_glue_isr_enter)
-    *(.text.tx_glue_isr_exit)
+    *(.text.SysTick_Handler .text.SysTick_Handler.*)
+    *(.text.HAL_IncTick .text.HAL_IncTick.*)
+    *(.text.tx_glue_isr_enter .text.tx_glue_isr_enter.*)
+    *(.text.tx_glue_isr_exit .text.tx_glue_isr_exit.*)
 
     /* RTL8720DN UART RX (issue #23): ~75 k interrupts/s once the link goes to a
      * high baud rate.  rtl_uart_isr is static and may be inlined into the two
      * handlers -- either way it ends up in ITCM, so it is not ASSERTed below. */
-    *(.text.USART1_IRQHandler)
-    *(.text.UART9_IRQHandler)
+    *(.text.USART1_IRQHandler .text.USART1_IRQHandler.*)
+    *(.text.UART9_IRQHandler .text.UART9_IRQHandler.*)
     *(.text.rtl_uart_isr*)
 
     /* ...and the wake-up it performs (issue #23 U0-3).  The RX ISR signals the eRPC
@@ -171,10 +181,10 @@ SECTIONS
      * suspended on the event flag, so every notification really does resume it).  It
      * is shared with every other ISR-to-thread wakeup in the system, which makes
      * placing it here a general win rather than a special case. */
-    *(.text.erpc_rx_ready)
-    *(.text._txe_event_flags_set)
-    *(.text._tx_event_flags_set)
-    *(.text._tx_thread_system_resume)
+    *(.text.erpc_rx_ready .text.erpc_rx_ready.*)
+    *(.text._txe_event_flags_set .text._txe_event_flags_set.*)
+    *(.text._tx_event_flags_set .text._tx_event_flags_set.*)
+    *(.text._tx_thread_system_resume .text._tx_thread_system_resume.*)
 
     /* ...and the two tails of that same path (issue #29).  Both are only reached
      * when a waiting thread is really made ready, which is exactly the request/reply
@@ -187,15 +197,15 @@ SECTIONS
      * as leaves, so nothing further follows them: preempt_check's
      * _tx_thread_system_return() is the inline PENDSVSET store from tx_port.h, not a
      * call (it would become one again under TX_DISABLE_INLINE). */
-    *(.text._tx_thread_system_preempt_check)
-    *(.text._tx_timer_system_deactivate)
+    *(.text._tx_thread_system_preempt_check .text._tx_thread_system_preempt_check.*)
+    *(.text._tx_timer_system_deactivate .text._tx_timer_system_deactivate.*)
 
     /* Fault handlers (app/fault.c).  This buys the fetch cost of the handler body
      * only: the vector read itself still comes from the flash and fault_handler_c
      * calls log_write there too (the linker emits a veneer for it).  See the file
      * header. */
-    *(.text.HardFault_Handler)
-    *(.text.fault_handler_c)
+    *(.text.HardFault_Handler .text.HardFault_Handler.*)
+    *(.text.fault_handler_c .text.fault_handler_c.*)
     *(.text.fault_rest*)
 
     . = ALIGN(8);
@@ -434,6 +444,16 @@ SECTIONS
    * An input-section pattern that stops matching does NOT fail the link -- the
    * code just silently reverts to the flash and the interrupt-latency win vanishes
    * unnoticed.  Assert that the named entry points really did land in ITCM.
+   *
+   * 🔴 THESE ARE AN EARLY WARNING, NOT THE FINAL GUARD (issue #39).  Every one of
+   * them is written against a SYMBOL NAME, and LTO renames symbols: once
+   * `_tx_event_flags_set` has become `_tx_event_flags_set.isra.0`, DEFINED() below
+   * is false, the conditional collapses to `1`, and the ASSERT passes while the
+   * function sits in the flash.  The guard fails in exactly the situation it exists
+   * for.  They are kept because they still fire early -- at link time, and for the
+   * non-LTO and blink builds.  What actually holds the line is the post-link check
+   * cmake/check_itcm_residency.py, which matches on suffix-stripped base names and
+   * additionally proves that nothing inside .itcm branches out through a veneer.
    *
    * DEFINED(...) guards each one because both app firmwares share this script and
    * blink links neither ThreadX nor the UART/fault handlers; ORIGIN(ITCM) is 0, so

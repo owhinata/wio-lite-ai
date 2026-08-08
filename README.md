@@ -912,10 +912,10 @@ Listed in memory-hierarchy order — the same order `free` and `membench` print
 
 | Region | Address | Notes |
 |---|---|---|
-| ITCM | `0x00000000` | 64 KB; holds the **interrupt paths** (`.itcm`, 3,272 B): ThreadX PendSV + SysTick, the RTL8720 UART RX ISR **and the whole wake-up it signals** (`tx_event_flags_set` + `_tx_thread_system_resume`, issue #23 U0-3 — that call alone had put the ISR back to 4.3 µs warm / 12.9 µs cold — plus their two tails `_tx_thread_system_preempt_check` + `_tx_timer_system_deactivate`, issue #29), and the fault handlers, plus the 4 KB `.itcm_bench` scratch. Zero-wait-state and outside both caches, so an ISR never pays a cold fetch through the 16 KB I-cache: measured against the external-XIP build the same UART ISR went from **8.7 µs cold / 3.3 µs warm to a flat 0.7 µs** (issue #24). The tails matter because they only run when a thread is *really* woken — with them still in the flash, request/reply commands (`wifi ver`, `wifi scan`) measured 3.5 µs against 0.1 µs for an ISR that wakes nobody; 106 bytes of ITCM took that to **1.5 µs**, and `wifi link bench` improved 2.1 → 1.5 µs too. Those figures were taken while the app ran from the external flash; issue #25 shrank the gap without closing it (ITCM is still zero-wait and never evicted). Loaded from its load image by `SystemInit()`, which also zero-fills all 64 KB to initialise the TCM ECC; kept read-only by the MPU so a NULL write raises MemManage instead of corrupting ISR code. |
+| ITCM | `0x00000000` | 64 KB; holds the **interrupt paths** (`.itcm`, 2,784 B): ThreadX PendSV + SysTick, the RTL8720 UART RX ISR **and the whole wake-up it signals** (`tx_event_flags_set` + `_tx_thread_system_resume`, issue #23 U0-3 — that call alone had put the ISR back to 4.3 µs warm / 12.9 µs cold — plus their two tails `_tx_thread_system_preempt_check` + `_tx_timer_system_deactivate`, issue #29), and the fault handlers, plus the 4 KB `.itcm_bench` scratch. Zero-wait-state and outside both caches, so an ISR never pays a cold fetch through the 16 KB I-cache: measured against the external-XIP build the same UART ISR went from **8.7 µs cold / 3.3 µs warm to a flat 0.7 µs** (issue #24). The tails matter because they only run when a thread is *really* woken — with them still in the flash, request/reply commands (`wifi ver`, `wifi scan`) measured 3.5 µs against 0.1 µs for an ISR that wakes nobody; 106 bytes of ITCM took that to **1.5 µs**, and `wifi link bench` improved 2.1 → 1.5 µs too. Those figures were taken while the app ran from the external flash; issue #25 shrank the gap without closing it (ITCM is still zero-wait and never evicted). Loaded from its load image by `SystemInit()`, which also zero-fills all 64 KB to initialise the TCM ECC; kept read-only by the MPU so a NULL write raises MemManage instead of corrupting ISR code. |
 | DTCM | `0x20000000` | 128 KB; holds the reset-persistent `.log_noinit` crash-log ring, the **32 KB NetX Duo packet pool** (`.nx_pool`, issue #23 U3 — no DMA touches a frame, so DTCM costs nothing from AXI-SRAM and evicts nothing from the D-cache) and `membench` scratch. All of it bypasses the D-cache. |
 | AXI-SRAM (D1) | `0x24000000` | 320 KB; `_estack = 0x24050000` (the MSP the bootloader loads). Also holds `.axi_dma`, the 4 KB SDMMC1 bounce buffer (issue #6) — in its **own output section, 32 B-aligned at both ends**, so the driver's per-transfer clean/invalidate cannot disturb a neighbouring variable's cache line. AXI-SRAM and not DTCM because the SDMMC's IDMA is an AHB master and the TCMs are reachable only by the core (RM0468 sec 2.4). |
-| FLASH | `0x08020000` | internal flash **sectors 1-3 = 384 KB** (issue #25). Sector 0 (`0x08000000`, 128 KB) is the DFU bootloader; the 128 KB erase granule is what keeps the two apart, so no programming path can reach it. ~905 MB/s read (`membench`). |
+| FLASH | `0x08020000` | internal flash **sectors 1-3 = 384 KB** (issue #25). Sector 0 (`0x08000000`, 128 KB) is the DFU bootloader; the 128 KB erase granule is what keeps the two apart, so no programming path can reach it. ~905 MB/s read (`membench`). The image currently uses **271,228 B = 69.0%**; see [Build](#build) for why it is built `-Os` + LTO. |
 | PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). Since issue #7 the first 300 KB are the **LTDC double frame buffer**, which the display controller reads continuously while scanout is on — hence the `lcd off` interlock on every path that retunes OCTOSPI1. |
 | *(bootloader)* | `0x08000000` | internal flash **sector 0, 128 KB** — the DFU bootloader. The app does not own it and no app-side path can erase it (the 128 KB erase granule is the sector granule). |
 | *(external flash)* | `0x70000000` | the 16 MB W25Q128 the app used to execute from, now storage: its **first 1 MB is the `kv` configuration partition** (FlashDB) and the remaining 15 MB is reserved for the blob region issue #10 still has to design — deliberately with no FAL partition entry, so nothing can reach it by accident. **Deliberately still not mapped**, even though issue #37 brought OCTOSPI2 back up: `port/nor` reaches the device only through indirect transactions, and `app/mpu.c` keeps the 256 MB window no-access + execute-never so a stray or *speculative* access raises MemManage (recorded in `dmesg`) instead of hitting a controller that is not in memory-mapped mode. Opening a window here is a separate design with its own MPU region. |
@@ -926,6 +926,72 @@ Listed in memory-hierarchy order — the same order `free` and `membench` print
 cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake
 cmake --build build            # -> build/shell.{elf,bin,hex}  (also boot.* and blink.*)
 ```
+
+### Optimisation: built for size, not speed (issue #39)
+
+`shell` is compiled `-Os -flto=auto`. The app partition is 384 KB and the image had
+reached **82.5%** of it with issue #9 (on-device AI) not started; this gives back
+**53 KB** (324,320 → 271,228 B) *without touching the memory map, the MPU or the DFU
+update path* — which every other option in issue #39 (moving the 50 KB string pool to
+the external NOR, reviving XIP, feature toggles) would have had to. `-flto` alone at
+`-O2` is counter-productive: cross-TU inlining makes the image **bigger**.
+
+Speed is protected where it is actually measured, not by the `-O` level:
+
+- The interrupt paths live in **ITCM** (issues #24/#29) and are held there by
+  `cmake/check_itcm_residency.py`, below.
+- **The two benchmarks keep their own flags**, because they are instruments and a
+  reading has to mean the same thing across builds:
+  - `coremark` — `-O3 -funroll-loops` (`coremark_obj` is a separate object library and
+    is not LTO'd). The score *is* the deliverable and the flags are part of what a
+    CoreMark result means. Costs about 6 KB over plain `-O3`.
+  - `membench` — `-O2 -fno-lto` (`cmd_membench.c` only, 1.1 KB). Its bandwidth loops
+    are the yardstick issue #3 tuned the PSRAM against and issue #25 used to justify
+    moving execution to the internal flash. `-Os` disables loop unrolling, which turns
+    the read loop from 73 instructions into 47 and makes it **loop-bound rather than
+    memory-bound**: measured that way ITCM, DTCM and cached SRAM all report an
+    identical 1453 MB/s and the internal flash reads "859 MB/s" instead of 905 —
+    numbers about the benchmark, not about the memory.
+
+Two flags disable optimisations that are legal C but wrong for this firmware. Both
+cost almost nothing (1,008 B and 224 B) and both only start to matter under LTO,
+because LTO propagates these inferences *across translation units* for the first time:
+
+| flag | why |
+|---|---|
+| `-fno-strict-aliasing` | NetX Duo and FileX cast packet buffers to protocol headers constantly. Whole-program alias analysis is exactly the condition under which that type punning stops being harmless. |
+| `-fno-delete-null-pointer-checks` | **ITCM is at `0x00000000`**, so address 0 is a real location this firmware deliberately touches — `SystemInit()` writes and reads back all 64 KB. |
+
+For an SWD debugging session, where `-Os -flto` makes single-stepping painful:
+
+```bash
+cmake -B build-dbg -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
+      -DBSP_OPT_LEVEL=-O2 -DBSP_ENABLE_LTO=OFF
+```
+
+### `cmake/check_itcm_residency.py` — the ITCM guard
+
+Runs after every `shell` link and fails the build if an interrupt path left ITCM. It
+exists because the **linker-script ASSERTs cannot do this job under LTO**. They are
+written against symbol *names*, and LTO renames what it clones: once
+`_tx_event_flags_set` has become `_tx_event_flags_set.isra.0`, `DEFINED()` reports
+false, the guard's conditional collapses to `1`, and the ASSERT **passes because the
+thing it guards has vanished**. Meanwhile the linker-script selector
+`*(.text._tx_event_flags_set)` has stopped matching and the RTL8720 RX wake-up path is
+back in the flash — with no build error. (The selectors are now written as the pair
+`.text.NAME .text.NAME.*` to match clones; the ASSERTs are kept as an early warning
+for the non-LTO and `blink` builds.)
+
+So the check works on the linked image instead, on suffix-stripped base names:
+
+1. **residency** — every symbol whose base name is a required interrupt path lies
+   inside `[_sitcm, _eitcm)`. *All* matching symbols, not just one: LTO can leave both
+   `foo` and `foo.isra.0` alive. A name that matches nothing is also a failure — that
+   is precisely the case the ASSERT goes blind to.
+2. **no leakage** — nothing inside ITCM branches out through a long-branch veneer
+   other than the two accepted ones (`log_write` from the fault handler,
+   `__NVIC_SystemReset` at the tail of the reset path). This catches residency loss
+   for code that is not on the required list at all.
 
 ## Flash (over DFU)
 

@@ -43,6 +43,10 @@ set(CMAKE_C_COMPILER   "${GCC_BIN}/arm-none-eabi-gcc")
 set(CMAKE_ASM_COMPILER "${GCC_BIN}/arm-none-eabi-gcc")
 set(CMAKE_OBJCOPY      "${GCC_BIN}/arm-none-eabi-objcopy" CACHE FILEPATH "")
 set(CMAKE_SIZE         "${GCC_BIN}/arm-none-eabi-size"    CACHE FILEPATH "")
+# nm/objdump are used by the post-link .itcm residency check (issue #39); export
+# them here so nothing has to reconstruct the toolchain path.
+set(CMAKE_NM           "${GCC_BIN}/arm-none-eabi-nm"      CACHE FILEPATH "")
+set(CMAKE_OBJDUMP      "${GCC_BIN}/arm-none-eabi-objdump" CACHE FILEPATH "")
 
 # Don't try to link a full executable during the compiler check (no _start yet).
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
