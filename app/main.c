@@ -174,8 +174,8 @@ void tx_application_define(void *first_unused_memory)
    * panel reset, wakes the ST7789 over its serial link and configures the
    * controller.  It waits on no ThreadX object and runs no DMA2D transfer (the
    * frame buffers are cleared by a CPU loop), which is what makes it safe here;
-   * it does spend ~135 ms in HAL_Delay for the reset pulse and the ST7789's
-   * mandatory sleep-out settle, which is fine because SysTick is already feeding
+   * it does spend ~255 ms in HAL_Delay for the reset pulse and the ST7789's two
+   * mandatory 120 ms settles (issue #43), which is fine because SysTick is already feeding
    * HAL_IncTick and the IWDG is not armed until further down.
    * The frame buffers live in the OCTOSPI1 PSRAM, so the
    * bring-up is gated on psram_ready() HERE rather than inside the driver --
@@ -184,7 +184,7 @@ void tx_application_define(void *first_unused_memory)
    * display the `lcd` commands report it down. */
 #if BSP_PSRAM_INIT_IN_APP
   if (psram_ready())
-    (void) ltdc_init();   /* ~135 ms: reset pulse + the ST7789 sleep-out settle */
+    (void) ltdc_init();   /* ~255 ms: reset pulse + the ST7789's two 120 ms settles */
   else
     LOG_WRN("PSRAM down -- LCD not started (frame buffers live there)");
 #endif

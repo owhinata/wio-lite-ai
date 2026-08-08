@@ -78,6 +78,19 @@
  * scanout with zero FIFO underruns*.  See port/ltdc/st7789_rgb.h; ltdc_init()
  * runs it between the reset pulse and the alternate-function handover.
  *
+ * And the panel does not lose that state when the MCU does: it has its own
+ * supply, so a software reset hands the sequence an already-awake controller.
+ * That is issue #43 -- the sequence needs a SWRESET prefix to be replayable, and
+ * ltdc_panel_recover() exists so it can be replayed at all without a power
+ * cycle.
+ *
+ * The same multiplexing has a second, nastier consequence: with RGB565 the LTDC
+ * pads red by *replicating* its top bits into R[2:0] (RM0468 sec 38.3.2), so
+ * scan-out drives CS/SCL/SDA with the top three bits of every pixel's red -- and
+ * a live camera frame clocks real commands into the panel that way, blanking it.
+ * PA1 (R2 = CS) is therefore kept out of the LTDC and parked high; see
+ * ltdc_pin_cs_park() in ltdc_display.c.
+ *
  * The timing, polarity and 6.00 MHz pixel clock were likewise recovered from the
  * board's factory firmware rather than guessed, so they are constants here.
  *
@@ -185,7 +198,8 @@ uint32_t ltdc_refresh_chz(void);
 
 /**
  * One-time bring-up: ThreadX objects, LTDC + DMA2D clock gates, GPIO (AF14
- * everywhere except PA15/LTDC_R3 which is AF9, plus the LCD_RST/LCD_BL outputs),
+ * everywhere except PA15/LTDC_R3 which is AF9 and PA1/LTDC_R2 which stays a
+ * GPIO held high -- see ltdc_pin_cs_park() -- plus the LCD_RST/LCD_BL outputs),
  * the panel reset pulse, one RGB565 layer pointed at frame buffer 0, the
  * reload-ready and DMA2D IRQs, then backlight on.  BOTH buffers are cleared to
  * black by the CPU before the layer comes up (.psram_noinit is NOLOAD, i.e.
@@ -198,8 +212,9 @@ uint32_t ltdc_refresh_chz(void);
  * **Safe to call from tx_application_define(), and constrained accordingly**: it
  * only *creates* ThreadX objects and never waits on one, and it runs no DMA2D
  * transfer (both frame buffers are cleared by a CPU loop).  It does spend about
- * 135 ms in HAL_Delay() -- the reset pulse plus the ST7789's mandatory 120 ms
- * sleep-out settle -- which is fine there: SysTick already feeds HAL_IncTick()
+ * 255 ms in HAL_Delay() -- the reset pulse plus the ST7789's two mandatory
+ * 120 ms settles, the software-reset one and the sleep-out one (issue #43; see
+ * st7789_rgb.h) -- which is fine there: SysTick already feeds HAL_IncTick()
  * (issue #12), and the IWDG is armed later in the same function.  The IRQs it
  * enables stay dormant until the first ltdc_flip(), which cannot happen before
  * the scheduler starts.
@@ -234,10 +249,36 @@ bool ltdc_scanout_off(void);
 int ltdc_set_scanout(bool on);
 
 /** Drive LCD_BL (PF5): the backlight, on/off.  LCD_RST (PG5) is released by
- *  ltdc_init() and never touched again -- resetting the panel would put the
- *  ST7789 back to sleep, and its serial pins have become LTDC outputs by then,
- *  so the wake-up sequence could not be resent without a full re-init. */
+ *  ltdc_init() and not touched again during normal operation -- resetting the
+ *  panel puts the ST7789 back to sleep, and its serial pins have become LTDC
+ *  outputs by then, so the wake-up sequence cannot be resent piecemeal.
+ *  ltdc_panel_recover() below is the one path that does the whole thing. */
 void ltdc_backlight(bool on);
+
+/**
+ * Re-run the panel bring-up on a live system: stop scanout, take CS/SDA/SCL back
+ * from the LTDC, pulse LCD_RST, resend the ST7789 sequence, hand the pins back,
+ * and restore whatever scanout state was in effect (an `lcd off` stays off).
+ *
+ * This exists because the panel has its own supply: a software reset restarts
+ * the MCU but leaves the ST7789 awake, and until issue #43 there was no way back
+ * from a panel that had stopped accepting pixels except unplugging the board.
+ * `lcd off` / `lcd on` cannot do it -- they only toggle LTDCEN and the backlight.
+ *
+ * **Thread context only, and it blocks for ~245 ms** (the ST7789's two mandatory
+ * 120 ms settles), holding the frame lock throughout -- so drawing commands and
+ * the camera preview thread wait behind it.
+ *
+ * The caller is responsible for the OCTOSPI1 guard: scanout stops and restarts
+ * inside this call, so hold psram_acquire_shared() across it exactly as `lcd on`
+ * does.  (This module does not include psram.h -- see the file header.)
+ *
+ * Returns LTDC_OK, or LTDC_ERR_STATE if the LTDC never came up or has latched a
+ * reload fault (that one is still a reset).  There is no failure return from the
+ * sequence itself: the ST7789 is write-only over this link, so the check is the
+ * picture -- run `lcd bar` afterwards.
+ */
+int ltdc_panel_recover(void);
 
 /** Read the sticky FIFO-underrun / transfer-error flags (RM0468 sec 38.5).  The
  *  hardware sets these regardless of the interrupt enables, so they work with no

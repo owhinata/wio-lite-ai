@@ -25,6 +25,11 @@
  * OCTOSPI1_CS, so the port G setup is per-pin (HAL_GPIO_Init does read-modify-
  * write) and never disturbs the PSRAM chip select.
  *
+ * **R2 on PA1 is NOT driven by the LTDC.**  It is also the ST7789's CS, and
+ * leaving it under the LTDC lets scanned-out red bits clock commands into the
+ * panel (issue #43).  It is parked as a GPIO high instead -- ltdc_pin_cs_park()
+ * has the full story.  R0/R1 (SDA/SCL) do stay with the LTDC.
+ *
  * The panel is a 2.8" 240x320 unit with an ST7789 controller and no published
  * datasheet: its timing, polarity, pixel clock and serial wake-up sequence were
  * all recovered from the board's factory firmware (see st7789_rgb.h), so they
@@ -535,8 +540,17 @@ static void ltdc_reset_pins_init(void)
 	HAL_GPIO_Init(LCD_BL_PORT, &g);
 }
 
-/* Hand every LTDC signal to its alternate function.  Runs last, after the ST7789
-   has been configured over the serial link that shares R0/R1/R2. */
+static void ltdc_pin_cs_park(void);   /* PA1 = LTDC_R2 = ST7789 CS; see below */
+
+/*
+ * Hand the LTDC signals to their alternate function.  Runs last, after the
+ * ST7789 has been configured over the serial link that shares R0/R1/R2.
+ *
+ * ALL OF THEM EXCEPT PA1.  PA1 is LTDC_R2 *and* the ST7789's CS, and it stays a
+ * GPIO driven high forever -- see ltdc_pin_cs_park() below for why.  Parking it
+ * is done HERE, at the end, so that every path that re-arms the LTDC pins gets
+ * it for free and cannot forget.
+ */
 static void ltdc_gpio_init(void)
 {
 	GPIO_InitTypeDef g = {0};
@@ -546,8 +560,8 @@ static void ltdc_gpio_init(void)
 	g.Speed = GPIO_SPEED_FREQ_HIGH;
 
 	g.Alternate = GPIO_AF14_LTDC;
-	/* PA1 R2, PA3 B5, PA5 R4, PA7 VSYNC, PA8 R6 */
-	g.Pin = GPIO_PIN_1 | GPIO_PIN_3 | GPIO_PIN_5 | GPIO_PIN_7 | GPIO_PIN_8;
+	/* PA3 B5, PA5 R4, PA7 VSYNC, PA8 R6.  (PA1 = R2 is deliberately absent.) */
+	g.Pin = GPIO_PIN_3 | GPIO_PIN_5 | GPIO_PIN_7 | GPIO_PIN_8;
 	HAL_GPIO_Init(GPIOA, &g);
 	/* PB0 G1, PB1 G0, PB8 B6, PB9 B7, PB10 G4, PB11 G5, PB15 G7 */
 	g.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_8 | GPIO_PIN_9 |
@@ -572,6 +586,66 @@ static void ltdc_gpio_init(void)
 	/* The one exception to AF14: LTDC_R3 is AF9 on PA15 (JTDI). */
 	g.Alternate = GPIO_AF9_LTDC;
 	g.Pin       = GPIO_PIN_15;
+	HAL_GPIO_Init(GPIOA, &g);
+
+	ltdc_pin_cs_park();
+}
+
+/*
+ * Park PA1 -- LTDC_R2, which is also the ST7789's CS -- as a GPIO output driven
+ * HIGH, and never give it back to the LTDC (issue #43).
+ *
+ * THE PROBLEM.  RM0468 sec 38.3.2 ("Pixel input format", just above Table 315):
+ * components narrower than 8 bits are expanded "by bit replication", and it
+ * spells the RGB565 red case out -- 5 bits r4..r0 come out as bit positions
+ * 43210432.  So the LTDC drives R2 = r4, R1 = r3, R0 = r2.  On this board those
+ * three lines ARE the ST7789's CS, SCL and SDA (st7789_rgb.h; the pin identities
+ * come from the factory firmware's Arduino pin table, not from the schematic,
+ * which only names them LCD_R0/R1/R2).  Scan-out therefore drives the panel's
+ * serial bus with the top three bits of red, at the pixel clock:
+ *
+ *     CS = red bit 4      SCL = red bit 3      SDA = red bit 2
+ *
+ * Every pixel whose red MSB is 0 asserts CS, and every 0->1 step of red bit 3
+ * while it is asserted clocks one bit into the ST7789's command register.  Nine
+ * of those and the panel executes whatever they spell -- DISPOFF, SLPIN, a
+ * RAMCTRL write -- and goes blank.  Uniformly white, permanently, with the LTDC
+ * reporting a flawless scan-out because nothing on this side went wrong.
+ *
+ * WHY IT HID FOR TWO ISSUES.  Every test pattern is safe by construction: the
+ * bars, the gradient and the bouncing rectangle are all either red = 0 (CS
+ * asserted but red bit 3 never rises) or piecewise constant.  So #7 and #8 both
+ * passed.  A live camera frame is not: red crosses 8 constantly while the MSB
+ * stays 0, and the panel dies within seconds.  It was pinned down by streaming
+ * the OV2640's own colour bars (`camera stream start test`), which runs the
+ * identical DVP -> DCMI -> DMA -> PSRAM path at the identical rate and differs
+ * only in the pixel values -- that never fails, live video always does.
+ *
+ * THE FIX.  Keep CS deasserted and the command port cannot hear anything, no
+ * matter what the pixels do.  ST7789V sec 8.4.2: with CSX high the serial
+ * interface is held initialized and SCL/SDA have no effect; sec 8.9: the RGB
+ * interface is a separate path (VSYNC/HSYNC/DOTCLK/DE/data) that does not
+ * involve CSX.  The board had already proved both halves of that BEFORE this
+ * parking existed, back when CS still followed red bit 4: `lcd bar`'s
+ * white/yellow/red/magenta bars are drawn at red MSB 1, i.e. CS high, and
+ * `lcd anim` ran entirely at red 0, i.e. CS low -- and both displayed correctly.
+ * So neither CSX level disturbs the picture, and high is the safe one to pick.
+ *
+ * THE COST is one bit of red, and it is the cheapest bit there is: R[7:3] carry
+ * the real 5-bit red (weight 248/255) and R[2:0] are only the replication
+ * padding (weight 7/255).  Pinning R2 high adds at most 4/255 = 1.6% red, so
+ * black leaves the LTDC as (4,0,0).  SCL and SDA stay with the LTDC: with CS
+ * high they are ignored, and they are still real (if tiny) data bits.
+ */
+static void ltdc_pin_cs_park(void)
+{
+	GPIO_InitTypeDef g = {0};
+
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);   /* CS deasserted */
+	g.Pin   = GPIO_PIN_1;
+	g.Mode  = GPIO_MODE_OUTPUT_PP;
+	g.Pull  = GPIO_NOPULL;
+	g.Speed = GPIO_SPEED_FREQ_LOW;   /* a static level; no edges to shape */
 	HAL_GPIO_Init(GPIOA, &g);
 }
 
@@ -716,8 +790,14 @@ int ltdc_init(void)
 	 *
 	 * ltdc_gpio_init() then takes the pins over for the alternate function and
 	 * parks LCD_RST/LCD_BL, so it must run AFTER the serial sequence.
+	 *
+	 * st7789_rgb_pins_init() runs BEFORE the reset pulse, not with the sequence:
+	 * see issue #43 and st7789_rgb.h.  Until it does, those three lines are
+	 * floating inputs -- and after a software reset the panel is powered, awake
+	 * and listening to them.
 	 */
 	ltdc_reset_pins_init();
+	st7789_rgb_pins_init();
 	ltdc_panel_reset();
 	st7789_rgb_init();
 	ltdc_gpio_init();
@@ -773,6 +853,77 @@ fail_obj:
 	tx_mutex_delete(&ltdc_lock);
 	tx_semaphore_delete(&ltdc_reload_sem);
 	return rc;
+}
+
+/*
+ * Re-run the panel bring-up on a live system (issue #43).
+ *
+ * The ST7789 keeps its own supply across an MCU reset, so it can be left in a
+ * state the power-on sequence does not recover from -- and once ltdc_init() has
+ * handed CS/SDA/SCL to the LTDC there was no way to resend that sequence short
+ * of unplugging the board.  `lcd off` / `lcd on` does not help: it toggles
+ * LTDCEN and the backlight and never speaks to the panel at all.
+ *
+ * What LTDCEN=0 actually does is worth being precise about, because it is the
+ * step this function leans on.  It does NOT tri-state the LTDC pins: RM0468
+ * sec 38.4.1 says the timing generator is held reset at (total width - 1,
+ * total height - 1), the FIFOs are flushed, and blanking data keeps coming out.
+ * So disabling the LTDC stops the scanout, the FIFO and the PSRAM fetch -- which
+ * is exactly what we need -- and the pins become ours only on the next line,
+ * where st7789_rgb_pins_init() rewrites MODER and the GPIO block takes over.
+ *
+ * HAL_LTDC_Init() is deliberately NOT re-run.  The controller and layer
+ * configuration survive untouched, and re-running it would re-enable the
+ * transfer-error and FIFO-underrun interrupts that ltdc_controller_init() masks
+ * on purpose -- whose handler then clears the very flags ltdc_errors() reports.
+ * Toggling LTDCEN is the whole of what is needed.
+ *
+ * ltdc_lock is held across the ~245 ms sequence, which serializes this against
+ * the drawing commands and the camera preview thread (both take the same lock
+ * before touching a buffer).  No new lock order is introduced.
+ *
+ * Thread context only -- HAL_Delay() spins here rather than sleeping, which is
+ * what lets boot and this path share one code path.
+ */
+int ltdc_panel_recover(void)
+{
+	bool was_on;
+
+	if (!ltdc_up)
+		return LTDC_ERR_STATE;
+	ltdc_lock_frame();
+	if (ltdc_fault) {       /* a stuck VBR reload is a different failure; the
+	                           display is latched down and a reset owns it */
+		ltdc_unlock_frame();
+		return LTDC_ERR_STATE;
+	}
+	was_on = !ltdc_disabled;
+
+	ltdc_backlight(false);
+	__HAL_LTDC_DISABLE(&hltdc);
+	/* Publish "not scanning out" while we work: app/psram.c reads this to decide
+	   whether OCTOSPI1 is being fetched from.  The caller holds the OCTOSPI1
+	   guard across the whole call, so nothing can retune the bus in the window
+	   this opens (see cmd_lcd.c). */
+	ltdc_disabled = true;
+
+	ltdc_reset_pins_init();     /* idempotent; also re-asserts LCD_RST */
+	st7789_rgb_pins_init();
+	ltdc_panel_reset();
+	st7789_rgb_init();
+	ltdc_gpio_init();
+
+	/* Restore the scanout state we found, rather than forcing it on: `lcd reset`
+	   after an `lcd off` must not silently start reading PSRAM again. */
+	if (was_on) {
+		__HAL_LTDC_ENABLE(&hltdc);
+		ltdc_disabled = false;
+		ltdc_backlight(true);
+	}
+
+	ltdc_unlock_frame();
+	LOG_INF("panel re-initialized (scanout %s)", was_on ? "on" : "off");
+	return LTDC_OK;
 }
 
 /* ==========================================================================

@@ -24,6 +24,14 @@
  *     SCL = PH3  (LTDC_R1)
  *     (PG7 = LTDC_CLK is also parked low as a GPIO during the sequence)
  *
+ * The schematic only names these LCD_R0/R1/R2; that they are also the ST7789's
+ * serial bus comes from the factory firmware's Arduino pin table (below).
+ *
+ * SDA and SCL do go back to the LTDC afterwards.  **CS does not** -- PA1 stays a
+ * GPIO driven high for good, because leaving it under the LTDC lets scanned-out
+ * red bits clock commands into the panel.  That is issue #43's second half; the
+ * mechanism and the evidence are in ltdc_pin_cs_park() (ltdc_display.c).
+ *
  * Frames are 9 bits, MSB first: a leading data/command bit (0 = command,
  * 1 = parameter) followed by the byte, clocked in on SCL's rising edge with CS
  * low for the frame and high between frames.
@@ -41,8 +49,29 @@
  * scan order.
  *
  * The sequence is CPU/GPIO only: no DMA, no interrupts, no ThreadX call.  It
- * takes ~135 ms, almost all of it the mandatory sleep-out settle, and is safe to
- * run from tx_application_define() alongside the rest of ltdc_init().
+ * takes ~245 ms, almost all of it two mandatory 120 ms settles (see below), and
+ * is safe to run both from tx_application_define() alongside the rest of
+ * ltdc_init() and from a thread, where HAL_Delay() merely spins.
+ *
+ * ---- The panel is NOT necessarily cold when this runs (issue #43) -----------
+ *
+ * The ST7789 has its own supply, so a software reset -- `crash`, `reboot`, a DFU
+ * reboot -- restarts the MCU and leaves the panel awake: Sleep Out, DISPON, RGB
+ * interface live.  The factory transcription was never written against that
+ * state (an Arduino sketch only ever starts from power-on) and does not recover
+ * from it: the panel went uniformly white and stayed white until the board was
+ * unplugged, while the LTDC reported a perfectly healthy scanout.
+ *
+ * Two things follow, and both are in st7789_rgb.c:
+ *
+ *   - the sequence is prefixed with SWRESET + 120 ms, which puts the controller
+ *     back into the state the transcription assumes; and
+ *   - the serial pins are parked BEFORE the caller's RESX pulse, which is why
+ *     st7789_rgb_pins_init() is separate from st7789_rgb_init().  Between the
+ *     MCU reset and ltdc_init() those three lines are floating inputs while the
+ *     panel is awake and listening, so a stray edge on SCL can leave its 9-bit
+ *     shift register misaligned and every later command garbage.  Driving them
+ *     to their idle levels first closes that window.
  */
 #ifndef ST7789_RGB_H
 #define ST7789_RGB_H
@@ -52,14 +81,36 @@ extern "C" {
 #endif
 
 /**
- * Configure CS/SDA/SCL (plus the parked LTDC_CLK) as plain GPIO outputs, run the
- * ST7789 power-on sequence, and leave the controller awake with its RGB
- * interface enabled and the display on.
+ * Take CS/SDA/SCL (plus LTDC_CLK, parked low) away from the LTDC and drive them
+ * as plain GPIO outputs at their idle levels -- CS and SCL high, SDA and the
+ * pixel clock low -- so the panel sees a quiet, driven bus.
  *
- * The caller MUST have pulsed the panel reset first, and MUST reconfigure these
- * pins back to their LTDC alternate function afterwards -- this function
- * deliberately leaves them as GPIO so the caller decides when the handover
- * happens.  The GPIOA/GPIOG/GPIOH clocks must already be enabled.
+ * **Call this BEFORE pulsing the panel reset**, not after: the point is that the
+ * three serial lines are never floating while the ST7789 is powered and
+ * listening (see the file header).  The GPIOA/GPIOG/GPIOH clocks must already
+ * be enabled.  Every HAL_GPIO_Init here is per-port and read-modify-write, so
+ * PG6 (OCTOSPI1_CS), which neighbours LTDC_CLK on PG7, is not disturbed.
+ *
+ * Idempotent, and safe to call while the LTDC is disabled but still owns the
+ * alternate function: writing MODER hands the pins to the GPIO block.
+ */
+void st7789_rgb_pins_init(void);
+
+/**
+ * Run the ST7789 power-on sequence -- SWRESET, then the factory transcription --
+ * and leave the controller awake with its RGB interface enabled and the display
+ * on.  Takes ~245 ms, almost all of it the two mandatory 120 ms settles.
+ *
+ * Call order is fixed and every step matters:
+ *
+ *     st7789_rgb_pins_init();   // park the serial bus, still driven
+ *     <pulse LCD_RST>           // caller's job
+ *     st7789_rgb_init();        // this function
+ *     <restore the LTDC AF>     // caller's job -- SDA/SCL only, NOT CS
+ *
+ * The pins are left as GPIO on return: this function deliberately does not hand
+ * them back, so the caller decides when the LTDC takes over.  CS (PA1) is left
+ * high by the last frame and must simply stay that way (see the file header).
  */
 void st7789_rgb_init(void);
 

@@ -117,6 +117,33 @@ static void st_send_sequence(void)
 	};
 	uint32_t i = 0;
 
+	/*
+	 * SWRESET is a PREFIX to the transcription above, not part of it.
+	 *
+	 * The factory image never sends it, because an Arduino sketch only ever
+	 * starts from a cold panel.  This firmware does not: a software reset
+	 * (`crash`, `reboot`, a DFU reboot) restarts the MCU while the ST7789 keeps
+	 * its own supply, so the table above can be replayed into a controller that
+	 * is already Sleep Out + DISPON with its RGB interface live -- a state it
+	 * was never written against, and one it does not recover from.  That is
+	 * issue #43: after a soft reset the panel stayed uniformly white until the
+	 * board was unplugged, while the LTDC reported a perfectly healthy scanout
+	 * and every `lcd` command returned success.
+	 *
+	 * So restore the state the transcription DOES assume, then replay it.  This
+	 * keeps issue #7's "the factory image is the specification" premise intact:
+	 * the specified bytes are still sent verbatim, they are just no longer sent
+	 * into an undefined initial state.
+	 *
+	 * The 120 ms is mandatory, not padding.  The ST7789V forbids SLPOUT for
+	 * 120 ms after a reset taken while the display was in Sleep Out mode --
+	 * exactly the software-reset case, for the software reset here and for the
+	 * hardware RESX pulse the caller drove just before.  Both are covered,
+	 * because this wait sits between them and the table's leading SLPOUT.
+	 */
+	st_cmd(0x01);          /* SWRESET */
+	HAL_Delay(120);
+
 	while (i < sizeof seq) {
 		uint8_t n   = seq[i++];
 		uint8_t cmd = seq[i++];
@@ -129,7 +156,7 @@ static void st_send_sequence(void)
 	}
 }
 
-void st7789_rgb_init(void)
+void st7789_rgb_pins_init(void)
 {
 	GPIO_InitTypeDef g = {0};
 
@@ -143,14 +170,23 @@ void st7789_rgb_init(void)
 	g.Pull  = GPIO_NOPULL;
 	g.Speed = GPIO_SPEED_FREQ_LOW;
 
+	/* Per-pin / per-port HAL_GPIO_Init calls, which are read-modify-write: PG6
+	   (OCTOSPI1_CS) sits right next to ST_PCLK_PIN = PG7 and must not move. */
 	g.Pin = ST_CS_PIN;
 	HAL_GPIO_Init(ST_CS_PORT, &g);
 	g.Pin = ST_SDA_PIN | ST_SCL_PIN;
 	HAL_GPIO_Init(ST_SDA_PORT, &g);
 	g.Pin = ST_PCLK_PIN;
 	HAL_GPIO_Init(ST_PCLK_PORT, &g);
+}
 
-	HAL_Delay(1);
+void st7789_rgb_init(void)
+{
+	/* No settle needed on entry.  The factory image inserted a 1 ms wait here,
+	   but that covered the gap between parking the pins and the first frame --
+	   and st7789_rgb_pins_init() now runs a whole reset pulse earlier.  What the
+	   ST7789 actually requires, 5 ms between RESX going high and the first
+	   command, is already provided four times over by ltdc_panel_reset(). */
 	st_send_sequence();
 	/* Pins are left as GPIO: the caller re-arms the LTDC alternate function once
 	   it is ready to start scanning (see st7789_rgb.h). */

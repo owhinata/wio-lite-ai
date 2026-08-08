@@ -14,6 +14,7 @@
  *   lcd anim            bouncing rectangle (tear-free double-buffer demo)
  *   lcd blit            DMA2D M2M demo (copy the colour bars left->right half)
  *   lcd on | lcd off    whole display on/off (backlight + LTDC scanout)
+ *   lcd reset           resend the ST7789 power-on sequence to a live panel
  *
  * The LTDC is brought up at boot (app/main.c) with a DMA2D-accelerated,
  * tear-free double buffer in the PSRAM.  Each drawing command paints the back
@@ -324,6 +325,50 @@ static int cmd_lcd_off(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
+/*
+ * `lcd reset`: resend the ST7789 power-on sequence to a live panel.
+ *
+ * The panel has its own supply, so a software reset (`crash`, `reboot`) leaves
+ * it awake in a state the sequence used to be unable to recover from -- the
+ * screen goes uniformly white and every counter keeps reporting health (issue
+ * #43).  `lcd off` / `lcd on` is not that: it toggles LTDCEN and the backlight
+ * and never speaks to the panel.  This is the one command that does.
+ *
+ * The OCTOSPI1 guard is TAKEN FIRST and held across the whole call, not probed:
+ * ltdc_panel_recover() stops scanout and starts it again, and in that window a
+ * `psram` subcommand could otherwise grab the bus and retune it underneath the
+ * scanout we are about to bring back.  Same reasoning as `lcd on` above -- see
+ * the time-of-check/time-of-use note on psram_acquire().
+ */
+static int cmd_lcd_reset(struct cli_instance *sh, int argc, char **argv)
+{
+	int rc;
+
+	(void)argc;
+	(void)argv;
+	if (!ltdc_is_up()) {
+		cli_error(sh, "lcd: display not initialized\r\n");
+		return 1;
+	}
+	if (!psram_acquire_shared()) {
+		cli_error(sh, "lcd: OCTOSPI1 busy (a psram/membench command holds "
+		              "it)\r\n");
+		return 1;
+	}
+	cli_print(sh, "lcd: resetting the panel (~0.3 s)...\r\n");
+	rc = ltdc_panel_recover();
+	psram_release();
+	if (rc != LTDC_OK) {
+		cli_error(sh, "lcd: panel reset refused (display faulted)\r\n");
+		return 1;
+	}
+	/* The ST7789 is write-only over this link, so there is nothing to read back:
+	   the picture is the check. */
+	cli_print(sh, "lcd: panel re-initialized%s -- run 'lcd bar' to check\r\n",
+	          ltdc_scanout_off() ? " (scanout still off)" : "");
+	return 0;
+}
+
 CLI_SUBCMD_SET_CREATE(lcd_subcmds,
 	CLI_CMD(info, NULL, "panel / clock / frame buffer / LTDC error flags",
 	        cmd_lcd_info),
@@ -338,6 +383,8 @@ CLI_SUBCMD_SET_CREATE(lcd_subcmds,
 	        cmd_lcd_blit),
 	CLI_CMD(on, NULL, "display on (backlight + scanout)", cmd_lcd_on),
 	CLI_CMD(off, NULL, "display off (frees OCTOSPI1 for `psram`)", cmd_lcd_off),
+	CLI_CMD(reset, NULL, "resend the ST7789 power-on sequence (~0.3 s)",
+	        cmd_lcd_reset),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(lcd, lcd_subcmds,

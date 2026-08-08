@@ -123,6 +123,8 @@ time as the USB console. 24 commands:
   - *patterns*: `lcd bar` (eight colour bars — the one image that proves the RGB
     channel wiring and the RGB565 bit order), `grad`, `fill <colour>`, `clear`,
     `anim` (bouncing rectangle, paced by the flip), `blit` (a strided DMA2D M2M copy).
+  - *recovery*: `lcd reset` resends the ST7789 power-on sequence to a live panel
+    (see *the panel keeps its state across an MCU reset* below).
   - *state*: `lcd info` reports geometry, blanking, the real PLL3R pixel clock, the
     resulting refresh rate, the frame-buffer address and the sticky **FIFO-underrun /
     transfer-error** flags. `lcd off` stops scanout **and frees OCTOSPI1** (see below);
@@ -132,6 +134,47 @@ time as the USB console. 24 commands:
     part that actually mattered — its **serial power-on sequence** were recovered
     by disassembling the board's factory Arduino firmware (see *Key design
     points*). 6.00 MHz pixel clock, 298x336 total frame, 59.9 Hz.
+  - *the panel keeps its state across an MCU reset* (issue #43). It has its own
+    supply, so `crash` / `reboot` / a DFU reboot restart the STM32 but hand the
+    bring-up an ST7789 that is still Sleep Out + DISPON. The factory transcription
+    was never written against that — an Arduino sketch only ever starts cold — and
+    the panel went **uniformly white and stayed white until the board was
+    unplugged**, while `lcd info` reported `scanout active`, no underrun, no
+    transfer error, and `camera preview` counted `dropped 0`. The sequence is
+    therefore prefixed with a **SWRESET + 120 ms**, which puts the controller back
+    into the state the transcription assumes, and the serial lines (which are
+    LTDC_R2/R0/R1) are now **driven to their idle levels before the RESX pulse**
+    rather than left floating while an awake panel listens to them.
+    `lcd reset` resends the whole sequence to a live panel — stop scanout, take
+    the pins back from the LTDC, pulse LCD_RST, replay, hand them back, restore
+    the previous scanout state. It blocks ~0.3 s. `lcd off` / `lcd on` is *not*
+    a substitute: it toggles LTDCEN and the backlight and never speaks to the
+    panel at all, which is why there was no in-band recovery before this.
+  - *the panel's CS is a red data line, and that is a live hazard* (issue #43,
+    second half). With RGB565 the LTDC does not zero-pad the low bits — RM0468
+    sec 38.3.2 says narrow components are widened **by bit replication**, and
+    spells out that a 5-bit red comes out as bit positions `43210432`. So the
+    controller drives `R2 = r4`, `R1 = r3`, `R0 = r2` — which on this board are
+    the ST7789's **CS, SCL and SDA**. Scan-out therefore bangs the panel's
+    command port with the top three bits of every pixel's red: any pixel with
+    red MSB 0 asserts CS, and each 0→1 step of red bit 3 clocks in a bit. Nine
+    of them and the panel executes whatever they spell (DISPOFF, SLPIN, …) and
+    goes permanently blank — **uniformly white, with the LTDC reporting a
+    flawless scan-out**.
+    Every test pattern is safe by construction (`bar`, `grad` and `anim` are
+    either red = 0 or piecewise constant), which is why #7 and #8 both passed;
+    **live camera video kills it within seconds**. It was pinned down with
+    `camera stream start test`, the OV2640's own colour bars: identical DVP →
+    DCMI → DMA → PSRAM path at an identical rate, differing only in pixel
+    values — that never fails, live video always does.
+    The fix is to keep PA1 (R2/CS) out of the LTDC and park it as a GPIO driven
+    high, so the command port is permanently deselected (ST7789V sec 8.4.2; the
+    RGB path does not involve CSX, sec 8.9 — and the board had already proved
+    both, back when CS still followed red bit 4: `lcd bar`'s bright bars drew
+    with CS high and `lcd anim` ran entirely with CS low, and both displayed
+    correctly). It costs the cheapest bit there is: `R[7:3]` carry the real red and
+    `R[2:0]` are only replication padding, so pinning R2 adds at most 4/255 =
+    1.6% red.
   - The two RGB565 frame buffers (2 × 76800 px = 300 KB) live in the **PSRAM**, which
     the MPU already maps non-cacheable — so the CPU, the DMA2D and the LTDC's read DMA
     are coherent with no cache maintenance. AXI-SRAM has no room for them.
