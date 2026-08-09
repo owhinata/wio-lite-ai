@@ -375,9 +375,42 @@ if(HOST_CXX)
         COMMENT "host c++ -> verify_tflite (checks a .tflite before you send it)"
         VERBATIM)
     add_custom_target(verify-model DEPENDS "${CMAKE_BINARY_DIR}/verify_tflite")
+
+    # --- Host-side model rewriter (scripts/tflite_int8_input.cc) --------------
+    # Issue #51.  Strips a model's own leading QUANTIZE so the graph input becomes the
+    # quantized tensor -- which is the only way to exercise app/nn_camera.c's int8
+    # ingest path, because "an int8 model" from the model zoo means int8 WEIGHTS and
+    # float I/O.  See the file header.
+    #
+    # Same shape as verify-model above (host compiler, custom command, not in ALL) and
+    # for the same reason: this project cross-compiles, so a developer-machine
+    # executable cannot be an ordinary target here.  It does NOT include
+    # nn_tflm_ops.h -- deciding whether a model's operators are registered belongs to
+    # verify_tflite, and one question should have one answer in one place.
+    add_custom_command(
+        OUTPUT "${CMAKE_BINARY_DIR}/tflite_int8_input"
+        COMMAND "${HOST_CXX}" -std=c++17 -O1 -w
+                -I "${TFLM_ROOT}"
+                -I "${TFLM_ROOT}/third_party/flatbuffers/include"
+                # gemmlowp/ruy are reachable from micro_interpreter.h, which this tool
+                # includes for TFLITE_SCHEMA_VERSION alone.
+                -I "${TFLM_ROOT}/third_party/gemmlowp"
+                -I "${TFLM_ROOT}/third_party/ruy"
+                "${CMAKE_SOURCE_DIR}/scripts/tflite_int8_input.cc"
+                # GetBuiltinCode() again: the accessor that reads an operator code
+                # across the schema's deprecated/current field pair.  Linked rather
+                # than reimplemented against the unpacked object, so both host tools
+                # identify operators the same way.
+                "${TFLM_ROOT}/tensorflow/compiler/mlir/lite/schema/schema_utils.cc"
+                -o "${CMAKE_BINARY_DIR}/tflite_int8_input"
+        DEPENDS "${CMAKE_SOURCE_DIR}/scripts/tflite_int8_input.cc"
+        COMMENT "host c++ -> tflite_int8_input (rewrites a model to an int8 input)"
+        VERBATIM)
+    add_custom_target(int8-input-model DEPENDS "${CMAKE_BINARY_DIR}/tflite_int8_input")
 else()
-    message(STATUS "tflm: no host C++ compiler found -- the `verify-model` target is "
-                   "unavailable (the firmware itself is unaffected)")
+    message(STATUS "tflm: no host C++ compiler found -- the `verify-model` and "
+                   "`int8-input-model` targets are unavailable (the firmware itself "
+                   "is unaffected)")
 endif()
 
 # --- Attach to a firmware target ---------------------------------------------

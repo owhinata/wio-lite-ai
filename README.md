@@ -1164,7 +1164,9 @@ port/       threadx/ ThreadX low-level init + shared SysTick glue
                      drives it lives in app/ instead (nn_camera.c)
 scripts/    host-side tools.  verify_tflite.cc checks a .tflite against THIS
             firmware configuration before you transfer it, by calling the same
-            tflite::VerifyModelBuffer() the board would (issue #9)
+            tflite::VerifyModelBuffer() the board would (issue #9).
+            tflite_int8_input.cc rewrites a float-input model into an
+            int8-input one by stripping its own leading QUANTIZE (issue #51)
             coremark/ EEMBC CoreMark port (core_portme.*)
             netxduo/ nx_user.h (NetX Duo build configuration; the driver is in app/,
                      because what it sits on is the RTL8720 link, not a MAC)
@@ -1308,6 +1310,7 @@ cmake -B build-tflm -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchai
       -DCONFIG_NN_BACKEND=tflm
 cmake --build build-tflm                              # -> 333,828 B, 59,388 B free
 cmake --build build-tflm --target verify-model        # the host-side model checker
+cmake --build build-tflm --target int8-input-model    # the host-side model rewriter
 ```
 
 Selecting `tflm` also flips `BSP_ENABLE_SD`'s *default* to OFF, and says so at configure
@@ -1417,6 +1420,46 @@ another int8 model can be dropped into a blob slot without a rebuild. The donor
 measured that widening at **+97,056 B**, which on this partition is most of the budget —
 hence a configure-time decision rather than a constant in the source.
 
+#### Making an int8-input model (issue #51)
+
+🔴 **"An int8 model" does not mean "an int8 input."** The model this firmware runs —
+`blazeface_front_128_int8.tflite` from the ST model zoo — has int8 *weights* and
+**float32 I/O**: its first operator is a `QUANTIZE` that converts the float input to
+int8 (scale 1/255, zero point −128), and four `DEQUANTIZE`s convert the outputs back.
+So `app/nn_camera.c`'s int8 ingest branch could not run no matter how the board was
+driven — not because of a firmware condition, but because of a property of the *file*.
+That is issue #51, and it is the reason the branch shipped unexercised in phase 3.
+
+`scripts/tflite_int8_input.cc` removes that leading `QUANTIZE` and makes its output the
+graph input:
+
+```
+cmake --build build-tflm --target int8-input-model verify-model
+./build-tflm/tflite_int8_input blazeface_front_128_int8.tflite bf128_int8_in.tflite
+./build-tflm/verify_tflite bf128_int8_in.tflite      # then blob write <slot> + sb -k
+```
+
+Same weights, same arithmetic; the only thing that changes is **who quantizes** — the
+model, or `nncam_rows()` from the tensor's own scale/zero point. That is what makes the
+on-board check a *differential* one: load the original in one slot and the rewrite in
+another, point the camera at the same thing, and the same face has to appear. A check
+of that shape cannot be satisfied by numbers that merely look plausible.
+
+The rewrite deletes the orphaned float tensor and renumbers every tensor index in the
+file, which is why the tool **refuses more than it converts**. It rejects multi-subgraph
+models, graphs that reference debug metadata, inputs with more than one consumer, and —
+the one that is easy to miss — **any metadata buffer whose name is not on a short
+allowlist of names known to be index-free**. tflite-micro reads an
+`OfflineMemoryAllocation` metadata buffer as a tensor count followed by one offset *per
+tensor index*; a model carrying it would pass the flatbuffer verifier after renumbering
+and then fail `AllocateTensors()` on the board, where the only symptom is one
+`kTfLiteError` with no string. The verifier checks structure and never meaning, so an
+unfamiliar metadata name is precisely the case that cannot be reasoned about — hence an
+allowlist rather than a denylist, and a refusal that names what it saw.
+
+It prints no CRC-32 on purpose. `verify_tflite` prints the value `blob list` and
+`ai model load` display, and one number with one source cannot disagree with itself.
+
 ### Live camera inference (issue #9 phases 3–4)
 
 ```
@@ -1518,6 +1561,18 @@ threshold set too high. For a quantized input the normalized value goes through 
 tensor's **own** `scale`/`zero_point`, so `ai norm` reaches the model whatever its
 dtype (the donor hardcoded `rgb - 128`, because its tensor descriptor carried no
 quantization params to use).
+
+🔴 **There is no fallback when that scale reads back as zero — the model is refused
+instead** (issue #51). A zero scale is not "unit scale": it is what a **per-axis**
+quantized tensor looks like through this API, whose real parameters live in an affine
+quantization struct `port/nn/nn.h` does not expose. The one reachable case for a
+fallback was therefore the one where it fed the model wrong pixels and said nothing —
+using exactly the hardcoded assumption the sentence above rejects. `ai stream start`
+now reports it once, out loud, rather than per pixel, never. On the host, the
+quantization `nncam_rows()` performs was checked against tflite-micro's own
+`AffineQuantize` reference over all 256 channel values × both `ai norm` settings ×
+four (scale, zero point) pairs: **identical everywhere**, which is why stripping a
+model's `QUANTIZE` and doing it in the firmware yields the same tensor.
 
 ## Flash (over DFU)
 

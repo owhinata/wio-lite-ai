@@ -54,6 +54,7 @@
 #define NNCAM_ERR_INIT    (-8)  /**< thread / semaphore / mutex creation failed   */
 #define NNCAM_ERR_TEARING (-9)  /**< stop: still tearing down -- see below        */
 #define NNCAM_ERR_REARM  (-10)  /**< re-arm after a lost stream failed; stop first */
+#define NNCAM_ERR_QUANT  (-11)  /**< int8 input without a per-tensor quant scale   */
 
 struct nn_camera_stats {
 	uint8_t  running;

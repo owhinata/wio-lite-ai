@@ -103,15 +103,45 @@ static void ai_print_tensor(struct cli_instance *sh, const char *tag, int idx,
 	shape[pos] = '\0';
 
 	if (t->dtype == NN_DTYPE_INT8 || t->dtype == NN_DTYPE_UINT8) {
-		/* Scale as parts-per-million: svc/fmt.c implements no %f (and no precision
-		 * flag), so every fractional value in this firmware is printed as scaled
-		 * integers -- the same idiom as the fps and MHz lines elsewhere. */
-		uint32_t s_ppm = (uint32_t)(t->scale * 1000000.0f + 0.5f);
+		/*
+		 * Integer part and six fraction digits, printed separately: svc/fmt.c
+		 * implements no %f (and no precision flag), so every fractional value in
+		 * this firmware is printed as scaled integers -- the same idiom as the fps
+		 * and MHz lines elsewhere.
+		 *
+		 * 🔴 NOT parts-per-million into a fixed "0.%06lu" (issue #51).  That form
+		 * silently misprints any scale >= 1 -- 1.5 came out as "0.1500000" -- and
+		 * output tensors routinely have one.  A quantization scale is the number
+		 * you check when detections look wrong, so it has to survive being read.
+		 */
+		float s = t->scale;
+		uint32_t s_int, s_frac;
 
-		cli_print(sh, "  %s[%d]  %s %s  q(s=0.%06lu zp=%ld)  %luB\r\n",
+		/* 🔴 Clamped BEFORE the cast, not after: float -> uint32_t is undefined for
+		 * NaN and for anything outside the destination's range, and `ai info` is the
+		 * command reached for when a model is already suspect -- it must not be the
+		 * thing that then misbehaves. */
+		if (!(s > 0.0f)) {
+			/* Zero, negative, or NaN.  Zero is the one that actually happens: a
+			 * per-axis quantized tensor reads back as scale 0 through this API
+			 * (app/nn_camera.c refuses such an input for exactly that reason). */
+			s_int = 0u;
+			s_frac = 0u;
+		} else if (s >= 1000000.0f) {
+			s_int = 999999u;   /* saturated; no real quantization scale is here */
+			s_frac = 999999u;
+		} else {
+			s_int = (uint32_t)s;
+			s_frac = (uint32_t)((s - (float)s_int) * 1000000.0f + 0.5f);
+			if (s_frac >= 1000000u) {   /* the rounding carried */
+				s_int++;
+				s_frac -= 1000000u;
+			}
+		}
+		cli_print(sh, "  %s[%d]  %s %s  q(s=%lu.%06lu zp=%ld)  %luB\r\n",
 		          tag, idx, shape, ai_dtype_name(t->dtype),
-		          (unsigned long)s_ppm, (long)t->zero_point,
-		          (unsigned long)t->bytes);
+		          (unsigned long)s_int, (unsigned long)s_frac,
+		          (long)t->zero_point, (unsigned long)t->bytes);
 	} else {
 		cli_print(sh, "  %s[%d]  %s %s  %luB\r\n",
 		          tag, idx, shape, ai_dtype_name(t->dtype),
@@ -741,6 +771,9 @@ static const char *ai_nncam_strerror(int rc)
 	case NNCAM_ERR_GEOM:    return "the model input does not tile onto the camera's "
 	                               "4 bands, or its dtype is neither int8 nor "
 	                               "float32 (`ai info`)";
+	case NNCAM_ERR_QUANT:   return "the int8 input carries no per-tensor quantization "
+	                               "scale (`ai info` shows q(s=0.000000)) -- a "
+	                               "per-axis quantized input is not supported";
 	case NNCAM_ERR_INIT:    return "the worker thread or its objects could not be "
 	                               "created";
 	case NNCAM_ERR_TEARING: return "still tearing down (a callback or an inference "
@@ -882,6 +915,7 @@ static int cmd_ai_stream_stats(struct cli_instance *sh, int argc, char **argv)
 	cli_print(sh, "maxscore: %ld (raw x1000, pre-sigmoid)  cand: %d (pre-NMS)\r\n",
 	          (long)(blazeface_last_max_score() * 1000.0f),
 	          blazeface_last_ncand());
+
 	return 0;
 }
 

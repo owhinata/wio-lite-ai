@@ -166,6 +166,15 @@ static unsigned nncam_oy_bound(unsigned band, unsigned oh)
  * silently wrong for any model quantized differently, and `ai norm` would do nothing
  * on a quantized input.  The 1/scale reciprocal is computed once per band rather
  * than per channel: a vdiv.f32 is ~14 cycles and there are 3 per pixel.
+ *
+ * 🔴 scale > 0 IS GUARANTEED BY nn_camera_start(), which is why there is no fallback
+ * here (issue #51).  There used to be one -- the donor's (rgb - 128) when the scale
+ * read back as zero -- and it was not dead code: a PER-AXIS quantized tensor arrives
+ * with TfLiteTensor::params.scale == 0, because its real parameters live in the
+ * affine-quantization struct that port/nn/nn.h does not expose.  So the fallback's
+ * only reachable case was the one where it silently fed the model wrong pixels, with
+ * the same hardcoded assumption the paragraph above rejects.  Refusing the model at
+ * start() says so once, out loud, instead of per pixel, never.
  */
 static void nncam_rows(const uint16_t *src, unsigned src_y0,
                        unsigned oy0, unsigned oy_end, struct nn_tensor *in)
@@ -174,7 +183,7 @@ static void nncam_rows(const uint16_t *src, unsigned src_y0,
 	const int is_f32 = (in->dtype == NN_DTYPE_FLOAT32);
 	const float bias = nncam_norm_signed ? -1.0f : 0.0f;
 	const float gain = nncam_norm_signed ? (1.0f / 127.5f) : (1.0f / 255.0f);
-	const float inv_scale = (in->scale > 0.0f) ? (1.0f / in->scale) : 0.0f;
+	const float inv_scale = is_f32 ? 0.0f : (1.0f / in->scale);
 	const int32_t zp = in->zero_point;
 	unsigned oy, ox, c;
 
@@ -203,20 +212,16 @@ static void nncam_rows(const uint16_t *src, unsigned src_y0,
 				int8_t *o8 = (int8_t *)in->data + o;
 
 				for (c = 0; c < oc && c < 3u; c++) {
-					float v = (float)rgb[c] * gain + bias;
-					int q;
+					float f = ((float)rgb[c] * gain + bias) * inv_scale;
+					/* Round half away from zero without libm: this
+					   firmware links none, and lrintf() would pull it in
+					   for three multiply-adds per pixel.  This is the
+					   rounding TFLM's own QUANTIZE kernel does --
+					   reference_ops::AffineQuantize() -> TfLiteRound()
+					   -> std::round() -- so a model whose leading
+					   QUANTIZE was stripped gets the identical tensor. */
+					int q = (int)(f + (f >= 0.0f ? 0.5f : -0.5f)) + (int)zp;
 
-					if (inv_scale != 0.0f) {
-						float f = v * inv_scale;
-
-						/* Round half away from zero without libm: this
-						   firmware links none, and lrintf() would pull it
-						   in for three multiply-adds per pixel. */
-						q = (int)(f + (f >= 0.0f ? 0.5f : -0.5f)) +
-						    (int)zp;
-					} else {
-						q = (int)rgb[c] - 128;
-					}
 					if (q < -128)
 						q = -128;
 					else if (q > 127)
@@ -516,6 +521,20 @@ int nn_camera_start(int colorbar)
 	if (in->dtype != NN_DTYPE_FLOAT32 && in->dtype != NN_DTYPE_INT8) {
 		nn_session_release();
 		return NNCAM_ERR_GEOM;
+	}
+	/*
+	 * 🔴 The quantization parameters have to be USABLE, not merely present (#51).
+	 * nn_tensor carries ONE scale, and the backend fills it from
+	 * TfLiteTensor::params.scale -- which a PER-AXIS quantized tensor leaves at zero,
+	 * keeping its real parameters in the affine-quantization struct this API does not
+	 * expose.  So a zero here does not mean "unit scale", it means "the number you
+	 * need is somewhere you cannot see", and quantizing with any assumed constant
+	 * would feed the model wrong pixels with nothing to show for it.  Refuse instead;
+	 * nncam_rows() then needs no per-pixel fallback (see its comment).
+	 */
+	if (in->dtype == NN_DTYPE_INT8 && !(in->scale > 0.0f)) {
+		nn_session_release();
+		return NNCAM_ERR_QUANT;
 	}
 	nncam_oh = in->dims[1];
 	nncam_ow = in->dims[2];
