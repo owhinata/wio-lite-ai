@@ -84,8 +84,13 @@ REQUIRED_DTCM = (
 #              would keep running and the panel would show whatever was in the
 #              buffer at boot.
 #
-# cam_frame / cam_ring / ltdc_fb are the other master-touched buffers, but they live
-# in PSRAM and are covered by the .psram_noinit ASSERT in the linker script.
+# cam_frame / cam_ring / ltdc_fb are the other master-touched buffers.  They live in
+# PSRAM and are checked by cmake/check_psram_ai_residency.py, which asserts they stay
+# OUT of the cacheable carve-out issue #9 opened in the top 2 MB of that window.  (An
+# earlier version of this comment said the linker script's .psram_noinit ASSERT covered
+# them; it never did -- that ASSERT only bounds the total against the 8 MB window and
+# says nothing about which sub-range a buffer landed in.  Harmless while the whole
+# window was non-cacheable, wrong the moment part of it was not.)
 REQUIRED_AXI = (
     "sd_bounce",
     "cam_band",

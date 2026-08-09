@@ -33,6 +33,7 @@
  */
 #include "stm32h7xx_hal.h"   /* CMSIS core (ARM_MPU_*, __MPU_PRESENT) + device */
 #include "app.h"
+#include "psram.h"           /* PSRAM_AI_BASE_ADDR / PSRAM_AI_BYTES (issue #9) */
 
 /* One MPU region: base, size code (ARM_MPU_REGION_SIZE_*), and its RASR word.
  * Region numbers are the array index; keep the count <= the 16 M7 regions. */
@@ -115,7 +116,60 @@ static const struct mpu_region mpu_regions[] = {
 		                     /*SubRegionDisable*/ 0u,
 		                     ARM_MPU_REGION_SIZE_256MB),
 	},
+	/*
+	 * Region 3: the top 2 MB of the PSRAM window, Normal cacheable write-back
+	 * write-allocate -- TEX=001, C=1, B=1, S=0, AP=full, XN=1 (PM0253 sec 4.6.6).
+	 * This is the first carve-out the region 0 comment above anticipated, and it
+	 * overrides region 0 in the overlap because the MPU resolves overlapping
+	 * regions in favour of the HIGHEST region number (PM0253 sec 4.6).
+	 *
+	 * WHY.  Issue #9's inference runtime keeps its activations, input staging and
+	 * model slots here, and they are far too large for AXI-SRAM.  Through the
+	 * non-cacheable window that working set is bound by one bus transaction per
+	 * access rather than by bandwidth: the phase 1 stub measured ~9.8 core cycles
+	 * for every byte-wide access, against the 113 MB/s the same window streams.
+	 * Cache line fills amortise 32 bytes per transaction, which is the whole point.
+	 *
+	 * WHY SHAREABLE IS 0 HERE AND 1 IN REGION 0, WHICH IS NOT A TYPO.  Region 0 is
+	 * shared with the LTDC, the DMA2D and the DCMI, and being non-cacheable is what
+	 * makes that safe.  Nothing but the CPU may touch THIS region -- that is the
+	 * precondition for caching it at all -- and on a Cortex-M7 leaving S=1 would
+	 * defeat the carve-out outright: Normal Cacheable Shared memory is not held in
+	 * the data cache by default, and only CACR.SIWT changes how it is treated at all
+	 * (PM0253 sec 4.9.3).  A shareable "cacheable" region would therefore be exactly
+	 * as slow as what it replaced, while looking configured.
+	 *
+	 * WHY NO CACHE MAINTENANCE IS NEEDED WHEN THE ATTRIBUTE FLIPS.  Same argument as
+	 * region 0's, and it depends on the ordering the file header states: mpu_config()
+	 * runs before SCB_EnableDCache() and long before app/psram.c brings the PSRAM up,
+	 * so at the moment this range becomes cacheable there is nothing cached from it.
+	 *
+	 * XN stays set.  Only data lives here -- issue #9 deliberately rejected the
+	 * relocatable-network backend that would have executed from external memory --
+	 * so the window keeps W^X.
+	 *
+	 * 2 MB at 0x90600000 is a power of two at a natural boundary and reaches exactly
+	 * the top of the 8 MB window, so like the rows above it needs no sub-region
+	 * masking.  ldscript/STM32H725AEIx_IROM.ld asserts .psram_ai starts at the same
+	 * address, and cmake/check_psram_ai_residency.py asserts both that the NN buffers
+	 * are inside it and that no bus-master buffer ever lands in it.
+	 */
+	{
+		.rbar = ARM_MPU_RBAR(3u, PSRAM_AI_BASE_ADDR),
+		.rasr = ARM_MPU_RASR(/*DisableExec*/ 1u, ARM_MPU_AP_FULL,
+		                     /*TEX*/ 1u, /*IsShareable*/ 0u,
+		                     /*IsCacheable*/ 1u, /*IsBufferable*/ 1u,
+		                     /*SubRegionDisable*/ 0u,
+		                     ARM_MPU_REGION_SIZE_2MB),
+	},
 };
+
+_Static_assert(PSRAM_AI_BYTES == 0x00200000u,
+               "MPU region 3 is coded ARM_MPU_REGION_SIZE_2MB; keep PSRAM_AI_BYTES in step");
+_Static_assert((PSRAM_AI_BASE_ADDR & (PSRAM_AI_BYTES - 1u)) == 0u,
+               "an ARMv7-M MPU region must be naturally aligned to its own size");
+_Static_assert(PSRAM_AI_BASE_ADDR + PSRAM_AI_BYTES == PSRAM_BASE_ADDR + PSRAM_SIZE_BYTES,
+               "the carve-out is meant to reach exactly the top of the PSRAM window");
 
 #define MPU_REGION_COUNT (sizeof mpu_regions / sizeof mpu_regions[0])
 

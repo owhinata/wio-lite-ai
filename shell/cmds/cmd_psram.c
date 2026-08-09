@@ -7,14 +7,20 @@
  * @brief   `psram` shell command (issue #3): OCTOSPI1 APS6408 PSRAM status + test.
  *
  *   psram info          show bring-up state, device clock, ID, mmap window
- *   psram test [bytes]  write/read/verify patterns over the mmap window (default
- *                       the whole 8 MB); reports the first mismatch address
+ *   psram test [bytes]  write/read/verify patterns over the mmap window (default,
+ *                       and maximum, the 6 MB non-cacheable pool -- see below);
+ *                       reports the first mismatch address
  *
  * This is the primary functional check for the OCTOSPI1 octal wiring + latency:
  * a wrong data-line AF, latency code, or delay-block setting shows up as a
  * mismatch (or, if the mmap latency is badly off, an AXI/bus fault that the
  * fault handler records to dmesg).  Registered only in the `shell` executable
  * (like cmd_membench.c); PSRAM is scratch RAM so no dangerous-command gate.
+ *
+ * `psram test` deliberately stops at the top of the non-cacheable pool (6 MB) rather
+ * than covering the device: issue #9 made the last 2 MB Normal write-back, and a
+ * memory test through a write-back cache proves nothing, because the read-back can
+ * be served from the cache while the device is not answering at all.
  *
  * Clean-room design; no third-party code reused.
  */
@@ -216,8 +222,9 @@ static int test_pass(struct cli_instance *sh, uint32_t base, uint32_t words,
 
 static int cmd_psram_test(struct cli_instance *sh, int argc, char **argv)
 {
-	uint32_t len = PSRAM_SIZE_BYTES;
+	uint32_t len = PSRAM_NC_BYTES;
 	uint32_t words;
+	int clamped = 0;
 
 	if (!psram_ready()) {
 		cli_error(sh, "psram: not ready (bring-up failed; see `psram info`)\r\n");
@@ -227,8 +234,24 @@ static int cmd_psram_test(struct cli_instance *sh, int argc, char **argv)
 		cli_error(sh, "psram: bad length '%s'\r\n", argv[1]);
 		return 1;
 	}
-	if (len == 0u || len > PSRAM_SIZE_BYTES)
-		len = PSRAM_SIZE_BYTES;
+	/*
+	 * Bounded by the non-cacheable pool, not by the device.  Since issue #9 phase 2a
+	 * the top 2 MB is Normal write-back (app/mpu.c region 3), and a memory test
+	 * cannot run through a write-back cache and mean anything: the store below can
+	 * be answered by the cache and never reach the APS6408, so a device that has
+	 * stopped answering would still be reported PASS.  That is the reading issues
+	 * #3 and #16 tuned the timing against, so it has to stay a device test.
+	 */
+	if (len == 0u || len > PSRAM_NC_BYTES) {
+		clamped = (len > PSRAM_NC_BYTES);
+		len = PSRAM_NC_BYTES;
+	}
+	if (clamped)
+		cli_warn(sh, "psram: clamped to %lu KB -- above 0x%08lX the window is "
+		             "cacheable, where a write/read-back can be answered by the "
+		             "cache instead of the device\r\n",
+		         (unsigned long)(PSRAM_NC_BYTES / 1024u),
+		         (unsigned long)PSRAM_AI_BASE_ADDR);
 	len &= ~0x3u;                       /* whole 32-bit words */
 	words = len / 4u;
 

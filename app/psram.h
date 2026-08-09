@@ -10,6 +10,32 @@
 #define PSRAM_BASE_ADDR   0x90000000u
 #define PSRAM_SIZE_BYTES  0x00800000u   /* 8 MB (APS6408_RAM_SIZE) */
 
+/*
+ * The window is not uniform since issue #9 phase 2a.  Its top 2 MB is carved out as
+ * Normal cacheable write-back (app/mpu.c region 3) for the CPU-only working set of
+ * the NN runtime -- activations, input staging and model slots -- because inference
+ * through a non-cacheable window is bound by one bus transaction per access rather
+ * than by bandwidth.  Everything below stays Normal non-cacheable, which is what
+ * lets the LTDC, the DMA2D and the DCMI share their buffers with the CPU untouched.
+ *
+ * Two rules follow, and both are enforced after every link by
+ * cmake/check_psram_ai_residency.py:
+ *   - nothing a bus master touches may live in the carve-out (it would read stale
+ *     cache lines, intermittently, under cache pressure);
+ *   - the linker script's .psram_ai section must start exactly at PSRAM_AI_BASE_ADDR,
+ *     since the MPU region and the section are declared in different files.
+ *
+ * 2 MB naturally aligned at 0x90600000, so the MPU needs no sub-region masking.
+ */
+#define PSRAM_AI_BASE_ADDR  0x90600000u
+#define PSRAM_AI_BYTES      0x00200000u   /* 2 MB, ending at the top of the window */
+
+/* The non-cacheable pool: everything below the carve-out.  `psram test` and the
+ * membench PSRAM row bound themselves by this -- a write-back region cannot be used
+ * to test the device, because a store followed by a load can be answered by the
+ * cache and never reach the APS6408 at all. */
+#define PSRAM_NC_BYTES    (PSRAM_AI_BASE_ADDR - PSRAM_BASE_ADDR)   /* 6 MB */
+
 /* Bring-up failure stages (psram_init_stage): which init transaction failed.
  * OK means every stage passed and memory-mapped mode was entered. */
 #define PSRAM_STAGE_OK    0u

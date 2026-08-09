@@ -84,6 +84,7 @@
 #define SRAM_CACHED_BYTES  ( 4u * 1024u)   /* fits in the 16 KB L1 D-cache */
 #define FLASH_BENCH_BYTES  (64u * 1024u)
 #define PSRAM_BENCH_BYTES  (64u * 1024u)   /* scratch at PSRAM base (non-cacheable mmap) */
+#define PSRAM_AI_BENCH_BYTES (64u * 1024u) /* same size in the cacheable carve-out */
 #define IFLASH_BENCH_BASE  0x08000000u   /* embedded flash via AXIM (read-only).  Starts in
                                           * the bootloader's sector, but a READ is harmless
                                           * -- no write/erase, so no brick risk. */
@@ -101,6 +102,23 @@ static uint32_t dtcm_bench_buf[DTCM_BENCH_BYTES / 4]
  * bytes read back as the zeros SystemInit() wrote when it initialised the ECC. */
 static const uint32_t itcm_bench_buf[ITCM_BENCH_BYTES / 4]
 	__attribute__((aligned(32), section(".itcm_bench"), used));
+
+/* Scratch in the cacheable PSRAM carve-out (issue #9 phase 2a).  Same device and the
+ * same 64 KB working set as the PSRAM row below, but a different part of it, reached
+ * through the other set of MPU attributes -- so the pair reads as a cacheability
+ * comparison rather than an address one.
+ *
+ * A REAL BUFFER RATHER THAN A RAW ADDRESS, unlike the PSRAM row below it, for two
+ * reasons.  The PSRAM row writes over whatever is at 0x90000000 -- today the head of
+ * the camera ring, which is only safe because psram_acquire() refuses while a stream
+ * or a scan-out is live; doing the same at the carve-out's base would land on the NN
+ * runtime's tensors.  And the section attribute is load-bearing: a plain static here
+ * would go to .bss, push _end up and MOVE the malloc'd sram_bench_buf below, which
+ * would change the numbers the SRAM rows report -- exactly the kind of silent
+ * recalibration the -O2 -fno-lto pin on this file exists to prevent.  In .psram_ai it
+ * costs no .bss and no heap. */
+static uint32_t psram_ai_bench_buf[PSRAM_AI_BENCH_BYTES / 4]
+	__attribute__((aligned(32), section(".psram_ai.bench"), used));
 
 /* Volatile sink: every measured loop ends by storing into it, so -O2/-O3 cannot
  * eliminate the loop as dead code. */
@@ -491,6 +509,16 @@ static int cmd_membench(struct cli_instance *sh, int argc, char **argv)
 		else {
 			bw_row(sh, "PSRAM  (64KB)", (uint32_t *)PSRAM_BASE_ADDR,
 			       PSRAM_BENCH_BYTES / 4u, clk, 1);
+			/* Same device, same 64 KB, through the cacheable carve-out
+			 * (issue #9 phase 2a).  Placed after the non-cacheable row so
+			 * this one's line fills cannot warm anything the other measures. */
+			bw_row(sh, "PSRAM  (64KB, cached)", psram_ai_bench_buf,
+			       PSRAM_AI_BENCH_BYTES / 4u, clk, 1);
+			/* Write the dirty lines back HERE, on our own time.  The latency
+			 * table runs after this one, and a write-back to OCTOSPI1 landing
+			 * inside somebody else's timed region would be charged to them. */
+			SCB_CleanInvalidateDCache_by_Addr((uint32_t *)psram_ai_bench_buf,
+			                                  (int32_t)sizeof psram_ai_bench_buf);
 			psram_release();
 		}
 	}

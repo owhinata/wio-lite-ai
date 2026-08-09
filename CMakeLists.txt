@@ -656,3 +656,16 @@ add_custom_command(TARGET shell POST_BUILD
             $<TARGET_FILE:shell>
     COMMENT "check .dtcm_bss residency and DMA reachability (issue #46)"
     VERBATIM)
+
+# And the same kind of gate for the cacheable PSRAM carve-out (issue #9 phase 2a).
+# It guards the rule that replaced "everything in PSRAM is safe for DMA" once the top
+# 2 MB stopped being non-cacheable, and that rule has no runtime enforcement at all: a
+# DMA buffer in there transfers correctly and is then read back stale from the data
+# cache, intermittently, only under cache pressure.  `shell` only, like the two above.
+add_custom_command(TARGET shell POST_BUILD
+    COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/cmake/check_psram_ai_residency.py"
+            --nm "${CMAKE_NM}"
+            $<TARGET_FILE:shell>
+    COMMENT "check .psram_ai residency and cache safety (issue #9)"
+    VERBATIM)

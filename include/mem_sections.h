@@ -56,6 +56,31 @@
 #define DTCM_BSS  __attribute__((section(".dtcm_bss")))
 
 /**
+ * Put a definition in the CACHEABLE PSRAM carve-out (.psram_ai, issue #9 phase 2a).
+ *
+ * The top 2 MB of the OCTOSPI1 window is mapped Normal write-back by app/mpu.c
+ * region 3, unlike the rest of it.  This is where the NN runtime's large CPU-only
+ * working set goes -- activations, input staging, model slots -- because through the
+ * non-cacheable window that working set costs one bus transaction per access instead
+ * of one per cache line.
+ *
+ * 🔴 CPU-ONLY, WITH NO EXCEPTIONS.  Everywhere else in this firmware, "PSRAM" and
+ * "safe for DMA" mean the same thing, because the window is non-cacheable and the
+ * camera and display drivers rely on that for coherency with no maintenance at all.
+ * That is exactly untrue in here.  A buffer a bus master writes will still transfer
+ * correctly and then be read back stale from the data cache -- so this failure does
+ * not announce itself the way the DTCM one does (there the transfer moves nothing,
+ * every time).  It depends on cache pressure, which means it can pass every test on
+ * a quiet system.  cmake/check_psram_ai_residency.py refuses the build instead.
+ *
+ * The section is NOLOAD like .psram_noinit, so nothing zeroes it: a resident must
+ * not assume statics start at zero, and a measurement over it should fill it first.
+ * Alignment is left to the caller; 32 bytes keeps a buffer on cache-line boundaries
+ * so a neighbour cannot share a dirty line with it.
+ */
+#define PSRAM_AI  __attribute__((section(".psram_ai")))
+
+/**
  * Fill word SystemInit() stamps over the unused main stack, so `free` can report a
  * high-water mark by finding the lowest address that still holds it.
  *

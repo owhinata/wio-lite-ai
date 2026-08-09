@@ -545,11 +545,47 @@ SECTIONS
     _psram_end = .;
   } >PSRAM
 
+  /* The cacheable carve-out (issue #9 phase 2a): the top 2 MB of the same window,
+   * mapped Normal write-back by app/mpu.c region 3 for the NN runtime's CPU-only
+   * working set.  Pinned to an absolute address rather than packed after the
+   * residents above, because an MPU region must be a power of two at a natural
+   * boundary -- 0x90600000 is 2 MB-aligned and reaches exactly the top of the
+   * window, so the region needs no sub-region masking.  The ~5 MB left between the
+   * two is unallocated address space, not wasted RAM.
+   *
+   * NOTHING A BUS MASTER TOUCHES MAY GO HERE.  The camera and display buffers rely
+   * on the window being non-cacheable for coherency with no maintenance; in here
+   * they would read stale lines, intermittently, only under cache pressure.  The
+   * ASSERTs below cannot see that -- cmake/check_psram_ai_residency.py is what
+   * checks it, in both directions, after every link. */
+  .psram_ai 0x90600000 (NOLOAD) :
+  {
+    . = ALIGN(32);
+    _psram_ai_start = .;
+    *(.psram_ai)
+    *(.psram_ai*)
+    . = ALIGN(32);
+    _psram_ai_end = .;
+  } >PSRAM
+
   .ARM.attributes 0 : { *(.ARM.attributes) }
 
   /* Anything placed in PSRAM must fit inside the 8 MB OCTOSPI1 window. */
   ASSERT(_psram_end <= ORIGIN(PSRAM) + LENGTH(PSRAM),
          ".psram_noinit overflows the 8 MB OCTOSPI1 PSRAM window")
+
+  /* The carve-out's base is duplicated in app/mpu.c (the MPU region) and in
+   * cmake/check_psram_ai_residency.py.  It has to be: a linker script cannot include
+   * a C header.  So each states it independently and this catches a divergence at
+   * link time -- a region whose base does not match its section maps the wrong
+   * bytes cacheable, which is silent until it corrupts something. */
+  ASSERT(_psram_ai_start == ORIGIN(PSRAM) + 0x600000,
+         ".psram_ai must start at 0x90600000 to match MPU region 3 in app/mpu.c")
+  ASSERT(_psram_ai_end <= ORIGIN(PSRAM) + 0x800000,
+         ".psram_ai overflows the 2 MB cacheable carve-out")
+  /* Growing .psram_noinit into the carve-out would make DMA buffers cacheable. */
+  ASSERT(_psram_end <= _psram_ai_start,
+         ".psram_noinit has grown into the .psram_ai cacheable carve-out")
 
   /* The DTCM residents must fit UNDER the main stack, not merely inside DTCM.  ld
    * does not diagnose an overflowing NOLOAD region on its own, and it has no idea

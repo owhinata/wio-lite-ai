@@ -27,14 +27,14 @@
  * than one output, and both a quantized and a non-quantized output so `ai info`
  * exercises both print paths.
  *
- * PLACEMENT.  All three buffers live in the external PSRAM (.psram_noinit.nn).
- * They are 17 KB of CPU-only bulk, which is the PSRAM row of the memory policy in
- * include/mem_sections.h: AXI-SRAM is reserved for what a bus master must reach,
- * and DTCM has under 8 KB genuinely free once the main stack is accounted for.
- * Being NOLOAD they hold garbage at reset, so a caller measuring with them fills
- * the input first (shell/cmds/cmd_ai.c).  Nothing here dereferences them outside
- * run() -- in particular null_open() only fills descriptors, which is what lets
- * `ai info` work with the PSRAM down.
+ * PLACEMENT.  All three buffers live in the cacheable PSRAM carve-out (.psram_ai,
+ * issue #9 phase 2a).  They are 17 KB of CPU-only bulk, which is the PSRAM row of
+ * the memory policy in include/mem_sections.h: AXI-SRAM is reserved for what a bus
+ * master must reach, and DTCM has under 8 KB genuinely free once the main stack is
+ * accounted for.  Being NOLOAD they hold garbage at reset, so a caller measuring
+ * with them fills the input first (shell/cmds/cmd_ai.c).  Nothing here dereferences
+ * them outside run() -- in particular null_open() only fills descriptors, which is
+ * what lets `ai info` work with the PSRAM down.
  *
  * Clean-room design; no third-party code reused.
  */
@@ -43,6 +43,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+#include "mem_sections.h"   /* PSRAM_AI: the cacheable, CPU-only carve-out */
 
 /* Stub geometry.  NHWC input, two outputs shaped like a small detector head. */
 #define NULL_IN_H      64
@@ -55,16 +57,12 @@
 #define NULL_SCR_COUNT ((uint32_t)NULL_CELLS)
 #define NULL_SCR_BYTES (NULL_SCR_COUNT * (uint32_t)sizeof(float))      /*  1024 */
 
-/* 32-byte aligned like every other PSRAM resident here (port/ltdc/ltdc_display.c,
- * port/camera/camera.c): not needed for coherency -- the window is MPU Normal
- * non-cacheable -- but it keeps each buffer on cache-line boundaries for when
- * issue #9 P2a moves this section into a cacheable carve-out. */
-static int8_t null_in_buf[NULL_IN_BYTES]
-	__attribute__((aligned(32), section(".psram_noinit.nn")));
-static int8_t null_box_buf[NULL_BOX_BYTES]
-	__attribute__((aligned(32), section(".psram_noinit.nn")));
-static float  null_scr_buf[NULL_SCR_COUNT]
-	__attribute__((aligned(32), section(".psram_noinit.nn")));
+/* In the CACHEABLE PSRAM carve-out since issue #9 phase 2a (the rest of that window
+ * is non-cacheable).  32-byte aligned so no two of them share a cache line, which
+ * matters here in a way it did not while the window was uniform. */
+static int8_t null_in_buf[NULL_IN_BYTES]   PSRAM_AI __attribute__((aligned(32)));
+static int8_t null_box_buf[NULL_BOX_BYTES] PSRAM_AI __attribute__((aligned(32)));
+static float  null_scr_buf[NULL_SCR_COUNT] PSRAM_AI __attribute__((aligned(32)));
 
 /* Defeats dead-store elimination of the pass below.  The firmware is built -Os with
  * LTO, so the optimiser sees the whole program and would otherwise be free to prove
@@ -159,10 +157,11 @@ static uint32_t null_activations_bytes(void *impl)
 
 /*
  * The synthetic workload: FNV-1a over the input, then both outputs written from it.
- * Reads 12,288 B and writes 5,120 B of non-cacheable PSRAM, which at the measured
- * 113 MB/s read / 154 MB/s write is a few hundred microseconds -- far enough above
- * the noise floor to prove the cycle counter, and far below the wrap bound nn_run()
- * documents.
+ * Reads 12,288 B and writes 5,120 B, which is comfortably above the noise floor of
+ * the cycle counter and far below the wrap bound nn_run() documents.  It is also the
+ * measurement that showed why phase 2a was worth doing: through the non-cacheable
+ * window this cost ~9.8 core cycles per access, i.e. one bus transaction each, with
+ * the streaming bandwidth of the device nowhere in sight.
  */
 static int null_run(void *impl)
 {

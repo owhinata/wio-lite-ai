@@ -34,6 +34,12 @@
  *          _dtcm_used_end (emitted at the end of the last DTCM section) is the used
  *          count -- read from the linker, not the log/membench internals.  The main
  *          stack sits at the TOP of the same region and is reported separately.
+ *   PSRAM  two rows since issue #9 phase 2a, because the window stopped being one
+ *          kind of memory.  "PSRAM" is the non-cacheable pool, bounded by the
+ *          carve-out rather than by the device so its free bytes stay spendable;
+ *          "PSRAM+" is the cacheable carve-out at the top, whose used count comes
+ *          from the .psram_ai section bounds rather than from ORIGIN, since it does
+ *          not start at one.
  *   ITCM   used = _itcm_used_end - ORIGIN(ITCM), i.e. the .itcm interrupt-path
  *          residents (issue #24) plus the .itcm_bench membench buffer, bump-placed
  *          from ORIGIN exactly like the DTCM block above.  The trailing "itcm:" line
@@ -72,6 +78,12 @@
 #define ITCM_LENGTH   (64u * 1024u)
 #define PSRAM_ORIGIN  0x90000000u          /* external OCTOSPI1 APS6408 (issue #3) */
 #define PSRAM_LENGTH  (8u * 1024u * 1024u)
+/* The window is two rows, not one, since issue #9 phase 2a carved its top 2 MB out as
+ * cacheable (app/mpu.c region 3).  The base row is bounded by the carve-out rather
+ * than by the device, so its "free" stays spendable: allocating past PSRAM_AI_ORIGIN
+ * would land in memory with different attributes. */
+#define PSRAM_AI_ORIGIN  0x90600000u
+#define PSRAM_AI_LENGTH  (2u * 1024u * 1024u)
 
 /*
  * Linker boundary symbols.  Their *addresses* carry the values -- declared as
@@ -86,6 +98,7 @@ extern uint8_t _estack[];            /* top of DTCM = initial MSP (issue #46) */
 extern uint8_t _smsp_stack[];        /* bottom of the main stack */
 extern uint8_t _dtcm_used_end[];     /* top of the DTCM resident block */
 extern uint8_t _psram_end[];         /* top of PSRAM residents (.psram_noinit) */
+extern uint8_t _psram_ai_start[], _psram_ai_end[];  /* cacheable carve-out (issue #9) */
 extern uint8_t _sitcm[], _eitcm[];   /* .itcm run image in ITCM (issue #24) */
 /* ORIGIN(FLASH) / LENGTH(FLASH) of the app partition, PROVIDEd by the linker
  * script.  Absolute symbols: the ADDRESS carries the value, hence sym(). */
@@ -184,9 +197,17 @@ static int cmd_free(struct cli_instance *sh, int argc, char **argv)
 	             ".data/.bss + DMA scratch + heap (bus-master reachable)");
 	print_region(sh, "Flash", flash_origin, flash_length, flash_used,
 	             ".isr/.text/.rodata/.data (internal)");
-	print_region(sh, "PSRAM", PSRAM_ORIGIN, PSRAM_LENGTH,
+	/* Two rows for one device.  The base row's total stops at the carve-out because
+	 * its free bytes have to stay spendable, and the carve-out gets its own row so
+	 * the NN runtime's 2 MB budget is visible.  Between them they account for the
+	 * whole 8 MB; the gap between .psram_noinit's top and the carve-out shows up as
+	 * the base row's free. */
+	print_region(sh, "PSRAM", PSRAM_ORIGIN, PSRAM_AI_ORIGIN - PSRAM_ORIGIN,
 	             sym(_psram_end) - PSRAM_ORIGIN,          /* .psram_noinit residents */
-	             "ext OCTOSPI1 APS6408 (free scratch pool)");
+	             "ext OCTOSPI1 APS6408, non-cacheable (DMA-shareable scratch)");
+	print_region(sh, "PSRAM+", PSRAM_AI_ORIGIN, PSRAM_AI_LENGTH,
+	             sym(_psram_ai_end) - sym(_psram_ai_start),
+	             "cacheable carve-out, CPU-only (.psram_ai, NN working set)");
 
 	cli_print(sh, "\r\n");
 	cli_print(sh, "heap:  base 0x%08lX  arena %lu  in-use %lu  free-pool %lu\r\n",
