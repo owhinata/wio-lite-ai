@@ -34,7 +34,7 @@ time as the USB console. 27 commands:
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | storage | `sd` (card: info/read/format · FAT: ls/cat/write/rm/mkdir/df/umount) · `nor` (info/read/erase/write/test) · `kv` (list/get/set/desc/del/info/format) |
 | display | `lcd` (info/on/off · fill/bar/grad/clear/anim/blit) |
-| camera / AI | `camera` (probe/on/off/info/scan · capture/save/send · stream start/stop/stats · preview · reg) · `ai` (info/bench) |
+| camera / AI | `camera` (probe/on/off/info/scan · capture/save/send · stream start/stop/stats · preview · reg) · `ai` (info/bench · model load/unload · **run** · **stream** start/stop/stats · **overlay** · **norm** · **thresh** · **dets**) |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
 | wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench · **flash** info/read/backup/imgload/imginfo/write) · `net` (L3 = **host NetX Duo only**: info/ip/dhcp/ping/echo/shell) |
 | benchmarks | `coremark` · `membench` |
@@ -80,6 +80,31 @@ time as the USB console. 27 commands:
     the display is scanning out — whether the LTDC underran *during that run*, read
     from the sticky flags inside the measured window rather than left to a later
     `lcd info` that could not tell inference apart from anything else that ran.
+  - **Live camera inference** (issue #9 phases 3–4): `ai stream start` runs
+    **camera → BlazeFace → face boxes** continuously, and `ai overlay on` draws them
+    on the preview. `ai run` does one shot. See *Live camera inference* below.
+- **`ai stream` / `ai overlay`** — the camera-driven pipeline. The interesting part is
+  what it does **not** have: no staging buffer, no state machine, no per-inference
+  copy. Inference is ~373 ms and a camera frame period is ~74 ms, so a fresh frame is
+  always available the moment one is wanted — what is needed is not buffering but a
+  way to say *"fill me one"*. The producer downsamples bands **straight into
+  `nn_input()->data`** and only while the worker has asked for a frame:
+
+  ```
+  worker:   want_frame = 1 -> wait(sem) -> nn_run() -> decode -> publish -> repeat
+  band cb:  band 0 && want_frame -> latch filling
+            filling -> downsample this band's rows into nn_input()->data
+            band 3  -> filling = 0; want_frame = 0; post(sem)
+  ```
+
+  That deletes the donor firmware's two 192 KB staging buffers, its four-state
+  machine, its epoch counters and a 196,608 B memcpy per inference — but the handoff
+  then *is* the correctness argument, so `ai stream stats` reports the numbers that
+  would otherwise fail silently: **`ingest max`** against the ~18.5 ms band deadline,
+  and **`stream`**, which says `LOST` when a DCMI overrun tore the band stream down
+  underneath a client that still believes it is running. Nothing re-arms itself —
+  re-issuing the command does, because a stream that quietly restarts after an
+  overrun hides exactly the fault worth seeing.
 - **`kv`** — the **persistent configuration store**: a FlashDB key-value database in
   the first megabyte of that NOR. Each entry carries its **type** (`str`/`u32`/`bool`/
   `bytes`) and a **description**, both stored on the flash next to the value, so a
@@ -1078,6 +1103,9 @@ app/        main + USB CDC wiring, fault handlers, USB descriptors, retarget,
             kv_boot.c (the thread that opens it, issue #37),
             asset region: blob.c (8 x 256 KB NOR slots + the YMODEM sink,
             issue #10),
+            camera glue: cam_band.c (refcounted fan-out of the one band
+            callback), cam_preview.c (bands -> LTDC + the box overlay) and
+            nn_camera.c (bands -> nn_input() -> BlazeFace, issue #9 P3/P4),
             RTL8720DN link: erpc.c (service thread) / link_data.c (DATA channel) /
             wifi_rpc.c (typed wrappers) / rtl_link.c (ownership) /
             net_shell.c (telnet console transport + server) /
@@ -1119,6 +1147,12 @@ port/       threadx/ ThreadX low-level init + shared SysTick glue
                      the host checker so the two cannot disagree.  Compiled
                      into a separate static library with the tflite-micro +
                      CMSIS-NN tree that cmake/tflite-micro.cmake fetches
+            models/  model-SPECIFIC post-processing, above the model-agnostic
+                     API: blazeface.c decodes the four output tensors into face
+                     boxes (SSD anchors + NMS, issue #9 phase 3).  It depends on
+                     nn.h alone -- no HAL, no ThreadX, no libm -- which is why
+                     the host tests can run it, and why the camera glue that
+                     drives it lives in app/ instead (nn_camera.c)
 scripts/    host-side tools.  verify_tflite.cc checks a .tflite against THIS
             firmware configuration before you transfer it, by calling the same
             tflite::VerifyModelBuffer() the board would (issue #9)
@@ -1374,6 +1408,78 @@ another int8 model can be dropped into a blob slot without a rebuild. The donor
 measured that widening at **+97,056 B**, which on this partition is most of the budget —
 hence a configure-time decision rather than a constant in the source.
 
+### Live camera inference (issue #9 phases 3–4)
+
+```
+DCMI -> DMA2_Stream1 (double buffer, two FIXED 60-row bands in AXI-SRAM)
+  -> camera producer thread -> app/cam_band.c fans the band out:
+       1. app/cam_preview.c  : transpose into the LTDC back buffer (PSRAM)
+       2. app/nn_camera.c    : downsample straight into nn_input()->data
+  -> preview thread (prio 12): draw the boxes, then ltdc_flip()
+  -> nn worker  thread (prio 18): nn_run() -> blazeface_decode() -> publish
+```
+
+**`app/cam_band.c` exists because `port/camera` holds exactly one band callback**, and
+both the preview and the NN want bands. Putting the NN call inside `preview_band()`
+would have worked only while the preview was on — and inference with the preview
+**off** is the fastest configuration this board has, so that is exactly the case that
+must not be second-class. Fan-out order is fixed (preview first) so the picture never
+waits on inference bookkeeping, and it is refcounted, so `ai stream stop` does not
+black out a running preview and `camera preview off` does not stop inference.
+
+Two things there are worth more than the refcount:
+
+- **The stop drains in-flight callbacks, and a "busy" flag could not express that.**
+  Clearing a claim and then waiting for a flag misses the producer that has *already
+  passed the claim test and not yet entered the callback*: it would run afterwards and
+  write the input tensor after stop concluded the drain was complete and handed the
+  arena to `ai bench`, which memsets it. So the claim test and an in-flight counter
+  are updated **together under one PRIMASK section** — the same idiom as
+  `nn_session_try_acquire()`. Once the claim reads 0 inside that section a producer
+  pass has either already incremented (and release waits for it) or will read 0 and
+  skip; there is no third case.
+- **If the drain or the worker does not come back, `ai stream stop` releases
+  nothing** and reports `still tearing down`. Holding a session nobody can use is
+  recoverable; handing the model and its arena to `ai bench` while a
+  dead-but-not-returned callback can still write the input tensor is not. Running the
+  command again completes the release.
+
+🔴 **`ai stream` holds `psram_acquire_shared()` for its whole lifetime**, unlike every
+other continuous user, which arms itself and lets go. That is not a shortcut — the two
+gates `psram_acquire()` consults answer for the *camera* and the *display*, and the
+thing that must not be retuned underneath is neither: it is the worker reading its
+arena out of the PSRAM carve-out. The instant a DCMI overrun tears the band stream
+down, `camera_streaming()` goes false while that worker is still inside `nn_run()`.
+The consequence is documented rather than discovered: **start `camera preview on`
+before `ai stream start`** — the guard coexists with an already-armed scan-out but
+refuses a *new* `lcd on` / `camera preview on` while held.
+
+The band split is exact: 240 rows / 4 = 60 source rows per band, and 128 output rows
+/ 4 = 32. Output row `oy` samples source row `oy*240/128`, which for `oy ∈ [32b,
+32b+32)` lands in `[60b, 60b+58]` — wholly inside band `b`, so **no band-boundary
+sampling case exists**. `app/nn_camera.c` computes that split in the general form and
+refuses at start any input geometry it does not tile exactly, rather than silently
+leaving output rows holding whatever the arena last contained.
+
+**The overlay is drawn on the flip thread, not the producer's.** That thread has
+~74 ms of slack per frame; the band callback has ~18.5 ms and every microsecond there
+costs real pixels. A 90° rotation maps an axis-aligned rectangle to an axis-aligned
+rectangle, so a box is four `ltdc_fill_rect()` calls and needs no new primitive —
+each clips and transposes itself. 🔴 The box is clamped to the surface **in signed
+arithmetic before the `uint16_t` cast**: the decoder's `x = cx - w/2` is routinely
+negative for a face at the frame edge, and `surf_clip()` clips only the far edges, so
+a negative value cast to `uint16_t` becomes ~65535 and sails straight through it.
+
+**Two runtime knobs, because detection quality is not a build-time property.** If no
+faces are found the ambiguity is normalization vs threshold vs preprocessing, and
+`ai norm <0|1>` ([0,1] or [-1,1]) and `ai thresh <milli>` separate them on the board
+without a DFU cycle — as does `maxscore`, which reports the peak raw score *even when
+nothing passed the threshold*, the one reading that tells a dead model from a
+threshold set too high. For a quantized input the normalized value goes through the
+tensor's **own** `scale`/`zero_point`, so `ai norm` reaches the model whatever its
+dtype (the donor hardcoded `rgb - 128`, because its tensor descriptor carried no
+quantization params to use).
+
 ## Flash (over DFU)
 
 ```bash
@@ -1405,8 +1511,14 @@ sh shell/test/run_host_tests.sh    # -> "host tests passed"
 Covers command registration, the parser, the RX state machine / dispatch, the
 output API, dummy-backend integration + flow control, the line editor, the history
 ring, the byte ring, Tab completion, the YMODEM sender and receiver, the camera
-frame pipeline, and the CRC-32 the blob region stamps assets with — the last one
-being the only part of the blob work that can be checked without the board.
+frame pipeline, the CRC-32 the blob region stamps assets with — the only part of the
+blob work checkable without the board — and the **BlazeFace decoder**, whose anchor
+decode, NMS and threshold conversion are the one piece of new arithmetic in issue #9
+phase 3 that fails *silently*: a wrong anchor scale or an off-by-512 into the second
+anchor group draws a plausible rectangle in the wrong place, which on the board is
+indistinguishable from bad exposure or a wrong normalization. Here the expected box
+is computed by hand. It runs the real `port/nn/models/blazeface.c` against a stubbed
+`nn_output()`, which is possible only because that file depends on `nn.h` alone.
 
 ## `blink` — minimal example
 

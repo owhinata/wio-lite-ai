@@ -96,15 +96,26 @@ int psram_ready(void);
  *
  *   psram_acquire_shared() -- for callers that only READ OR WRITE the memory:
  *                             `lcd on`, `camera stream start`, `camera capture`
- *                             / `save` / `send`.  Refused only while a
- *                             reconfiguring command holds the bus.  These do not
- *                             exclude each other, which is what lets the display
- *                             scan out while the camera streams (issue #8 3c).
+ *                             / `save` / `send`, `ai bench`, `ai stream`.
+ *                             Refused only while a reconfiguring command holds
+ *                             the bus.  These do not exclude each other, which is
+ *                             what lets the display scan out while the camera
+ *                             streams (issue #8 3c).
  *
  * A continuous user takes the shared guard just long enough to arm itself, then
  * releases it: from that point the gates above (ltdc_scanout_active(),
- * camera_streaming()) are what keep the reconfigurers away.  It cannot simply
- * hold the guard, because a stream is open-ended and may stop itself.
+ * camera_streaming()) are what keep the reconfigurers away.
+ *
+ * 🔴 `ai stream` IS THE ONE EXCEPTION: it holds the shared guard for its whole
+ * lifetime (issue #9 phase 3, app/nn_camera.h).  Arm-and-release does not work for
+ * it, because the two gates above answer for the CAMERA and the DISPLAY, and the
+ * thing that must not be retuned underneath is neither -- it is the NN worker
+ * reading its arena out of the cacheable PSRAM carve-out.  The moment a DCMI
+ * overrun tears the band stream down, camera_streaming() goes false while that
+ * worker is still inside nn_run(), and a `psram clk` would become legal.  The
+ * consequence is that a running `ai stream` refuses a NEW `lcd on` / `lcd reset` /
+ * `camera capture` / `camera preview on`, so every site that reports this guard as
+ * busy names `ai stream` as a possible holder.
  */
 int psram_acquire(void);
 int psram_acquire_shared(void);

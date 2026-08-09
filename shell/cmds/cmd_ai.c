@@ -38,6 +38,7 @@
  */
 #include "cli.h"
 #include "nn.h"
+#include "blazeface.h"       /* issue #9 P3: model-specific decode, above the nn API */
 #include "psram.h"
 
 #if BSP_ENABLE_KV
@@ -46,6 +47,11 @@
 #endif
 #if BSP_ENABLE_LCD
 #include "ltdc_display.h"    /* ltdc_errors: the underrun evidence around a bench */
+#endif
+#if BSP_ENABLE_CAMERA
+#include "cam_band.h"        /* who is on the band stream (the preview-first note) */
+#include "camera.h"          /* camera_band_streaming(): is `ai run` cold-starting? */
+#include "nn_camera.h"       /* issue #9 P3: the camera-driven worker              */
 #endif
 
 #include "stm32h7xx_hal.h"   /* SystemCoreClock (the DWT/CPU clock) */
@@ -204,7 +210,7 @@ static int ai_psram_take(struct cli_instance *sh)
 	}
 	if (!psram_acquire_shared()) {
 		cli_error(sh, "ai: OCTOSPI1 busy (a psram/membench/wifi flash command "
-		          "holds it)\r\n");
+		          "holds it, or `ai stream` is running -- `ai stream stop`)\r\n");
 		return -1;
 	}
 	return 0;
@@ -599,6 +605,411 @@ static int cmd_ai_bench(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
+/* ---- ai dets / ai thresh (issue #9 phase 3) ------------------------------- */
+
+/*
+ * Print a detection list.  Units are spelled out on the header line because they
+ * differ on purpose: the geometry is a percentage of the frame (which is how a box
+ * is read off the screen), while the score is a milli-probability so it is on the
+ * SAME scale as `ai thresh` -- a box is shown exactly when its printed score clears
+ * the printed threshold.  svc/fmt.c implements no %f, so both are scaled integers,
+ * the same idiom as the quantization scale in ai_print_tensor() above.
+ */
+static void ai_print_dets(struct cli_instance *sh, const struct bf_det *d, int n)
+{
+	int i;
+
+	cli_print(sh, "dets    : %d  (x/y/w/h in %% of frame, score in milli; "
+	          "thresh %u)\r\n", n, blazeface_get_thresh_milli());
+	for (i = 0; i < n; i++)
+		cli_print(sh, "  face[%d]  x %ld%% y %ld%% w %ld%% h %ld%%  score %ld\r\n",
+		          i, (long)(d[i].x * 100.0f), (long)(d[i].y * 100.0f),
+		          (long)(d[i].w * 100.0f), (long)(d[i].h * 100.0f),
+		          (long)(d[i].score * 1000.0f));
+}
+
+/*
+ * Decode whatever is currently in the model's output tensors.
+ *
+ * With no camera in the picture this is exactly what proves the decoder against the
+ * board rather than the host: run `ai bench 1` (which fills the input with a constant
+ * pattern) and then `ai dets`, and the two diagnostics below say whether the model
+ * responded at all.  That separation is the point -- `dets: 0` alone cannot tell a
+ * dead model from a threshold set too high, so maxscore and cand are printed beside
+ * it.  Returns -1 for a model whose outputs are not BlazeFace-shaped, which is what
+ * the CONFIG_NN_BACKEND=null build gets, and it says so rather than printing zeros.
+ */
+static int cmd_ai_dets(struct cli_instance *sh, int argc, char **argv)
+{
+	struct bf_det dets[BF_MAX_DET];
+	struct nn_model *m = NULL;
+	int n, rc;
+
+	(void)argc; (void)argv;
+
+#if BSP_ENABLE_CAMERA
+	/* While a stream runs, the worker holds the NN session, so decoding here would
+	   simply be refused -- and would be the wrong answer anyway.  Report the boxes
+	   the worker published instead. */
+	if (nn_camera_running()) {
+		n = nn_camera_dets_get(dets, BF_MAX_DET);
+		ai_print_dets(sh, dets, n);
+		cli_print(sh, "maxscore: %ld (raw x1000, pre-sigmoid)  cand: %d (pre-NMS)"
+		          "  [live stream]\r\n",
+		          (long)(blazeface_last_max_score() * 1000.0f),
+		          blazeface_last_ncand());
+		return 0;
+	}
+#endif
+
+	rc = nn_model_open(&m);
+	if (rc != 0) {
+		cli_error(sh, "ai: model open failed (%d)\r\n", rc);
+		return 1;
+	}
+	/* Reading the output tensors walks the arena, which lives in the PSRAM -- the
+	 * same reason `ai bench` is guarded and `ai info` is not. */
+	if (ai_guards_take(sh) != 0)
+		return 1;
+	n = blazeface_decode(m, dets, BF_MAX_DET);
+	ai_guards_give();
+
+	if (n < 0) {
+		cli_error(sh, "ai: the loaded model's outputs are not BlazeFace-shaped "
+		          "(need 1x512x16 / 1x512x1 / 1x384x16 / 1x384x1 float32 -- "
+		          "see `ai info`)\r\n");
+		return 1;
+	}
+	ai_print_dets(sh, dets, n);
+	cli_print(sh, "maxscore: %ld (raw x1000, pre-sigmoid)  cand: %d (pre-NMS)\r\n",
+	          (long)(blazeface_last_max_score() * 1000.0f),
+	          blazeface_last_ncand());
+	return 0;
+}
+
+static int cmd_ai_thresh(struct cli_instance *sh, int argc, char **argv)
+{
+	if (argc > 1) {
+		uint32_t v;
+
+		if (cli_parse_u32(argv[1], &v) != 0 || v < 1u || v > 999u) {
+			cli_error(sh, "ai: thresh must be 1 .. 999 (milli-probability)\r\n");
+			return 1;
+		}
+		blazeface_set_thresh_milli((unsigned)v);
+	}
+	/* The logit is what is actually compared against the raw tensor, so print it
+	 * too: it is the number that appears next to a score in any model discussion,
+	 * and having only the friendly unit on screen hides the conversion. */
+	cli_print(sh, "thresh  : %u milli-probability  (raw logit x1000 = %ld)\r\n",
+	          blazeface_get_thresh_milli(),
+	          (long)(blazeface_get_thresh_logit() * 1000.0f));
+	return 0;
+}
+
+/* ---- ai run / ai stream / ai norm / ai overlay (issue #9 phase 3) --------- */
+
+#if BSP_ENABLE_CAMERA
+
+/*
+ * How long `ai run` lets the sensor settle when it started the stream itself.
+ *
+ * 🔴 NOT CAMERA_WARM_FRAMES.  That constant belongs to camera_capture_locked() and
+ * neither stream path uses it (port/camera/camera.c says so explicitly) -- a band
+ * stream starts delivering immediately, with the AEC/AWB still converging, so the
+ * first frames are badly exposed.  ~8 frame periods at ~13.5 fps is enough for them
+ * to settle, and saying so on the console is what keeps it from looking hung.
+ */
+#define AI_RUN_WARM_MS    600u
+#define AI_RUN_TIMEOUT_MS 3000u
+
+static const char *ai_nncam_strerror(int rc)
+{
+	switch (rc) {
+	case NNCAM_ERR_RUNNING: return "a stream is already running (`ai stream stats`)";
+	case NNCAM_ERR_NOTRUN:  return "not running";
+	case NNCAM_ERR_MODEL:   return "no model loaded, or it has no usable input "
+	                               "tensor (`blob list`, then `ai model load <slot>`)";
+	case NNCAM_ERR_SESSION: return "the NN session is busy (`ai bench` or "
+	                               "`ai model load` is running)";
+	case NNCAM_ERR_PSRAM:   return "PSRAM not ready, or OCTOSPI1 is held by a "
+	                               "psram/membench/devmem/wifi flash command";
+	case NNCAM_ERR_BAND:    return "the camera would not start a band stream -- a "
+	                               "frame stream may own the DCMI "
+	                               "(`camera stream stop`), the other console may be "
+	                               "starting or stopping it, or see `dmesg`";
+	case NNCAM_ERR_GEOM:    return "the model input does not tile onto the camera's "
+	                               "4 bands, or its dtype is neither int8 nor "
+	                               "float32 (`ai info`)";
+	case NNCAM_ERR_INIT:    return "the worker thread or its objects could not be "
+	                               "created";
+	case NNCAM_ERR_TEARING: return "still tearing down (a callback or an inference "
+	                               "has not returned) -- run `ai stream stop` again";
+	case NNCAM_ERR_REARM:   return "the stream could not be re-armed (the DCMI may "
+	                               "be owned elsewhere) -- run `ai stream stop`, "
+	                               "then `ai stream start`";
+	default:                return "unknown error";
+	}
+}
+
+static uint32_t ai_cyc_to_us(uint32_t cyc)
+{
+	uint32_t mhz = SystemCoreClock / 1000000u;
+
+	return mhz ? (cyc / mhz) : 0u;
+}
+
+/*
+ * The guard is held for the stream's whole lifetime (see app/nn_camera.h), so
+ * `camera preview on` is refused while it runs.  Anyone who wanted to watch the
+ * boxes has to start the preview first, and finding that out by being refused is
+ * worse than being told.
+ */
+static void ai_stream_order_note(struct cli_instance *sh)
+{
+#if BSP_ENABLE_LCD
+	if (!cam_band_claimed(CAM_BAND_PREVIEW))
+		cli_print(sh, "note    : the OCTOSPI1 guard is held for the stream's "
+		          "lifetime, so `camera preview on` is refused until "
+		          "`ai stream stop` -- start the preview FIRST if you want to "
+		          "see the boxes\r\n");
+#else
+	(void)sh;
+#endif
+}
+
+static int cmd_ai_stream_start(struct cli_instance *sh, int argc, char **argv)
+{
+	int colorbar = 0, rc, rearm;
+
+	if (argc > 1) {
+		if (strcmp(argv[1], "test") != 0) {
+			cli_error(sh, "ai: usage: ai stream start [test]\r\n");
+			return 1;
+		}
+		colorbar = 1;
+	}
+	/* Sampled before the call, because a successful re-arm clears the latch. */
+	rearm = nn_camera_running() && cam_band_stream_lost();
+
+	rc = nn_camera_start(colorbar);
+	if (rc != NNCAM_OK) {
+		cli_error(sh, "ai: %s\r\n", ai_nncam_strerror(rc));
+		return 1;
+	}
+	if (rearm) {
+		/* Say which of the two happened.  "started" over a stream that was only
+		   re-armed would hide that an outage occurred at all -- and the counters
+		   deliberately keep running across it, so they would not show it either. */
+		cli_print(sh, "ai: stream re-armed after a lost stream "
+		          "(counters continue; `ai stream stop` to reset them)\r\n");
+		return 0;
+	}
+	cli_print(sh, "ai: inference stream started (worker prio 18%s)\r\n",
+	          colorbar ? ", colorbar" : "");
+	ai_stream_order_note(sh);
+	return 0;
+}
+
+static int cmd_ai_stream_stop(struct cli_instance *sh, int argc, char **argv)
+{
+	int rc;
+
+	(void)argc; (void)argv;
+
+	rc = nn_camera_stop();
+	if (rc == NNCAM_ERR_NOTRUN) {
+		cli_warn(sh, "ai: not running\r\n");
+		return 0;
+	}
+	if (rc != NNCAM_OK) {
+		cli_error(sh, "ai: %s\r\n", ai_nncam_strerror(rc));
+		return 1;
+	}
+	cli_print(sh, "ai: stopped\r\n");
+	return 0;
+}
+
+/*
+ * Deliberately longer than a progress display needs.  This phase deleted the donor's
+ * staging machinery on the argument that the 373 ms : 74 ms ratio makes it
+ * unnecessary, and these counters are how the board says whether that actually held.
+ * `ingest max` against the ~18.5 ms band deadline and `stream` are the two that
+ * would otherwise fail silently.
+ */
+static int cmd_ai_stream_stats(struct cli_instance *sh, int argc, char **argv)
+{
+	struct nn_camera_stats st;
+	struct bf_det dets[BF_MAX_DET];
+	uint32_t fps_x100 = 0u;
+	int n;
+
+	(void)argc; (void)argv;
+
+	nn_camera_stats_get(&st);
+	if (st.elapsed_ms)
+		fps_x100 = (uint32_t)((uint64_t)st.infers * 100000u / st.elapsed_ms);
+
+	cli_print(sh, "state   : %s\r\n", st.running ? "running" : "stopped");
+	cli_print(sh, "session : %s\r\n",
+	          st.holds_guards ? "held (NN + OCTOSPI1)" : "free");
+	cli_print(sh, "stream  : %s\r\n",
+	          st.stream_lost ? "LOST -- re-issue `ai stream start` to re-arm"
+	                         : (st.running ? "ok" : "-"));
+	cli_print(sh, "infers  : %lu in %lu ms  (%lu.%02lu inf/s)\r\n",
+	          (unsigned long)st.infers, (unsigned long)st.elapsed_ms,
+	          (unsigned long)(fps_x100 / 100u), (unsigned long)(fps_x100 % 100u));
+	cli_print(sh, "frames  : %lu ingested, %lu skipped (worker busy), %lu error(s)\r\n",
+	          (unsigned long)st.frames, (unsigned long)st.skipped,
+	          (unsigned long)st.errors);
+	cli_print(sh, "ingest  : last %lu us  max %lu us  (band deadline ~18500 us)\r\n",
+	          (unsigned long)ai_cyc_to_us(st.ingest_last_cyc),
+	          (unsigned long)ai_cyc_to_us(st.ingest_max_cyc));
+	cli_print(sh, "latency : %lu us  (%lu cycles)\r\n",
+	          (unsigned long)ai_cyc_to_us(st.infer_last_cyc),
+	          (unsigned long)st.infer_last_cyc);
+	cli_print(sh, "norm    : %s   overlay: %s\r\n",
+	          st.norm_signed ? "[-1,1]" : "[0,1]", st.overlay ? "on" : "off");
+
+	n = nn_camera_dets_get(dets, BF_MAX_DET);
+	ai_print_dets(sh, dets, n);
+	cli_print(sh, "maxscore: %ld (raw x1000, pre-sigmoid)  cand: %d (pre-NMS)\r\n",
+	          (long)(blazeface_last_max_score() * 1000.0f),
+	          blazeface_last_ncand());
+	return 0;
+}
+
+/* Bare `ai stream` -- report and show the verbs, like `ai model`. */
+static int cmd_ai_stream(struct cli_instance *sh, int argc, char **argv)
+{
+	if (argc > 1) {
+		cli_error(sh, "ai: unknown stream subcommand '%s'\r\n", argv[1]);
+		cli_print(sh, "usage: ai stream <start [test] | stop | stats>\r\n");
+		return 1;
+	}
+	cli_print(sh, "stream  : %s\r\n", nn_camera_running() ? "running" : "stopped");
+	cli_print(sh, "usage: ai stream <start [test] | stop | stats>\r\n");
+	return 0;
+}
+
+static int cmd_ai_run(struct cli_instance *sh, int argc, char **argv)
+{
+	struct nn_camera_stats st;
+	struct bf_det dets[BF_MAX_DET];
+	uint32_t base, waited;
+	int cold, rc, n;
+
+	(void)argc; (void)argv;
+
+	if (nn_camera_running()) {
+		cli_error(sh, "ai: a stream is already running -- use `ai stream stats` "
+		          "or `ai dets`\r\n");
+		return 1;
+	}
+
+	/* Whether WE start the stream decides whether the sensor needs settling time. */
+	cold = !camera_band_streaming();
+
+	rc = nn_camera_start(0);
+	if (rc != NNCAM_OK) {
+		cli_error(sh, "ai: %s\r\n", ai_nncam_strerror(rc));
+		return 1;
+	}
+
+	if (cold) {
+		cli_print(sh, "ai: starting the camera, %lu ms for the exposure to "
+		          "settle...\r\n", (unsigned long)AI_RUN_WARM_MS);
+		if (cli_sleep(sh, AI_RUN_WARM_MS) != 0)
+			goto cancelled;
+	}
+
+	/* Count from HERE, so the reported detection comes from a settled frame rather
+	   than from whichever inference happened to finish during the warm-up. */
+	nn_camera_stats_get(&st);
+	base = st.infers;
+
+	for (waited = 0u; waited < AI_RUN_TIMEOUT_MS; waited += 10u) {
+		nn_camera_stats_get(&st);
+		if (st.infers > base || st.stream_lost)
+			break;
+		if (cli_sleep(sh, 10u) != 0)
+			goto cancelled;
+	}
+
+	n = nn_camera_dets_get(dets, BF_MAX_DET);
+	nn_camera_stats_get(&st);
+	(void)nn_camera_stop();
+
+	if (st.stream_lost) {
+		cli_error(sh, "ai: the band stream died during the run (DCMI overrun?) -- "
+		          "see `camera stream stats`\r\n");
+		return 1;
+	}
+	if (st.infers <= base) {
+		cli_warn(sh, "ai: no inference completed in %lu ms\r\n",
+		         (unsigned long)AI_RUN_TIMEOUT_MS);
+		return 0;
+	}
+	cli_print(sh, "inference: %lu us\r\n",
+	          (unsigned long)ai_cyc_to_us(st.infer_last_cyc));
+	ai_print_dets(sh, dets, n);
+	cli_print(sh, "maxscore: %ld (raw x1000, pre-sigmoid)  cand: %d (pre-NMS)\r\n",
+	          (long)(blazeface_last_max_score() * 1000.0f),
+	          blazeface_last_ncand());
+	return 0;
+
+cancelled:
+	/* Ctrl+C: cli_core drops every byte a dispatching handler writes once cancel
+	   latches (issue #16), so there is nothing to report -- just clean up. */
+	(void)nn_camera_stop();
+	return 1;
+}
+
+static int cmd_ai_norm(struct cli_instance *sh, int argc, char **argv)
+{
+	if (argc > 1) {
+		if (strcmp(argv[1], "0") == 0)
+			nn_camera_set_norm(0);
+		else if (strcmp(argv[1], "1") == 0)
+			nn_camera_set_norm(1);
+		else {
+			cli_error(sh, "ai: usage: ai norm <0|1>  (0=[0,1], 1=[-1,1])\r\n");
+			return 1;
+		}
+	}
+	cli_print(sh, "norm    : %s\r\n",
+	          nn_camera_get_norm() ? "[-1,1] (signed)" : "[0,1] (unsigned)");
+	return 0;
+}
+
+#if BSP_ENABLE_LCD
+static int cmd_ai_overlay(struct cli_instance *sh, int argc, char **argv)
+{
+	if (argc > 1) {
+		if (strcmp(argv[1], "on") == 0)
+			nn_camera_set_overlay(1);
+		else if (strcmp(argv[1], "off") == 0)
+			nn_camera_set_overlay(0);
+		else {
+			cli_error(sh, "ai: usage: ai overlay <on|off>\r\n");
+			return 1;
+		}
+	}
+	cli_print(sh, "overlay : %s\r\n", nn_camera_get_overlay() ? "on" : "off");
+	return 0;
+}
+#endif /* BSP_ENABLE_LCD */
+
+CLI_SUBCMD_SET_CREATE(ai_stream_subcmds,
+	CLI_CMD_ARG(start, NULL, "claim the band stream and infer continuously [test]",
+	            cmd_ai_stream_start, 1, 1),
+	CLI_CMD(stop,  NULL, "stop inferring and release the stream", cmd_ai_stream_stop),
+	CLI_CMD(stats, NULL, "fps / ingest cost / stream health / detections",
+	        cmd_ai_stream_stats),
+	CLI_SUBCMD_SET_END);
+
+#endif /* BSP_ENABLE_CAMERA */
+
 CLI_SUBCMD_SET_CREATE(ai_model_subcmds,
 	CLI_CMD_ARG(load,   NULL, "read a .tflite from NOR blob <slot> and run it",
 	            cmd_ai_model_load,   2, 0),
@@ -612,6 +1023,23 @@ CLI_SUBCMD_SET_CREATE(ai_subcmds,
 	            "runtime model swap (load <slot> / unload)", cmd_ai_model, 1, 2),
 	CLI_CMD_ARG(bench, NULL, "run inference [n] times, report latency",
 	            cmd_ai_bench, 1, 1),
+	CLI_CMD_ARG(dets,   NULL, "decode the current outputs into face boxes",
+	            cmd_ai_dets,   1, 0),
+	CLI_CMD_ARG(thresh, NULL, "score threshold [milli-probability 1..999]",
+	            cmd_ai_thresh, 1, 1),
+#if BSP_ENABLE_CAMERA
+	CLI_CMD(run, NULL, "one-shot: grab a camera frame, infer, print the boxes",
+	        cmd_ai_run),
+	CLI_CMD_ARG(stream, ai_stream_subcmds,
+	            "continuous camera inference (start [test] / stop / stats)",
+	            cmd_ai_stream, 1, 2),
+	CLI_CMD_ARG(norm, NULL, "input normalization [0=[0,1] | 1=[-1,1]]",
+	            cmd_ai_norm, 1, 1),
+#if BSP_ENABLE_LCD
+	CLI_CMD_ARG(overlay, NULL, "draw the boxes on the LCD preview [on|off]",
+	            cmd_ai_overlay, 1, 1),
+#endif
+#endif
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(ai, ai_subcmds,

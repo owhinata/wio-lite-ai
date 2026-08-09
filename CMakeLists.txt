@@ -491,6 +491,15 @@ if(BSP_ENABLE_CAMERA)
     list(APPEND SHELL_SOURCES
         "${CMAKE_SOURCE_DIR}/port/camera/camera.c"
         "${CMAKE_SOURCE_DIR}/port/camera/ov2640_regs.c"
+        # issue #9 phase 3: the band stream now has two consumers (the preview and
+        # the NN ingest), and port/camera holds exactly one callback.  The mux is
+        # gated on the camera ALONE -- the NN client needs no display, and running
+        # inference with the preview off is the fastest configuration this board has.
+        "${CMAKE_SOURCE_DIR}/app/cam_band.c"
+        # issue #9 phase 3: the camera -> inference glue.  Camera-only for the same
+        # reason as the mux; the overlay it feeds is drawn by cam_preview.c, which
+        # is the file already gated on the pair.
+        "${CMAKE_SOURCE_DIR}/app/nn_camera.c"
         "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_camera.c")
     # The LCD preview (issue #8 phase 3c) needs BOTH drivers, so it is the one
     # source gated on the pair.  With either option off there is nothing to glue
@@ -540,6 +549,16 @@ else()
 endif()
 # membench's cacheable row is in the carve-out whichever backend is built.
 list(APPEND NN_PSRAM_AI_REQUIRED --require psram_ai_bench_buf)
+# issue #9 phase 3: model-specific post-processing, above the model-agnostic nn API.
+# Built UNCONDITIONALLY -- including in the `null` build, whose stub tensors it simply
+# does not recognise (blazeface_decode() returns -1 without touching anything).  That
+# is what lets `ai dets` be registered unconditionally, and keeping the reference in
+# every build is also what keeps the three --require lines below honest: a symbol
+# --gc-sections dropped would be reported as "no such object in the image", which
+# reads like a placement regression and is not one.
+list(APPEND NN_SOURCES "${CMAKE_SOURCE_DIR}/port/nn/models/blazeface.c")
+list(APPEND NN_PSRAM_AI_REQUIRED
+     --require bf_cx --require bf_cy --require bf_cand)
 list(APPEND SHELL_SOURCES ${NN_SOURCES} "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_ai.c")
 
 add_executable(shell
@@ -587,6 +606,7 @@ target_include_directories(shell PRIVATE
     "${CMAKE_SOURCE_DIR}/port/camera"            # issue #8: camera.h
     "${CMAKE_SOURCE_DIR}/port/nor"               # issue #37: nor_flash.h
     "${CMAKE_SOURCE_DIR}/port/nn"                # issue #9: nn.h / nn_backend.h
+    "${CMAKE_SOURCE_DIR}/port/nn/models"         # issue #9 P3: blazeface.h
     # issue #37: our fdb_cfg.h / fal_cfg.h must be found BEFORE FlashDB's own inc/,
     # which ships fdb_cfg_template.h only -- FlashDB includes <fdb_cfg.h> by name.
     "${CMAKE_SOURCE_DIR}/port/flashdb"
@@ -713,6 +733,7 @@ if(BSP_ENABLE_KV)
 endif()
 if(BSP_ENABLE_CAMERA)
     list(APPEND DTCM_REQUIRED --require-dtcm cam_producer_stack) # port/camera/camera.c
+    list(APPEND DTCM_REQUIRED --require-dtcm nn_worker_stack)    # app/nn_camera.c
     list(APPEND DTCM_REQUIRED --require-axi  cam_band)           # DCMI via DMA2_Stream1
     if(BSP_ENABLE_LCD)
         list(APPEND DTCM_REQUIRED --require-dtcm preview_stack)  # app/cam_preview.c

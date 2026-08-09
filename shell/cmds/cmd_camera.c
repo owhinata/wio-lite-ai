@@ -73,6 +73,7 @@
  * Clean-room design; no third-party code reused.
  */
 #include "camera.h"
+#include "cam_band.h"     /* issue #9 P3: who is on the band stream, and is it alive */
 #include "cli.h"
 #if BSP_ENABLE_PSRAM
 #include "psram.h"        /* psram_acquire(): OCTOSPI1 interlock, see cam_psram_* */
@@ -116,7 +117,8 @@ static int cam_psram_take(struct cli_instance *sh)
 	   distinction is what lets the display show a live preview. */
 	if (!psram_acquire_shared()) {
 		cli_error(sh, "camera: OCTOSPI1 busy (wait for "
-		              "psram/membench/devmem/wifi flash)\r\n");
+		              "psram/membench/devmem/wifi flash, or run "
+		              "`ai stream stop`)\r\n");
 		return 0;
 	}
 	return 1;
@@ -253,11 +255,21 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 		uint32_t shown, dropped, blit_us;
 
 		cam_preview_stats(&shown, &dropped, &blit_us);
+		/* "on, stream LOST" is the latched state, and it is worth distinguishing
+		   from a plain stop: it means the DCMI tore the stream down underneath a
+		   client that still believes it is running (issue #9 phase 3,
+		   app/cam_band.c).  Nothing re-arms by itself -- re-issuing the command
+		   does -- so this line has to say which of the two happened. */
 		cli_print(sh, "preview: %s (%u AXI-SRAM bands of %u rows, rotated to "
 		              "320x240 landscape), shown %lu dropped %lu, "
 		              "last blit %lu us\r\n",
 		          cam_preview_enabled()
-		                  ? (camera_band_streaming() ? "on" : "on, stream stopped")
+		                  ? (camera_band_streaming()
+		                             ? "on"
+		                             : (cam_band_stream_lost()
+		                                        ? "on, stream LOST -- re-issue "
+		                                          "`camera preview on`"
+		                                        : "on, stream stopped"))
 		                  : "off",
 		          (unsigned)CAMERA_BANDS_PER_FRAME, (unsigned)CAMERA_BAND_ROWS,
 		          (unsigned long)shown, (unsigned long)dropped,
@@ -867,7 +879,7 @@ CLI_SUBCMD_SET_CREATE(camera_stream_subcmds,
  */
 static int cmd_camera_preview(struct cli_instance *sh, int argc, char **argv)
 {
-	int on, colorbar = 0;
+	int on, colorbar = 0, rc;
 
 	if (strcmp(argv[1], "on") == 0)
 		on = 1;
@@ -893,12 +905,25 @@ static int cmd_camera_preview(struct cli_instance *sh, int argc, char **argv)
 	   only across the arm, then handed over to camera_streaming(). */
 	if (on && !cam_psram_take(sh))
 		return 1;
-	if (cam_preview_enable(on, colorbar) != 0) {
+	rc = cam_preview_enable(on, colorbar);
+	if (rc != 0) {
 		if (on)
 			cam_psram_give();
-		cli_error(sh, "camera: the display is down or its scanout is off "
-		              "('lcd on'), or the camera would not start "
-		              "(see `dmesg`)\r\n");
+		/* -2 is its own case: everything is healthy, but switching the sensor's
+		   test pattern means restarting the shared band stream, and `ai stream` is
+		   on it.  The catch-all below would send someone to `dmesg` for a fault
+		   that is not there. */
+		if (rc == -2)
+			cli_error(sh, "camera: switching the test pattern restarts the band "
+			              "stream, which `ai stream` is using -- "
+			              "`ai stream stop` first\r\n");
+		else if (rc == -3)
+			cli_error(sh, "camera: the other console is starting or stopping the "
+			              "band stream -- try again\r\n");
+		else
+			cli_error(sh, "camera: the display is down or its scanout is off "
+			              "('lcd on'), or the camera would not start "
+			              "(see `dmesg`)\r\n");
 		return 1;
 	}
 	if (on)

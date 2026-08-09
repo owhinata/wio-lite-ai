@@ -201,4 +201,20 @@ gcc $CFLAGS -I "$svc" \
     $LDFLAGS -o "$out/test_frame_pipeline"
 "$out/test_frame_pipeline"
 
+# issue #9 phase 3 -- the BlazeFace decoder (port/nn/models/blazeface.c): SSD anchor
+# decode + NMS + the score-threshold knob.  This is the one piece of new arithmetic
+# whose failure is silent -- a wrong anchor scale or an off-by-512 into the second
+# anchor group draws a plausible rectangle in the wrong place, and on the board that
+# is indistinguishable from bad exposure or a wrong normalization.  Here the expected
+# box is computed by hand.  The decoder depends on nn.h alone (no HAL, no ThreadX, no
+# libm), and struct nn_model is opaque, so the test supplies its own nn_output_count()
+# / nn_output() and runs the real decoder unmodified.  Built against the REAL
+# include/mem_sections.h so the PSRAM_AI attribute on the host is the same one the
+# firmware uses -- a shimmed copy could drift from it without anything noticing.
+gcc $CFLAGS -I "$here/../../include" -I "$here/../../port/nn" \
+    -I "$here/../../port/nn/models" \
+    "$here/test_blazeface.c" "$here/../../port/nn/models/blazeface.c" \
+    $LDFLAGS -lm -o "$out/test_blazeface"
+"$out/test_blazeface"
+
 echo "host tests passed"
