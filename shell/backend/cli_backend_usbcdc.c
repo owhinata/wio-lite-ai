@@ -78,8 +78,14 @@ static int usbcdc_read(struct cli_transport *tr, uint8_t *data, size_t cap)
 	return (int)cli_uart_ring_get_buf(&u->rx_ring, data, cap);
 }
 
+/* No .flush: this backend hands bytes to a ring the usb thread drains continuously, so
+ * there is nothing an end-of-unit signal would change (issue #49 is about a backend that
+ * transmits, where a partial unit costs a round trip). */
 const struct cli_transport_api cli_usbcdc_api = {
-	usbcdc_init, usbcdc_enable, usbcdc_write, usbcdc_read, NULL, NULL, NULL,
+	.init   = usbcdc_init,
+	.enable = usbcdc_enable,
+	.write  = usbcdc_write,
+	.read   = usbcdc_read,
 };
 
 /* ---- usb-thread bridge: rings <-> TinyUSB CDC -------------------------- */

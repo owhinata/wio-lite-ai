@@ -76,8 +76,23 @@ static int dummy_write(struct cli_transport *tr, const uint8_t *data, size_t len
 	return (int)accept;
 }
 
+/* End-of-unit hook: this backend transmits nothing, so it only COUNTS (issue #49).
+ * The count is what lets a host test assert "one flush per output call", which is the
+ * property the telnet backend's segment coalescing rests on. */
+static void dummy_flush(struct cli_transport *tr)
+{
+	struct cli_dummy *d = (struct cli_dummy *)tr->ctx;
+
+	if (d != NULL)
+		d->flushes++;
+}
+
 const struct cli_transport_api cli_dummy_api = {
-	dummy_init, dummy_enable, dummy_write, dummy_read, NULL, NULL, NULL,
+	.init   = dummy_init,
+	.enable = dummy_enable,
+	.write  = dummy_write,
+	.read   = dummy_read,
+	.flush  = dummy_flush,
 };
 
 /* ---- test/driver helpers ----------------------------------------------- */

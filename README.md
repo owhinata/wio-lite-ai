@@ -606,6 +606,25 @@ time as the USB console. 24 commands:
     connection — `nx_tcp_socket_state_wait()` is a `tx_thread_sleep(1)` loop, which a
     command can afford and a resident service cannot. The board idles at 98.9 % with the
     console up.
+  - **The ring is filled by `write()` but sent by `flush()`** (issue #49). The ring alone
+    left echo sluggish — measured at **17 bytes per TCP segment**, one peer ACK per
+    keystroke fragment — because the core stages in 32-byte chunks and the drain, at a
+    higher priority than the CLI, transmitted each one on arrival. `write()` cannot see
+    whether more of the same output is coming, but `cli_unlock()` can: it ends every
+    bracketed output call, and a whole line-editor redraw is exactly one such bracket. So
+    `cli_transport_api` gained an optional **`flush`** hook called from there, and the
+    telnet backend does its waking in that instead of in `write()`. One redraw is now one
+    segment and **nothing is delayed to achieve it** — the boundary was always known, the
+    old code just could not see it. (Rejected first: hand-rolled Nagle in the drain. NetX
+    only fires the queue-depth notify when the queue was AT its maximum and drops below,
+    so holding a sub-MSS segment at count 1–3 gets no callback at all and recovery falls to
+    the 50 ms poll — which would have *added* ~90 ms to a keystroke.) Two rules keep it
+    honest: `write()` must still kick when it could not take everything, or the core waits
+    for room whose only source is a drain whose only wake-up cannot arrive; and the hook
+    fires on *every* release, nested ones included, because `cli_console_claim()` holds the
+    lock across an entire YMODEM transfer and an "outermost only" rule would stall it.
+    `net shell status` reports `avg B/seg` so this is one number to read, not a ratio to
+    infer.
   - **Teardown is a proof, not an attempt.** The unwind cannot drop the interface under a
     live socket: detaching the DATA consumer restores the link service thread's stale-byte
     flush, and those bytes are the middle of a frame if anything can still transmit. So

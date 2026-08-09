@@ -34,7 +34,18 @@
 /* ---- output lock: no-op on the single-threaded host --------------------- */
 
 int  cli_lock(struct cli_instance *sh)   { (void)sh; return 0; }
-void cli_unlock(struct cli_instance *sh) { (void)sh; }
+
+/* No mutex on the host, but the END-OF-UNIT signal is real behaviour, not locking:
+ * cli_core.c calls the backend's flush() from here, and a backend that transmits
+ * depends on it (issue #49).  Mirror it, or the whole path goes untested. */
+void cli_unlock(struct cli_instance *sh)
+{
+	struct cli_instance  *o  = sh->fg ? sh->fg : sh;
+	struct cli_transport *tr = o->tr;
+
+	if (tr != NULL && tr->api->flush != NULL)
+		tr->api->flush(tr);
+}
 
 /* ---- backend notify: no-op (RX is pumped synchronously) ----------------- *
  * The real notify_tx contract ("backend calls this when TX space frees") is NOT

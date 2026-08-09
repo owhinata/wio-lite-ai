@@ -255,6 +255,14 @@ static uint32_t g_sessions, g_rx_bytes, g_tx_bytes, g_rx_drops;
  *                which is what NXN_TCP_TX_DEPTH and the pool were sized to avoid.
  */
 static uint32_t g_tx_qdepth, g_tx_win, g_tx_nobuf;
+/*
+ * TCP segments this console has transmitted.  Reported next to the byte count because
+ * BYTES PER SEGMENT is the health number for an interactive console, and issue #49 had to
+ * infer it from bytes / refusals -- which only worked because refusals happened to be
+ * near-universal at the time.  17 B/seg means one peer ACK per keystroke fragment; a
+ * redraw should be one segment.
+ */
+static uint32_t g_tx_segs;
 /* High-water mark of the TX ring, so `net shell status` can say whether the CLI ever had
  * to wait on it at all (bytes; the usable depth is NSH_TX_RING - 1). */
 static uint32_t g_tx_hiwater;
@@ -400,7 +408,17 @@ static int nsh_write(struct cli_transport *tr, const uint8_t *data, size_t len)
 	if ((uint32_t)count > g_tx_hiwater)
 		g_tx_hiwater = (uint32_t)count;
 
-	if (i != 0u)
+	/*
+	 * Deliberately NO kick here in the normal case (issue #49).  The core stages in
+	 * 32-byte chunks, so waking the drain now would transmit a third of a redraw and
+	 * pay a peer ACK for it; nsh_flush() does the waking when the whole unit is in.
+	 *
+	 * 🔴 EXCEPT when we could not take it all.  Then the core parks on CLI_EVT_TX
+	 * waiting for room, the only source of room is the drain, and the drain's only
+	 * wake-up would be an end-of-unit that cannot arrive because the unit is stuck
+	 * here.  This one line is what keeps the flow-control contract from deadlocking.
+	 */
+	if (i < len)
 		nsh_tx_kick();
 	/* Told to stop rather than told to wait: the session ended while we were in the loop,
 	 * so swallow the remainder exactly as the entry check does.  Reporting it as a short
@@ -409,6 +427,20 @@ static int nsh_write(struct cli_transport *tr, const uint8_t *data, size_t len)
 	if (i < len && !g_ctx.connected)
 		return (int)len;
 	return (int)i;                               /* INPUT bytes consumed */
+}
+
+/*
+ * "The unit of output is complete" -- the core calls this from cli_unlock() (issue #49).
+ * THIS is what transmits: nsh_write() only fills the ring, so a whole line-editor redraw
+ * reaches the drain in one piece and leaves as one TCP segment instead of one per 32-byte
+ * staging chunk.  Nothing is delayed to get that -- the boundary was already known, the
+ * old code just could not see it.
+ */
+static void nsh_flush(struct cli_transport *tr)
+{
+	(void)tr;
+	if (cli_uart_ring_count(&g_ctx.tx) != 0u)
+		nsh_tx_kick();
 }
 
 static int nsh_read(struct cli_transport *tr, uint8_t *data, size_t cap)
@@ -451,7 +483,12 @@ static void nsh_session_begin(struct cli_transport *tr)
 }
 
 static const struct cli_transport_api nsh_api = {
-	nsh_init, nsh_enable, nsh_write, nsh_read, NULL, NULL, nsh_session_begin,
+	.init          = nsh_init,
+	.enable        = nsh_enable,
+	.write         = nsh_write,
+	.read          = nsh_read,
+	.session_begin = nsh_session_begin,
+	.flush         = nsh_flush,
 };
 
 struct cli_transport net_shell_transport = {
@@ -637,6 +674,7 @@ static unsigned nsh_tx_drain(void)
 		 * cli_tx_send_blocking() waiting for exactly this. */
 		cli_uart_ring_advance_tail(&g_ctx.tx, run);
 		g_tx_bytes += (uint32_t)run;
+		g_tx_segs++;
 		if (g_ctx.sh != NULL)
 			cli_transport_notify_tx(g_ctx.sh);
 	}
@@ -1147,6 +1185,11 @@ void net_shell_print_status(struct cli_instance *sh)
 	cli_print(sh, "  sessions  %lu   rx %lu B   tx %lu B   rx-drops %lu\r\n",
 	          (unsigned long)g_sessions, (unsigned long)g_rx_bytes,
 	          (unsigned long)g_tx_bytes, (unsigned long)g_rx_drops);
+	/* Bytes per segment is the interactive-health number: a whole redraw should leave as
+	 * one segment, and 17 B/seg (issue #49) meant a peer ACK per keystroke fragment. */
+	cli_print(sh, "  tx segs   %lu   avg %lu B/seg\r\n",
+	          (unsigned long)g_tx_segs,
+	          (unsigned long)(g_tx_segs ? g_tx_bytes / g_tx_segs : 0u));
 	cli_print(sh, "  tx queue  %lu (back-pressure, normal)   window %lu%s   no-buf %lu%s\r\n",
 	          (unsigned long)g_tx_qdepth, (unsigned long)g_tx_win,
 	          g_tx_win ? "  <-- peer is not reading" : "",
@@ -1168,11 +1211,13 @@ void net_shell_print_status(struct cli_instance *sh)
 	 * hardware measurement to that.  `dmesg` consults neither the output path nor
 	 * cancel_req, and survives a reset.
 	 */
-	LOG_INF("status: %s, port %u, auto-arm %s, sessions %lu, rx %lu B, tx %lu B, "
-	        "rx-drops %lu, tx queue %lu, window %lu, no-buf %lu, ring peak %lu B, "
-	        "dropped %lu B, last: %s",
+	LOG_INF("status: %s, port %u, auto-arm %s, sessions %lu, rx %lu B, tx %lu B in "
+	        "%lu segs (%lu B/seg), rx-drops %lu, tx queue %lu, window %lu, no-buf %lu, "
+	        "ring peak %lu B, dropped %lu B, last: %s",
 	        st, (unsigned)g_port, g_autoarm ? "on" : "off", (unsigned long)g_sessions,
 	        (unsigned long)g_rx_bytes, (unsigned long)g_tx_bytes,
+	        (unsigned long)g_tx_segs,
+	        (unsigned long)(g_tx_segs ? g_tx_bytes / g_tx_segs : 0u),
 	        (unsigned long)g_rx_drops, (unsigned long)g_tx_qdepth,
 	        (unsigned long)g_tx_win, (unsigned long)g_tx_nobuf,
 	        (unsigned long)g_tx_hiwater,

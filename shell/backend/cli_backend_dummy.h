@@ -68,9 +68,14 @@ struct cli_dummy {
 	int      tx_unlimited;        /**< 1: accept all; 0: bounded by tx_free */
 	size_t   tx_free;             /**< free TX capacity when bounded */
 	int      tx_fail;             /**< 1: write() returns -1 immediately */
+
+	/* End-of-unit hook calls (issue #49).  A test asserts the core signals the end of
+	 * an output call exactly once, which is what a transmitting backend needs in order
+	 * to send a whole redraw as one packet. */
+	uint32_t flushes;
 };
 
-/** The dummy transport vtable (init/enable/write/read; uninit/update are NULL). */
+/** The dummy transport vtable (init/enable/write/read/flush; uninit/update are NULL). */
 extern const struct cli_transport_api cli_dummy_api;
 
 /**

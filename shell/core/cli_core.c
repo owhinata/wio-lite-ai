@@ -322,12 +322,19 @@ static ULONG cli_wait(unsigned ticks)
  * below the RTO turned every lost segment into a truncated report (issue #48).  The
  * transport is asked, not the instance, so a background job -- whose worker aliases
  * tr to the foreground's (cli_job.c) -- inherits the same answer.
+ *
+ * But the raised deadline applies to COMMAND OUTPUT only, which is what it was for.
+ * The wait below only listens for RX and polls for Ctrl+C while a command is running;
+ * on the editor's echo path it waits on CLI_EVT_TX alone, so a long deadline there
+ * buys nothing and freezes the keyboard for its whole length instead (issue #49).  A
+ * background job is always command output, and a freshly reset worker has not set
+ * dispatching yet, so it is recognised by sh->fg.
  */
 static unsigned cli_tx_deadline(const struct cli_instance *sh)
 {
 	const struct cli_transport *tr = sh->tr;
 
-	if (tr != NULL && tr->tx_timeout != 0u)
+	if (tr != NULL && tr->tx_timeout != 0u && (sh->dispatching || sh->fg != NULL))
 		return (unsigned)tr->tx_timeout;
 	return (unsigned)CLI_TX_TIMEOUT;
 }
@@ -357,7 +364,23 @@ int cli_lock(struct cli_instance *sh)
 
 void cli_unlock(struct cli_instance *sh)
 {
-	tx_mutex_put(&cli_out_target(sh)->tx_lock);
+	struct cli_instance  *o  = cli_out_target(sh);
+	struct cli_transport *tr = o->tr;
+
+	/*
+	 * Tell the backend the unit of output is complete (issue #49), BEFORE releasing:
+	 * afterwards another writer could take the lock and start a new unit in the gap,
+	 * and the backend would flush the two together.  The hook only sets a flag, and
+	 * nothing it wakes takes tx_lock, so holding it across the call is safe.
+	 *
+	 * Every release, including a nested one -- see the vtable comment: a missed flush
+	 * stalls a backend that waits for it (cli_console_claim() holds this lock for a
+	 * whole YMODEM transfer, so its inner writes never reach the outermost release),
+	 * while a redundant one only transmits as early as it always did.
+	 */
+	if (tr != NULL && tr->api->flush != NULL)
+		tr->api->flush(tr);
+	tx_mutex_put(&o->tx_lock);
 }
 
 /* Set for the duration of a raw binary transfer (issue #50); see cli_internal.h. */

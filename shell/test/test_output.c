@@ -212,6 +212,46 @@ static void test_tx_failure(void)
 	assert(r == 0 && strcmp(cli_dummy_output_str(&tr), "back") == 0);
 }
 
+/*
+ * End-of-unit signal (issue #49).  A backend that TRANSMITS needs to know when an output
+ * call is complete, or it sends a third of a line-editor redraw and pays a network round
+ * trip for it -- which is exactly what made the telnet console sluggish.  Two properties
+ * the telnet backend's coalescing rests on:
+ *
+ *   1. exactly ONE flush per output call, however many staged chunks it took;
+ *   2. a flush on EVERY release, nested ones included -- cli_console_claim() holds the
+ *      output lock across a whole YMODEM transfer, so if only the outermost release
+ *      signalled, every block inside it would sit unsent and the protocol would stall.
+ */
+static void test_flush_signal(void)
+{
+	struct cli_dummy *d = (struct cli_dummy *)tr.ctx;
+	char big[CLI_PRINTF_BUFFER_SIZE * 3 + 7];
+
+	setup();
+	d->flushes = 0;
+	cli_print(&sh, "hi");
+	assert(d->flushes == 1);                /* short: one staged chunk, one flush */
+
+	/* Long enough to auto-flush the staging buffer several times: the backend must
+	 * still be told "done" exactly once, or one redraw becomes several packets. */
+	memset(big, 'x', sizeof big - 1);
+	big[sizeof big - 1] = '\0';
+	cli_dummy_clear_output(&tr);
+	d->flushes = 0;
+	cli_print(&sh, "%s", big);
+	assert(d->flushes == 1);
+	assert(strlen(cli_dummy_output_str(&tr)) == sizeof big - 1);
+
+	/* Nested: the inner release signals too (the YMODEM case above). */
+	d->flushes = 0;
+	assert(cli_lock(&sh) == 0);             /* outer holder, as a transfer would */
+	cli_print(&sh, "block");                /* inner lock/unlock */
+	assert(d->flushes == 1);                /* signalled WITHOUT the outer release */
+	cli_unlock(&sh);
+	assert(d->flushes == 2);
+}
+
 int main(void)
 {
 	test_formatter();
@@ -220,6 +260,8 @@ int main(void)
 	test_color();
 	test_write_and_hexdump();
 	test_tx_failure();
-	printf("OK: formatter / boundaries / autoflush / colour / hexdump / tx-fail pass\n");
+	test_flush_signal();
+	printf("OK: formatter / boundaries / autoflush / colour / hexdump / tx-fail / "
+	       "flush pass\n");
 	return 0;
 }

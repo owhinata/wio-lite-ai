@@ -105,6 +105,23 @@ struct cli_transport_api {
 	 * client sees, and a previous command's output that drained after a reconnect
 	 * is dropped -- see issue #49 P4).  Never invoked for a persistent transport. */
 	void (*session_begin)(struct cli_transport *tr);
+	/*
+	 * Optional (NULL ok): "that was a complete unit of output".  The core calls it
+	 * from cli_unlock(), i.e. at the end of every bracketed output call -- and a
+	 * whole line-editor redraw is exactly one such bracket (cli_edit.c).
+	 *
+	 * It exists because write() alone cannot tell a backend whether more of the
+	 * same unit is coming: the core stages in CLI_PRINTF_BUFFER_SIZE chunks, so a
+	 * backend that transmits on every write() splits one redraw across several
+	 * packets.  Over TCP that cost a peer ACK per chunk and made the telnet console
+	 * sluggish (issue #49); with this, the same redraw leaves as one segment and
+	 * NOTHING is delayed to achieve it -- the boundary is already known.
+	 *
+	 * Called on EVERY release, nested ones included, because a missed flush is a
+	 * stall while a redundant one merely transmits as early as it used to.  A
+	 * backend that transmits from write() simply leaves this NULL.
+	 */
+	void (*flush)(struct cli_transport *tr);
 };
 
 /** A backend instance: API table + owning shell + backend-private context. */
