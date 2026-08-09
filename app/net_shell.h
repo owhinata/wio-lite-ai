@@ -23,8 +23,15 @@
  *
  * None of that exists now.  The stack is on this side of the link, so there is no far end
  * still running an operation we abandoned, nothing to leak, and no worker to compete for.
- * What replaces it is smaller and stricter: a server thread that owns the socket, NetX
- * callbacks that only push bytes into a ring, and a teardown that must PROVE it happened.
+ * What replaces it is smaller and stricter: a server thread that owns the socket AND is the
+ * only thing that transmits, NetX callbacks that only push bytes into a ring or set a flag,
+ * and a teardown that must PROVE it happened.
+ *
+ * U4-2 also deleted the TX ring, on the reasoning that TCP's own back-pressure could
+ * replace it.  Issue #48 put it back: the callbacks that were supposed to signal that
+ * back-pressure do not all exist, and a deadline shorter than the TCP retransmit timeout
+ * turned one lost segment into a truncated report.  The mechanism, and what makes the ring
+ * load-bearing rather than a buffer, is documented at the top of net_shell.c.
  *
  * ---- the console REQUIRES the host stack ---------------------------------------
  *

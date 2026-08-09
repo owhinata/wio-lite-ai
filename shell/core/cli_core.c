@@ -315,6 +315,24 @@ static ULONG cli_wait(unsigned ticks)
 }
 
 /*
+ * The no-progress deadline for output on @sh, in ticks (0 still means "never drop").
+ *
+ * A backend may raise it above CLI_TX_TIMEOUT when its own recovery is legitimately
+ * slower than the default: the telnet console's is a TCP retransmit, and a deadline
+ * below the RTO turned every lost segment into a truncated report (issue #48).  The
+ * transport is asked, not the instance, so a background job -- whose worker aliases
+ * tr to the foreground's (cli_job.c) -- inherits the same answer.
+ */
+static unsigned cli_tx_deadline(const struct cli_instance *sh)
+{
+	const struct cli_transport *tr = sh->tr;
+
+	if (tr != NULL && tr->tx_timeout != 0u)
+		return (unsigned)tr->tx_timeout;
+	return (unsigned)CLI_TX_TIMEOUT;
+}
+
+/*
  * Output lock (issue #5): the per-instance TX mutex guards a whole output call
  * (format + stage + flush) so concurrent writers to one instance never corrupt
  * out_buf/out_len.  TX_INHERIT (set in cli_init) bounds priority inversion while
@@ -480,11 +498,12 @@ int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t le
 			 * pinning fg->tx_lock (issue #25). */
 			ULONG flags;
 			/* Always FINITE for a bg job (issue #25): it holds the shared
-			 * fg->tx_lock while sending, so it must not honour CLI_TX_TIMEOUT==0
-			 * (never-drop) -- a wedged TX would pin the lock and freeze the
-			 * foreground.  Use the configured timeout, or CLI_BG_TX_WEDGE_TICKS. */
-			ULONG budget = CLI_TX_TIMEOUT ? (ULONG)CLI_TX_TIMEOUT
-			                              : (ULONG)CLI_BG_TX_WEDGE_TICKS;
+			 * fg->tx_lock while sending, so it must not honour a zero
+			 * (never-drop) deadline -- a wedged TX would pin the lock and freeze
+			 * the foreground.  Use the configured timeout (the transport's when it
+			 * raised it, issue #48), or CLI_BG_TX_WEDGE_TICKS. */
+			ULONG budget = cli_tx_deadline(sh) ? (ULONG)cli_tx_deadline(sh)
+			                                   : (ULONG)CLI_BG_TX_WEDGE_TICKS;
 
 			if ((ULONG)(tx_time_get() - stall_start) >= budget) {
 				sh->tx_dropped += (uint32_t)(len - sent);   /* wedged: drop */
@@ -515,7 +534,7 @@ int cli_tx_send_blocking(struct cli_instance *sh, const uint8_t *data, size_t le
 			return -1;
 
 		if (tx_event_flags_get(&sh->events, mask, TX_OR_CLEAR, &flags,
-		                       cli_wait(CLI_TX_TIMEOUT)) != TX_SUCCESS) {
+		                       cli_wait(cli_tx_deadline(sh))) != TX_SUCCESS) {
 			sh->tx_dropped += (uint32_t)(len - sent);   /* timeout */
 			return -1;
 		}

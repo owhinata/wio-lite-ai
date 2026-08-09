@@ -247,8 +247,8 @@ static void test_tx_failure_promotes_result(void)
 static void test_instance_isolation(void)
 {
 	struct cli_dummy     d1 = {0}, d2 = {0};
-	struct cli_transport t1 = { &cli_dummy_api, NULL, &d1 };
-	struct cli_transport t2 = { &cli_dummy_api, NULL, &d2 };
+	struct cli_transport t1 = { .api = &cli_dummy_api, .ctx = &d1 };
+	struct cli_transport t2 = { .api = &cli_dummy_api, .ctx = &d2 };
 	struct cli_instance  s1, s2;
 
 	memset(&s1, 0, sizeof s1); s1.tr = &t1; t1.sh = &s1; strcpy(s1.prompt, "1> ");

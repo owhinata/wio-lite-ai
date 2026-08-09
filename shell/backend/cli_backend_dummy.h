@@ -79,7 +79,10 @@ extern const struct cli_transport_api cli_dummy_api;
  */
 #define CLI_BACKEND_DUMMY_DEFINE(_name)                                       \
 	static struct cli_dummy     _name##_ctx;                              \
-	static struct cli_transport _name = { &cli_dummy_api, NULL, &_name##_ctx }
+	static struct cli_transport _name = {                                 \
+		.api = &cli_dummy_api,                                        \
+		.ctx = &_name##_ctx,                                          \
+	}
 
 /* ---- test/driver helpers ----------------------------------------------- */
 

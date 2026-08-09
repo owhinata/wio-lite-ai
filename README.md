@@ -585,12 +585,27 @@ time as the USB console. 24 commands:
     of create/listen/accept/relisten/disconnect/unaccept/unlisten/delete — which is what
     lets the teardown prove what it proves. The NetX callbacks on the IP thread only push
     bytes into a ring and set flags. The CLI threads appear solely inside `write()`.
-  - **No transmit ring and no polling.** Output goes straight into an `NX_PACKET`, and
-    back-pressure is TCP's own: a refused send makes `write()` return short, the core waits
-    on `CLI_EVT_TX`, and NetX's window-update / queue-depth notifications resume it. The
-    server waits on `nx_tcp_socket_establish_notify()` rather than polling for a connection
-    — `nx_tcp_socket_state_wait()` is a `tx_thread_sleep(1)` loop, which a command can
-    afford and a resident service cannot. The board idles at 98.9 % with the console up.
+  - **A transmit ring, drained by the server thread** (issue #48). U4-2 removed the ring
+    and left back-pressure to TCP — `write()` built an `NX_PACKET` itself, returned short
+    when the socket refused, and NetX's window-update / queue-depth notifications were
+    meant to resume the core. That lost the tail of every long report, three ways at once:
+    the core stages in 32-byte chunks so a 5 kB report became ~180 tiny segments against a
+    4-deep transmit queue; **the window-update callback can never fire** for an
+    `NX_NO_WAIT` sender (NetX only calls it for a socket on the transmit *suspension* list,
+    `nx_tcp_socket_state_transmit_check.c:75-130`) and packet-pool exhaustion has no
+    callback at all, so two of the three refusals had no wake-up source; and recovering a
+    lost segment takes a 2 s retransmit against what was a 1 s deadline. Now the CLI hands
+    bytes to a ring and is answered at once, the server coalesces them into MSS-sized
+    segments, and **every slice it moves fires `cli_transport_notify_tx()`** — the same
+    property that kept the USB CDC backend healthy throughout. Refusals are retried on a
+    50 ms bounded wait, armed only while the ring is non-empty, so the two paths NetX
+    cannot signal are covered by construction rather than by a callback that turns out to
+    be dead. The transport also raises its own no-progress deadline (`cli_transport::
+    tx_timeout`, 5 s) above the RTO, because a ring cannot absorb output larger than itself.
+    The server still waits on `nx_tcp_socket_establish_notify()` rather than polling for a
+    connection — `nx_tcp_socket_state_wait()` is a `tx_thread_sleep(1)` loop, which a
+    command can afford and a resident service cannot. The board idles at 98.9 % with the
+    console up.
   - **Teardown is a proof, not an attempt.** The unwind cannot drop the interface under a
     live socket: detaching the DATA consumer restores the link service thread's stale-byte
     flush, and those bytes are the middle of a frame if anything can still transmit. So
@@ -605,12 +620,16 @@ time as the USB console. 24 commands:
   issue-#21 restriction on module-side blocking calls is **gone** — the console no
   longer occupies a module worker.
 
-  `net shell status` separates the three reasons a write can be refused, because they mean
-  opposite things: `tx waits` is the designed back-pressure (a 64 kB `dmesg` over telnet
-  produces thousands and that is health), `no-buf` means output was competing with the
-  receive path for packets, and `busy` means the teardown held the socket. It is emitted to
-  the log as well as the console — the console's own status is most wanted exactly when
-  that console is in trouble.
+  `net shell status` separates the reasons the socket would not take a segment, because
+  they mean opposite things and merging them is what hid issue #48 for two releases — a
+  single "back-pressure, normal" counter read as health while output was being dropped.
+  `tx queue` is the designed back-pressure (a `dmesg` over telnet produces thousands and
+  that is health), `window` means the peer is not reading, `no-buf` means output was
+  competing with the receive path for packets. Alongside them the **ring peak** says how
+  close the console came to making the CLI wait at all, and **`dropped`** says whether that
+  wait ran out — the one number that says output was *lost*, which is otherwise entirely
+  silent. It is emitted to the log as well as the console: the console's own status is most
+  wanted exactly when that console is in trouble.
 
   Known limits: `printf()` follows the console of the thread that ran the command —
   `_write` hands a non-CDC instance's output to that instance's transport — which is what

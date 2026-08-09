@@ -8,19 +8,53 @@
  *
  * Three threads touch what is here, and the split between them is the whole design:
  *
- *   server thread (14)   owns the socket.  It is the ONLY caller of create / listen /
- *                        accept / relisten / disconnect / unaccept / unlisten / delete,
- *                        which is why the teardown can prove what it proves.
- *   NetX IP thread (11)  runs the receive / disconnect / window callbacks.  They only
- *                        move bytes into the RX ring and set flags -- never a socket call.
+ *   server thread (14)   owns the socket: the ONLY caller of create / listen / accept /
+ *                        relisten / disconnect / unaccept / unlisten / delete, and the ONLY
+ *                        thread that transmits.  That is why the teardown can prove what it
+ *                        proves.  (It is not the only caller of every socket API -- the
+ *                        receive callback below runs nx_tcp_socket_receive() on the IP
+ *                        thread, which is NetX's own idiom.)
+ *   NetX IP thread (11)  runs the receive / disconnect / establish / queue-depth callbacks.
+ *                        They only move bytes into the RX ring and set flags.
  *   CLI threads (16)     the shell instance and any background job, inside write().
  *
+ * ---- why there is a TX ring, and what happens without one (issue #48) -------------
+ *
  * The RX ring is strict SPSC: the IP thread is the only producer, the CLI instance thread
- * the only consumer.  There is no TX ring at all -- output goes straight into an NX_PACKET
- * and out through nx_tcp_socket_send(), and back-pressure is TCP's own: a refused send
- * makes write() return short, the core waits on CLI_EVT_TX, and NetX's window-update /
- * queue-depth callbacks wake it.  That is the mechanism the packet pool and the link's
- * DATA transmit pool were sized around (see the transmit budget note in app/nx_net.h).
+ * the only consumer.  Output goes through a TX ring in the other direction, drained by the
+ * server thread.  Until issue #48 it did not: write() built an NX_PACKET and called
+ * nx_tcp_socket_send() itself, leaving back-pressure to TCP -- a refused send returned
+ * short, the core waited on CLI_EVT_TX, and NetX's window-update / queue-depth callbacks
+ * were supposed to wake it.  That failed in three ways at once, and telnet lost the tail of
+ * every long report:
+ *
+ *   1. ONE call, ONE segment.  The core stages output in CLI_PRINTF_BUFFER_SIZE (32 B)
+ *      chunks, so a 5 kB report became ~180 tiny TCP segments against a 4-deep transmit
+ *      queue (NXN_TCP_TX_DEPTH).  The console lived permanently at the queue limit, one
+ *      peer ACK per 32 bytes of output.
+ *   2. TWO of the three refusals had NO wake-up source at all.  nx_tcp_socket_window_
+ *      update_notify is only ever invoked from _nx_tcp_socket_state_transmit_check(), whose
+ *      whole body sits inside `if (socket_ptr -> nx_tcp_socket_transmit_suspension_list)`
+ *      (nx_tcp_socket_state_transmit_check.c:75-130) -- and an NX_NO_WAIT send never joins
+ *      that list, so the callback we registered could not fire, ever.  Packet-pool
+ *      exhaustion has no callback in NetX at all.  Both stalled until the deadline.
+ *   3. Even the working path (NX_TX_QUEUE_DEPTH -> queue-depth notify on ACK) needs a
+ *      retransmit when a segment is lost on the link, and NXN_TCP_RTO_MS is 2 s against a
+ *      1 s CLI_TX_TIMEOUT.  One lost segment was a guaranteed truncation, and cli_printf.c
+ *      latches tx_failed, so it cost the whole REST of the command's output, not a line.
+ *
+ * The ring fixes all three: the CLI hands bytes to a local buffer and is answered at once,
+ * the server thread coalesces them into MSS-sized segments, and every byte it moves fires
+ * cli_transport_notify_tx() unconditionally -- which is exactly why the USB CDC backend
+ * (shell/backend/cli_backend_usbcdc.c) never had this problem.  Refusals are retried on a
+ * short bounded wait, so the two paths NetX cannot signal are covered by construction
+ * rather than by a callback that turns out to be dead.  The transport additionally raises
+ * its own no-progress deadline above the RTO (tx_timeout, below), because a ring cannot
+ * absorb output larger than itself.
+ *
+ * TCP is still what paces the wire: the packet pool and the link's DATA transmit pool are
+ * sized around NXN_TCP_TX_DEPTH (see the transmit budget note in app/nx_net.h), and none of
+ * that changed.
  *
  * No clock/RCC/register work of its own (clock-safe).  Clean-room design.
  */
@@ -50,16 +84,61 @@
  * f746 port uses. */
 #define NSH_PRIORITY        14u
 /*
- * From the measured high-water mark, not a guess: 596 B after a telnet session that ran
- * `dmesg` and `thread` (issue #23 U4-3).  Command execution happens in the bound CLI
- * instance, not here, so this thread only ever orchestrates.  2.6x the peak.
+ * Issue #48 moved the whole NetX transmit path onto this thread --
+ * nx_tcp_socket_send -> _nx_tcp_socket_send_internal -> _nx_ip_packet_send ->
+ * _nx_ip_driver_packet_send -> app/nx_link_driver.c -> link_data_send -- so issue #23
+ * U4-3's 596 B (measured when it only orchestrated) stopped bounding it.
+ *
+ * MEASURED AFTER THE MOVE: 492 B, on a session that filled the TX ring to its 4095 B
+ * ceiling with repeated `dmesg` / `coremark` / `membench`.  Lower than the old figure
+ * despite the deeper call chain, because command execution still happens in the bound CLI
+ * instance and -Os + LTO (issue #39) reworked the frames.  2560 keeps 5x on that, which is
+ * more than this thread needs -- if DTCM ever gets tight (it is the scarce region, see
+ * issue #46), this is a safe 1 KB to give back, not a number to defend.
  */
-#define NSH_STACK           1536u
+#define NSH_STACK           2560u
 
 #define NSH_RX_RING         512u
 #define NSH_WINDOW          2048u    /* advertised TCP receive window                */
 #define NSH_MSS             1400u    /* bytes per transmitted packet                 */
 #define NSH_EXTRACT         1500u    /* per-packet receive extraction buffer         */
+
+/*
+ * Output the CLI threads can hand over before they have to wait (issue #48).  It is what
+ * turns ~32-byte writes into MSS-sized segments, so it wants to be several MSS; 4 KB holds
+ * a `coremark` report or a `membench` table outright.  It is NOT big enough for everything
+ * (a `dmesg` is larger, and cli_uart_ring's usable depth is size-1), which is why the
+ * deadline below matters as well -- the two together are the fix, not either alone.
+ */
+#define NSH_TX_RING         4096u
+
+/*
+ * How long the drain waits for the socket to take more when it has just refused.
+ *
+ * This is the belt to the queue-depth callback's braces, and it is what makes the refusals
+ * NetX cannot signal (a window overflow, an empty packet pool) recoverable at all rather
+ * than fatal.  Only ever armed while the ring is non-empty, so an idle console still sleeps
+ * NSH_IDLE_MS and the 98.9 % idle of issue #23 U4 is unchanged.
+ */
+#define NSH_DRAIN_POLL_MS   50u
+
+/* Segments pushed per drain pass before going back round the loop (so a stop request is
+ * still noticed promptly during a long report). */
+#define NSH_TX_BURST        8u
+
+/*
+ * The console's no-progress deadline, in ticks, published through cli_transport::tx_timeout
+ * (the default CLI_TX_TIMEOUT of 1 s applies to every other backend).
+ *
+ * It MUST exceed NXN_TCP_RTO_MS (2 s): recovering a segment the link dropped means waiting
+ * out a retransmit, and a shorter deadline made that loss discard the rest of the command's
+ * output (issue #48).  2.5x covers the first retransmit with margin.  It deliberately does
+ * NOT cover a second consecutive loss of the same segment (2 s + 4 s of backoff) -- past
+ * that the cost is being tied to a peer that is alive but not reading.  The wait stays
+ * interruptible throughout: cli_tx_send_blocking() also wakes on CLI_EVT_RX and polls for
+ * Ctrl+C, and a session ending discards the ring and closes the write gate.
+ */
+#define NSH_TX_DEADLINE     5000u
 
 /*
  * How long the server sleeps between housekeeping passes when nothing is happening.  It is
@@ -89,14 +168,27 @@
 #define NSH_EVT_DISC        0x2u    /* the peer disconnected             */
 #define NSH_EVT_DONE        0x4u    /* teardown finished AND was proved  */
 #define NSH_EVT_CONN        0x8u    /* the socket reached ESTABLISHED    */
+#define NSH_EVT_TX          0x10u   /* output queued, or the socket took more */
 
 /* ---- state --------------------------------------------------------------- */
+
+/* PRIMASK critical section, as in shell/backend/cli_backend_usbcdc.c.  Nests safely inside
+ * ThreadX's own PRIMASK sections. */
+#define NSH_CRIT_ENTER()  do { uint32_t _pm = __get_PRIMASK(); __disable_irq()
+#define NSH_CRIT_EXIT()   __set_PRIMASK(_pm); } while (0)
 
 struct nsh_ctx {
 	struct cli_instance *sh;             /* set by nsh_init() from tr->sh          */
 	struct cli_uart_ring rx;             /* IP thread -> CLI thread (SPSC)         */
+	struct cli_uart_ring tx;             /* CLI/bg threads -> server thread (MPSC) */
 	uint8_t              rx_buf[NSH_RX_RING];
-	volatile uint8_t     connected;      /* write gate; owned by the CLI thread    */
+	/*
+	 * The write gate.  SET by the CLI thread (nsh_session_begin, once the connection is
+	 * confirmed), CLEARED by the server thread's teardown and by the disconnect callback
+	 * on the NetX IP thread.  Producers read it inside their critical section, which is
+	 * what makes a clear a hard cut-off -- see the gate note above nsh_tx_put_raw().
+	 */
+	volatile uint8_t     connected;
 };
 
 static struct nsh_ctx       g_ctx;
@@ -105,23 +197,26 @@ static TX_EVENT_FLAGS_GROUP g_evt;
 static UCHAR                g_stack[NSH_STACK] DTCM_BSS __attribute__((aligned(8)));
 static uint8_t              g_ready;
 
+/*
+ * The TX ring's storage.  CPU-only -- no bus master reads it; the server thread copies out
+ * of it into an NX_PACKET, and the packet pool itself is in DTCM too (app/nx_net.c) -- so
+ * DTCM is where the issue-#46 policy puts it.
+ *
+ * It is a STANDALONE symbol rather than a member of g_ctx on purpose: the post-link gate
+ * cmake/check_dtcm_residency.py matches by symbol name, so a buffer hidden inside a struct
+ * could silently fall back to AXI-SRAM with the build still green.  Keep `nsh_tx_buf` in
+ * that script's REQUIRED_DTCM whenever this line changes.
+ */
+static uint8_t              nsh_tx_buf[NSH_TX_RING] DTCM_BSS;
+
 static NX_TCP_SOCKET        g_sock;
 static uint8_t              g_sock_created;   /* server thread only */
-
-/*
- * Serialises "the socket is usable" between the CLI threads inside write() and the server
- * thread's teardown.  Held across short socket calls, with ONE exception: the bounded FIN
- * handshake in nsh_unwind(), which must not race a delete.  nsh_write() pays for that
- * exception by re-checking `connected` when its TX_NO_WAIT acquisition fails.
- */
-static TX_MUTEX             g_sock_lock;
 
 /* Owned by the server thread (others only read). */
 static volatile enum net_shell_state g_state;
 static uint16_t  g_port = NET_SHELL_PORT_DEFAULT;
 static int       g_iac;                          /* telnet IAC receive state          */
 static uint8_t   g_extract[NSH_EXTRACT];         /* IP thread only                    */
-static uint8_t   g_stage[2u * NSH_MSS];          /* write() escaping; under g_sock_lock */
 static uint8_t   g_ip[4];                        /* address we listen on, for status  */
 
 /* Set by the disconnect callback (IP thread). */
@@ -142,25 +237,128 @@ static volatile uint16_t g_req_port = NET_SHELL_PORT_DEFAULT;
 static const char *g_last = "never started";     /* last state-changing reason        */
 static uint32_t g_sessions, g_rx_bytes, g_tx_bytes, g_rx_drops;
 /*
- * Why a write() was not accepted, kept apart because the three answers mean opposite
- * things and a single "refused" counter says nothing:
+ * Why the socket would not take a segment.  Kept APART, because merging them is what hid
+ * issue #48: a single "tx waits 1402 (back-pressure, normal)" could not distinguish the
+ * healthy answer from the one with no wake-up source, and the report read as healthy while
+ * the console was dropping output.  Same lesson as issue #23 U4's tx-refused counter --
+ * never collapse quantities whose answers point in opposite directions.
  *
- *   g_tx_wait   the TCP window or the socket's transmit queue is full.  This is the
- *               DESIGNED back-pressure -- the core waits on CLI_EVT_TX and NetX's
- *               window/queue notify resumes it -- so a large number here is health, not
- *               trouble.  A 64 kB `dmesg` over telnet produces thousands.
- *   g_tx_nobuf  the packet pool was empty or below this console's reserve.  THIS is the
- *               sizing signal: it means output was competing with the receive path for
- *               packets, which is what NXN_TCP_TX_DEPTH and the pool were sized to avoid.
- *   g_tx_busy   the socket mutex was held -- only the teardown does that.
+ *   g_tx_qdepth  the socket's transmit queue was at NXN_TCP_TX_DEPTH.  The DESIGNED
+ *                back-pressure: a peer ACK releases a packet and the queue-depth callback
+ *                wakes the drain.  A large number is normal.
+ *   g_tx_win     the peer's window (or congestion window) had no room.  NetX cannot signal
+ *                this to an NX_NO_WAIT sender at all (see the header), so it is the
+ *                NSH_DRAIN_POLL_MS retry that recovers it.  Expected to be ~0 in practice;
+ *                a large number means the peer is not reading.
+ *   g_tx_nobuf   the packet pool was empty or below this console's reserve.  THIS is the
+ *                sizing signal: output was competing with the receive path for packets,
+ *                which is what NXN_TCP_TX_DEPTH and the pool were sized to avoid.
  */
-static uint32_t g_tx_wait, g_tx_nobuf, g_tx_busy;
+static uint32_t g_tx_qdepth, g_tx_win, g_tx_nobuf;
+/* High-water mark of the TX ring, so `net shell status` can say whether the CLI ever had
+ * to wait on it at all (bytes; the usable depth is NSH_TX_RING - 1). */
+static uint32_t g_tx_hiwater;
+
+/* ---- TX ring, producer side (any CLI thread; PRIMASK) -------------------- */
+
+/*
+ * The ring has THREE producers -- the instance thread, a background job writing through
+ * sh->fg, and session_begin(), which the core calls WITHOUT its output lock
+ * (cli_core.c) -- so it is MPSC, and they serialise with the same short interrupt-masked
+ * region the USB CDC backend uses.  A mutex is not an option: write() is a non-blocking
+ * contract and is already called under the instance's tx_lock.  The server thread is the
+ * sole consumer and touches only `tail`, so it never contends with them.
+ *
+ * 🔴 THE WRITE GATE IS READ INSIDE THAT REGION, not before it, and that is load-bearing.
+ * `connected` is cleared by the server thread (or the disconnect callback) and followed by
+ * nsh_tx_discard(); if a producer could test it and enqueue as two separate steps, a CLI
+ * thread preempted between them -- it runs at 16, below both the server (14) and the IP
+ * thread (11) -- could append AFTER the discard, and those bytes, belonging to a client
+ * that is gone, would be the first thing the NEXT client saw.  Testing and storing in one
+ * critical section makes the clear a hard cut-off instead: the store is atomic, so every
+ * region that begins after it refuses, and every byte accepted before it is already visible
+ * to the discard that follows.
+ */
+
+/*
+ * Store @n bytes verbatim and INDIVISIBLY -- all of them or none.  Returns 1 on success.
+ *
+ * Indivisible matters: the only caller sends telnet negotiation, and another producer
+ * (a background job from the previous session is the realistic one, since it keeps writing
+ * through sh->fg) landing in the middle of IAC WILL ECHO would turn a command into
+ * garbage on the wire.  The pre-U4 code got this for free by emitting the whole sequence in
+ * one nx_tcp_socket_send() under the socket mutex; with a ring the equivalent guarantee has
+ * to be spelled out.
+ */
+static int nsh_tx_put_raw(const uint8_t *p, size_t n)
+{
+	int ok;
+
+	NSH_CRIT_ENTER();
+	ok = g_ctx.connected && cli_uart_ring_free(&g_ctx.tx) >= n;
+	if (ok)
+		(void)cli_uart_ring_put_buf(&g_ctx.tx, p, n);
+	NSH_CRIT_EXIT();
+	return ok;
+}
+
+/*
+ * Store one SHELL byte, telnet-encoded: a literal 0xFF must go out as IAC IAC or the client
+ * reads it as the start of a command (f746's nx_shell strips IAC on receive but never
+ * escaped its output, which corrupts any binary the shell prints).  The pair goes in inside
+ * ONE critical section, so another producer can never be interleaved between the halves.
+ *
+ * NOT for the telnet negotiation in nsh_charmode: those bytes ARE IAC sequences and must go
+ * through nsh_tx_put_raw() unescaped.
+ */
+static int nsh_tx_put(uint8_t b)
+{
+	int ok;
+
+	NSH_CRIT_ENTER();
+	if (!g_ctx.connected)              /* see the gate note above */
+		ok = 0;
+	else if (b == 0xFFu)
+		ok = (cli_uart_ring_free(&g_ctx.tx) >= 2u) &&
+		     cli_uart_ring_put(&g_ctx.tx, 0xFFu) &&
+		     cli_uart_ring_put(&g_ctx.tx, 0xFFu);
+	else
+		ok = cli_uart_ring_put(&g_ctx.tx, b);
+	NSH_CRIT_EXIT();
+	return ok;
+}
+
+/* Wake the drain.  The ring, never this flag, is the source of truth (see nsh_entry). */
+static void nsh_tx_kick(void)
+{
+	(void)tx_event_flags_set(&g_evt, NSH_EVT_TX, TX_OR);
+}
+
+/*
+ * Drop everything queued.  Advances `tail` by a count it has already read, so it cannot run
+ * past a producer's `head` -- but that alone would NOT make it a clean cut: what stops a
+ * producer appending straight after it is the write gate being read inside the producers'
+ * critical section (see the note above).  CALL IT ONLY WITH `connected` ALREADY CLEARED.
+ *
+ * Always followed by the TX notify, so a writer blocked on CLI_EVT_TX wakes, re-enters
+ * write() and returns at once on the closed gate instead of waiting out the deadline.
+ */
+static void nsh_tx_discard(void)
+{
+	size_t n = cli_uart_ring_count(&g_ctx.tx);
+
+	if (n)
+		cli_uart_ring_advance_tail(&g_ctx.tx, n);
+	if (g_ctx.sh != NULL)
+		cli_transport_notify_tx(g_ctx.sh);
+}
 
 /* ---- transport vtable ---------------------------------------------------- */
 
 static int nsh_init(struct cli_transport *tr)
 {
 	cli_uart_ring_init(&g_ctx.rx, g_ctx.rx_buf, sizeof g_ctx.rx_buf);
+	cli_uart_ring_init(&g_ctx.tx, nsh_tx_buf, sizeof nsh_tx_buf);
 	g_ctx.connected = 0;
 	g_ctx.sh        = tr->sh;      /* cli_init() sets tr->sh before calling init */
 	return 0;
@@ -173,108 +371,44 @@ static int nsh_enable(struct cli_transport *tr)
 }
 
 /*
- * Put @n bytes on the wire verbatim.  MUST be called with g_sock_lock held.  Returns the
- * number of bytes accepted (0 when the pool or the socket refused).
- */
-static int nsh_emit_locked(const uint8_t *p, ULONG n)
-{
-	NX_PACKET_POOL *pool = (NX_PACKET_POOL *)nx_net_pool();
-	NX_PACKET *pkt = NX_NULL;
-	UINT s;
-
-	if (pool == NX_NULL || !g_sock_created)
-		return 0;
-	/* Leave the receive path some pool.  Advisory: an unlocked read of a counter NetX
-	 * maintains, which is the right weight for a policy whose only job is to keep an
-	 * output burst from being the reason a frame was dropped. */
-	if (pool->nx_packet_pool_available <= NSH_POOL_RESERVE) {
-		g_tx_nobuf++;
-		return 0;
-	}
-	if (nx_packet_allocate(pool, &pkt, NX_TCP_PACKET, NX_NO_WAIT) != NX_SUCCESS) {
-		g_tx_nobuf++;
-		return 0;
-	}
-	if (nx_packet_data_append(pkt, (VOID *)p, n, pool, NX_NO_WAIT) != NX_SUCCESS) {
-		nx_packet_release(pkt);
-		g_tx_nobuf++;
-		return 0;
-	}
-	s = nx_tcp_socket_send(&g_sock, pkt, NX_NO_WAIT);
-	if (s != NX_SUCCESS) {
-		/* Release it -- NetX did not take it -- and let the core wait for the notify.
-		 * The window/queue answers are the healthy path and are counted apart from
-		 * anything else (NX_NOT_CONNECTED on a disconnect race lands in g_tx_nobuf,
-		 * which is harmless: the session is ending anyway). */
-		nx_packet_release(pkt);
-		if (s == NX_WINDOW_OVERFLOW || s == NX_TX_QUEUE_DEPTH)
-			g_tx_wait++;
-		else
-			g_tx_nobuf++;
-		return 0;
-	}
-	return (int)n;
-}
-
-/*
- * ---- the write path, and the one rule it must not break ------------------------
+ * ---- the write path ------------------------------------------------------------
  *
- * cli_transport_api.write() is a NON-BLOCKING contract (cli_instance.h): it returns how
- * much it took and the core waits on CLI_EVT_TX for the rest.  So g_sock_lock is acquired
- * with TX_NO_WAIT and a failure returns 0 rather than waiting -- during a teardown the
- * server holds it only across short socket calls, and the teardown clears `connected` and
- * fires the TX notify, so the core re-enters write() and gets `len` back on the closed
- * gate instead of waiting out CLI_TX_TIMEOUT.
- *
- * A literal 0xFF must go out as IAC IAC or a telnet client reads it as the start of a
- * command (f746's nx_shell strips IAC on receive but never escaped its output, which
- * corrupts any binary the shell prints).  The escape happens into a static staging buffer,
- * which is safe precisely because g_sock_lock is held: write() has three possible callers
- * (the instance thread, a background job through sh->fg, and session_begin(), which the
- * core calls WITHOUT its output lock).
+ * cli_transport_api.write() is a NON-BLOCKING contract (cli_instance.h): enqueue what fits,
+ * return the count, and let the core wait on CLI_EVT_TX for the rest.  Since issue #48 that
+ * is all it does -- no NetX call, no lock, no socket.  Everything that can refuse, block or
+ * be torn down lives on the server thread, which is what makes the contract honest instead
+ * of merely non-blocking.
  */
 static int nsh_write(struct cli_transport *tr, const uint8_t *data, size_t len)
 {
-	size_t i, out = 0, taken = 0;
-	int sent;
+	size_t i, count;
 
 	(void)tr;
 	/* Not connected: swallow it.  Returning `len` is what keeps the shell from ever
 	 * wedging on a console nobody is attached to. */
 	if (!g_ctx.connected)
 		return (int)len;
-	if (len == 0u)
-		return 0;
-
-	if (tx_mutex_get(&g_sock_lock, TX_NO_WAIT) != TX_SUCCESS) {
-		/*
-		 * The holder is the teardown, which DOES wait under this lock (the bounded
-		 * FIN handshake in nsh_unwind()).  It clears `connected` first, but we may
-		 * have read it just before that -- so re-read it here.  Without this the core
-		 * would wait out CLI_TX_TIMEOUT for space that is never coming, on a session
-		 * that has already ended.
-		 */
-		g_tx_busy++;
-		return g_ctx.connected ? 0 : (int)len;
-	}
 
 	for (i = 0; i < len; i++) {
-		size_t need = (data[i] == 0xFFu) ? 2u : 1u;
-
-		if (out + need > NSH_MSS)
-			break;                       /* one packet's worth per call */
-		g_stage[out++] = data[i];
-		if (need == 2u)
-			g_stage[out++] = 0xFFu;
-		taken++;
+		if (!nsh_tx_put(data[i]))
+			break;                       /* full, or the gate shut under us */
 	}
-	sent = nsh_emit_locked(g_stage, (ULONG)out);
-	(void)tx_mutex_put(&g_sock_lock);
+	/* Sample the depth BEFORE waking the drain: afterwards the server thread may already
+	 * have emptied it, and the peak -- whose whole job is to say how close this console
+	 * came to making the CLI wait -- would read low. */
+	count = cli_uart_ring_count(&g_ctx.tx);
+	if ((uint32_t)count > g_tx_hiwater)
+		g_tx_hiwater = (uint32_t)count;
 
-	if (sent <= 0)
-		return 0;                            /* core waits for CLI_EVT_TX */
-	g_tx_bytes += (uint32_t)out;
-	return (int)taken;                           /* INPUT bytes consumed */
+	if (i != 0u)
+		nsh_tx_kick();
+	/* Told to stop rather than told to wait: the session ended while we were in the loop,
+	 * so swallow the remainder exactly as the entry check does.  Reporting it as a short
+	 * write instead would send the core to wait for room that this session will never
+	 * need. */
+	if (i < len && !g_ctx.connected)
+		return (int)len;
+	return (int)i;                               /* INPUT bytes consumed */
 }
 
 static int nsh_read(struct cli_transport *tr, uint8_t *data, size_t cap)
@@ -309,11 +443,11 @@ static void nsh_session_begin(struct cli_transport *tr)
 	g_ctx.connected = g_link_live;
 	if (!g_ctx.connected)
 		return;
-	/* Raw: these ARE IAC sequences and must not be escaped. */
-	if (tx_mutex_get(&g_sock_lock, TX_NO_WAIT) == TX_SUCCESS) {
-		(void)nsh_emit_locked(nsh_charmode, (ULONG)sizeof nsh_charmode);
-		(void)tx_mutex_put(&g_sock_lock);
-	}
+	/* RAW, not nsh_tx_put(): these ARE IAC sequences.  Escaping them would send
+	 * IAC IAC WILL ECHO and the client would print 0xFF instead of negotiating.  In one
+	 * call, so the six bytes cannot be split by another producer. */
+	(void)nsh_tx_put_raw(nsh_charmode, sizeof nsh_charmode);
+	nsh_tx_kick();
 }
 
 static const struct cli_transport_api nsh_api = {
@@ -324,6 +458,9 @@ struct cli_transport net_shell_transport = {
 	.api = &nsh_api,
 	.sh  = NULL,                   /* set by cli_init() */
 	.ctx = &g_ctx,
+	/* Longer than every other backend, and specifically longer than NXN_TCP_RTO_MS --
+	 * see NSH_TX_DEADLINE (issue #48). */
+	.tx_timeout = NSH_TX_DEADLINE,
 };
 
 /* ---- NetX callbacks (IP-thread context: ring + flags only) --------------- */
@@ -421,14 +558,90 @@ static void nsh_establish_cb(NX_TCP_SOCKET *s)
 	(void)tx_event_flags_set(&g_evt, NSH_EVT_CONN, TX_OR);
 }
 
-static void nsh_tx_notify(NX_TCP_SOCKET *s)
+/*
+ * The socket's transmit queue dropped back below NXN_TCP_TX_DEPTH, because a peer ACK
+ * released packets (nx_tcp_socket_state_ack_check.c:567-582).  IP-thread context: flag only.
+ *
+ * It wakes the DRAIN, not the CLI.  The CLI is waiting for room in the ring, and only the
+ * drain can make room; conflating the two directions is how the old code ended up telling
+ * the core "space freed" when nothing had been sent.
+ */
+static void nsh_queue_notify(NX_TCP_SOCKET *s)
 {
-	(void)s;                            /* window / queue space freed */
-	if (g_ctx.sh != NULL)
-		cli_transport_notify_tx(g_ctx.sh);
+	(void)s;
+	nsh_tx_kick();
 }
 
 /* ---- socket lifecycle (server thread only) ------------------------------- */
+
+/*
+ * Push queued output.  SERVER THREAD ONLY -- it is the sole consumer of the ring and the
+ * sole caller of nx_tcp_socket_send().
+ *
+ * Returns the number of segments sent.  Stops at the first refusal and leaves the bytes in
+ * the ring; the caller then arms a short wait (see nsh_entry) and tries again, which is
+ * what covers the refusals NetX has no callback for.
+ */
+static unsigned nsh_tx_drain(void)
+{
+	NX_PACKET_POOL *pool = (NX_PACKET_POOL *)nx_net_pool();
+	unsigned n;
+
+	if (pool == NX_NULL || !g_sock_created || !g_link_live)
+		return 0;
+
+	for (n = 0u; n < NSH_TX_BURST; n++) {
+		const uint8_t *p;
+		size_t         run = cli_uart_ring_contig(&g_ctx.tx, &p);
+		NX_PACKET     *pkt = NX_NULL;
+		UINT           s;
+
+		if (run == 0u)
+			break;
+		if (run > NSH_MSS)
+			run = NSH_MSS;
+
+		/* Leave the receive path some pool.  Advisory: an unlocked read of a counter
+		 * NetX maintains, which is the right weight for a policy whose only job is to
+		 * keep an output burst from being the reason a frame was dropped. */
+		if (pool->nx_packet_pool_available <= NSH_POOL_RESERVE) {
+			g_tx_nobuf++;
+			break;
+		}
+		if (nx_packet_allocate(pool, &pkt, NX_TCP_PACKET, NX_NO_WAIT) != NX_SUCCESS) {
+			g_tx_nobuf++;
+			break;
+		}
+		if (nx_packet_data_append(pkt, (VOID *)p, (ULONG)run, pool,
+		                          NX_NO_WAIT) != NX_SUCCESS) {
+			nx_packet_release(pkt);
+			g_tx_nobuf++;
+			break;
+		}
+		s = nx_tcp_socket_send(&g_sock, pkt, NX_NO_WAIT);
+		if (s != NX_SUCCESS) {
+			/* NetX did not take it, so we still own it.  The three answers are
+			 * counted apart on purpose -- see the counters' comment.  (A
+			 * NX_NOT_CONNECTED from a disconnect race lands in g_tx_nobuf, which is
+			 * harmless: the session is ending anyway.) */
+			nx_packet_release(pkt);
+			if (s == NX_TX_QUEUE_DEPTH)
+				g_tx_qdepth++;
+			else if (s == NX_WINDOW_OVERFLOW)
+				g_tx_win++;
+			else
+				g_tx_nobuf++;
+			break;
+		}
+		/* Sent: free the ring space and tell the core, which may be parked in
+		 * cli_tx_send_blocking() waiting for exactly this. */
+		cli_uart_ring_advance_tail(&g_ctx.tx, run);
+		g_tx_bytes += (uint32_t)run;
+		if (g_ctx.sh != NULL)
+			cli_transport_notify_tx(g_ctx.sh);
+	}
+	return n;
+}
 
 /*
  * Arm the passive open.  CALL EXACTLY ONCE PER CONNECTION.
@@ -489,8 +702,19 @@ static int nsh_arm(uint16_t port)
 	/* Available because NX_DISABLE_EXTENDED_NOTIFY_SUPPORT is not defined; it is what
 	 * lets this thread wait on an event instead of polling for ESTABLISHED. */
 	(void)nx_tcp_socket_establish_notify(&g_sock, nsh_establish_cb);
-	(void)nx_tcp_socket_window_update_notify_set(&g_sock, nsh_tx_notify);
-	(void)nx_tcp_socket_queue_depth_notify_set(&g_sock, nsh_tx_notify);
+	/*
+	 * Enabled by NX_ENABLE_TCP_QUEUE_DEPTH_UPDATE_NOTIFY (port/netxduo/nx_user.h), and the
+	 * ONLY transmit-side callback worth registering here.
+	 *
+	 * nx_tcp_socket_window_update_notify_set() is deliberately NOT called: NetX invokes
+	 * that callback from one place, _nx_tcp_socket_state_transmit_check(), whose entire
+	 * body is guarded by `if (socket_ptr -> nx_tcp_socket_transmit_suspension_list)`
+	 * (nx_tcp_socket_state_transmit_check.c:75-130).  A sender using NX_NO_WAIT never joins
+	 * that list, so registering it produces a callback that can never fire -- which read as
+	 * a live wake-up source for two years and cost issue #48 its diagnosis.  A window
+	 * overflow is recovered by the drain's NSH_DRAIN_POLL_MS retry instead.
+	 */
+	(void)nx_tcp_socket_queue_depth_notify_set(&g_sock, nsh_queue_notify);
 	/* Bound what this socket can have outstanding towards the link's DATA transmit
 	 * pool -- the transmit budget note in app/nx_net.h is what makes that number safe. */
 	(void)nx_tcp_socket_transmit_configure(&g_sock, NXN_TCP_TX_DEPTH, NXN_TCP_RTO_MS,
@@ -523,10 +747,8 @@ static int nsh_arm(uint16_t port)
 
 fail:
 	if (g_sock_created) {
-		(void)tx_mutex_get(&g_sock_lock, TX_WAIT_FOREVER);
 		if (nx_tcp_socket_delete(&g_sock) == NX_SUCCESS)
 			g_sock_created = 0u;
-		(void)tx_mutex_put(&g_sock_lock);
 	}
 	LOG_WRN("arm failed: %s", g_last);
 	g_state = NET_SHELL_OFF;
@@ -552,24 +774,22 @@ static int nsh_unwind(void)
 	NX_IP *ip = (NX_IP *)nx_net_ip();
 	UINT s;
 
-	/* Stop producers first, and wake anyone parked in the core's TX wait so it
-	 * re-enters write() and returns on the closed gate. */
+	/*
+	 * Stop producers first, throw away whatever they queued, and wake anyone parked in
+	 * the core's TX wait so it re-enters write() and returns on the closed gate.
+	 *
+	 * No lock is needed around the socket calls below: since issue #48 this thread is the
+	 * only one that transmits, so there is no CLI thread to be caught inside
+	 * nx_tcp_socket_send() while the socket is deleted -- which was the single race the
+	 * old g_sock_lock existed for.
+	 */
 	g_ctx.connected = 0;
 	g_link_live     = 0u;
-	if (g_ctx.sh != NULL)
-		cli_transport_notify_tx(g_ctx.sh);
+	nsh_tx_discard();
 
 	if (!g_sock_created)
 		return 0;
 
-	/*
-	 * The lock keeps a CLI thread from being inside nx_tcp_socket_send() while the
-	 * socket is deleted.  It IS held across the bounded FIN handshake below -- the one
-	 * place this file waits under it -- which is why nsh_write() re-checks `connected`
-	 * when its TX_NO_WAIT acquisition fails: a writer must not be told "no space" for a
-	 * second while the session it belongs to is being dismantled.
-	 */
-	(void)tx_mutex_get(&g_sock_lock, TX_WAIT_FOREVER);
 	(void)nx_tcp_socket_disconnect(&g_sock, NSH_DISC_MS);
 	(void)nx_tcp_server_socket_unaccept(&g_sock);
 	if (ip != NX_NULL)
@@ -577,7 +797,6 @@ static int nsh_unwind(void)
 	s = nx_tcp_socket_delete(&g_sock);
 	if (s == NX_SUCCESS)
 		g_sock_created = 0u;
-	(void)tx_mutex_put(&g_sock_lock);
 
 	if (s != NX_SUCCESS) {
 		LOG_ERR("socket delete refused (0x%02x) -- the console may still transmit",
@@ -596,18 +815,15 @@ static int nsh_end_session(const char *why)
 
 	g_ctx.connected = 0;
 	g_link_live     = 0u;
-	if (g_ctx.sh != NULL)
-		cli_transport_notify_tx(g_ctx.sh);
+	nsh_tx_discard();
 	/* A command may still be running for the client that just left.  0x03 is exactly
 	 * what Ctrl+C delivers, so pushing one cancels it and leaves the instance idle for
 	 * the next client instead of holding the console until it finishes on its own. */
 	if (nsh_rx_put(0x03u) && g_ctx.sh != NULL)
 		cli_transport_notify_rx(g_ctx.sh);
 
-	(void)tx_mutex_get(&g_sock_lock, TX_WAIT_FOREVER);
 	(void)nx_tcp_socket_disconnect(&g_sock, NSH_DISC_MS);
 	(void)nx_tcp_server_socket_unaccept(&g_sock);
-	(void)tx_mutex_put(&g_sock_lock);
 
 	if (ip == NX_NULL)
 		return -1;
@@ -709,6 +925,15 @@ static void nsh_entry(ULONG arg)
 					nsh_do_stop("the host stack went down");
 				break;
 			}
+			/*
+			 * Throw away anything still queued BEFORE opening the write gate.
+			 * The teardown discarded once already, but a producer that was
+			 * inside nsh_write() at the time could have appended after it, and
+			 * those bytes belong to a client that is gone -- without this they
+			 * would be the first thing the NEW client sees.  The RX side has the
+			 * same guarantee in nsh_session_begin().
+			 */
+			nsh_tx_discard();
 			g_peer_gone = 0u;
 			g_link_live = 1u;
 			g_sessions++;
@@ -720,11 +945,24 @@ static void nsh_entry(ULONG arg)
 			break;
 
 		case NET_SHELL_SESSION:
-			/* Nothing to do while a client is attached: the callbacks move the
-			 * bytes.  Wait for the disconnect, waking periodically so a stop
-			 * request and a vanished interface are both noticed. */
-			(void)tx_event_flags_get(&g_evt, NSH_EVT_DISC | NSH_EVT_CMD,
-			                         TX_OR_CLEAR, &f, NSH_IDLE_MS);
+			/*
+			 * Push whatever the shell queued, then wait -- briefly if the ring
+			 * still holds something, otherwise until something happens.  Bytes
+			 * left over mean either the socket refused (and NetX may not call
+			 * anything back) or NSH_TX_BURST capped the pass; both want another
+			 * pass soon rather than a full idle sleep.
+			 *
+			 * The RING, not the flag, decides: producers fill it and THEN raise
+			 * NSH_EVT_TX, so reading the count after draining and before arming
+			 * the wait cannot miss a producer.  One that lands in between finds
+			 * the flag sticky and the wait returns at once.
+			 */
+			(void)nsh_tx_drain();
+			(void)tx_event_flags_get(&g_evt,
+			                         NSH_EVT_DISC | NSH_EVT_CMD | NSH_EVT_TX,
+			                         TX_OR_CLEAR, &f,
+			                         cli_uart_ring_count(&g_ctx.tx) != 0u
+			                                 ? NSH_DRAIN_POLL_MS : NSH_IDLE_MS);
 			if (g_req_stop)
 				break;                 /* handled at the top of the loop */
 			if (!nx_net_is_up()) {
@@ -749,8 +987,6 @@ static void nsh_entry(ULONG arg)
 int net_shell_init(void)
 {
 	if (tx_event_flags_create(&g_evt, "nshell") != TX_SUCCESS)
-		return -1;
-	if (tx_mutex_create(&g_sock_lock, "nshsock", TX_INHERIT) != TX_SUCCESS)
 		return -1;
 	if (tx_thread_create(&g_thread, "net-shell", nsh_entry, 0,
 	                     g_stack, sizeof g_stack, NSH_PRIORITY, NSH_PRIORITY,
@@ -911,9 +1147,18 @@ void net_shell_print_status(struct cli_instance *sh)
 	cli_print(sh, "  sessions  %lu   rx %lu B   tx %lu B   rx-drops %lu\r\n",
 	          (unsigned long)g_sessions, (unsigned long)g_rx_bytes,
 	          (unsigned long)g_tx_bytes, (unsigned long)g_rx_drops);
-	cli_print(sh, "  tx waits  %lu (back-pressure, normal)   no-buf %lu%s   busy %lu\r\n",
-	          (unsigned long)g_tx_wait, (unsigned long)g_tx_nobuf,
-	          g_tx_nobuf ? "  <-- pool too small" : "", (unsigned long)g_tx_busy);
+	cli_print(sh, "  tx queue  %lu (back-pressure, normal)   window %lu%s   no-buf %lu%s\r\n",
+	          (unsigned long)g_tx_qdepth, (unsigned long)g_tx_win,
+	          g_tx_win ? "  <-- peer is not reading" : "",
+	          (unsigned long)g_tx_nobuf,
+	          g_tx_nobuf ? "  <-- pool too small" : "");
+	/* The ring high-water says whether the CLI ever had to wait at all, and dropped says
+	 * whether that wait ran out -- the pair issue #48 had no way to ask for.  Non-zero
+	 * `dropped` means output was LOST, which is otherwise entirely silent. */
+	cli_print(sh, "  tx ring   %lu/%u B peak   dropped %lu B%s\r\n",
+	          (unsigned long)g_tx_hiwater, (unsigned)(NSH_TX_RING - 1u),
+	          (unsigned long)(g_ctx.sh ? g_ctx.sh->tx_dropped : 0u),
+	          (g_ctx.sh && g_ctx.sh->tx_dropped) ? "  <-- output was truncated" : "");
 	if (g_last != NULL)
 		cli_print(sh, "  last      %s\r\n", g_last);
 	/*
@@ -924,10 +1169,13 @@ void net_shell_print_status(struct cli_instance *sh)
 	 * cancel_req, and survives a reset.
 	 */
 	LOG_INF("status: %s, port %u, auto-arm %s, sessions %lu, rx %lu B, tx %lu B, "
-	        "rx-drops %lu, tx waits %lu, no-buf %lu, busy %lu, last: %s",
+	        "rx-drops %lu, tx queue %lu, window %lu, no-buf %lu, ring peak %lu B, "
+	        "dropped %lu B, last: %s",
 	        st, (unsigned)g_port, g_autoarm ? "on" : "off", (unsigned long)g_sessions,
 	        (unsigned long)g_rx_bytes, (unsigned long)g_tx_bytes,
-	        (unsigned long)g_rx_drops, (unsigned long)g_tx_wait,
-	        (unsigned long)g_tx_nobuf, (unsigned long)g_tx_busy,
+	        (unsigned long)g_rx_drops, (unsigned long)g_tx_qdepth,
+	        (unsigned long)g_tx_win, (unsigned long)g_tx_nobuf,
+	        (unsigned long)g_tx_hiwater,
+	        (unsigned long)(g_ctx.sh ? g_ctx.sh->tx_dropped : 0u),
 	        g_last ? g_last : "?");
 }

@@ -71,6 +71,7 @@ REQUIRED_DTCM = (
     "_tx_timer_thread_stack_area",  # ThreadX timer thread (upstream; linker pattern)
     "rtl_ring",                     # RTL8720 UART RX ring, ~75 k interrupts/s
     "rtl_tx_ring",                  # RTL8720 UART TX ring
+    "nsh_tx_buf",                   # telnet console TX ring (issue #48)
 )
 
 # Must stay in AXI-SRAM: a bus master writes or reads these directly.

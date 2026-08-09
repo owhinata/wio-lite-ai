@@ -75,7 +75,10 @@ extern const struct cli_transport_api cli_usbcdc_api;
  */
 #define CLI_BACKEND_USBCDC_DEFINE(_name)                                       \
 	static struct cli_usbcdc    _name##_ctx;                                \
-	static struct cli_transport _name = { &cli_usbcdc_api, NULL, &_name##_ctx }
+	static struct cli_transport _name = {                                   \
+		.api = &cli_usbcdc_api,                                         \
+		.ctx = &_name##_ctx,                                            \
+	}
 
 /**
  * USB-thread bridge: shuttle bytes between this transport's rings and the TinyUSB

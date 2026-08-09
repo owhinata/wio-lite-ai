@@ -38,7 +38,12 @@ extern "C" {
 
 /* Event-flag bits signalled to an instance thread. */
 #define CLI_EVT_RX    0x1u   /**< RX data available (set by the backend / ISR) */
-#define CLI_EVT_TX    0x2u   /**< reserved for #5 flow control; unused in #4 */
+#define CLI_EVT_TX    0x2u   /**< TX space freed: the backend sets it after a short
+                              *   write() has room again, and cli_tx_send_blocking()
+                              *   suspends on it (issue #5 flow control).  Every backend
+                              *   OWES this after refusing bytes -- a path that can refuse
+                              *   without ever setting it makes the core wait out its
+                              *   deadline and DROP the rest of the output (issue #48). */
 #define CLI_EVT_KILL  0x4u   /**< request the thread to stop (full stop is future) */
 #define CLI_EVT_CONN  0x8u   /**< a transport (re)connected: begin a fresh session
                               *   (issue #49 P4 -- the TCP backend posts this on
@@ -107,6 +112,20 @@ struct cli_transport {
 	const struct cli_transport_api *api;
 	struct cli_instance            *sh;   /**< set by cli_init() */
 	void                           *ctx;  /**< backend-private (owns the HAL handle etc.) */
+	/**
+	 * How long an output may make no progress before the rest of it is dropped, in
+	 * ThreadX ticks.  0 (the default, and what every backend but one leaves it at)
+	 * means CLI_TX_TIMEOUT.
+	 *
+	 * It lives on the TRANSPORT rather than the instance because it is a property
+	 * of the backend: the number has to exceed however long that backend can
+	 * legitimately take to free space.  For a ring drained by a local thread that
+	 * is microseconds; for the telnet console (app/net_shell.c) recovery can mean
+	 * a TCP retransmit, so a deadline shorter than the RTO turns one lost segment
+	 * into a truncated report -- issue #48.  A background job inherits it for free,
+	 * because cli_job.c aliases the worker's tr to the foreground's.
+	 */
+	ULONG                           tx_timeout;
 };
 
 /**
