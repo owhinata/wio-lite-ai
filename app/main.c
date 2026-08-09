@@ -46,9 +46,16 @@
 #include "camera.h"     /* FPC-24 DVP camera: XCLK + SCCB bring-up (issue #8) */
 #if BSP_ENABLE_LCD
 #include "cam_preview.h" /* live camera preview on the LCD (issue #8 phase 3c) */
+#endif
+#endif
+/* 🔴 UNCONDITIONAL, and it has to be (issue #50).  usb_stack and iwdg_stack
+ * below are DTCM_BSS in every configuration, so this include cannot sit inside
+ * the camera/LCD guards it used to -- BSP_ENABLE_CAMERA=OFF then left DTCM_BSS
+ * undefined and the build failed on a stack that has nothing to do with either
+ * option.  Which defeated the point of the switch: it exists to produce a
+ * firmware that leaves a peripheral alone while bisecting a suspicion, and it
+ * was unusable exactly when something was already wrong. */
 #include "mem_sections.h"  /* DTCM_BSS: CPU-only data out of AXI-SRAM (issue #46) */
-#endif
-#endif
 
 /* --- interactive shell over USB CDC ------------------------------------- */
 CLI_BACKEND_USBCDC_DEFINE(cdc_tr);

@@ -22,7 +22,7 @@ under load.
 So the checks below, on suffix-stripped base names (LTO renames these: the linked
 image really does contain `cam_ring.lto_priv.0`):
 
-  1. CACHE SAFETY -- every symbol in MUST_STAY_NONCACHEABLE lies OUTSIDE the MPU
+  1. CACHE SAFETY -- every symbol given with --noncacheable lies OUTSIDE the MPU
      region, not merely outside the .psram_ai section.  The region is what makes
      memory cacheable, and it covers the whole 2 MB whether or not the linker put
      anything there, so a raw address or a future section inside the window would be
@@ -67,21 +67,28 @@ PSRAM_AI_LENGTH = 2 * 1024 * 1024
 #   null:  null_in_buf, null_box_buf, null_scr_buf, psram_ai_bench_buf
 #   tflm:  nn_tflm_arena, nn_tflm_model_buf, psram_ai_bench_buf
 
-# Must stay OUTSIDE it: every PSRAM buffer a bus master touches.  All three are
-# coherent today only because the window they sit in is non-cacheable, and none of
-# the drivers issues any cache maintenance at all.
+# Must stay OUTSIDE it: every PSRAM buffer a bus master touches.  These are coherent
+# today only because the window they sit in is non-cacheable, and none of the drivers
+# issues any cache maintenance at all.
 #
 #   ltdc_fb    LTDC read DMA + DMA2D writes (port/ltdc/ltdc_display.c).  The worst of
-#              the three: the display controller reads it CONTINUOUSLY while scan-out
-#              is on, so there is no quiet moment in which a clean could catch up.
+#              them: the display controller reads it CONTINUOUSLY while scan-out is
+#              on, so there is no quiet moment in which a clean could catch up.
 #   cam_ring   DCMI via DMA2_Stream1, double-buffered while streaming (port/camera).
 #   cam_frame  DCMI target for a single capture, same file, same reasoning -- its own
 #              declaration spells the cache contract out.
-MUST_STAY_NONCACHEABLE = (
-    "ltdc_fb",
-    "cam_ring",
-    "cam_frame",
-)
+#
+# 🔴 THEY ARE PASSED IN WITH --noncacheable, NOT LISTED HERE, and for the same reason
+# --require is passed in: every one of them belongs to a BSP_ENABLE_* option, and a
+# name this script demands from a build that never compiled it is reported as "no such
+# object in the image" -- which reads like a placement regression and is not one.
+# check_dtcm_residency.py learned this in issue #9 phase 2c, when a hardcoded
+# sd_bounce made BSP_ENABLE_SD=OFF unbuildable; this file kept its own hardcoded list
+# and made BSP_ENABLE_CAMERA=OFF unbuildable in exactly the same way (issue #50).
+# The rule both scripts now follow: ONLY residents that exist in EVERY configuration
+# may be named in the source; anything a toggle can remove comes from CMakeLists.txt,
+# which is the only place that knows what was built.
+MUST_STAY_NONCACHEABLE = ()
 
 # GCC clone/localisation suffixes; they stack, so stripping repeats.  Same set as
 # cmake/check_dtcm_residency.py -- kept in step with it deliberately.
@@ -184,6 +191,10 @@ def main():
     ap.add_argument("--require", action="append", metavar="SYMBOL", default=[],
                     help="base name of an object that must live in .psram_ai; repeat "
                          "once per object (the set depends on CONFIG_NN_BACKEND)")
+    ap.add_argument("--noncacheable", action="append", metavar="SYMBOL", default=[],
+                    help="base name of a PSRAM buffer a bus master touches, which "
+                         "must therefore stay OUT of the cacheable carve-out; repeat "
+                         "once per object (the set depends on BSP_ENABLE_*)")
     args = ap.parse_args()
 
     # No --require at all would leave only the DMA-safety half running, and report OK
@@ -207,8 +218,12 @@ def main():
 
     region_end = PSRAM_AI_ORIGIN + PSRAM_AI_LENGTH
 
+    # Union, exactly as check_dtcm_residency.py does: the tuple above holds what
+    # exists in every configuration (nothing, today), CMakeLists.txt supplies the rest.
+    noncacheable = tuple(MUST_STAY_NONCACHEABLE) + tuple(args.noncacheable)
+
     failures = check_out_of_range(
-        syms, MUST_STAY_NONCACHEABLE, PSRAM_AI_ORIGIN, region_end,
+        syms, noncacheable, PSRAM_AI_ORIGIN, region_end,
         "the cacheable PSRAM carve-out",
         "A bus master owns this buffer, and every driver that shares it with the CPU "
         "relies on the PSRAM window being non-cacheable instead of issuing cache "
@@ -229,7 +244,7 @@ def main():
 
     print(f"check_psram_ai_residency: OK -- {ai_end - ai_start} B in .psram_ai at "
           f"0x{ai_start:08x}, {len(args.require)} required residents, "
-          f"{len(MUST_STAY_NONCACHEABLE)} DMA buffer(s) still non-cacheable")
+          f"{len(noncacheable)} DMA buffer(s) still non-cacheable")
     return 0
 
 

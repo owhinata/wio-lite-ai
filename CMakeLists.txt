@@ -559,6 +559,20 @@ list(APPEND NN_PSRAM_AI_REQUIRED --require psram_ai_bench_buf)
 list(APPEND NN_SOURCES "${CMAKE_SOURCE_DIR}/port/nn/models/blazeface.c")
 list(APPEND NN_PSRAM_AI_REQUIRED
      --require bf_cx --require bf_cy --require bf_cand)
+# The other half of that gate: PSRAM buffers a bus master owns, which must stay OUT
+# of the cacheable carve-out.  Named here rather than in the script for the same
+# reason as the DTCM list above -- each belongs to a BSP_ENABLE_* option, and a name
+# demanded from a build that never compiled it is reported as "no such object in the
+# image", which reads like a placement regression and is not one.  That is issue #50:
+# check_dtcm_residency.py was fixed this way in issue #9 phase 2c while this gate kept
+# its hard-coded list, so BSP_ENABLE_CAMERA=OFF still could not be built.
+if(BSP_ENABLE_LCD)
+    list(APPEND NN_PSRAM_AI_REQUIRED --noncacheable ltdc_fb)   # LTDC scan-out + DMA2D
+endif()
+if(BSP_ENABLE_CAMERA)
+    list(APPEND NN_PSRAM_AI_REQUIRED --noncacheable cam_ring)  # DCMI via DMA2_Stream1
+    list(APPEND NN_PSRAM_AI_REQUIRED --noncacheable cam_frame) # DCMI single capture
+endif()
 list(APPEND SHELL_SOURCES ${NN_SOURCES} "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_ai.c")
 
 add_executable(shell
