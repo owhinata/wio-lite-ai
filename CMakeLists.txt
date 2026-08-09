@@ -471,6 +471,35 @@ if(BSP_ENABLE_CAMERA)
     endif()
 endif()
 
+# issue #9: on-device NN inference.  Unlike the blocks above there is no
+# BSP_ENABLE_AI: the BSP_ENABLE_* switches all name a piece of HARDWARE, and their
+# point is to build a firmware that leaves those pins and peripherals alone while
+# bisecting a suspicion.  This is a software layer with no hardware of its own, so
+# what varies is not whether it exists but WHICH RUNTIME it dispatches to.
+#
+# Exactly one backend translation unit is compiled, and that is the whole selection
+# mechanism: nn.c has one `extern const struct nn_backend_vt nn_backend_vt_selected`
+# and the linker resolves it against whichever backend was added here.  No source
+# file has an #ifdef for this, and the default `null` build needs no -D at all.
+#
+# If the app partition ever gets tight again (issue #39), a `none` value that drops
+# the whole layer is the natural place to add the toggle.
+set(CONFIG_NN_BACKEND "null" CACHE STRING "NN inference backend: null | tflm")
+set_property(CACHE CONFIG_NN_BACKEND PROPERTY STRINGS null tflm)
+
+set(NN_SOURCES "${CMAKE_SOURCE_DIR}/port/nn/nn.c")
+if(CONFIG_NN_BACKEND STREQUAL "null")
+    list(APPEND NN_SOURCES "${CMAKE_SOURCE_DIR}/port/nn/nn_null.c")
+elseif(CONFIG_NN_BACKEND STREQUAL "tflm")
+    message(FATAL_ERROR
+        "CONFIG_NN_BACKEND=tflm: the TensorFlow Lite Micro backend arrives in issue "
+        "#9 phase 2c -- it needs C++ enabled for this project, the CMSIS-NN kernels, "
+        "and a model in the external NOR blob region (issue #10).")
+else()
+    message(FATAL_ERROR "CONFIG_NN_BACKEND must be 'null' or 'tflm'")
+endif()
+list(APPEND SHELL_SOURCES ${NN_SOURCES} "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_ai.c")
+
 add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/main.c"
     "${CMAKE_SOURCE_DIR}/app/usb_cdc.c"
@@ -515,6 +544,7 @@ target_include_directories(shell PRIVATE
     "${CMAKE_SOURCE_DIR}/port/ltdc"              # issue #7: ltdc_display.h
     "${CMAKE_SOURCE_DIR}/port/camera"            # issue #8: camera.h
     "${CMAKE_SOURCE_DIR}/port/nor"               # issue #37: nor_flash.h
+    "${CMAKE_SOURCE_DIR}/port/nn"                # issue #9: nn.h / nn_backend.h
     # issue #37: our fdb_cfg.h / fal_cfg.h must be found BEFORE FlashDB's own inc/,
     # which ships fdb_cfg_template.h only -- FlashDB includes <fdb_cfg.h> by name.
     "${CMAKE_SOURCE_DIR}/port/flashdb"

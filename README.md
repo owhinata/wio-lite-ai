@@ -25,7 +25,7 @@ its clock tree** — see *Key design points*.
 Presents a `wio> ` prompt on **`/dev/ttyACM0`** (USB CDC, `0483:5740`, "CDC in FS
 Mode") with line editing, history, and Tab completion — and, once the board is on WiFi,
 the same shell over **telnet** (`wio-net> `, see `net shell` below), usable at the same
-time as the USB console. 24 commands:
+time as the USB console. 27 commands:
 
 | Group | Commands |
 |---|---|
@@ -34,6 +34,7 @@ time as the USB console. 24 commands:
 | timing / jobs | `sleep` · `usleep` · `watch` · `jobs` · `kill` |
 | storage | `sd` (card: info/read/format · FAT: ls/cat/write/rm/mkdir/df/umount) · `nor` (info/read/erase/write/test) · `kv` (list/get/set/desc/del/info/format) |
 | display | `lcd` (info/on/off · fill/bar/grad/clear/anim/blit) |
+| camera / AI | `camera` (probe/on/off/info/scan · capture/save/send · stream start/stop/stats · preview · reg) · `ai` (info/bench) |
 | diagnostics | `devmem` (peek/poke/dump) · `dmesg` · `crash` (bus/undef/div0) · `wdt` (info/starve) · `psram` (info/test/mmapscan/…) |
 | wireless | `wifi` (L2: info/on/off/reset/log/ver · connect/status/disconnect/scan · **link** info/baud/bench/dbench · **flash** info/read/backup/imgload/imginfo/write) · `net` (L3 = **host NetX Duo only**: info/ip/dhcp/ping/echo/shell) |
 | benchmarks | `coremark` · `membench` |
@@ -55,6 +56,18 @@ time as the USB console. 24 commands:
 - **`coremark`** — EEMBC CoreMark. **≈2333 (4.24 CoreMark/MHz)** with both L1 caches on.
 - **`membench`** — DWT-cycle-precise read/write/copy bandwidth + pointer-chase
   latency for DTCM / AXI-SRAM (cached vs refill) / PSRAM / internal + external flash.
+- **`ai`** — the on-device inference layer (issue #9). `port/nn` is a backend-agnostic
+  tensor-in/tensor-out API, and each build links **exactly one** backend behind it —
+  selected by `-DCONFIG_NN_BACKEND`, resolved purely at link time (one translation
+  unit defines `nn_backend_vt_selected`, so no source file carries an `#ifdef` for
+  it). Today that is **`null`: a synthetic stub, not an inference runtime**, and
+  `ai info` says so. It exists to bring the whole path up and prove it on the board
+  — the vtable, the race-free singleton open, the single-session guard that stops
+  the two consoles racing, the cycle measurement and the command — before the real
+  runtime, a model and C++ arrive. `ai bench [n]` reports min/avg/max latency from
+  the DWT cycle counter. **The stub's run() is not empty on purpose**: an empty one
+  reports zero cycles, and zero is also what a *broken* counter reports, so it is
+  the one reading that cannot tell "measured correctly" from "measured nothing".
 - **`kv`** — the **persistent configuration store**: a FlashDB key-value database in
   the first megabyte of that NOR. Each entry carries its **type** (`str`/`u32`/`bool`/
   `bytes`) and a **description**, both stored on the flash next to the value, so a
@@ -1003,6 +1016,11 @@ port/       threadx/ ThreadX low-level init + shared SysTick glue
                      PWDN/RESETB, sensor identification (issue #8 phase 1) and
                      QVGA RGB565 snapshot over DMA2_Stream1 (phase 2).
                      ov2640_regs.c holds ST's register table (BSD-3, see NOTICE)
+            nn/      backend-agnostic NN inference API (issue #9): nn.h/nn.c
+                     dispatch + DWT timing + the single-session guard,
+                     nn_backend.h the vtable one backend implements, and
+                     nn_null.c that stub backend.  CONFIG_NN_BACKEND picks which
+                     backend translation unit is compiled in
             coremark/ EEMBC CoreMark port (core_portme.*)
             netxduo/ nx_user.h (NetX Duo build configuration; the driver is in app/,
                      because what it sits on is the RTL8720 link, not a MAC)
@@ -1032,8 +1050,8 @@ Listed in memory-hierarchy order — the same order `free` and `membench` print
 | ITCM | `0x00000000` | 64 KB; holds the **interrupt paths** (`.itcm`, 2,784 B): ThreadX PendSV + SysTick, the RTL8720 UART RX ISR **and the whole wake-up it signals** (`tx_event_flags_set` + `_tx_thread_system_resume`, issue #23 U0-3 — that call alone had put the ISR back to 4.3 µs warm / 12.9 µs cold — plus their two tails `_tx_thread_system_preempt_check` + `_tx_timer_system_deactivate`, issue #29), and the fault handlers, plus the 4 KB `.itcm_bench` scratch. Zero-wait-state and outside both caches, so an ISR never pays a cold fetch through the 16 KB I-cache: measured against the external-XIP build the same UART ISR went from **8.7 µs cold / 3.3 µs warm to a flat 0.7 µs** (issue #24). The tails matter because they only run when a thread is *really* woken — with them still in the flash, request/reply commands (`wifi ver`, `wifi scan`) measured 3.5 µs against 0.1 µs for an ISR that wakes nobody; 106 bytes of ITCM took that to **1.5 µs**, and `wifi link bench` improved 2.1 → 1.5 µs too. Those figures were taken while the app ran from the external flash; issue #25 shrank the gap without closing it (ITCM is still zero-wait and never evicted). Loaded from its load image by `SystemInit()`, which also zero-fills all 64 KB to initialise the TCM ECC; kept read-only by the MPU so a NULL write raises MemManage instead of corrupting ISR code. |
 | DTCM | `0x20000000` | 128 KB, and since issue #46 it holds **all the CPU-only hot data**: the reset-persistent `.log_noinit` crash-log ring, the **32 KB NetX Duo packet pool** (`.nx_pool`, issue #23 U3), `membench` scratch, `.dtcm_bss` = **every ThreadX thread stack and the two RTL8720 UART rings** (48,640 B), and at the very top the **main (MSP/ISR) stack**, 8 KB ending at `_estack = 0x20020000`. All of it bypasses the D-cache — which for stacks is the point, not a side effect. The bootloader accepts a DTCM MSP: it validates the app's `vector[0]` against the on-chip RAM regions and `0x20000000` is one of them (`boot/main.c`), so `boot/` is unchanged. There is **no MPU guard page** below the main stack: ARMv7-M has no MSPLIM, so a guard faults while stacking the very exception meant to report it and locks up (PM0253 sec 2.5.1/2.5.2/2.5.5). `SystemInit()` stamps the unused stack with a pattern instead and `free` reports the high-water mark. |
 | AXI-SRAM (D1) | `0x24000000` | 320 KB, **reserved for what a bus master has to reach** (issue #46): `.data`/`.bss`, the heap (up to `__ram_end`), and `.axi_dma` — the 4 KB SDMMC1 bounce buffer (issue #6) and the 2 × 38,400 B camera band buffers (issue #35), in their **own output section, 32 B-aligned at both ends**, so a driver's per-transfer clean/invalidate cannot disturb a neighbouring variable's cache line. DMA1/DMA2 and the SDMMC1 IDMA **cannot address either TCM** (RM0468 sec 2.1.2/2.1.5/2.1.6), which makes this the scarce memory: a survey of every `*_DMA()` call found only three master-touched buffers in the whole firmware, so the other 217 KB sitting here was CPU-only data occupying the one region the camera's DCMI band (issue #35) has no substitute for. Moving it out took usage from **221,024 B to 135,520 B**; issue #35 then spent 76,800 B of that on the band buffers, leaving **115,264 B** free. 🔴 Putting a DMA buffer in DTCM does not fault — the transfer silently moves nothing — so both directions are checked after every link by `cmake/check_dtcm_residency.py`. |
-| FLASH | `0x08020000` | internal flash **sectors 1-3 = 384 KB** (issue #25). Sector 0 (`0x08000000`, 128 KB) is the DFU bootloader; the 128 KB erase granule is what keeps the two apart, so no programming path can reach it. ~905 MB/s read (`membench`). The image currently uses **272,112 B = 69.2%**; see [Build](#build) for why it is built `-Os` + LTO. |
-| PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). Since issue #7 the first 300 KB are the **LTDC double frame buffer**, which the display controller reads continuously while scanout is on — hence the `lcd off` interlock on every path that retunes OCTOSPI1. |
+| FLASH | `0x08020000` | internal flash **sectors 1-3 = 384 KB** (issue #25). Sector 0 (`0x08000000`, 128 KB) is the DFU bootloader; the 128 KB erase granule is what keeps the two apart, so no programming path can reach it. ~905 MB/s read (`membench`). The image currently uses **277,684 B = 70.6%**; see [Build](#build) for why it is built `-Os` + LTO. |
+| PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). Since issue #7 the first 300 KB are the **LTDC double frame buffer**, which the display controller reads continuously while scanout is on — hence the `lcd off` interlock on every path that retunes OCTOSPI1. Issue #9 added the 17 KB of `ai` stub tensors here for the same reason the bulk buffers are here and not in AXI-SRAM: they are large and CPU-only, and AXI-SRAM is reserved for what a bus master has to reach. Note that the DTCM figure the linker prints as "free" is not spendable — the top 8 KB of it is the main stack, so the real headroom there is about 7.6 KB. |
 | *(bootloader)* | `0x08000000` | internal flash **sector 0, 128 KB** — the DFU bootloader. The app does not own it and no app-side path can erase it (the 128 KB erase granule is the sector granule). |
 | *(external flash)* | `0x70000000` | the 16 MB W25Q128 the app used to execute from, now storage: its **first 1 MB is the `kv` configuration partition** (FlashDB) and the remaining 15 MB is reserved for the blob region issue #10 still has to design — deliberately with no FAL partition entry, so nothing can reach it by accident. **Deliberately still not mapped**, even though issue #37 brought OCTOSPI2 back up: `port/nor` reaches the device only through indirect transactions, and `app/mpu.c` keeps the 256 MB window no-access + execute-never so a stray or *speculative* access raises MemManage (recorded in `dmesg`) instead of hitting a controller that is not in memory-mapped mode. Opening a window here is a separate design with its own MPU region. |
 
