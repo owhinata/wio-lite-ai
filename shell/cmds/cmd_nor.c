@@ -26,6 +26,12 @@
  * Addresses are device offsets (0 .. 16 MB), not 0x70000000 pointers: the window
  * is never memory-mapped and stays fenced off in the MPU (see port/nor).
  *
+ * EVERY SUBCOMMAND HERE REACHES THE BARE DEVICE, past both of its tenants.  Two
+ * ranges hold live data and nothing in this file will stop you from erasing them:
+ * [0, 1 MB) is the `kv` configuration partition (app/kv.c) and [1 MB, 3 MB) is the
+ * blob region's eight asset slots (app/blob.c).  Use `kv` and `blob` for those; this
+ * is the tool for looking at the device itself, and it is deliberately unguarded.
+ *
  * Clean-room design; no third-party code reused.
  */
 #include "cli.h"
@@ -45,11 +51,20 @@
 #define NOR_WRITE_MAX     NOR_PAGE_SIZE
 
 /*
- * Default scratch sector for `nor test`.  Deliberately at 1 MB -- the first
- * sector *above* the KV partition, in the 15 MB reserved for future blobs -- so
- * running the acceptance test never destroys a live configuration.
+ * Default scratch sector for `nor test`.  At 3 MB -- the first sector ABOVE the
+ * blob region (issue #10 put eight 256 KB asset slots at 1 MB .. 3 MB), in the
+ * 13 MB that is still unallocated -- so running the acceptance test destroys
+ * neither a live configuration nor a stored model.
+ *
+ * It used to be 0x00100000, chosen when everything past the KV partition was spare;
+ * the blob region moved in on top of it, which would have made a bare `nor test`
+ * erase slot 0's HEADER and silently retire the blob stored there.  The lesson is
+ * in the default, not in a check: `nor` is the raw-device debugging tool, so an
+ * EXPLICIT address inside the blob region is still honoured (as `nor erase` and
+ * `nor write` would be) -- it is the argument-less form, the one that gets typed
+ * without thinking, that has to land somewhere harmless.
  */
-#define NOR_TEST_DEFAULT_ADDR  0x00100000u
+#define NOR_TEST_DEFAULT_ADDR  0x00300000u
 
 static const char *nor_strerror(int rc)
 {
@@ -419,7 +434,7 @@ CLI_SUBCMD_SET_CREATE(nor_subcmds,
 	CLI_CMD_ARG(read,  NULL, "hexdump <addr> [len]",                      cmd_nor_read,  2, 1),
 	CLI_CMD_ARG(erase, NULL, "erase 4 KB sector(s) <addr> [len]",         cmd_nor_erase, 2, 1),
 	CLI_CMD_ARG(write, NULL, "program <addr> <hex> (erase first)",        cmd_nor_write, 3, 0),
-	CLI_CMD_ARG(test,  NULL, "partial-page-program acceptance test [addr]", cmd_nor_test, 1, 1),
+	CLI_CMD_ARG(test,  NULL, "partial-page-program acceptance test [addr] (defaults to 0x300000, above kv+blob)", cmd_nor_test, 1, 1),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(nor, nor_subcmds,

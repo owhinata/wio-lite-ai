@@ -579,8 +579,11 @@ static int cmd_flash_imgload(struct cli_instance *sh, int argc, char **argv)
 	          (unsigned long)PSRAM_BASE_ADDR, (unsigned long)RTL_IMG_MAX);
 	/* xfer_recv_sink_locked() does not print this (its caller owns the console), but
 	 * the handshake budget is only long enough if the operator starts now. */
+	/* Not "Ctrl+C aborts": a receive has no local abort (cmd_xfer.h) -- 0x03 is
+	 * ordinary file data and cannot be told apart from a keypress. */
 	cli_print(sh, "wifi: start the sender now -- `sb <file>` (lrzsz YMODEM batch send; "
-	          "`sz` will NOT work), or Ctrl+A Ctrl+S in picocom; Ctrl+C aborts\r\n");
+	          "`sz` will NOT work), or Ctrl+A Ctrl+S in picocom; cancel the sender on "
+	          "the PC to abort\r\n");
 	rc = xfer_recv_sink_locked(sh, rtl_img_sink());
 
 	/* Print the transfer post-mortem BEFORE branching, so a failure is as

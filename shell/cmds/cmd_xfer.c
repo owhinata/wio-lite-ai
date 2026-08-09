@@ -65,6 +65,74 @@ static int io_put(void *ctx, const uint8_t *buf, size_t len)
 	return cli_write((struct cli_instance *)ctx, buf, len) < 0 ? -1 : 0;
 }
 
+/* ---- post-failure drain --------------------------------------------------- *
+ *
+ * After a FAILED transfer, keep discarding until the line goes quiet.
+ *
+ * ONE cli_rx_flush() IS NOT ENOUGH, and issue #10 caught it on hardware: a peer
+ * that has just been sent CAN does not stop instantly.  lrzsz retries the block it
+ * was on a couple of times before it accepts the cancel, and those retries arrive
+ * AFTER the flush -- so they land in the line editor, which echoes them and RUNS
+ * THEM AS A COMMAND.  Rejecting an oversized file with `blob write` put the
+ * sender's block 0 (filename, size, mtime, mode) on the prompt and executed the
+ * filename.  It printed "command not found" that time; the point is that it is the
+ * SENDER choosing what the shell executes, which is not a thing to leave in.
+ *
+ * Bounded two ways, because the peer might not stop at all: a quiet window that
+ * ends as soon as nothing more arrives, and a byte cap so the loop terminates
+ * against a peer that never stops.  Both directions drain -- a receiver that never
+ * saw our CAN goes on NAKing exactly like a sender does.
+ *
+ * BE HONEST ABOUT WHAT THE CAP MEANS.  Hitting it is not a clean finish: it is
+ * "stopped discarding while bytes were still coming", i.e. the original bug again.
+ * So it is set far past anything a real peer emits after a CAN -- lrzsz's retried
+ * block 0 is ~133 B, and this is 256 KB, which USB CDC moves in a fraction of a
+ * second, because draining bytes is nearly free while returning early is exactly
+ * what puts them on the prompt.  If it is ever reached anyway, that is SAID, on the
+ * console and in the log, rather than being allowed to read as a clean drain.
+ *
+ * Nor is the quiet window a proof of quiescence -- nothing available here is.  A
+ * peer that goes quiet for a second and then retries can still get bytes to the
+ * prompt.  It is a mitigation sized against measured behaviour (on board #2, lrzsz
+ * retried twice within well under a second and then quit), not a guarantee.  What
+ * keeps that acceptable is that the sender and the console operator are the SAME
+ * party: this is robustness, not a privilege boundary being defended.
+ *
+ * ONLY ON THE FAILURE PATH.  After YM_OK the batch is closed and the peer has
+ * stopped by construction, so the proven success path keeps its timing unchanged.
+ */
+#define XFER_DRAIN_QUIET_MS    1000u
+#define XFER_DRAIN_MAX_BYTES   262144u
+
+static void xfer_drain_until_quiet(struct cli_instance *sh)
+{
+	uint32_t dropped = 0u;
+
+	while (dropped < XFER_DRAIN_MAX_BYTES) {
+		/* <0 is either the quiet window expiring or the session going away;
+		 * both mean stop.  cli_read_byte() waits on an event flag rather than
+		 * spinning, so the IWDG petter keeps running throughout. */
+		if (cli_read_byte(sh, XFER_DRAIN_QUIET_MS) < 0)
+			break;
+		dropped++;
+	}
+	cli_rx_flush(sh);
+
+	if (dropped >= XFER_DRAIN_MAX_BYTES) {
+		cli_warn(sh, "xfer: the peer is STILL sending -- stopped discarding after "
+		         "%lu B, so stray bytes may reach the prompt and be run as a "
+		         "command. Stop the program on the PC.\r\n",
+		         (unsigned long)dropped);
+		log_write(LOG_LEVEL_WRN, "xfer",
+		          "drain cap hit at %lu B -- peer did not stop",
+		          (unsigned long)dropped);
+	} else if (dropped != 0u) {
+		log_write(LOG_LEVEL_INF, "xfer",
+		          "drained %lu late byte(s) from the peer after a failed transfer",
+		          (unsigned long)dropped);
+	}
+}
+
 int xfer_send_source_locked(struct cli_instance *sh, const struct ym_source *src)
 {
 	struct ym_io   io = { sh, io_getc, io_put };
@@ -83,6 +151,8 @@ int xfer_send_source_locked(struct cli_instance *sh, const struct ym_source *src
 	cli_rx_flush(sh);                  /* drop type-ahead / the command newline */
 	res = ymodem_send(&io, src);
 	cli_rx_flush(sh);                  /* drop a trailing 'O'/'C'/garbage tail   */
+	if (res != YM_OK)
+		xfer_drain_until_quiet(sh);    /* the receiver may still be NAKing */
 
 	switch (res) {
 	case YM_OK:
@@ -151,6 +221,8 @@ int xfer_recv_sink_locked(struct cli_instance *sh, const struct ym_sink *sink)
 	cli_rx_flush(sh);                  /* drop type-ahead / the command newline */
 	res = ymodem_recv(&io, sink);
 	cli_rx_flush(sh);                  /* drop a trailing 'O'/CAN/garbage tail   */
+	if (res != YM_OK)
+		xfer_drain_until_quiet(sh);    /* the sender may still be retrying */
 
 	/*
 	 * Mirror the post-mortem into the log ring as well as the console.  While a
@@ -200,8 +272,13 @@ int xfer_recv_sink(struct cli_instance *sh, const struct ym_sink *sink)
 {
 	int rc;
 
+	/* NOT "Ctrl+C aborts", which this line claimed until issue #10 noticed it
+	 * contradicts the receive contract three functions up: while receiving, 0x03 is
+	 * file data and io_getc_recv() deliberately passes it through, so there is no
+	 * local abort at all.  Telling the operator to press a key that does nothing is
+	 * worse than telling them nothing. */
 	cli_print(sh, "ymodem: start the sender now -- e.g. `sb <file>` (lrzsz "
-	              "YMODEM batch send); Ctrl+C aborts\r\n");
+	              "YMODEM batch send); abort from the PC, not with Ctrl+C\r\n");
 
 	switch (cli_console_claim(sh)) {
 	case 0:

@@ -100,8 +100,32 @@ time as the USB console. 27 commands:
   **indirect-only** (never memory-mapped; the `0x70000000` window stays fenced off in
   the MPU — see *Key design points*). `nor info` reports the JEDEC id, geometry and the
   live controller registers; `read`/`erase`/`write` are the raw operations; `nor test`
-  is the acceptance test for the partial-page programming the coming configuration
-  store depends on. Addresses are device offsets, not pointers.
+  is the acceptance test for the partial-page programming the configuration store
+  depends on. Addresses are device offsets, not pointers. Every subcommand reaches
+  the bare device, past both of its tenants (`kv` and `blob`) — deliberately, since
+  this is the tool for looking at the device itself.
+- **`blob`** — the **asset region** on that same NOR (issue #10): eight 256 KB slots
+  at 1 MB–3 MB holding read-only files that arrive from the PC over YMODEM. It exists
+  because issue #9 supplies the TFLM model from here: a 189 KB `.tflite` does not fit
+  in the internal flash's spare ~115 KB, and linking one in would spend an internal
+  flash erase cycle (of ~10k) on every model change.
+
+  ```
+  wio> blob write 0            # erases the slot, then `sb model.tflite` on the PC
+  wio> blob list
+  slot  addr      state        size      crc32     name
+     0  100000    valid      193456  414FA339  model.tflite
+     1  140000    empty
+  ```
+
+  The blob is named by the **sender** (`sb model.tflite` → `model.tflite`), so the
+  name on the board cannot disagree with the file that was sent. `blob verify` re-reads
+  the payload and checks it against the stored CRC-32; `blob write` runs that verify
+  automatically. Two properties are worth knowing before using it: the slot is
+  **erased before the transfer starts** (so a failed transfer does not leave the old
+  contents — write to another slot to keep what you have), and **a receive has no
+  local Ctrl+C** (0x03 is ordinary file data — cancel the sender on the PC). See
+  *Key design points* for why the header is written last, and in two steps.
 - **`psram`** — the on-board **8 MB APS6408 Octal DDR PSRAM** on OCTOSPI1, memory-mapped
   at `0x90000000`, running **133 MHz Fixed Latency** (≈113 read / 154 write MB/s; see
   *Key design points*). `psram info` shows the operating state, `psram test [bytes]`
@@ -917,6 +941,54 @@ time as the USB console. 27 commands:
   touched (see *Brick safety*), and the external flash is readable over SWD or with a
   hot-air gun regardless. `kv list` masks the value so it does not end up in a pasted
   log, which is shoulder-surfing hygiene and not protection — do not treat it as such.
+- **Asset region (issue #10 / issue #9 P2b)**: `app/blob.c` puts eight 256 KB slots at
+  1 MB–3 MB of the same NOR, each holding one file received over YMODEM. It is a third
+  sibling of `port/nor` and `app/kv.c`, not a layer over either — it calls the `nor_*`
+  primitives directly and borrows exactly one thing from the database side,
+  `fdb_calc_crc32()`. Four decisions carry it:
+  - **The header is written last, and in two steps.** `ymodem.h` is explicit that
+    `YM_OK` requires reaching the sender's closing block and that any other result
+    means the caller must *discard* what the sink accumulated — so a slot's header is
+    only written once the transfer has completed, and an interrupted one leaves the
+    header sector erased and the slot reading `empty`. Written in *one* program,
+    though, a page program that failed or lost power part-way could land the magic
+    and leave the rest half-formed: a slot that looks valid and is not. So the body
+    (version, name, length, CRC) is programmed, **read back and compared**, and only
+    then is the 4-byte magic programmed by a separate call. Every outcome is either
+    "no magic, so not valid" or "magic, so the body was verified". Both programs
+    touch still-erased bytes of one 256-byte page, which is exactly the partial-page
+    programming `nor test` accepts on this device. Same trick as the DFU bootloader's
+    vector-last commit.
+  - **The stored CRC-32 comes from the received stream, not from a read-back.**
+    Deriving it from the flash after writing would make `blob verify` compare the
+    flash against itself and pass forever, however badly the write went. Computed
+    over the bytes the PC sent, it is a claim about the transfer that a later
+    read-back can falsify — which is what makes the automatic verify worth running.
+  - **The CRC-32 is not written, and not wrapped.** `fdb_calc_crc32()` is already in
+    the build and already accumulating, and it **already inverts at both ends** — so
+    starting from 0 gives standard CRC-32/ISO-HDLC, the same number as `crc32` or
+    `zlib.crc32` on the PC. Adding the usual "init `0xFFFFFFFF`, complement the
+    result" wrapper inverts twice and yields a *different* value, with no way to tell
+    whether the CRC, the transfer or the flash was at fault.
+    `shell/test/test_crc32.c` pins both the canonical vector and the chaining
+    property, on the host, without the board.
+  - **The device lock is not held across a transfer.** Each `nor_*` primitive takes
+    the recursive device mutex itself; holding it for the whole YMODEM session would
+    stall the configuration store for as long as a transfer takes and buy nothing.
+    The ranges are disjoint (FAL range-checks within a partition, and the only
+    partition is `kv` at `[0, 1 MB)`) and so is the device *state* — this driver
+    never writes a status register, never uses erase suspend/resume and never enters
+    memory-mapped mode, and each WREN → program/erase → WIP wait completes inside one
+    lock. What *is* serialised is blob-mutating operations against each other, with a
+    PRIMASK test-and-set: YMODEM only runs on the USB CDC console, but a telnet
+    session can still type `blob erase` into the middle of a `blob write`. The honest
+    cost in the other direction is that `kv format` erases a megabyte and would delay
+    a block ACK by seconds — do not run one during a transfer.
+
+  The slot is **erased before the protocol starts**, not inside the sink's `begin()`,
+  where a second of silence would land between block 0 and its ACK while the sender
+  counts retries. Nobody is waiting yet at that point. The price — a failed transfer
+  does not leave the old contents behind — is what the other seven slots are for.
 - **LCD (issue #7)**: `port/ltdc/ltdc_display.c` drives the FPC-40 RGB panel. All 28
   LTDC signals are **AF14 except `LTDC_R3` on PA15, which is AF9** — a detail taken
   from ST's own machine-readable pin data (`_ref/stm32_open_pin_data/`, cross-checked
@@ -992,6 +1064,8 @@ app/        main + USB CDC wiring, fault handlers, USB descriptors, retarget,
             OCTOSPI1 PSRAM bring-up (psram.c), MPU regions (mpu.c),
             configuration store: kv.c (the only FlashDB caller) +
             kv_boot.c (the thread that opens it, issue #37),
+            asset region: blob.c (8 x 256 KB NOR slots + the YMODEM sink,
+            issue #10),
             RTL8720DN link: erpc.c (service thread) / link_data.c (DATA channel) /
             wifi_rpc.c (typed wrappers) / rtl_link.c (ownership) /
             net_shell.c (telnet console transport + server) /
@@ -1003,7 +1077,8 @@ shell/      core/    HW-independent CLI engine (parse/edit/history/complete/...)
             test/    host unit tests (run with host gcc; see below)
 port/       threadx/ ThreadX low-level init + shared SysTick glue
             nor/     external W25Q128 NOR on OCTOSPI2, indirect-only, with the
-                     recursive device mutex the config store shares (issue #37)
+                     recursive device mutex the config store and the asset
+                     region share (issues #37, #10)
             flashdb/ FlashDB build config + its FAL device over port/nor,
                      and the log/assert hooks that keep it fail-soft (issue #37)
             sd/      microSD block driver over SDMMC1 + its internal IDMA (issue #6)
@@ -1054,7 +1129,7 @@ Listed in memory-hierarchy order — the same order `free` and `membench` print
 | FLASH | `0x08020000` | internal flash **sectors 1-3 = 384 KB** (issue #25). Sector 0 (`0x08000000`, 128 KB) is the DFU bootloader; the 128 KB erase granule is what keeps the two apart, so no programming path can reach it. ~905 MB/s read (`membench`). The image currently uses **278,052 B = 70.7%**; see [Build](#build) for why it is built `-Os` + LTO. |
 | PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). Since issue #7 the first 300 KB are the **LTDC double frame buffer**, which the display controller reads continuously while scanout is on — hence the `lcd off` interlock on every path that retunes OCTOSPI1. 🔴 **The window is no longer one kind of memory.** Issue #9 carved its **top 2 MB (`0x90600000`, `.psram_ai`) out as Normal write-back cacheable** (MPU region 3) for the NN runtime's working set, because through the non-cacheable mapping that working set is billed *one bus transaction per access* rather than per cache line — measured at ~9.8 core cycles for every byte-wide access, with the device's 113 MB/s nowhere in sight. Measured effect on the same workload: **296 µs → 114 µs, 2.6×** — and that is a *floor*, because the workload streams once with no reuse, so it collects only the line-fill amortisation and none of the cache hits real inference gets. `membench` puts the streaming half of that at read 113 → 184 MB/s and write 154 → 281 MB/s. Everything below stays non-cacheable, which is what lets the LTDC, the DMA2D and the DCMI share their buffers with the CPU with no maintenance at all. That split is the whole reason `free` prints **two** PSRAM rows, and why **nothing a bus master touches may be placed in the carve-out**: unlike the DTCM mistake, such a buffer still transfers correctly and is then read back stale, intermittently, only under cache pressure. `cmake/check_psram_ai_residency.py` refuses the build instead. Note also that the DTCM figure the linker prints as "free" is not spendable — the top 8 KB of it is the main stack, so the real headroom there is about 7.6 KB. |
 | *(bootloader)* | `0x08000000` | internal flash **sector 0, 128 KB** — the DFU bootloader. The app does not own it and no app-side path can erase it (the 128 KB erase granule is the sector granule). |
-| *(external flash)* | `0x70000000` | the 16 MB W25Q128 the app used to execute from, now storage: its **first 1 MB is the `kv` configuration partition** (FlashDB) and the remaining 15 MB is reserved for the blob region issue #10 still has to design — deliberately with no FAL partition entry, so nothing can reach it by accident. **Deliberately still not mapped**, even though issue #37 brought OCTOSPI2 back up: `port/nor` reaches the device only through indirect transactions, and `app/mpu.c` keeps the 256 MB window no-access + execute-never so a stray or *speculative* access raises MemManage (recorded in `dmesg`) instead of hitting a controller that is not in memory-mapped mode. Opening a window here is a separate design with its own MPU region. |
+| *(external flash)* | `0x70000000` | the 16 MB W25Q128 the app used to execute from, now storage: its **first 1 MB is the `kv` configuration partition** (FlashDB), **1 MB–3 MB is the `blob` asset region** (issue #10: 8 slots × 256 KB, each 4 KB header + 252 KB payload), and the remaining 13 MB is unallocated. Only the `kv` megabyte has a FAL partition entry; the blob region is addressed directly by `app/blob.c`, so a stray FAL call still cannot reach it. **Deliberately still not mapped**, even though issue #37 brought OCTOSPI2 back up: `port/nor` reaches the device only through indirect transactions, and `app/mpu.c` keeps the 256 MB window no-access + execute-never so a stray or *speculative* access raises MemManage (recorded in `dmesg`) instead of hitting a controller that is not in memory-mapped mode. Opening a window here is a separate design with its own MPU region. |
 
 ## Build
 
@@ -1178,7 +1253,9 @@ sh shell/test/run_host_tests.sh    # -> "host tests passed"
 
 Covers command registration, the parser, the RX state machine / dispatch, the
 output API, dummy-backend integration + flow control, the line editor, the history
-ring, the byte ring, and Tab completion.
+ring, the byte ring, Tab completion, the YMODEM sender and receiver, the camera
+frame pipeline, and the CRC-32 the blob region stamps assets with — the last one
+being the only part of the blob work that can be checked without the board.
 
 ## `blink` — minimal example
 

@@ -21,6 +21,7 @@ inc="$here/../include"
 core="$here/../core"
 svc="$here/../../svc"       # freestanding service layer (fmt.c / fmt.h)
 backend="$here/../backend"
+fdb="$here/../../lib/flashdb"   # third-party FlashDB (its CRC-32 is used by app/blob.c)
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 
@@ -172,6 +173,21 @@ gcc $CFLAGS -I "$svc" \
     "$here/test_ymodem_recv.c" "$svc/ymodem.c" \
     $LDFLAGS -pthread -o "$out/test_ymodem_recv"
 "$out/test_ymodem_recv"
+
+# issue #10 (#9 P2b) -- the CRC-32 the blob region stamps assets with.  app/blob.c
+# does not implement one: it reuses FlashDB's fdb_calc_crc32(), which is already in
+# the build and already accumulating.  Two properties it relies on are invisible in
+# that function's signature -- that starting from 0 gives standard CRC-32/ISO-HDLC
+# (so the board and the PC agree) and that feeding the result back in continues the
+# same CRC (so a file arriving as ~185 YMODEM blocks lands on the one-call value).
+# Pinned here because it is the only part of the blob work verifiable off the board.
+# Built against port/flashdb (fdb_cfg.h) exactly as the firmware is; the FlashDB
+# sources are third-party, hence the one relaxed warning.
+gcc $CFLAGS -Wno-unused-parameter \
+    -I "$here/../../port/flashdb" -I "$fdb/inc" -I "$fdb/port/fal/inc" \
+    "$here/test_crc32.c" "$fdb/src/fdb_utils.c" \
+    $LDFLAGS -o "$out/test_crc32"
+"$out/test_crc32"
 
 # issue #8 phase 3a -- camera frame pipeline core (svc/frame_pipeline.c): ring slot
 # acquire/publish, refcount pin/put, DROP/LATEST policy + pending transfer, detach

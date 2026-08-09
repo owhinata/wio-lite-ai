@@ -21,13 +21,16 @@
  * Partition layout of the 16 MB device.  Only the first megabyte is claimed:
  *
  *   0x000000  kv        1 MB   FlashDB KVDB, 4 KB sectors x 256
- *   0x100000  (unused) 15 MB   reserved for the read-only blob region that issue
- *                              #10 still has to design; NOTHING here touches it,
- *                              and it deliberately has no partition entry so a
- *                              stray FAL call cannot reach it either.
+ *   0x100000  blob      2 MB   the read-only asset region (issue #10): 8 slots of
+ *                              256 KB, owned by app/blob.c.  It STILL has no
+ *                              partition entry, which is the point -- blob.c
+ *                              addresses the device directly, so FAL (and through
+ *                              it FlashDB) has no route out of the first megabyte
+ *                              no matter what it is asked for.
+ *   0x300000  (unused) 13 MB   unallocated, and likewise unreachable from here.
  *
- * The store sits at offset 0 so the blob region can later grow upward without
- * moving -- and therefore without reformatting -- the configuration.
+ * The store sits at offset 0 so the asset region could grow upward without moving
+ * -- and therefore without reformatting -- the configuration.
  *
  * 1 MB is far more than the key space needs (a few kilobytes).  The slack is the
  * point: FlashDB is log-structured, so spare sectors are what turn a rewrite into

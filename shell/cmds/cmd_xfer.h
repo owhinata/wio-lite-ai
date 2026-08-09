@@ -82,6 +82,15 @@ int xfer_send_source(struct cli_instance *sh, const struct ym_source *src);
  * all the data arrived but the sender's closing block never did (ymodem_recv()
  * reports that as YM_ERR_TIMEOUT by design).  Callers must discard whatever the
  * sink accumulated in that case.  Returns 0 on a completed transfer, 1 otherwise.
+ *
+ * ON FAILURE the console RX is drained until the line goes quiet, not merely
+ * flushed once: a peer that has just been sent CAN keeps retrying for a moment,
+ * and anything still arriving when this returns would reach the line editor and be
+ * EXECUTED as a command (issue #10 saw a rejected sender's filename run at the
+ * prompt).  So a failed transfer costs up to a second of draining before it
+ * reports; a successful one is unchanged.  The drain is a mitigation, not a proof
+ * of quiescence -- a peer that pauses past the quiet window, or one still talking
+ * at the byte cap (which says so, loudly), can still get bytes to the prompt.
  */
 int xfer_recv_sink_locked(struct cli_instance *sh, const struct ym_sink *sink);
 
