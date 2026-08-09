@@ -276,8 +276,9 @@ static int cmd_camera_info(struct cli_instance *sh, int argc, char **argv)
 		          (unsigned long)blit_us);
 	}
 #endif
-	cli_print(sh, "sensor cfg: %s, DVP byte swap on\r\n",
-	          ci.configured ? "QVGA RGB565 loaded" : "not loaded (lazy)");
+	cli_print(sh, "sensor cfg: %s, DVP byte swap on, %s\r\n",
+	          ci.configured ? "QVGA RGB565 loaded" : "not loaded (lazy)",
+	          camera_get_orient());
 	if (camera_get_mode(&m) == CAM_OK)
 		cli_print(sh, "frame:   %ux%u %s (%lu bytes) -- %s\r\n",
 		          (unsigned)m.width, (unsigned)m.height, m.format,

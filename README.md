@@ -203,6 +203,15 @@ time as the USB console. 27 commands:
     resulting refresh rate, the frame-buffer address and the sticky **FIFO-underrun /
     transfer-error** flags. `lcd off` stops scanout **and frees OCTOSPI1** (see below);
     `lcd on` restarts it.
+  - 🔴 *the board boots with the panel initialized but **dark*** (issue #53) —
+    `lcd on` presents. What is deferred is only the presenting: the reset pulse,
+    the ST7789 wake-up sequence and the controller setup all still run at boot,
+    because deferring *those* is what produces a display that comes up "LTDC
+    perfectly healthy, screen uniformly white" (issues #7 and #43). The gain is
+    that nothing reads OCTOSPI1 continuously until asked, so `psram` tuning,
+    `membench` and `devmem` work from boot without an `lcd off` first — and
+    `ai bench` does not silently carry the ~26 ms scan-out tax that issue #9
+    twice mistook for a change in inference cost.
   - *the panel*: BL28005-B / JS28019H, 2.8" 240x320, **ST7789** controller. It has
     no datasheet in circulation, so its timing, polarity, pixel clock and — the
     part that actually mattered — its **serial power-on sequence** were recovered

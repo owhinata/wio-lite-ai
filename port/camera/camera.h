@@ -178,6 +178,10 @@ int camera_get_info(struct camera_info *out);
 /** Capture geometry / pixel format.  Constant in phase 2. */
 int camera_get_mode(struct camera_mode *out);
 
+/** Readout orientation as configured after ST's table, for `camera info`
+ *  (issue #53).  Never NULL. */
+const char *camera_get_orient(void);
+
 /** Which shape of stream owns the DCMI (camera_stream_stats.mode). */
 enum camera_stream_mode {
 	CAM_STREAM_NONE = 0,   /**< nothing running                               */

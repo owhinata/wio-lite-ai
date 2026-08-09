@@ -187,6 +187,17 @@
 #define OV2640_REG_IMAGE_MODE  0xDAu   /* DSP bank    */
 #define OV2640_IMAGE_MODE_RGB565 0x08u
 #define OV2640_IMAGE_MODE_SWAP   0x01u
+
+/*
+ * REG04, sensor bank: readout orientation.  ST's table ships 0xA8, which is the
+ * 0x28 base (VREF/HREF enables) with bit 7 -- horizontal mirror -- SET, so the
+ * live image comes out left-right reversed.  Split into base + bit so the value
+ * in ov2640_apply_orient_locked() reads as an intent rather than a magic number.
+ */
+#define OV2640_REG_REG04       0x04u   /* sensor bank */
+#define OV2640_REG04_BASE      0x28u
+#define OV2640_REG04_HMIRROR   0x80u
+#define OV2640_REG04_VFLIP     0x40u
 #define OV2640_BANK_DSP    0x00u
 
 /* ---- capture ------------------------------------------------------------- */
@@ -376,6 +387,14 @@ static struct camera_info info;
 #define CAM_I2C_INT_PULLUP    0     /* the board's 4.7k pull-ups are enough      */
 #define CAM_SCCB_READ_SPLIT   1     /* OmniVision's two-transaction read         */
 #define CAM_DVP_BYTE_SWAP     1     /* IMAGE_MODE bit0, as ST's table ships it   */
+/*
+ * Readout orientation (issue #53).  ST's table ships the horizontal mirror ON,
+ * which puts the live image out left-right reversed; this board wants it off.
+ * Stated here, next to the byte-swap decision, because both are the same kind of
+ * choice: what is "right" depends on what looks at the frame, not on the sensor.
+ */
+#define CAM_SENSOR_HMIRROR    0
+#define CAM_SENSOR_VFLIP      0
 #define CAM_I2C_TIMING        CAM_I2C_TIMING_100K
 
 /* ---- locking ------------------------------------------------------------- */
@@ -898,6 +917,46 @@ static int ov2640_apply_swap_locked(void)
 	return CAM_OK;
 }
 
+/*
+ * Re-write REG04 after the table so the readout orientation comes from
+ * CAM_SENSOR_HMIRROR / CAM_SENSOR_VFLIP rather than from ST's 0xA8.  Exactly the
+ * same treatment as the byte swap above, and for the same reason: the table stays
+ * byte-identical to upstream because "known-good" is the only property it has
+ * that we cannot re-derive, so every register we disagree with them about is
+ * re-written here where it can be found.
+ *
+ * Verify with `camera reg` (read it back) AND with the picture -- an orientation
+ * bug shows up in no counter anywhere, which is the recurring lesson of issues
+ * #7, #43 and #8 phase 3a.
+ *
+ * 🔴 THE READ-BACK DOES NOT EQUAL WHAT WAS WRITTEN, and that is not a fault.
+ * REG04 bits [1:0] are AEC[1:0] -- the bottom two bits of the automatic exposure
+ * value -- and the sensor's own AEC loop rewrites them continuously while it is
+ * streaming.  Measured on board #2: this writes 0x28 and `camera reg 0x30 0x04`
+ * then reads 0x2A.  Check bit 7, not the whole byte.  (Zeroing AEC[1:0] here is
+ * harmless and is exactly what ST's table does with its 0xA8: it happens once at
+ * configure time, before streaming, and the AEC overwrites it immediately.)
+ *
+ * The bank matters for that read: this leaves SENSOR selected, and so does
+ * ov2640_set_colorbar_locked() which runs after it, so a bare `camera reg` after
+ * configure lands in the right bank.  Before the table has been applied (`camera
+ * on` alone, sensor cfg "not loaded") the read returns the power-on default and
+ * says nothing about this function.
+ */
+static int ov2640_apply_orient_locked(void)
+{
+	uint8_t v = OV2640_REG04_BASE |
+	            (CAM_SENSOR_HMIRROR ? OV2640_REG04_HMIRROR : 0u) |
+	            (CAM_SENSOR_VFLIP ? OV2640_REG04_VFLIP : 0u);
+
+	if (sccb_write_locked(OV2640_ADDR, OV2640_REG_BANK, CAM_REG_WIDTH_8,
+	                      OV2640_BANK_SENSOR) != CAM_OK ||
+	    sccb_write_locked(OV2640_ADDR, OV2640_REG_REG04, CAM_REG_WIDTH_8,
+	                      v) != CAM_OK)
+		return CAM_ERR_HAL;
+	return CAM_OK;
+}
+
 /* COM7 bit1 swaps the live image for the sensor's internal colour-bar pattern.
    Worth having: it exercises DVP -> DCMI -> DMA -> PSRAM with a signal that owes
    nothing to the lens, the light or the exposure loop. */
@@ -938,6 +997,9 @@ static int camera_configure_locked(int colorbar)
 		if (rc != CAM_OK)
 			return rc;
 		rc = ov2640_apply_swap_locked();
+		if (rc != CAM_OK)
+			return rc;
+		rc = ov2640_apply_orient_locked();
 		if (rc != CAM_OK)
 			return rc;
 
@@ -2124,6 +2186,23 @@ int camera_get_mode(struct camera_mode *out)
 	out->frame_bytes = CAMERA_FRAME_BYTES;
 	out->format      = "RGB565";
 	return CAM_OK;
+}
+
+/*
+ * Reported by `camera info` beside the byte swap, because it is the same kind of
+ * fact: a build-time decision to disagree with ST's register table, invisible in
+ * any counter, and detectable only by looking at the picture.  Derived from the
+ * CAM_SENSOR_* constants so the console cannot drift from what was written.
+ */
+const char *camera_get_orient(void)
+{
+	if (CAM_SENSOR_HMIRROR && CAM_SENSOR_VFLIP)
+		return "h-mirror + v-flip";
+	if (CAM_SENSOR_HMIRROR)
+		return "h-mirror";
+	if (CAM_SENSOR_VFLIP)
+		return "v-flip";
+	return "no mirror/flip";
 }
 
 int camera_frame_read(uint32_t offset, void *dst, uint32_t len, uint32_t *gen)

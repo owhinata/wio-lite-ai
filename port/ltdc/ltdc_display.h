@@ -221,6 +221,15 @@ uint32_t ltdc_refresh_chz(void);
  *
  * Idempotent; on failure it cleans up (display off, HAL_LTDC_DeInit, objects
  * deleted) and leaves ltdc_is_up() false.
+ *
+ * 🔴 ON SUCCESS THE PANEL IS INITIALIZED BUT DARK (issue #53): the ST7789 has
+ * been woken and the controller configured, but LTDCEN and the backlight are
+ * off, so ltdc_is_up() is true while ltdc_scanout_active() is false until
+ * ltdc_set_scanout(true) (`lcd on`).  Drawing entry points still write the back
+ * buffer; ltdc_flip() refuses, because no VBR reload would ever arrive.
+ * Deferring the WAKE-UP instead of the presentation would be a different and
+ * much worse thing -- see the note at the top of this file about "LTDC healthy,
+ * screen uniformly white".
  */
 int ltdc_init(void);
 

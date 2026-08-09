@@ -835,11 +835,35 @@ int ltdc_init(void)
 	HAL_NVIC_SetPriority(DMA2D_IRQn, 10, 0);
 	HAL_NVIC_EnableIRQ(DMA2D_IRQn);
 
-	ltdc_backlight(true);
+	/*
+	 * Come up fully INITIALIZED but DARK (issue #53).  `lcd on` presents.
+	 *
+	 * 🔴 What is deferred is only PRESENTING.  Everything above still ran: the
+	 * reset pulse, the ST7789's SWRESET + factory sequence, the CS park and the
+	 * controller configuration.  Skipping any of that and doing it at `lcd on`
+	 * instead is how a display comes up "LTDC perfectly healthy, screen uniformly
+	 * white" -- the failure mode issues #7 and #43 each cost days to find, and no
+	 * counter anywhere reports it.
+	 *
+	 * Here rather than in the caller because switching the backlight on and then
+	 * off around a return would visibly flash the panel on every boot; the pin is
+	 * still parked low from ltdc_reset_pins_init(), so it simply never lights.
+	 * And not via ltdc_set_scanout(), which takes ltdc_lock: this runs from
+	 * tx_application_define() with the scheduler stopped, and this driver's
+	 * contract is that ltdc_init() waits on no ThreadX object.
+	 *
+	 * The side effect is the point as much as the darkness is: with no scan-out
+	 * there is no continuous LTDC read of OCTOSPI1, so `psram` tuning, `membench`
+	 * and `devmem` work from boot without an `lcd off` first, and `ai bench` does
+	 * not silently carry the ~26 ms scan-out tax that issue #9 twice mistook for
+	 * a change in inference cost.
+	 */
+	__HAL_LTDC_DISABLE(&hltdc);
+	ltdc_disabled = true;
 
 	ltdc_up = true;
 	LOG_INF("ST7789 up: %ux%u RGB565 x2 @0x%08lx, %lu.%02lu MHz (div %lu), "
-	        "%lu.%02lu Hz",
+	        "%lu.%02lu Hz, scanout off (`lcd on`)",
 	        (unsigned)ltdc_cfg.w, (unsigned)ltdc_cfg.h,
 	        (unsigned long)(uintptr_t)&ltdc_fb[0][0],
 	        (unsigned long)(ltdc_pixel_clock_hz() / 1000000u),
