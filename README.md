@@ -1453,6 +1453,36 @@ Two things there are worth more than the refcount:
   dead-but-not-returned callback can still write the input tensor is not. Running the
   command again completes the release.
 
+🔴 **The whole design rests on one invariant: the producer and the worker never hold
+the input tensor at the same time** — and issue #54 is what happens when it breaks.
+The tensor is not private to the fill: its arena lifetime *ends at the first operator*,
+so the planner reuses that space for intermediates, and an `Invoke()` was measured
+rewriting **48,997 of the int8 model's 49,152 input bytes** (194,096 of 196,608 for the
+float one). A band written during an inference is therefore not a stale frame, it is
+half camera and half activation map.
+
+`want_frame` is the licence, and it used to be armed *before* the wait — so a single
+stale post let an inference start with the licence already granted, the next band 0
+began filling underneath it, that fill completed during the inference and posted again.
+**Self-sustaining: one slip and every later frame is wrong.** The window is routine
+rather than exotic, because the wait times out after 100 ms while a fill can take up to
+two frame periods (~148 ms) from arming, so the timeout and the post can land together.
+The fix is to discard pending posts *before* arming: it costs one frame, against every
+frame after it.
+
+The reason this took a firmware change and not just a reading is that the symptom is
+never a crash and rarely an obviously broken picture — it is `maxscore` quietly
+disagreeing with itself between runs (+1736, −2449, −3472 on the same scene). So
+`ai stream stats` now reports the invariant instead of assuming it:
+
+```
+tensor  : 0 raced (must be 0), 1 stale post(s) dropped
+```
+
+`raced` counts bands that wrote the tensor while an inference owned it and must stay 0;
+`stale` counts the posts the drain threw away, each one a race that would have started.
+That second number is what proved the bug was real rather than suspected.
+
 🔴 **`ai stream` holds `psram_acquire_shared()` for its whole lifetime**, unlike every
 other continuous user, which arms itself and lets go. That is not a shortcut — the two
 gates `psram_acquire()` consults answer for the *camera* and the *display*, and the

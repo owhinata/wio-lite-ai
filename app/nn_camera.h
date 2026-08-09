@@ -65,6 +65,8 @@ struct nn_camera_stats {
 	uint32_t frames;         /**< complete frames ingested into the tensor     */
 	uint32_t skipped;        /**< complete frames that passed while busy       */
 	uint32_t errors;
+	uint32_t raced;          /**< bands that wrote the tensor mid-inference (#54) */
+	uint32_t stale_posts;    /**< frame posts discarded by the pre-arm drain (#54) */
 	uint32_t ingest_last_cyc;/**< DWT cycles of the last band's downsample     */
 	uint32_t ingest_max_cyc; /**< worst band since start -- vs the ~18.5 ms deadline */
 	uint32_t infer_last_cyc;

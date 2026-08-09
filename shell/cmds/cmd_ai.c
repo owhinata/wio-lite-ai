@@ -862,6 +862,12 @@ static int cmd_ai_stream_stats(struct cli_instance *sh, int argc, char **argv)
 	cli_print(sh, "frames  : %lu ingested, %lu skipped (worker busy), %lu error(s)\r\n",
 	          (unsigned long)st.frames, (unsigned long)st.skipped,
 	          (unsigned long)st.errors);
+	/* The ownership invariant, reported rather than assumed (#54).  `raced` must be 0;
+	 * anything else means part of the tensor the model saw was activations, not
+	 * camera.  `stale` counts the frame posts the pre-arm drain discarded -- each one
+	 * is a race that would have started and then never stopped. */
+	cli_print(sh, "tensor  : %lu raced (must be 0), %lu stale post(s) dropped\r\n",
+	          (unsigned long)st.raced, (unsigned long)st.stale_posts);
 	cli_print(sh, "ingest  : last %lu us  max %lu us  (band deadline ~18500 us)\r\n",
 	          (unsigned long)ai_cyc_to_us(st.ingest_last_cyc),
 	          (unsigned long)ai_cyc_to_us(st.ingest_max_cyc));

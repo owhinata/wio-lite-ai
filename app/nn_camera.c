@@ -73,6 +73,9 @@ static struct nn_model *nncam_model;
 
 /* Set by start/stop (thread context), read by the worker and the band callback. */
 static volatile int nncam_run;
+/* The worker is inside nn_run().  While set, the input tensor belongs to it -- the
+ * arena reuses that space for intermediates, so a producer write here is corruption. */
+static volatile int nncam_infer_active;
 /* The worker is inside the run loop, i.e. it may touch the tensors at any moment. */
 static volatile int nncam_worker_busy;
 /* The worker wants a frame; while this is 0 the producer does not touch the input. */
@@ -83,6 +86,10 @@ static volatile int nncam_filling;
 static volatile int nncam_holds_guards;
 
 static uint32_t nncam_infers, nncam_frames, nncam_skipped, nncam_errors;
+/* Diagnostics for the ownership invariant (#54).  `raced` must stay 0: it counts bands
+ * that wrote the input tensor while an inference owned it.  `stale` counts posts the
+ * pre-arm drain threw away -- each one is a race that WOULD have started. */
+static uint32_t nncam_raced, nncam_stale_posts;
 static uint32_t nncam_ingest_last, nncam_ingest_max, nncam_infer_cyc;
 static uint32_t nncam_start_tick;
 
@@ -268,6 +275,12 @@ static void nncam_band(unsigned band, const uint16_t *px, unsigned rows)
 		return;
 	}
 
+	/* The invariant this stream depends on: the worker and the producer never hold the
+	 * input tensor at the same time.  Counted rather than assumed, because when it
+	 * breaks the picture stays plausible -- part camera, part activations. */
+	if (nncam_infer_active)
+		nncam_raced++;
+
 	oy0    = nncam_oy_bound(band, nncam_oh);
 	oy_end = nncam_oy_bound(band + 1u, nncam_oh);
 
@@ -306,6 +319,40 @@ static void nncam_step(void)
 	struct bf_det tmp[BF_MAX_DET];
 	int n;
 
+	/*
+	 * 🔴 DISCARD ANY POST THAT PREDATES THIS ARM, AND DO IT BEFORE ARMING.
+	 *
+	 * want_frame is what licenses the producer to write the input tensor, so it must
+	 * never still be set when nn_run() starts -- the tensor's arena space is reused by
+	 * the intermediates of the very inference that is running (measured: an Invoke()
+	 * rewrites 48,997 of the input's 49,152 bytes), so a producer writing into it
+	 * concurrently and an inference reading it are the same memory.
+	 *
+	 * Without this drain, one stale post is enough to break that invariant FOREVER:
+	 * the wait returns immediately, the inference starts with want_frame already set,
+	 * the next band 0 begins filling underneath it, that fill completes during the
+	 * inference and posts again -- and the next iteration repeats the whole thing.
+	 * The state is self-sustaining, which is why the symptom is not an occasional bad
+	 * frame but a stream that is wrong from some point onwards.
+	 *
+	 * The window that produces the stale post is real and routine: this wait times out
+	 * after NNCAM_FRAME_WAIT_TICKS (100 ms) while a fill can legitimately take up to
+	 * two frame periods (~148 ms) from arming, so the producer's post and the timeout
+	 * can land together.  Discarding it costs one frame; not discarding it costs every
+	 * frame after it.
+	 *
+	 * 🔴 What this does NOT establish is "the post I get back belongs to a fill that
+	 * started after I armed".  A fill already in flight when the previous step timed
+	 * out completes and posts after this arm, and that is fine -- the guarantee that
+	 * matters comes from the PRODUCER, which clears want_frame BEFORE it posts (see
+	 * nncam_band()).  So a post can only be observed after the producer has finished
+	 * writing and given up its licence, which is exactly the invariant nn_run() needs.
+	 * The drain's narrower job is to make sure the post being observed is not one from
+	 * a frame whose licence was granted by an ARM THAT IS STILL IN FORCE.
+	 */
+	while (tx_semaphore_get(&nncam_frame_sem, TX_NO_WAIT) == TX_SUCCESS)
+		nncam_stale_posts++;
+
 	nncam_want_frame = 1;
 	if (tx_semaphore_get(&nncam_frame_sem, NNCAM_FRAME_WAIT_TICKS) != TX_SUCCESS) {
 		/* No frame within the bound.  The band flow may have ended without ever
@@ -325,7 +372,12 @@ static void nncam_step(void)
 	if (!nncam_run)
 		return;
 
-	if (nn_run(nncam_model) != 0) {
+	/* Guards the assertion above rather than any data: while this is set, NOTHING may
+	 * write the input tensor, and nncam_band() counts it if anything does. */
+	nncam_infer_active = 1;
+	n = nn_run(nncam_model);
+	nncam_infer_active = 0;
+	if (n != 0) {
 		nncam_errors++;
 		return;
 	}
@@ -496,6 +548,8 @@ int nn_camera_start(int colorbar)
 	nncam_frames      = 0u;
 	nncam_skipped     = 0u;
 	nncam_errors      = 0u;
+	nncam_raced       = 0u;
+	nncam_stale_posts = 0u;
 	nncam_ingest_last = 0u;
 	nncam_ingest_max  = 0u;
 	nncam_infer_cyc   = 0u;
@@ -583,6 +637,8 @@ void nn_camera_stats_get(struct nn_camera_stats *out)
 	out->frames       = nncam_frames;
 	out->skipped      = nncam_skipped;
 	out->errors       = nncam_errors;
+	out->raced        = nncam_raced;
+	out->stale_posts  = nncam_stale_posts;
 	out->ingest_last_cyc = nncam_ingest_last;
 	out->ingest_max_cyc  = nncam_ingest_max;
 	out->infer_last_cyc  = nncam_infer_cyc;
