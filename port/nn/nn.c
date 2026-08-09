@@ -217,6 +217,80 @@ uint32_t nn_last_cycles(const struct nn_model *m)
 	return (m && m->open) ? m->last_cycles : 0u;
 }
 
+/* ---- runtime model swap (issue #9 phase 2c) --------------------------------
+ *
+ * These three wrap the OPTIONAL vtable entries, and the reason they are written out
+ * rather than left to the caller is that a NULL function pointer is a landmine.  The
+ * `null` backend implements none of them; a caller that reached through the vtable
+ * itself would branch to address 0, which on this part is ITCM -- so it would not even
+ * fault cleanly, it would execute whatever interrupt code lives there.  Here it is a
+ * return value instead. */
+
+int nn_model_load_region(void **buf, uint32_t *cap)
+{
+	if (!buf || !cap)
+		return NN_ERR_ARG;
+	if (!nn_backend_vt_selected.load_region)
+		return NN_ERR_NOSUP;
+	return nn_backend_vt_selected.load_region(buf, cap);
+}
+
+int nn_model_reload(const void *data, uint32_t len, const char *name)
+{
+	void *impl = NULL;
+	int rc;
+
+	if (!nn_backend_vt_selected.reload)
+		return NN_ERR_NOSUP;
+	/* The singleton must already exist: reload REPLACES a model, and the open path
+	 * is what runs backend init and settles the race between the two consoles.  It
+	 * also means g_model.open below is a transition, never a first publication. */
+	if (!g_model.open)
+		return NN_ERR_STATE;
+
+	rc = nn_backend_vt_selected.reload(data, len, name, &impl);
+
+	/* Adopt whatever the backend ended up with, success or not: the vtable contract
+	 * is that *impl_out is the ACTIVE handle afterwards -- the new model on success,
+	 * the restored previous one on a rejection, NULL only if even that failed.  In
+	 * that last case clearing `open` is what lets a later nn_model_open() retry a
+	 * fresh build instead of handing out a handle to nothing. */
+	g_model.impl = impl;
+	g_model.open = impl ? 1u : 0u;
+	g_model.last_cycles = 0;   /* the previous timing measured a different model */
+	return rc;
+}
+
+const char *nn_model_strerror(int rc)
+{
+	switch (rc) {
+	case 0:                    return "ok";
+	case NN_MODEL_ERR_VERSION: return "schema version this runtime cannot read";
+	case NN_MODEL_ERR_OPS:     return "operator resolver could not be built";
+	case NN_MODEL_ERR_ARENA:   return "activations do not fit the arena, or the model "
+	                                  "uses an operator this build did not register";
+	case NN_MODEL_ERR_TENSOR:  return "a tensor has no buffer or too many dimensions";
+	case NN_MODEL_ERR_SHAPE:   return "input/output tensor count out of range";
+	case NN_MODEL_ERR_EMPTY:   return "empty or impossibly short model";
+	case NN_MODEL_ERR_FORMAT:  return "not a valid model for this runtime";
+	case NN_MODEL_ERR_SLOT:    return "buffer is not the staging region handed out";
+	case NN_ERR_ARG:           return "bad argument";
+	case NN_ERR_NOSUP:         return "this backend cannot load a model at run time";
+	case NN_ERR_STATE:         return "no model session is open";
+	default:                   return "unknown error";
+	}
+}
+
+int nn_heap_allocs(uint32_t *out)
+{
+	if (!out)
+		return NN_ERR_ARG;
+	if (!nn_backend_vt_selected.heap_allocs)
+		return NN_ERR_NOSUP;
+	*out = nn_backend_vt_selected.heap_allocs();
+	return 0;
+}
+
 /* ---- single-session guard -------------------------------------------------- */
 
 /* A plain flag test-set under a brief PRIMASK critical section: interrupt-safe,

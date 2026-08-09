@@ -1,0 +1,11 @@
+# Python packages the TFLM backend build needs (CONFIG_NN_BACKEND=tflm, issue #9
+# phase 2c).  Nothing else in this repository uses Python packages: the three
+# post-link gates under cmake/ are stdlib-only on purpose, so the default firmware
+# still builds on a machine with no venv and no network.
+#
+# These are pulled in only at CONFIGURE time, and only by the tflm branch:
+# create_tflm_tree.py evaluates tflite-micro's own Makefile, whose example step
+# (generate_cc_arrays.py) imports both.  cmake/tflite-micro.cmake creates ./.venv and
+# installs this file into it.
+numpy
+Pillow

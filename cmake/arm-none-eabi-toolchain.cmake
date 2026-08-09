@@ -41,6 +41,18 @@ endif()
 # --- Compilers / tools ------------------------------------------------------
 set(CMAKE_C_COMPILER   "${GCC_BIN}/arm-none-eabi-gcc")
 set(CMAKE_ASM_COMPILER "${GCC_BIN}/arm-none-eabi-gcc")
+# C++ is used by exactly one build -- CONFIG_NN_BACKEND=tflm, which calls
+# enable_language(CXX) from cmake/tflite-micro.cmake (issue #9 phase 2c).  It is named
+# HERE, unconditionally, rather than in that file, because a toolchain file is the only
+# place CMake reads compilers from and setting it later is too late.
+#
+# Naming it is not tidiness, it is a correctness fence.  project() declares C and ASM
+# only, so without this line enable_language(CXX) runs its own compiler search -- and
+# CMAKE_FIND_ROOT_PATH_MODE_PROGRAM is NEVER below, which tells CMake to look for
+# programs OUTSIDE the sysroot.  The search would find the host /usr/bin/c++ and
+# happily compile TFLM for x86-64.  Cross-compiling with the host compiler fails at
+# link, but only after a confusing detour.
+set(CMAKE_CXX_COMPILER "${GCC_BIN}/arm-none-eabi-g++")
 set(CMAKE_OBJCOPY      "${GCC_BIN}/arm-none-eabi-objcopy" CACHE FILEPATH "")
 set(CMAKE_SIZE         "${GCC_BIN}/arm-none-eabi-size"    CACHE FILEPATH "")
 # nm/objdump are used by the post-link .itcm residency check (issue #39); export

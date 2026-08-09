@@ -194,6 +194,14 @@ static int null_run(void *impl)
 	return 0;
 }
 
+/*
+ * load_region / reload / heap_allocs are left out on purpose, so they are NULL and
+ * nn.c answers NN_ERR_NOSUP for them.  A stub could fake a model swap -- accept the
+ * bytes, ignore them and report success -- and that would be the worst possible
+ * behaviour: `ai model load` would appear to work, and the first wrong inference would
+ * be blamed on the model rather than on the backend that never read it.  This backend
+ * has no model to swap, and says so.
+ */
 const struct nn_backend_vt nn_backend_vt_selected = {
 	.info = &(const struct nn_backend_info){ .name = "null", .version = "stub" },
 	.init              = null_init,

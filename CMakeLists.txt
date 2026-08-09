@@ -362,10 +362,37 @@ option(BSP_ENABLE_WFI "Enable ThreadX idle WFI power saving" ON)
 # the bring-up moves into the bootloader and BSP_PSRAM_INIT_IN_APP is turned OFF.
 option(BSP_ENABLE_PSRAM "Enable OCTOSPI1 APS6408 PSRAM (MPU window + psram command)" ON)
 option(BSP_PSRAM_INIT_IN_APP "Bring up OCTOSPI1 PSRAM app-side (app-first validation)" ON)
+# issue #9: which NN backend this build links.  Declared HERE, above the BSP_ENABLE_*
+# options, because BSP_ENABLE_SD's default depends on it -- the rest of the NN wiring
+# stays further down with the other source lists.
+set(CONFIG_NN_BACKEND "null" CACHE STRING "NN inference backend: null | tflm")
+set_property(CACHE CONFIG_NN_BACKEND PROPERTY STRINGS null tflm)
+
 # issue #6: on-board microSD over SDMMC1 + IDMA.  ON builds the block driver
 # (port/sd), its .axi_dma bounce buffer and the `sd` command.  Turn OFF to build a
 # firmware with no bus master at all -- useful when bisecting a D-cache coherency
 # suspicion, since SDMMC1's IDMA is the only DMA engine this app enables.
+#
+# 🔴 The DEFAULT flips to OFF for the tflm backend (issue #9 phase 2c).  That build adds
+# ~103 KB of interpreter and kernels to a 384 KB partition, and the microSD costs
+# 34,432 B of flash plus 18,624 B of AXI-SRAM -- the latter being the scarce memory,
+# since it is the only RAM a bus master can address (issue #46).  Nothing on the AI path
+# uses it: models come from the external NOR's blob region, which is the whole reason
+# issue #9 chose that route.  Turning SD off gives back a third of what TFLM costs and
+# takes nothing off the inference path.
+#
+# It is a DEFAULT and not a forced value: `-DBSP_ENABLE_SD=ON` still wins, because
+# option() leaves an already-defined cache entry alone.  The message below makes the
+# coupling visible -- a peripheral disappearing as a side effect of an unrelated switch
+# is the kind of thing that should never be discovered by wondering where `sd` went.
+if(CONFIG_NN_BACKEND STREQUAL "tflm" AND NOT DEFINED BSP_ENABLE_SD)
+    message(STATUS "tflm backend: defaulting BSP_ENABLE_SD=OFF "
+                   "(saves 34,432 B flash + 18,624 B AXI-SRAM; "
+                   "models come from the NOR blob region, not the SD card). "
+                   "Pass -DBSP_ENABLE_SD=ON to keep the microSD and FileX.")
+    set(BSP_ENABLE_SD OFF CACHE BOOL
+        "Enable the microSD card (SDMMC1) and the sd command")
+endif()
 option(BSP_ENABLE_SD "Enable the microSD card (SDMMC1) and the sd command" ON)
 
 # The block driver, the FileX media stack and the command are one unit -- cmd_sd.c
@@ -486,20 +513,33 @@ endif()
 #
 # If the app partition ever gets tight again (issue #39), a `none` value that drops
 # the whole layer is the natural place to add the toggle.
-set(CONFIG_NN_BACKEND "null" CACHE STRING "NN inference backend: null | tflm")
-set_property(CACHE CONFIG_NN_BACKEND PROPERTY STRINGS null tflm)
-
+#
+# CONFIG_NN_BACKEND itself is declared much earlier in this file, above the BSP_ENABLE_*
+# block, because BSP_ENABLE_SD's default depends on which backend was selected.
 set(NN_SOURCES "${CMAKE_SOURCE_DIR}/port/nn/nn.c")
+# Which buffers the cacheable-carve-out gate must find in the image depends on which
+# backend was selected, and CMake is the only place that knows.  Before issue #9 phase
+# 2c the list was hard-coded in the script, which meant the script itself refused every
+# tflm build -- the `null` stub's buffers are not in that image.
+set(NN_PSRAM_AI_REQUIRED "")
 if(CONFIG_NN_BACKEND STREQUAL "null")
     list(APPEND NN_SOURCES "${CMAKE_SOURCE_DIR}/port/nn/nn_null.c")
+    list(APPEND NN_PSRAM_AI_REQUIRED
+         --require null_in_buf --require null_box_buf --require null_scr_buf)
 elseif(CONFIG_NN_BACKEND STREQUAL "tflm")
-    message(FATAL_ERROR
-        "CONFIG_NN_BACKEND=tflm: the TensorFlow Lite Micro backend arrives in issue "
-        "#9 phase 2c -- it needs C++ enabled for this project, the CMSIS-NN kernels, "
-        "and a model in the external NOR blob region (issue #10).")
+    # TensorFlow Lite Micro (issue #9 phase 2c).  The backend translation unit is NOT
+    # added to SHELL_SOURCES: it is C++ and lives in the `tflm` static library that
+    # this file builds, together with the fetched tflite-micro + CMSIS-NN tree.  Only
+    # nn.c stays here, and it finds nn_backend_vt_selected in that archive at link
+    # time -- the same one-definition mechanism the `null` build uses.
+    include("${CMAKE_SOURCE_DIR}/cmake/tflite-micro.cmake")
+    list(APPEND NN_PSRAM_AI_REQUIRED
+         --require nn_tflm_arena --require nn_tflm_model_buf)
 else()
     message(FATAL_ERROR "CONFIG_NN_BACKEND must be 'null' or 'tflm'")
 endif()
+# membench's cacheable row is in the carve-out whichever backend is built.
+list(APPEND NN_PSRAM_AI_REQUIRED --require psram_ai_bench_buf)
 list(APPEND SHELL_SOURCES ${NN_SOURCES} "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_ai.c")
 
 add_executable(shell
@@ -631,6 +671,14 @@ set_source_files_properties("${CMAKE_SOURCE_DIR}/shell/cmds/cmd_membench.c"
 # pattern in the linker script stop matching.
 target_link_options(shell PRIVATE ${SHELL_OPT_FLAGS} -ffunction-sections -fdata-sections)
 
+# issue #9 phase 2c: link the C++ TFLM backend in, and force the final link back onto
+# the C driver.  Everything that decision involves is in cmake/tflite-micro.cmake --
+# it has to run here rather than in that file because the `shell` target does not exist
+# yet where the backend selection above includes it.
+if(CONFIG_NN_BACKEND STREQUAL "tflm")
+    nn_tflm_attach(shell)
+endif()
+
 firmware_finalize(shell)
 
 # issue #39: the last line of defence for the ITCM residency of the interrupt paths
@@ -651,10 +699,33 @@ add_custom_command(TARGET shell POST_BUILD
 # directions: a stack that quietly returned to AXI-SRAM (budget regression, no error)
 # and a DMA buffer that quietly moved to DTCM (the transfer moves nothing, no error).
 # `shell` only, like the check above: blink has none of these objects.
+#
+# The objects that only exist in SOME configurations are named here rather than in the
+# script, for the reason spelled out at the top of it: a required symbol the build never
+# compiled is reported as "no such object in the image", which reads like a placement
+# regression and is not one.  Before this, `BSP_ENABLE_SD=OFF` could not be built at
+# all -- the gate failed on sd_bounce -- which defeated the option's entire purpose,
+# since it exists to produce a firmware with no bus master while bisecting a D-cache
+# suspicion.  The condition on each line below is the same one that adds its source.
+set(DTCM_REQUIRED "")
+if(BSP_ENABLE_KV)
+    list(APPEND DTCM_REQUIRED --require-dtcm kv_boot_stack)      # app/kv_boot.c
+endif()
+if(BSP_ENABLE_CAMERA)
+    list(APPEND DTCM_REQUIRED --require-dtcm cam_producer_stack) # port/camera/camera.c
+    list(APPEND DTCM_REQUIRED --require-axi  cam_band)           # DCMI via DMA2_Stream1
+    if(BSP_ENABLE_LCD)
+        list(APPEND DTCM_REQUIRED --require-dtcm preview_stack)  # app/cam_preview.c
+    endif()
+endif()
+if(BSP_ENABLE_SD)
+    list(APPEND DTCM_REQUIRED --require-axi sd_bounce)           # SDMMC1 IDMA
+endif()
+
 add_custom_command(TARGET shell POST_BUILD
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_SOURCE_DIR}/cmake/check_dtcm_residency.py"
-            --nm "${CMAKE_NM}"
+            --nm "${CMAKE_NM}" ${DTCM_REQUIRED}
             $<TARGET_FILE:shell>
     COMMENT "check .dtcm_bss residency and DMA reachability (issue #46)"
     VERBATIM)
@@ -667,7 +738,44 @@ add_custom_command(TARGET shell POST_BUILD
 add_custom_command(TARGET shell POST_BUILD
     COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_SOURCE_DIR}/cmake/check_psram_ai_residency.py"
-            --nm "${CMAKE_NM}"
+            --nm "${CMAKE_NM}" ${NN_PSRAM_AI_REQUIRED}
             $<TARGET_FILE:shell>
     COMMENT "check .psram_ai residency and cache safety (issue #9)"
     VERBATIM)
+
+# issue #9 phase 2c: the C++ containment gate, for the tflm build only.  This firmware
+# had no C++ at all until that phase, and the two things that go wrong when C++ arrives
+# in a bare-metal image are both invisible at link time.
+#
+#   A global constructor runs from __libc_init_array, which the startup code calls
+#   immediately BEFORE main -- so before the MPU is programmed, before the caches are
+#   on, before the PSRAM window is usable, before log_init() and long before ThreadX.
+#   A constructor that touches the carve-out hangs the board with nothing in `dmesg`.
+#
+#   The exception machinery re-enters through the back door: one undefined reference to
+#   the throwing operator new is enough for the linker to extract __cxa_throw and the
+#   whole unwinder, in a build compiled -fno-exceptions from end to end.
+#
+# Both are checked on the linked image, because a linker-script ASSERT cannot do it:
+# C++ name mangling defeats DEFINED(sym) selectors the same way LTO's renaming does --
+# the condition goes false, the ternary collapses to 1, and the ASSERT passes.
+if(CONFIG_NN_BACKEND STREQUAL "tflm")
+    add_custom_command(TARGET shell POST_BUILD
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_SOURCE_DIR}/cmake/check_cxx_runtime.py"
+                --nm "${CMAKE_NM}" --objdump "${CMAKE_OBJDUMP}"
+                $<TARGET_FILE:shell>
+        COMMENT "check C++ runtime containment: no static ctors, no unwinder (issue #9)"
+        VERBATIM)
+
+    # Not a gate -- a report.  The shell thread's stack is 4,096 B and DTCM has under
+    # 8 KB free, so there is very little room to react if a CMSIS-NN kernel turns out to
+    # want a deep frame.  -fstack-usage answers that at build time instead of waiting
+    # for a `free` high-water reading to come back from the board.
+    add_custom_command(TARGET shell POST_BUILD
+        COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_SOURCE_DIR}/cmake/report_tflm_stack.py"
+                "${CMAKE_BINARY_DIR}/CMakeFiles/tflm.dir"
+        COMMENT "report the deepest tflm stack frames (issue #9)"
+        VERBATIM)
+endif()

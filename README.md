@@ -60,14 +60,26 @@ time as the USB console. 27 commands:
   tensor-in/tensor-out API, and each build links **exactly one** backend behind it —
   selected by `-DCONFIG_NN_BACKEND`, resolved purely at link time (one translation
   unit defines `nn_backend_vt_selected`, so no source file carries an `#ifdef` for
-  it). Today that is **`null`: a synthetic stub, not an inference runtime**, and
-  `ai info` says so. It exists to bring the whole path up and prove it on the board
-  — the vtable, the race-free singleton open, the single-session guard that stops
-  the two consoles racing, the cycle measurement and the command — before the real
-  runtime, a model and C++ arrive. `ai bench [n]` reports min/avg/max latency from
-  the DWT cycle counter. **The stub's run() is not empty on purpose**: an empty one
-  reports zero cycles, and zero is also what a *broken* counter reports, so it is
-  the one reading that cannot tell "measured correctly" from "measured nothing".
+  it).
+  - **`null`** (default) is **a synthetic stub, not an inference runtime**, and
+    `ai info` says so. It brought the whole path up and proved it on the board — the
+    vtable, the race-free singleton open, the single-session guard that stops the two
+    consoles racing, the cycle measurement and the command — before the real runtime,
+    a model and C++ arrived. **Its `run()` is not empty on purpose**: an empty one
+    reports zero cycles, and zero is also what a *broken* counter reports, so it is
+    the one reading that cannot tell "measured correctly" from "measured nothing".
+  - **`tflm`** is **TensorFlow Lite Micro with the CMSIS-NN int8 kernels**, and the
+    first C++ in this firmware (issue #9 phase 2c). It **has no built-in model**:
+    `ai model load <slot>` reads a `.tflite` out of a NOR blob slot into the cacheable
+    PSRAM carve-out, CRC-checks the copy it is about to interpret, and rebuilds the
+    interpreter around it. So `ai info` works on a board that has never been given a
+    model, changing models costs a transfer instead of an internal-flash erase cycle,
+    and a rejected model leaves the running one untouched (two staging slots, so the
+    live flatbuffer is never the one being overwritten).
+  - `ai bench [n]` reports min/avg/max latency from the DWT cycle counter, and — when
+    the display is scanning out — whether the LTDC underran *during that run*, read
+    from the sticky flags inside the measured window rather than left to a later
+    `lcd info` that could not tell inference apart from anything else that ran.
 - **`kv`** — the **persistent configuration store**: a FlashDB key-value database in
   the first megabyte of that NOR. Each entry carries its **type** (`str`/`u32`/`bool`/
   `bytes`) and a **description**, both stored on the flash next to the value, so a
@@ -1096,6 +1108,20 @@ port/       threadx/ ThreadX low-level init + shared SysTick glue
                      nn_backend.h the vtable one backend implements, and
                      nn_null.c that stub backend.  CONFIG_NN_BACKEND picks which
                      backend translation unit is compiled in
+              tflm/  the TensorFlow Lite Micro backend, and the only C++ in this
+                     firmware (issue #9 phase 2c).  nn_tflm.cc bridges a
+                     MicroInterpreter to the vtable, cxx_runtime.cc is the entire
+                     C++ runtime (our own operator new, so libstdc++'s throwing
+                     one is never extracted), nn_tflm_bufs.c holds the arena
+                     and the two model staging slots -- in C, deliberately, so
+                     the nm-based carve-out gate can still see them -- and
+                     nn_tflm_ops.h is the operator list, an X-macro shared with
+                     the host checker so the two cannot disagree.  Compiled
+                     into a separate static library with the tflite-micro +
+                     CMSIS-NN tree that cmake/tflite-micro.cmake fetches
+scripts/    host-side tools.  verify_tflite.cc checks a .tflite against THIS
+            firmware configuration before you transfer it, by calling the same
+            tflite::VerifyModelBuffer() the board would (issue #9)
             coremark/ EEMBC CoreMark port (core_portme.*)
             netxduo/ nx_user.h (NetX Duo build configuration; the driver is in app/,
                      because what it sits on is the RTL8720 link, not a MAC)
@@ -1107,8 +1133,11 @@ svc/        freestanding services: fmt (printf), log (DTCM ring), timebase (DWT)
 src/        custom clock-free SystemInit  (also the minimal `blink` example's main)
 ldscript/   STM32H725AEIx_IROM.ld (FLASH @ 0x08020000, RAM = AXI-SRAM, DTCM log, ITCM ISRs)
             STM32H725AEIx_ROM.ld  (the bootloader's own script: FLASH @ 0x08000000, 128 KB)
-cmake/      ARM GNU toolchain file (auto-downloads gcc into tools/) + the three
-            post-link placement guards (ITCM / DTCM / PSRAM carve-out)
+cmake/      ARM GNU toolchain file (auto-downloads gcc into tools/) + the post-link
+            guards: three placement ones (ITCM / DTCM / PSRAM carve-out) and, for
+            the tflm build only, check_cxx_runtime.py (no static constructors, no
+            exception runtime, no mangled names in the carve-out).
+            tflite-micro.cmake fetches and builds the TFLM + CMSIS-NN tree
 lib/        git submodules: cmsis_core/device_h7, stm32h7xx_hal_driver, tinyusb,
             threadx, netxduo, filex, coremark
 boot/       standalone USB DFU bootloader (internal 0x08000000) — see boot/README.md
@@ -1222,6 +1251,128 @@ The third check in the PSRAM guard is worth naming separately: the carve-out's b
 address is stated three times, in three languages that cannot include one another — the
 linker script, `app/mpu.c`, and the guard itself. If they ever drift apart the hardware
 caches a different range than the linker filled, and nothing else would notice.
+
+Which objects that guard *requires* in the carve-out is passed in from `CMakeLists.txt`
+(`--require`), not hard-coded: the answer depends on which NN backend was compiled in,
+and a list frozen in the script named the `null` stub's buffers and so failed every
+`tflm` build with "no such object in the image" — a message that reads exactly like a
+placement bug and is not one.
+
+### TensorFlow Lite Micro backend (`-DCONFIG_NN_BACKEND=tflm`, issue #9 phase 2c)
+
+```bash
+cmake -B build-tflm -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-toolchain.cmake \
+      -DCONFIG_NN_BACKEND=tflm
+cmake --build build-tflm                              # -> 333,828 B, 59,388 B free
+cmake --build build-tflm --target verify-model        # the host-side model checker
+```
+
+Selecting `tflm` also flips `BSP_ENABLE_SD`'s *default* to OFF, and says so at configure
+time — a peripheral vanishing as a side effect of an unrelated switch should never be
+discovered by wondering where `sd` went. `-DBSP_ENABLE_SD=ON` still wins.
+
+The first configure takes a few minutes: `cmake/tflite-micro.cmake` fetches the pinned
+tflite-micro commit, runs upstream's own `create_tflm_tree.py` to flatten it into a
+glob-able tree **under the build directory**, and lets that Makefile download
+flatbuffers/gemmlowp/ruy and — for `OPTIMIZED_KERNEL_DIR=cmsis_nn` — a matched
+CMSIS_6 + CMSIS-NN pair at their own pinned SHAs. Nothing is vendored and nothing lands
+in the repository. It needs network and a `python3` with `venv` (`./.venv` is created
+from `requirements.txt` for numpy/Pillow, which upstream's Makefile evaluation
+imports). A SHA-keyed stamp makes it a one-time cost, and each attempt starts from a
+clean clone because upstream's extractor **skips a download directory that merely
+exists** — so an interrupted fetch would otherwise never repair itself.
+
+This is the only build in the repository with C++ in it, and the containment is the
+design:
+
+| decision | why |
+|---|---|
+| all C++ in one `tflm` **STATIC** library | Archive members are extracted on demand, so the ~15 kernels the resolver never registers are never linked. As an OBJECT library every object would be linked unconditionally, *and* the linker script's `KEEP(*(.init_array*))` would anchor every kernel TU that has a static constructor against `--gc-sections`. |
+| `LINKER_LANGUAGE C` on `shell` | Required, not defensive. CMake picks the link driver by the highest `CMAKE_<LANG>_LINKER_PREFERENCE`, CXX (30) beats C (10), **and it propagates out of a linked static library**. Left alone, `g++` links the image and pulls the full libstdc++ — exceptions, unwinder and all — on top of the nano archives we asked for. |
+| our own `operator new`/`delete` | Undefined, the linker resolves it from `libstdc++_nano`, whose version *throws* — dragging in `__cxa_throw`, `_Unwind_*` and `std::bad_alloc` type-info into a build compiled `-fno-exceptions` end to end. `port/nn/tflm/cxx_runtime.cc` defines all of them, nothing else. |
+| **no** static constructors | `__libc_init_array` runs immediately before `main`: no MPU, both caches off, the PSRAM window not yet usable, no `dmesg`, no ThreadX. A constructor touching the carve-out does not fault — the access to unconfigured external memory simply never completes, and the board hangs leaving nothing behind. The arena and model slots are plain arrays; the interpreter *and* the op resolver are placement-new'd into plain storage on first use. |
+| **no** static destructors either | 🔴 The one that bit us. Writing the resolver as `static OpResolver resolver;` inside a function looks like it avoids everything above — construction is lazy, and `-fno-threadsafe-statics` removes the guard variable. But `MicroMutableOpResolver<N>` has a non-trivial destructor, so GCC still emits a registration for it, and **`-fno-use-cxa-atexit` does not remove that registration — it renames it**, from `__cxa_atexit()` to newlib's plain `atexit()`. The first link pulled `atexit`, `__register_exitproc` and `__call_exitprocs` into the image plus a `struct _atexit` in AXI-SRAM, to run a destructor at a program exit that cannot happen. The gate had been written against `__cxa_atexit` alone and passed. It now names both spellings, and the fix is placement-new, not dropping the flag. |
+| carve-out buffers **defined in C** (`nn_tflm_bufs.c`) | Two independent reasons, and either alone is enough. A C++ file-scope `static` can be emitted as `_ZL…`, which the nm-based residency gate would not recognise; and `extern "C" uint8_t buf[N];` is a *declaration*, not a definition ([dcl.link] treats it as carrying `extern`), so no symbol is emitted at all — the link still succeeds and only the gate notices. The wider point: **introducing C++ is not risky because of its syntax; it is risky because this firmware's safety net is written in C's terms and every part of it fails open when a name changes shape.** |
+| `-O2`/`-Os` and `C_STANDARD 11`, isolated from LTO | Same pattern as `coremark_obj` and `cmd_membench.c`: third-party code kept out of the whole-program optimiser. `C_STANDARD 11` is required because GCC 15 defaults C to `gnu23` and the CMSIS-NN sources are C11/C17 — the donor firmware on GCC 13.3 never hit this. The tree is deliberately **not** `-Werror`: a toolchain bump must not break the build for reasons unrelated to this firmware. |
+
+`cmake/check_cxx_runtime.py` runs after every `tflm` link and enforces those rows on the
+linked image: **all five** static-initialisation tables (`.preinit_array`,
+`.init_array`, `.fini_array`, `.ctors`, `.dtors`) no larger than the C-only baseline,
+with the offending entry resolved to a symbol *name*; no exception, unwind, guard or
+atexit symbols anywhere; and no mangled name inside the carve-out. It has to be a
+script rather than a linker-script ASSERT for the same reason the ITCM guard does —
+`DEFINED(sym) ? … : 1` passes vacuously once the name it asks about has changed. Each
+rule has been negative-tested against a real image rather than merely observed to pass.
+`cmake/report_tflm_stack.py` prints the deepest `-fstack-usage` frames beside it; that
+one is a report, not a gate, and says so when it finds nothing to measure — per-function
+frames cannot see call *depth*, so the board's `free` high-water mark is still the
+answer for stack headroom.
+
+**Flash is the binding constraint, and every default here was measured rather than
+argued.** The library itself is **103,297 B**, against a 66 KB pre-implementation
+estimate. The gap is not the verifier (22,936 B, within its predicted band) but a wrong
+model of how kernels are selected: **registering 8 operators does not select 8 kernels'
+worth of code.** The vendored `conv.cc`/`depthwise_conv.cc` wrappers switch on the
+*tensor* type at run time, so the int4 (~18.2 KB) and int16 (~5.6 KB) CMSIS-NN kernels
+are referenced unconditionally and `--gc-sections` cannot drop them. There is no build
+guard for it upstream, and patching a vendored tree is not something this repository
+does.
+
+The `-Os` question was settled on the board, with BlazeFace-front 128 int8, `lcd off`,
+20 runs:
+
+| | cycles | latency | cyc/MACC |
+|---|---:|---:|---:|
+| `-O2` (default) | 205.15 M | **373 ms** | 6.45 |
+| `-Os` | 236.96 M | 431 ms | 7.45 |
+| donor firmware, `-O2`, FMC SDRAM, GCC 13.3 | 134.35 M | 622 ms @216 MHz | 4.23 |
+
+The hope was that `-Os` would be nearly free because the 470 KB arena lives in external
+PSRAM and the work is memory-bound. **Half right.** Memory *is* the dominant term — even
+at `-O2` this part needs **1.53× the donor's cycles for identical work**, because the
+arena does not fit the 16 KB D-cache — but the optimiser still accounts for the
+remaining 1.16×, and 58 ms is not nothing. So `-O2` stays, and the flash it costs is
+found off the inference path instead:
+
+| lever | flash | AXI-SRAM | costs |
+|---|---:|---:|---|
+| `NN_TFLM_VERIFY=OFF` (default) | −22,936 B | — | the on-board structural check — **moved to the PC**, see below |
+| `BSP_ENABLE_SD=OFF` (default for this backend) | −34,432 B | −18,624 B | the microSD and FileX; **nothing on the AI path**, since models come from the NOR |
+
+Result: **333,828 B, 59,388 B free**, versus 365,156 B and 431 ms had both levers been
+left alone. Smaller *and* faster.
+
+**The verifier did not disappear; it moved to where it is cheaper, earlier and more
+informative.** `cmake --build build-tflm --target verify-model` builds
+`scripts/verify_tflite.cc` with the *host* compiler against the same fetched tree, so it
+calls the identical `tflite::VerifyModelBuffer()` — not an approximation of it, which
+would be worse than nothing, since partial flatbuffer validation passes the malformed
+files it does not happen to cover while reporting that the model was checked.
+
+```
+./build-tflm/verify_tflite model.tflite     # then blob write <slot> + sb model.tflite
+```
+
+Running it on the PC catches the problem *before* `blob write` erases a slot and before
+a ~90 s transfer, and it does one thing the board structurally cannot: **it names the
+missing operator.** `AllocateTensors()` returns a single `kTfLiteError` for "an operator
+is not registered" and for "the arena is too small", and `TF_LITE_STRIP_ERROR_STRINGS`
+leaves no message to separate them — so `ai model load` has to report both possibilities
+and let you guess. The operator list comes from `port/nn/tflm/nn_tflm_ops.h`, the same
+X-macro the firmware registers from, so the checker cannot drift out of step with the
+firmware it is vouching for. What is genuinely given up is that the check is no longer
+attached to the act of loading: a model reaching the NOR by some other route is not
+examined, and `ai info` therefore prints `no on-board model verify` so a build's posture
+is visible rather than assumed. Set `-DNN_TFLM_VERIFY=ON` for a build whose models will
+not pass through that command.
+
+Other knobs: `-DNN_TFLM_CMSIS_NN=OFF` swaps the SIMD int8 kernels for the reference
+ones (the donor firmware measured 622 ms vs 2,418 ms per inference at 216 MHz — an A/B,
+not a configuration anyone should ship), and `-DNN_TFLM_OPS=extended` widens the
+resolver from BlazeFace's 8 operators to a 23-operator common-vision superset so
+another int8 model can be dropped into a blob slot without a rebuild. The donor
+measured that widening at **+97,056 B**, which on this partition is most of the budget —
+hence a configure-time decision rather than a constant in the source.
 
 ## Flash (over DFU)
 

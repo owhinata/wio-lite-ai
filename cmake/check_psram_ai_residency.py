@@ -28,9 +28,17 @@ image really does contain `cam_ring.lto_priv.0`):
      anything there, so a raw address or a future section inside the window would be
      just as fatal.  This is the check that matters; the other two protect it.
 
-  2. RESIDENCY -- every symbol in REQUIRED_PSRAM_AI lies inside [_psram_ai_start,
+  2. RESIDENCY -- every symbol named by --require lies inside [_psram_ai_start,
      _psram_ai_end).  A base name matching NOTHING is also a failure: that is the
      vanished symbol a linker-script ASSERT cannot see.
+
+     The names come from the command line rather than from a constant in here, and
+     that is issue #9 phase 2c's doing.  Which buffers belong in the carve-out depends
+     on which NN backend was compiled in -- the `null` stub's three tensors, or the
+     TFLM arena and its model slots -- and CMakeLists.txt is the one place that knows.
+     While the list was hard-coded here it named the `null` buffers, so this gate
+     failed EVERY tflm build with "no such object in the image", which reads exactly
+     like a placement bug and is not one.
 
   3. AGREEMENT -- the section starts exactly at the MPU region base.  That address is
      stated three times in three languages (the linker script, app/mpu.c, and the
@@ -54,13 +62,10 @@ CANNOT_CHECK = 2   # exit code for "the check could not run", never confused wit
 PSRAM_AI_ORIGIN = 0x90600000
 PSRAM_AI_LENGTH = 2 * 1024 * 1024
 
-# Must be INSIDE the carve-out: the CPU-only buffers it exists for.
-REQUIRED_PSRAM_AI = (
-    "null_in_buf",         # `null` NN backend stub tensors (port/nn/nn_null.c)
-    "null_box_buf",
-    "null_scr_buf",
-    "psram_ai_bench_buf",  # membench's cacheable row (shell/cmds/cmd_membench.c)
-)
+# What must be INSIDE the carve-out is passed with --require (see check 2 above): it is
+# backend-dependent, and CMakeLists.txt owns that choice.  Today's callers pass
+#   null:  null_in_buf, null_box_buf, null_scr_buf, psram_ai_bench_buf
+#   tflm:  nn_tflm_arena, nn_tflm_model_buf, psram_ai_bench_buf
 
 # Must stay OUTSIDE it: every PSRAM buffer a bus master touches.  All three are
 # coherent today only because the window they sit in is non-cacheable, and none of
@@ -176,7 +181,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("elf")
     ap.add_argument("--nm", required=True)
+    ap.add_argument("--require", action="append", metavar="SYMBOL", default=[],
+                    help="base name of an object that must live in .psram_ai; repeat "
+                         "once per object (the set depends on CONFIG_NN_BACKEND)")
     args = ap.parse_args()
+
+    # No --require at all would leave only the DMA-safety half running, and report OK
+    # while silently checking nothing about residency.  That is the failure mode this
+    # whole file is written against, so refuse rather than half-run.
+    if not args.require:
+        die("no --require given: this gate cannot verify residency without the list "
+            "of required objects, and half a check reports the same OK as a whole one")
 
     syms = read_symbols(args.nm, args.elf)
     ai_start, ai_end = bounds(syms, "_psram_ai_start", "_psram_ai_end")
@@ -200,7 +215,7 @@ def main():
         "maintenance.  In here the transfer still happens and the CPU reads stale "
         "lines back -- intermittently, only under cache pressure.",
     ) + check_in_range(
-        syms, REQUIRED_PSRAM_AI, ai_start, ai_end, ".psram_ai",
+        syms, args.require, ai_start, ai_end, ".psram_ai",
         "It fell back to the non-cacheable pool: its PSRAM_AI attribute "
         "(include/mem_sections.h) was dropped or the definition moved.",
     )
@@ -213,7 +228,7 @@ def main():
         return 1
 
     print(f"check_psram_ai_residency: OK -- {ai_end - ai_start} B in .psram_ai at "
-          f"0x{ai_start:08x}, {len(REQUIRED_PSRAM_AI)} required residents, "
+          f"0x{ai_start:08x}, {len(args.require)} required residents, "
           f"{len(MUST_STAY_NONCACHEABLE)} DMA buffer(s) still non-cacheable")
     return 0
 

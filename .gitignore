@@ -1,5 +1,8 @@
-# Build output
+# Build output.  `build-*` covers the variant trees the feature toggles want kept side
+# by side -- build-tflm for CONFIG_NN_BACKEND=tflm (issue #9), which additionally holds
+# the fetched tflite-micro + CMSIS-NN source tree and is several hundred MB.
 /build/
+/build-*/
 
 # RTL8720DN device firmware build (issue #20).  fw/rtl8720/build.sh exports the pinned
 # upstream commit here, compiles it and drops the images -- all reproducible from the
@@ -11,6 +14,11 @@
 
 # Python
 __pycache__/
+
+# Virtualenv created by cmake/tflite-micro.cmake (CONFIG_NN_BACKEND=tflm, issue #9)
+# to hold numpy/Pillow for the tflite-micro tree generation.  Reproducible from
+# requirements.txt, so none of it belongs in git.
+/.venv/
 
 # Reference material (schematics, datasheets, vendor SDK zips, flash backups) --
 # large binaries, not source. Kept locally only.
