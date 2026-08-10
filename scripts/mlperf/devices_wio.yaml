@@ -1,0 +1,47 @@
+# Device list for the MLPerf Tiny runner, Wio Lite AI edition (issue #55).
+#
+#   python main.py --device_list <repo>/scripts/mlperf/devices_wio.yaml \
+#                  --test_script <repo>/scripts/mlperf/tests_performance_wio.yaml \
+#                  --dataset_path <datasets> --mode p
+#
+# It replaces upstream's benchmark/runner/devices_*.yaml rather than editing them --
+# lib/mlperf-tiny is a read-only mirror.  tests_performance_wio.yaml beside it does
+# the same for their test script, for one measured reason: this board is fast enough
+# that kws01 at upstream's iteration count finishes the whole loop in ~4 s, below the
+# runner's ten-second measurement floor.  See that file.
+#
+# 🔴 ONE ENTRY, AND THE OMISSIONS ARE THE POINT.
+#
+# The board's USB CDC enumerates as 0483:5740, which is ST's generic virtual COM port
+# ID -- and upstream's devices_kws_ic_vww.yaml gives that exact pair to the LPM01A
+# power monitor.  Loading their file would classify this board as a power meter and
+# then fail looking for a DUT.  So there is no `power` entry here and no `interface`
+# entry: energy mode needs an LPM01A or JouleScope, and the streaming wakeword needs
+# an STM32H573I-DK feeding I2S, neither of which this setup has.  Performance and
+# accuracy talk to the DUT directly over USB, which is the whole configuration.
+#
+# check_name is what disambiguates 0483:5740 if something else ST-flavoured is also
+# plugged in: the runner opens the port, sends `name%` and keeps the device only if it
+# answers m-name-dut-[...].  Two consequences worth knowing:
+#
+#   - THE `mlperf` MONITOR MUST ALREADY BE RUNNING when the runner starts.  At the
+#     shell prompt `name%` is just an unknown command, the probe gets no m-name reply,
+#     and the runner reports "failed to respond to 'name%'" -- which is the correct
+#     diagnosis, pointing at the one step that was missed.
+#   - "unspecified" is upstream's TH_VENDOR_NAME_STRING default, kept because that
+#     macro is defined unconditionally in their header and cannot be overridden from
+#     the command line without a redefinition warning.  It is a label in the host's
+#     log, not an identity check.
+#
+# Baud is nominal: this is USB CDC, where the line rate is a number the host and the
+# device both ignore.  It is still required by the schema, so all three modes get the
+# conventional 115200.
+- name: wio-lite-ai
+  type: dut
+  check_name: unspecified
+  baud:
+    performance: 115200
+    accuracy: 115200
+    energy: 115200
+  usb:
+    0x0483: 0x5740

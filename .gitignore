@@ -38,3 +38,14 @@ __pycache__/
 # secret like the flash dumps above, just 150 KB of nothing reproducible -- and a
 # `git add -A` while verifying on hardware will sweep one in if it is not listed.
 /frame*.raw
+
+# The MLPerf Tiny runner's host virtualenv (issue #55).  Separate from /.venv above,
+# which is the tflm build's: this one carries numpy/sklearn/matplotlib for the PC side
+# of a benchmark run and has no business in a firmware build.
+/.venv-mlperf/
+
+# ...and the runner's per-run output directory, if someone starts it from the repo
+# root instead of a scratch directory.  Each run writes a timestamped log plus
+# results.txt/json; they are results, not sources, and one `git add -A` during a
+# verification session would sweep in a directory per attempt.
+/sessions/

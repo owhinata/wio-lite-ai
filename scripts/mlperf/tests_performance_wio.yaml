@@ -1,0 +1,79 @@
+# Performance test script for the Wio Lite AI (issue #55).
+#
+# Derived from lib/mlperf-tiny/benchmark/runner/tests_performance.yaml at the pinned
+# commit (v1p4_rc, ced4c3b).  ONE VALUE DIFFERS: kws01's iteration count.  Everything
+# else is upstream's, copied rather than edited because the submodule is a read-only
+# mirror.
+#
+# 🔴 WHY kws01 NEEDS A DIFFERENT COUNT
+#
+# The runner requires a benchmark's five-iteration loop to take at least ten seconds
+# of wall clock (benchmark/runner/script.py, "Error 2: Loop finished before 10
+# seconds"), and refuses to report a median throughput otherwise.  That is a
+# measurement-validity floor, not a property of the workload: a run too short to
+# average over is noise.
+#
+# Upstream's counts are sized for the reference DUT, an STM32L4R5ZI at 80 MHz.  This
+# board runs at 550 MHz with CMSIS-NN kernels, so measured on hardware:
+#
+#     benchmark   per inference   upstream N   loop wall clock   verdict
+#     ic01/ic02      434.6 ms        20          43 s            ok
+#     vww01           42.8 ms        20          26 s            ok  (27 KB downloads
+#                                                                     dominate)
+#     ad01             4.31 ms     1500          32 s            ok
+#     kws01           10.17 ms       70           4 s            ERROR 2
+#
+# So only kws01 is raised, 70 -> 800: 8.1 s per window and about 41 s per loop, which
+# clears the floor with margin and still finishes each `infer` well inside the
+# runner's 30 s per-command timeout.  Raising the others would not make them more
+# valid, only slower.
+#
+# The number to keep an eye on is the per-`infer` time against that 30 s timeout: at
+# 800 iterations kws01 sits at 8.1 s.  If a future build gets much SLOWER, that is the
+# limit that bites first; if it gets much faster, the ten-second floor is the one to
+# recheck -- for every benchmark, not just this one.
+#
+# sww01 is deliberately absent: the streaming wakeword needs an STM32H573I-DK
+# interface board delivering I2S audio, which this setup does not have, and the board
+# never reports that model id.
+
+ad01:
+  name: anomoly_detection
+  model: ad01
+  truth_file: y_labels.csv
+  script:
+    - loop 5:
+      - download
+      - infer 1500 10
+ic01:
+  name: image_classification
+  model: ic01
+  truth_file: y_labels.csv
+  script:
+    - loop 5:
+      - download
+      - infer 20 5
+ic02:
+  name: image_classification
+  model: ic01
+  truth_file: y_labels.csv
+  script:
+    - loop:
+      - download
+      - infer 20 5
+kws01:
+  name: keyword_spotting
+  model: kws01
+  truth_file: y_labels.csv
+  script:
+    - loop 5:
+      - download
+      - infer 800 10      # upstream: 70 -- see the note at the top
+vww01:
+  name: person_detection
+  model: vww01
+  truth_file: y_labels.csv
+  script:
+    - loop 5:
+      - download
+      - infer 20 5

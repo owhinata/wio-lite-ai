@@ -1,0 +1,26 @@
+# Host packages the MLPerf Tiny runner needs (issue #55).
+#
+#   python3 -m venv .venv-mlperf
+#   .venv-mlperf/bin/pip install -r scripts/mlperf/requirements-runner.txt
+#
+# Separate from the repository's own requirements.txt, which is the two packages the
+# tflm build needs at CONFIGURE time.  This is the HOST side of a benchmark run and is
+# installed only by someone about to do one.
+#
+# 🔴 NO TENSORFLOW.  Running the benchmark does not need it -- the models are already
+# .tflite files and the inference happens on the board.  TensorFlow is only needed to
+# REGENERATE the accuracy stimulus files from their source datasets, which is a
+# separate job with much heavier requirements (see README.md).  Keeping it out of here
+# is the difference between a two-minute install and a multi-gigabyte one.
+#
+# Unpinned on purpose: upstream pins nothing for the runner either, and these are all
+# stable interfaces.  The one that has ever mattered is pyserial.
+
+pyserial      # the DUT link; benchmark/runner/serial_device.py
+pyyaml        # devices/tests configuration files
+numpy         # score arrays
+scikit-learn  # roc_auc_score, which is how ad01 is scored
+matplotlib    # imported unconditionally by main.py, used for its plots
+pyusb         # imported unconditionally by device_manager.py (for the JouleScope
+              # path).  Needed to import even though this setup has no power monitor;
+              # it does not touch libusb until something actually scans for one.
