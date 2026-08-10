@@ -28,14 +28,19 @@
  *
  * EVERY SUBCOMMAND HERE REACHES THE BARE DEVICE, past both of its tenants.  Two
  * ranges hold live data and nothing in this file will stop you from erasing them:
- * [0, 1 MB) is the `kv` configuration partition (app/kv.c) and [1 MB, 3 MB) is the
- * blob region's eight asset slots (app/blob.c).  Use `kv` and `blob` for those; this
+ * [0, 1 MB) is the `kv` configuration partition (app/kv.c) and [1 MB, 4 MB) is the
+ * blob region's six asset slots (app/blob.c).  Use `kv` and `blob` for those; this
  * is the tool for looking at the device itself, and it is deliberately unguarded.
  *
  * Clean-room design; no third-party code reused.
  */
 #include "cli.h"
 #include "nor_flash.h"
+/* For BLOB_REGION_END only: the `nor test` default address must stay clear of the
+ * asset region, and the assert below is what keeps the two from drifting apart.
+ * Both files are compiled only under BSP_ENABLE_KV (CMakeLists.txt), so the include
+ * is always resolvable wherever this file is built. */
+#include "blob.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -51,10 +56,17 @@
 #define NOR_WRITE_MAX     NOR_PAGE_SIZE
 
 /*
- * Default scratch sector for `nor test`.  At 3 MB -- the first sector ABOVE the
- * blob region (issue #10 put eight 256 KB asset slots at 1 MB .. 3 MB), in the
- * 13 MB that is still unallocated -- so running the acceptance test destroys
- * neither a live configuration nor a stored model.
+ * Default scratch sector for `nor test`.  At 4 MB -- the first sector ABOVE the
+ * blob region (issue #10 put asset slots at 1 MB .. 3 MB; issue #55 widened them to
+ * six 512 KB slots ending at 4 MB), in the 12 MB that is still unallocated -- so
+ * running the acceptance test destroys neither a live configuration nor a stored model.
+ *
+ * 🔴 THIS ADDRESS IS TIED TO THE BLOB REGION'S END, so it moves whenever the region
+ * does.  It was 0x00300000 until issue #55, which is exactly where the region now
+ * ends -- had it stayed, a bare `nor test` would have programmed the header sector
+ * of the new slot 4.  (Boards that ran `nor test` under the old default still have
+ * that residue there: it decodes as `invalid` rather than as a blob, and one
+ * `blob erase 4` clears it.)
  *
  * It used to be 0x00100000, chosen when everything past the KV partition was spare;
  * the blob region moved in on top of it, which would have made a bare `nor test`
@@ -64,7 +76,24 @@
  * `nor write` would be) -- it is the argument-less form, the one that gets typed
  * without thinking, that has to land somewhere harmless.
  */
-#define NOR_TEST_DEFAULT_ADDR  0x00300000u
+#define NOR_TEST_DEFAULT_HEX   0x400000
+#define NOR_TEST_DEFAULT_ADDR  ((uint32_t)NOR_TEST_DEFAULT_HEX)
+
+/*
+ * The help text at the bottom of this file QUOTES this address, and a help string
+ * naming a different address than the code uses is worse than one naming none -- it
+ * is confidently wrong, and it is read precisely by the person who has not looked at
+ * the code.  So the string is built from the same token, and the assert keeps the
+ * token itself above the region it is supposed to avoid.  (Two macros because
+ * stringifying the uint32_t-cast form would print the cast, not the address.)
+ */
+#define NOR_STR_(x)            #x
+#define NOR_STR(x)             NOR_STR_(x)
+#define NOR_TEST_DEFAULT_STR   NOR_STR(NOR_TEST_DEFAULT_HEX)
+
+_Static_assert(NOR_TEST_DEFAULT_ADDR >= BLOB_REGION_END,
+               "the `nor test` default must stay above the blob region -- issue #55 "
+               "moved the region's end and this address has to follow it");
 
 static const char *nor_strerror(int rc)
 {
@@ -434,7 +463,8 @@ CLI_SUBCMD_SET_CREATE(nor_subcmds,
 	CLI_CMD_ARG(read,  NULL, "hexdump <addr> [len]",                      cmd_nor_read,  2, 1),
 	CLI_CMD_ARG(erase, NULL, "erase 4 KB sector(s) <addr> [len]",         cmd_nor_erase, 2, 1),
 	CLI_CMD_ARG(write, NULL, "program <addr> <hex> (erase first)",        cmd_nor_write, 3, 0),
-	CLI_CMD_ARG(test,  NULL, "partial-page-program acceptance test [addr] (defaults to 0x300000, above kv+blob)", cmd_nor_test, 1, 1),
+	CLI_CMD_ARG(test,  NULL, "partial-page-program acceptance test [addr] (defaults to "
+	                         NOR_TEST_DEFAULT_STR ", above kv+blob)", cmd_nor_test, 1, 1),
 	CLI_SUBCMD_SET_END);
 
 CLI_CMD_REGISTER(nor, nor_subcmds,

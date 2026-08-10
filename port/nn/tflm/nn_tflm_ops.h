@@ -23,7 +23,10 @@
  *
  * Adding an operator here is not free: it is compiled kernel code in a 384 KB
  * partition.  The donor firmware measured the widening from the base set to the
- * extended one at +97,056 B.  Keep NN_TFLM_OPS=blazeface unless a model needs more.
+ * extended one at +97,056 B, and on THIS firmware `extended` does not fit at all --
+ * measured at issue #55: the link fails with FLASH overflowed by 29,200 B.  That is
+ * the whole reason the `mlperf` profile below exists instead of just using `extended`.
+ * Keep NN_TFLM_OPS=blazeface unless a model needs more.
  */
 #ifndef NN_TFLM_OPS_H
 #define NN_TFLM_OPS_H
@@ -42,13 +45,37 @@
 	X(DEQUANTIZE,         AddDequantize)
 
 /*
+ * Exactly what MLPerf Tiny v1.4 needs on top of the base set, added by
+ * -DNN_TFLM_OPS=mlperf (issue #55).
+ *
+ * 🔴 THREE OPERATORS, NOT FIFTEEN, AND THAT IS THE POINT.  All five v1.4 models --
+ * ic01 (ResNet), ic02 (larger ResNet), kws01 (DS-CNN), vww01 (MobileNet) and ad01
+ * (deep autoencoder) -- were checked with scripts/verify_tflite.cc against the base
+ * set, and the union of everything they were missing is these three.  `extended`
+ * would also cover them, and `extended` does not link (see above), so the difference
+ * between measuring the requirement and assuming it is the difference between a
+ * firmware that exists and one that does not.
+ *
+ * Measured cost on top of the base set: +23,632 B of text, leaving 21,320 B free in
+ * the 384 KB partition.  If that runs out, the next thing to give up is PAD and
+ * MAX_POOL_2D from the base set (+6,248 B back) -- no MLPerf model uses either, and
+ * only BlazeFace (issue #9) would stop running.
+ */
+#define NN_TFLM_OPS_MLPERF(X)                   \
+	X(FULLY_CONNECTED,    AddFullyConnected)    \
+	X(AVERAGE_POOL_2D,    AddAveragePool2D)     \
+	X(SOFTMAX,            AddSoftmax)
+
+/*
  * The common-vision superset, added by -DNN_TFLM_OPS=extended so a different int8
  * model can be dropped into a blob slot without rebuilding the firmware.
+ *
+ * ⚠ This profile currently OVERFLOWS the app partition (issue #55).  It is kept
+ * because it is the honest name for "everything a vision model might want" and
+ * because the partition may not always be this full -- but it is not a working
+ * configuration today, and `mlperf` is what you want instead.
  */
 #define NN_TFLM_OPS_EXTRA(X)                            \
-	X(FULLY_CONNECTED,        AddFullyConnected)         \
-	X(AVERAGE_POOL_2D,        AddAveragePool2D)          \
-	X(SOFTMAX,                AddSoftmax)                \
 	X(LOGISTIC,               AddLogistic)               \
 	X(RELU,                   AddRelu)                   \
 	X(RELU6,                  AddRelu6)                  \
@@ -67,12 +94,23 @@
  * this backend treats as fatal -- so the failure would at least be loud, but sizing it
  * by hand is still one more thing to forget.) */
 #define NN_TFLM_OPS_COUNT_ONE(e, m) +1
-#define NN_TFLM_OPS_BASE_COUNT  (0 NN_TFLM_OPS_BASE(NN_TFLM_OPS_COUNT_ONE))
-#define NN_TFLM_OPS_EXTRA_COUNT (0 NN_TFLM_OPS_EXTRA(NN_TFLM_OPS_COUNT_ONE))
+#define NN_TFLM_OPS_BASE_COUNT   (0 NN_TFLM_OPS_BASE(NN_TFLM_OPS_COUNT_ONE))
+#define NN_TFLM_OPS_MLPERF_COUNT (0 NN_TFLM_OPS_MLPERF(NN_TFLM_OPS_COUNT_ONE))
+#define NN_TFLM_OPS_EXTRA_COUNT  (0 NN_TFLM_OPS_EXTRA(NN_TFLM_OPS_COUNT_ONE))
 
+/*
+ * The three profiles are nested, not alternative: `extended` is a superset of
+ * `mlperf`, which is a superset of `blazeface`.  NN_TFLM_OPS_EXTRA therefore does NOT
+ * repeat the three MLPerf operators -- registering an operator twice is a resolver
+ * error, and this is the only place that could introduce one.
+ */
 #if defined(NN_TFLM_OPS_EXTENDED)
-#define NN_TFLM_OPS_ALL(X)  NN_TFLM_OPS_BASE(X) NN_TFLM_OPS_EXTRA(X)
-#define NN_TFLM_OPS_TOTAL   (NN_TFLM_OPS_BASE_COUNT + NN_TFLM_OPS_EXTRA_COUNT)
+#define NN_TFLM_OPS_ALL(X)  NN_TFLM_OPS_BASE(X) NN_TFLM_OPS_MLPERF(X) NN_TFLM_OPS_EXTRA(X)
+#define NN_TFLM_OPS_TOTAL   (NN_TFLM_OPS_BASE_COUNT + NN_TFLM_OPS_MLPERF_COUNT + \
+                             NN_TFLM_OPS_EXTRA_COUNT)
+#elif defined(NN_TFLM_OPS_MLPERF_PROFILE)
+#define NN_TFLM_OPS_ALL(X)  NN_TFLM_OPS_BASE(X) NN_TFLM_OPS_MLPERF(X)
+#define NN_TFLM_OPS_TOTAL   (NN_TFLM_OPS_BASE_COUNT + NN_TFLM_OPS_MLPERF_COUNT)
 #else
 #define NN_TFLM_OPS_ALL(X)  NN_TFLM_OPS_BASE(X)
 #define NN_TFLM_OPS_TOTAL   NN_TFLM_OPS_BASE_COUNT

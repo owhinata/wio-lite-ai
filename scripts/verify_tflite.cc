@@ -66,8 +66,8 @@
  * port/nn/tflm/nn_tflm_priv.h (NN_TFLM_MODEL_MAX).  Restated rather than included
  * because those headers pull in the firmware's world; the numbers are checked against
  * their sources by the message this prints when a model is too big. */
-static const uint32_t kBlobPayloadMax = 258048u;
-static const uint32_t kStagingMax     = 256u * 1024u;
+static const uint32_t kBlobPayloadMax = 520192u;
+static const uint32_t kStagingMax     = 512u * 1024u;
 
 /* CRC-32/ISO-HDLC, bit by bit -- the same value FlashDB's fdb_calc_crc32() produces on
  * the board and Python's zlib.crc32() produces on this machine.  Written out rather
@@ -108,6 +108,38 @@ static const tflite::BuiltinOperator kRegistered[] = {
 	NN_TFLM_OPS_ALL(NN_TFLM_OP_ENUM)
 #undef NN_TFLM_OP_ENUM
 };
+
+/*
+ * Which NN_TFLM_OPS profile this checker was built for.  It is printed beside the
+ * operator count, so it has to be derived from the SAME defines that select the list
+ * above -- a label that says "blazeface" next to eleven registered operators is the
+ * kind of confidently-wrong output this tool exists to prevent elsewhere.
+ */
+static const char *const kProfileName =
+#if defined(NN_TFLM_OPS_EXTENDED)
+	"extended";
+#elif defined(NN_TFLM_OPS_MLPERF_PROFILE)
+	"mlperf";
+#else
+	"blazeface";
+#endif
+
+/*
+ * What to tell the operator when a model needs an operator this build did not
+ * register: the next profile up, or -- when there is no next profile -- that widening
+ * is not the answer.  `extended` is the widest one there is, so advising it from an
+ * `extended` build would send someone to rebuild with the settings they already have.
+ *
+ * NULL means "no wider profile exists"; the REJECT message branches on it.
+ */
+static const char *const kNextProfile =
+#if defined(NN_TFLM_OPS_EXTENDED)
+	nullptr;
+#elif defined(NN_TFLM_OPS_MLPERF_PROFILE)
+	"extended";
+#else
+	"mlperf";
+#endif
 
 static bool is_registered(tflite::BuiltinOperator op)
 {
@@ -207,12 +239,7 @@ int main(int argc, char **argv)
 	       subgraphs ? (unsigned)subgraphs->size() : 0u,
 	       codes ? (unsigned)codes->size() : 0u);
 	printf("ops set : %d registered by this build (NN_TFLM_OPS=%s)\n",
-	       (int)(sizeof kRegistered / sizeof kRegistered[0]),
-#if defined(NN_TFLM_OPS_EXTENDED)
-	       "extended");
-#else
-	       "blazeface");
-#endif
+	       (int)(sizeof kRegistered / sizeof kRegistered[0]), kProfileName);
 
 	if (!missing.empty()) {
 		printf("RESULT  : REJECT -- the model uses %zu operator(s) this build did not\n"
@@ -221,8 +248,14 @@ int main(int argc, char **argv)
 			printf("            %s\n", m.c_str());
 		printf("          On the board this would fail as NN_MODEL_ERR_ARENA, whose\n"
 		       "          message cannot tell a missing operator from an arena that is\n"
-		       "          too small -- which is exactly why this check is here.\n"
-		       "          Rebuild with -DNN_TFLM_OPS=extended, or re-export the model.\n");
+		       "          too small -- which is exactly why this check is here.\n");
+		if (kNextProfile != nullptr)
+			printf("          Rebuild with -DNN_TFLM_OPS=%s, or re-export the model.\n",
+			       kNextProfile);
+		else
+			printf("          This is already the widest NN_TFLM_OPS profile, so the\n"
+			       "          operator has to be added to nn_tflm_ops.h or the model\n"
+			       "          re-exported without it.\n");
 		return 1;
 	}
 

@@ -6,7 +6,7 @@
  * @file    blob.h
  * @brief   Read-only asset region on the external NOR (issue #10 / issue #9 P2b).
  *
- * Eight fixed 256 KB slots above the `kv` partition, each holding one file that
+ * Six fixed 512 KB slots above the `kv` partition, each holding one file that
  * arrived from the PC over YMODEM.  This exists because issue #9 decided that the
  * TFLM model is supplied from the external NOR: a 189 KB `.tflite` does not fit in
  * the internal flash's spare ~115 KB, and linking it in would spend an internal
@@ -19,13 +19,26 @@
  * FlashDB or FAL -- the one thing it borrows from that side is fdb_calc_crc32().
  *
  *   0x000000 .. 0x100000   kv partition (FlashDB, issue #37)
- *   0x100000 .. 0x300000   THIS: 8 slots x 256 KB
- *   0x300000 .. 0x1000000  unallocated (13 MB, still with no FAL entry)
+ *   0x100000 .. 0x400000   THIS: 6 slots x 512 KB
+ *   0x400000 .. 0x1000000  unallocated (12 MB, still with no FAL entry)
  *
- * Slot layout.  The first 4 KB sector holds the header and the remaining 252 KB is
- * the payload.  Giving the header a whole sector costs 1.5% of a slot and buys two
+ * Slot layout.  The first 4 KB sector holds the header and the remaining 508 KB is
+ * the payload.  Giving the header a whole sector costs 0.8% of a slot and buys two
  * things: the payload stays 4 KB-aligned, and the header can be erased on its own
- * (one ~45 ms sector erase) to retire a blob without erasing 256 KB.
+ * (one ~45 ms sector erase) to retire a blob without erasing 512 KB.
+ *
+ * WHY 512 KB x 6 AND NOT 256 KB x 8 (issue #55).  MLPerf Tiny v1.4 needs five models
+ * on the device at once, and four of them -- IC (260,648 B), IC02 (512,024), VWW
+ * (333,288) and AD (276,976) -- do not fit the old 258,048 B payload.  512 KB is the
+ * smallest power-of-two slot that swallows the largest of them, and six of those hold
+ * the five benchmarks plus one non-MLPerf model (BlazeFace, issue #9, lives there).
+ * The region had to grow past 0x300000 to fit them, which is why the `nor test`
+ * default address moved with it (shell/cmds/cmd_nor.c) -- that is the one constant
+ * outside this file that is tied to the region END rather than to a slot.
+ *
+ * 🔴 THE GEOMETRY CHANGE IS WHY BLOB_FMT_VER IS NOW 2.  The new slot bases coincide
+ * with the old EVEN slots' header sectors, so a version-1 header would still decode
+ * and still verify -- under a different slot number.  See app/blob.c.
  *
  * THE HEADER IS WRITTEN LAST, AND IN TWO STEPS.  ymodem.h is explicit that YM_OK
  * requires reaching the sender's closing block and that anything else means the
@@ -87,13 +100,13 @@ extern "C" {
 
 /* ---- geometry ------------------------------------------------------------ */
 
-#define BLOB_SLOT_COUNT    8u
+#define BLOB_SLOT_COUNT    6u
 #define BLOB_REGION_BASE   0x00100000u
-#define BLOB_SLOT_SIZE     0x00040000u                 /* 256 KB               */
+#define BLOB_SLOT_SIZE     0x00080000u                 /* 512 KB               */
 #define BLOB_HDR_SIZE      NOR_SECTOR_SIZE             /* 4 KB, header only    */
-#define BLOB_PAYLOAD_MAX   (BLOB_SLOT_SIZE - BLOB_HDR_SIZE)   /* 258,048 B     */
-#define BLOB_REGION_SIZE   (BLOB_SLOT_COUNT * BLOB_SLOT_SIZE) /* 2 MB          */
-#define BLOB_REGION_END    (BLOB_REGION_BASE + BLOB_REGION_SIZE)  /* 0x300000  */
+#define BLOB_PAYLOAD_MAX   (BLOB_SLOT_SIZE - BLOB_HDR_SIZE)   /* 520,192 B     */
+#define BLOB_REGION_SIZE   (BLOB_SLOT_COUNT * BLOB_SLOT_SIZE) /* 3 MB          */
+#define BLOB_REGION_END    (BLOB_REGION_BASE + BLOB_REGION_SIZE)  /* 0x400000  */
 
 /* Longest stored name, excluding the terminator.  A YMODEM block 0 can carry more;
  * a longer name is truncated rather than refused, because the name is a label for

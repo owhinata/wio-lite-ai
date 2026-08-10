@@ -60,7 +60,25 @@
  * partial-page programming `nor test` accepts (W25Q128JV sec 8.2.13).
  */
 #define BLOB_MAGIC       0x314C4257u   /* bytes 'W','B','L','1' in memory order */
-#define BLOB_FMT_VER     1u
+/*
+ * 🔴 VERSION 2 BECAUSE THE SLOT GEOMETRY CHANGED (issue #55).  Slots went from
+ * 256 KB x 8 to 512 KB x 6, and the new slot bases (0x100000, 0x180000, 0x200000,
+ * 0x280000, ...) LAND EXACTLY ON THE OLD EVEN SLOTS' HEADER SECTORS -- payload
+ * included, since both start one 4 KB sector in.  A version-1 header written under
+ * the old geometry therefore decodes perfectly under the new one, and the old
+ * `length` still passes the (now larger) BLOB_PAYLOAD_MAX bound, so `blob list`
+ * would show it as valid, `blob verify` would pass, and `ai model load` would load
+ * it -- under a DIFFERENT SLOT NUMBER (old slot 2 appears as new slot 1, and the old
+ * odd slots vanish into the middle of a new slot's payload).
+ *
+ * "Silently renumbered but working" is worse than "broken": nothing in the system
+ * reports it, and every note that says which model is in which slot goes stale
+ * without a word.  Bumping the version turns all of them into BLOB_INVALID, which is
+ * exactly the state this field was added to express -- the header comment above
+ * already promised that "an unknown one is refused".  Migration is
+ * `blob erase <n>` + re-transfer.
+ */
+#define BLOB_FMT_VER     2u
 #define BLOB_HDR_BODY    4u            /* first byte of the body                */
 #define BLOB_HDR_BYTES   80u           /* magic + body + name[]                 */
 #define BLOB_HDR_NAME    16u           /* offset of name[] within the header    */

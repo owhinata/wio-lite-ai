@@ -167,7 +167,7 @@ static int cmd_blob_info(struct cli_instance *sh, int argc, char **argv)
 	          (unsigned long)(BLOB_PAYLOAD_MAX - info.length));
 	/* Be precise about what `valid` claims.  It means the HEADER decodes -- and,
 	 * because of the two-step commit, that the header was read back when it was
-	 * written.  It does not re-read 252 KB of payload on every listing.  `blob write`
+	 * written.  It does not re-read 508 KB of payload on every listing.  `blob write`
 	 * verifies once automatically; anything that could have disturbed the flash
 	 * since (or a power loss between the commit and that verify) is what this line
 	 * points at. */

@@ -52,9 +52,14 @@
 #define NN_TFLM_ARENA_BYTES  ((uint32_t)NN_TFLM_ARENA_KB * 1024u)
 
 /* Two model slots, double-buffered.  Sized to swallow a WHOLE blob payload
- * (BLOB_PAYLOAD_MAX = 258,048 B, app/blob.h) so `ai model load` can never be refused
+ * (BLOB_PAYLOAD_MAX = 520,192 B, app/blob.h) so `ai model load` can never be refused
  * for a reason the operator cannot see from `blob list`: any blob that fits a slot on
- * the NOR fits a slot here.  256 KB = 262,144 B leaves 4,096 B of margin over that.
+ * the NOR fits a slot here.  512 KB = 524,288 B leaves 4,096 B of margin over that.
+ *
+ * Both numbers doubled in issue #55, and they had to move together: MLPerf Tiny's
+ * IC02 is a 512,024 B flatbuffer, which is what set the blob slot size, and a staging
+ * buffer smaller than a blob slot would reintroduce exactly the "refused for an
+ * invisible reason" failure this sizing rule exists to prevent.
  *
  * TWO of them, not one, because a reload must not be able to destroy the model that is
  * currently running.  load_region() hands out the INACTIVE slot, so the flatbuffer the
@@ -63,19 +68,20 @@
  * can be rebuilt from memory that was never overwritten.  With a single slot, a
  * corrupt .tflite would take the working model down with it. */
 #define NN_TFLM_MODEL_SLOTS  2u
-#define NN_TFLM_MODEL_MAX    (256u * 1024u)
+#define NN_TFLM_MODEL_MAX    (512u * 1024u)
 
 /*
  * Carve-out budget (.psram_ai is 2 MB, 0x90600000..0x90800000):
  *     nn_tflm_arena        512 KB
- *     nn_tflm_model_buf  2x256 KB
+ *     nn_tflm_model_buf  2x512 KB   (issue #55: was 2x256 KB)
  *     psram_ai_bench_buf    64 KB   (pre-existing, shell/cmds/cmd_membench.c)
  *     ----------------------------
- *                        1,088 KB of 2,048 KB   -> ~960 KB still free
+ *                        1,600 KB of 2,048 KB   -> ~448 KB still free
  *
- * The free remainder is where issue #9 phase 3's camera staging goes.  The linker
- * script ASSERTs the total fits; cmake/check_psram_ai_residency.py checks that these
- * are the objects actually in there.
+ * The linker script ASSERTs the total fits (_psram_ai_end <= 0x90800000);
+ * cmake/check_psram_ai_residency.py checks that these are the objects actually in
+ * there.  Nothing costs flash -- the section is NOLOAD -- so what the extra megabyte
+ * spends is carve-out address space, and the ASSERT is what says whether there is any.
  */
 
 #ifdef __cplusplus

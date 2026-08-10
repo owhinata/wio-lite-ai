@@ -41,16 +41,38 @@ set(TFLM_GEN  "${TFLM_SRC}/tensorflow/lite/micro/tools/project_generation/create
 # 216 MHz -- a 3.9x difference, which is why ON is the default.
 set(NN_TFLM_CMSIS_NN ON CACHE BOOL "Use CMSIS-NN optimised kernels in the tflm backend")
 
-# Which ops the resolver registers.  `blazeface` is the 8 ops BlazeFace-front 128 int8
-# actually uses; `extended` adds the common-vision superset so another int8 model can
-# be loaded into a blob slot without a rebuild.  This is a knob rather than a constant
-# because the donor firmware measured the widening from 8 to 23 ops at +97,056 B of
-# flash -- on a 384 KB partition that is a decision, not a detail.  Kept as a CONFIGURE
-# option so widening the op set is a configure change, never a source edit.
-set(NN_TFLM_OPS "blazeface" CACHE STRING "tflm op resolver set: blazeface | extended")
-set_property(CACHE NN_TFLM_OPS PROPERTY STRINGS blazeface extended)
-if(NOT NN_TFLM_OPS STREQUAL "blazeface" AND NOT NN_TFLM_OPS STREQUAL "extended")
-    message(FATAL_ERROR "NN_TFLM_OPS must be 'blazeface' or 'extended'")
+# Which ops the resolver registers.  Three NESTED profiles, listed in the order they
+# grow (see port/nn/tflm/nn_tflm_ops.h, which is the single definition of each set):
+#
+#   blazeface   the 8 ops BlazeFace-front 128 int8 actually uses
+#   mlperf      + FULLY_CONNECTED / AVERAGE_POOL_2D / SOFTMAX = 11.  Exactly what the
+#               five MLPerf Tiny v1.4 models need (issue #55), measured with
+#               scripts/verify_tflite.cc rather than guessed.  +23,632 B of text.
+#   extended    + the common-vision superset = 26.  ⚠ DOES NOT LINK on this firmware
+#               today: FLASH overflows by 29,200 B (measured, issue #55).
+#
+# This is a knob rather than a constant because on a 384 KB partition the width of the
+# op set is a decision, not a detail -- and `mlperf` exists precisely because the
+# next profile up does not fit.  Kept as a CONFIGURE option so widening the op set is
+# a configure change, never a source edit.
+set(NN_TFLM_OPS "blazeface" CACHE STRING
+    "tflm op resolver set: blazeface | mlperf | extended")
+set_property(CACHE NN_TFLM_OPS PROPERTY STRINGS blazeface mlperf extended)
+if(NOT NN_TFLM_OPS MATCHES "^(blazeface|mlperf|extended)$")
+    message(FATAL_ERROR "NN_TFLM_OPS must be 'blazeface', 'mlperf' or 'extended'")
+endif()
+
+# The define each profile turns on, in ONE place: the firmware library and the
+# host-side verify_tflite build below both read this variable, and a checker built
+# against a different op set than the firmware is worse than no checker (the whole
+# argument is in nn_tflm_ops.h).  `blazeface` adds nothing, which is why this can be
+# empty -- and why it is a plain variable, not a generator expression: an unset genex
+# expands to an empty ARGUMENT rather than to nothing, and the compiler then sees "".
+set(NN_TFLM_OPS_DEFINE "")
+if(NN_TFLM_OPS STREQUAL "mlperf")
+    set(NN_TFLM_OPS_DEFINE "NN_TFLM_OPS_MLPERF_PROFILE=1")
+elseif(NN_TFLM_OPS STREQUAL "extended")
+    set(NN_TFLM_OPS_DEFINE "NN_TFLM_OPS_EXTENDED=1")
 endif()
 
 # Run the flatbuffers verifier over a model before handing it to the interpreter.
@@ -268,7 +290,7 @@ target_compile_definitions(tflm
 target_compile_definitions(tflm PRIVATE
     NN_TFLM_ARENA_KB=${NN_TFLM_ARENA_KB}
     NN_TFLM_VERIFY=$<BOOL:${NN_TFLM_VERIFY}>
-    $<$<STREQUAL:${NN_TFLM_OPS},extended>:NN_TFLM_OPS_EXTENDED=1>)
+    ${NN_TFLM_OPS_DEFINE})
 
 if(NN_TFLM_CMSIS_NN)
     # The CMSIS_6 core + CMSIS-NN include roots downloaded into the tree, mirroring the
@@ -348,11 +370,13 @@ target_link_libraries(tflm PUBLIC stdc++_nano supc++_nano m)
 # schema_generated.h, and most builds never need it.
 find_program(HOST_CXX NAMES c++ g++ clang++)
 if(HOST_CXX)
-    # A plain variable, not a generator expression: an unset genex expands to an empty
-    # ARGUMENT rather than to nothing, and the compiler then sees a literal "".
+    # The same profile define the firmware library got, so the checker and the board
+    # agree on the op set by construction.  Empty for `blazeface`, and an empty CMake
+    # variable expands to no argument at all here (unlike a genex, which would leave a
+    # literal "" on the command line).
     set(_vt_ops_def "")
-    if(NN_TFLM_OPS STREQUAL "extended")
-        set(_vt_ops_def "-DNN_TFLM_OPS_EXTENDED=1")
+    if(NN_TFLM_OPS_DEFINE)
+        set(_vt_ops_def "-D${NN_TFLM_OPS_DEFINE}")
     endif()
     add_custom_command(
         OUTPUT "${CMAKE_BINARY_DIR}/verify_tflite"
