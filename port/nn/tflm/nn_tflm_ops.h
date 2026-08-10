@@ -48,18 +48,26 @@
  * Exactly what MLPerf Tiny v1.4 needs on top of the base set, added by
  * -DNN_TFLM_OPS=mlperf (issue #55).
  *
- * 🔴 THREE OPERATORS, NOT FIFTEEN, AND THAT IS THE POINT.  All five v1.4 models --
- * ic01 (ResNet), ic02 (larger ResNet), kws01 (DS-CNN), vww01 (MobileNet) and ad01
- * (deep autoencoder) -- were checked with scripts/verify_tflite.cc against the base
- * set, and the union of everything they were missing is these three.  `extended`
- * would also cover them, and `extended` does not link (see above), so the difference
- * between measuring the requirement and assuming it is the difference between a
- * firmware that exists and one that does not.
+ * 🔴 A MEASURED SET, NOT A GENEROUS ONE, AND THAT IS THE POINT.  All five v1.4
+ * models -- ic01 (ResNet), ic02 (larger ResNet), kws01 (DS-CNN), vww01 (MobileNet)
+ * and ad01 (deep autoencoder) -- were run through scripts/verify_tflite.cc against
+ * the base set, and the union of everything they were missing is the first three
+ * entries below.  `extended` would also cover them, and `extended` does not link
+ * (see above), so the difference between measuring the requirement and assuming it
+ * is the difference between a firmware that exists and one that does not.
  *
- * Measured cost on top of the base set: +23,632 B of text, leaving 21,320 B free in
- * the 384 KB partition.  If that runs out, the next thing to give up is PAD and
- * MAX_POOL_2D from the base set (+6,248 B back) -- no MLPerf model uses either, and
+ * Measured cost of this profile over the base set: +23,624 B of text.  With the
+ * MLPerf harness on top (CONFIG_MLPERF_TINY=ON) the image is 377,976 B of 393,216,
+ * leaving 15,240 B.  If that runs out, the next thing to give up is PAD and
+ * MAX_POOL_2D from the base set (worth 6,248 B) -- no MLPerf model uses either, and
  * only BlazeFace (issue #9) would stop running.
+ *
+ * 🔴 "ONE MORE OPERATOR" IS NOT A UNIT OF FLASH, so do not budget by counting them.
+ * Adding MEAN and LOGISTIC to this profile was measured at ZERO bytes: their kernels
+ * are already in the image because TFLM's shared operator code reaches them and
+ * --gc-sections cannot drop them, so registering them buys only a resolver table
+ * entry that vanishes into alignment.  What costs is a kernel nothing else already
+ * pulled in.  Measure the profile you actually intend to ship.
  */
 #define NN_TFLM_OPS_MLPERF(X)                   \
 	X(FULLY_CONNECTED,    AddFullyConnected)    \

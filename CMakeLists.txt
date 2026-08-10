@@ -575,6 +575,41 @@ if(BSP_ENABLE_CAMERA)
 endif()
 list(APPEND SHELL_SOURCES ${NN_SOURCES} "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_ai.c")
 
+# issue #55: the MLPerf Tiny v1.4 benchmark harness.  Like CONFIG_NN_BACKEND above and
+# for the same reason, this is NOT a BSP_ENABLE_* switch -- those all name a piece of
+# hardware, and the point of each is a firmware that leaves those pins alone while
+# bisecting a suspicion.  There is no MLPerf peripheral.
+#
+# OFF by default because it is not free: it needs the ~340 MB upstream mirror, it adds
+# ~28 KB of harness and gp_buff to a partition that is already 93% full, and the
+# operator ops it needs (NN_TFLM_OPS=mlperf) cost more flash again.  A benchmark run is
+# a deliberate act, so turning it on is one too.
+option(CONFIG_MLPERF_TINY "Build the MLPerf Tiny v1.4 benchmark harness and `mlperf`" OFF)
+if(CONFIG_MLPERF_TINY)
+    # Required, not merely recommended.  The harness runs whatever model `ai model
+    # load` put in the interpreter, and the `null` backend has no interpreter --
+    # nn_model_reload() returns NN_ERR_NOSUP.  The build would succeed and the command
+    # would refuse every model, which is the least useful place to discover this.
+    if(NOT CONFIG_NN_BACKEND STREQUAL "tflm")
+        message(FATAL_ERROR
+            "CONFIG_MLPERF_TINY=ON needs CONFIG_NN_BACKEND=tflm (it benchmarks a model "
+            "the interpreter loads at run time; the `null` backend has no interpreter). "
+            "Configure with -DCONFIG_NN_BACKEND=tflm -DNN_TFLM_OPS=mlperf.")
+    endif()
+    # Not fatal: the operator set is a separate decision, and someone may deliberately
+    # be measuring a narrower one.  But `blazeface` cannot run a single MLPerf model,
+    # so saying nothing would let the failure surface as an unexplained refusal from
+    # `ai model load` instead.
+    if(NOT NN_TFLM_OPS STREQUAL "mlperf" AND NOT NN_TFLM_OPS STREQUAL "extended")
+        message(WARNING
+            "CONFIG_MLPERF_TINY=ON with NN_TFLM_OPS=${NN_TFLM_OPS}: none of the MLPerf "
+            "Tiny models will load (they need FULLY_CONNECTED, AVERAGE_POOL_2D and "
+            "SOFTMAX).  Add -DNN_TFLM_OPS=mlperf.")
+    endif()
+    include("${CMAKE_SOURCE_DIR}/cmake/mlperf-tiny.cmake")
+    list(APPEND SHELL_SOURCES "${CMAKE_SOURCE_DIR}/shell/cmds/cmd_mlperf.c")
+endif()
+
 add_executable(shell
     "${CMAKE_SOURCE_DIR}/app/main.c"
     "${CMAKE_SOURCE_DIR}/app/usb_cdc.c"
@@ -711,6 +746,17 @@ target_link_options(shell PRIVATE ${SHELL_OPT_FLAGS} -ffunction-sections -fdata-
 # yet where the backend selection above includes it.
 if(CONFIG_NN_BACKEND STREQUAL "tflm")
     nn_tflm_attach(shell)
+endif()
+
+# issue #55: the benchmark harness objects.  An OBJECT library, so these land in the
+# image exactly as if they had been listed in add_executable -- but compiled with the
+# C++ containment flags `shell` itself does not carry (cmake/mlperf-tiny.cmake).  The
+# link driver stays C: nn_tflm_attach() above already forces LINKER_LANGUAGE, which is
+# required anyway and covers this too.
+if(CONFIG_MLPERF_TINY)
+    target_link_libraries(shell PRIVATE mlperf_obj)
+    target_include_directories(shell PRIVATE "${CMAKE_SOURCE_DIR}/port/mlperf")
+    target_compile_definitions(shell PRIVATE CONFIG_MLPERF_TINY=1)
 endif()
 
 firmware_finalize(shell)

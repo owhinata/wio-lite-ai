@@ -47,7 +47,8 @@ set(NN_TFLM_CMSIS_NN ON CACHE BOOL "Use CMSIS-NN optimised kernels in the tflm b
 #   blazeface   the 8 ops BlazeFace-front 128 int8 actually uses
 #   mlperf      + FULLY_CONNECTED / AVERAGE_POOL_2D / SOFTMAX = 11.  Exactly what the
 #               five MLPerf Tiny v1.4 models need (issue #55), measured with
-#               scripts/verify_tflite.cc rather than guessed.  +23,632 B of text.
+#               scripts/verify_tflite.cc rather than guessed.  +23,624 B of text --
+#               and +6,072 B more with CONFIG_MLPERF_TINY=ON, which leaves 15,240 B.
 #   extended    + the common-vision superset = 26.  ⚠ DOES NOT LINK on this firmware
 #               today: FLASH overflows by 29,200 B (measured, issue #55).
 #

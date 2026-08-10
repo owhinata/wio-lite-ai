@@ -26,3 +26,8 @@
 [submodule "lib/flashdb"]
 	path = lib/flashdb
 	url = https://github.com/armink/FlashDB.git
+[submodule "lib/mlperf-tiny"]
+	path = lib/mlperf-tiny
+	url = https://github.com/mlcommons/tiny.git
+	branch = v1p4_rc
+	shallow = true

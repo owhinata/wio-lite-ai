@@ -120,6 +120,77 @@ void tx_glue_profile_enable(void)
 #endif
 }
 
+/*
+ * Microsecond time base (issue #55).  See tx_glue.h for why it takes two clocks to
+ * make one; this is the arithmetic.
+ *
+ * TIM2's kernel clock is COMPUTED, not assumed.  RM0468 sec 8.7.6 (RCC_CFGR.TIMPRE)
+ * and sec 8.7.8 (RCC_D2CFGR.D2PPRE1): with an APB prescaler of 1 the timer clock
+ * equals PCLK, otherwise it is 2x PCLK (TIMPRE = 0) or 4x (TIMPRE = 1), capped at
+ * HCLK.  With the bootloader's D2PPRE1 = /2 and TIMPRE = 0 that comes to 275 MHz --
+ * the number tx_user.h quotes -- but writing 275000000 here would be a constant that
+ * silently stops being true if the clock tree ever moves, and this firmware has been
+ * bitten by exactly that shape of assumption before (src/system_stm32h7xx.c on
+ * D1CorePrescTable).  port/camera/camera.c derives TIM5's the same way, for the same
+ * reason; it is static there, so this is a second copy rather than a shared helper --
+ * that file is behind BSP_ENABLE_CAMERA and this one must work without it.
+ */
+static uint32_t tx_glue_tim_ker_hz(void)
+{
+    uint32_t pclk1 = HAL_RCC_GetPCLK1Freq();
+    uint32_t hclk  = HAL_RCC_GetHCLKFreq();
+    uint32_t mul   = ((RCC->CFGR & RCC_CFGR_TIMPRE) != 0u) ? 4u : 2u;
+
+    if (pclk1 == hclk)
+        return hclk;
+    return (pclk1 * mul > hclk) ? hclk : pclk1 * mul;
+}
+
+uint32_t tx_glue_timer_hz(void)
+{
+#ifdef TX_EXECUTION_PROFILE_ENABLE
+    return tx_glue_tim_ker_hz();
+#else
+    return 0u;   /* TIM2 is not running; tx_glue_us64() falls back to the tick */
+#endif
+}
+
+uint64_t tx_glue_us64(void)
+{
+#ifdef TX_EXECUTION_PROFILE_ENABLE
+    /* Read the fine counter FIRST.  If the two reads straddle a tick boundary the
+       coarse value is then the LATER of the pair, which biases the wrap estimate away
+       from zero rather than through it -- and either way the error is ~1 ms against a
+       7.8 s tolerance. */
+    uint32_t fine     = TIM2->CNT;
+    uint64_t tick_us  = (uint64_t)tx_time_get() *
+                        (1000000u / TX_TIMER_TICKS_PER_SECOND);
+    uint32_t hz       = tx_glue_tim_ker_hz();
+    uint64_t period;      /* microseconds in one full 2^32 TIM2 wrap */
+    uint64_t fine_us;
+    uint64_t wraps;
+
+    if (hz == 0u)                     /* cannot happen; keeps the divides safe */
+        return tick_us;
+
+    period  = (0x100000000ull * 1000000ull) / hz;    /* 15,618,063 us at 275 MHz */
+    fine_us = ((uint64_t)fine * 1000000ull) / hz;
+
+    /* Round to the NEAREST wrap rather than truncating: near a boundary the tick and
+       the timer disagree by microseconds, and truncation would turn that into a whole
+       period of error in one direction.  The +period/2 bias makes the nearest wrap the
+       one selected, and the subtraction cannot underflow because tick_us only reaches
+       zero when fine_us does too (both count from the same reset). */
+    wraps = (tick_us + period / 2u >= fine_us)
+            ? (tick_us + period / 2u - fine_us) / period
+            : 0u;
+
+    return wraps * period + fine_us;
+#else
+    return (uint64_t)tx_time_get() * (1000000u / TX_TIMER_TICKS_PER_SECOND);
+#endif
+}
+
 /* Number of 1 ms SysTicks per ThreadX tick.  Default 1 (1 kHz ThreadX tick).
    Override with -DTX_GLUE_TICK_DIV; keep in sync with TX_TIMER_TICKS_PER_SECOND. */
 #ifndef TX_GLUE_TICK_DIV
