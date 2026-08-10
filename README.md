@@ -83,6 +83,40 @@ time as the USB console. 27 commands:
   - **Live camera inference** (issue #9 phases 3–4): `ai stream start` runs
     **camera → BlazeFace → face boxes** continuously, and `ai overlay on` draws them
     on the preview. `ai run` does one shot. See *Live camera inference* below.
+- **`mlperf`** — hands the console to the **MLPerf Tiny v1.4** monitor (issue #55), so
+  the board can be measured with the industry-standard tinyML suite instead of only
+  with `ai bench`. Upstream's own harness
+  (`lib/mlperf-tiny/benchmark/api/internally_implemented.cpp`, a read-only mirror
+  pinned to `v1p4_rc`) is compiled in unmodified and speaks its serial protocol over
+  the same USB CDC the shell uses; `port/mlperf` supplies the submitter half.
+  Built only with `-DCONFIG_MLPERF_TINY=ON -DNN_TFLM_OPS=mlperf`.
+  - 🔴 **One firmware runs every benchmark.** Upstream compiles the model into the
+    image and answers the host's `profile` query with a compile-time string, so each
+    benchmark is a separate build. This board already loads its model at run time from
+    a NOR blob slot, so the benchmark identity is a *function of what is loaded* —
+    `mlperf_model_id()` derives it from the tensor shapes, and
+    `TH_MODEL_VERSION` is defined as that call. Changing benchmark is
+    `ai model load <slot>`, not a reflash, so it costs no internal-flash erase cycle.
+  - **Measured, five-window medians** (arena in external PSRAM, `-O2` CMSIS-NN):
+
+    | benchmark | model | throughput | per inference |
+    |---|---|---:|---:|
+    | ic02 (reports as ic01) | ResNet large int8, 512 KB | 2.301 inf/s | 434.6 ms |
+    | kws01 | DS-CNN int8, 54 KB | 98.311 inf/s | 10.17 ms |
+    | vww01 | MobileNet 96×96 int8, 333 KB | 23.344 inf/s | 42.8 ms |
+    | ad01 | Deep AutoEncoder int8, 277 KB | 232.062 inf/s | 4.31 ms |
+
+  - 🔴 **The board is fast enough that the runner's *floor* bites, not its timeout.**
+    MLPerf requires a five-iteration loop to last ≥10 s or it reports no median, and
+    upstream's iteration counts are sized for an 80 MHz reference DUT. At 550 MHz
+    kws01's 70 iterations finish the whole loop in ~4 s and the run is rejected, so
+    `scripts/mlperf/tests_performance_wio.yaml` raises that one count to 800. The
+    other three clear the floor unchanged.
+  - **Energy and the streaming wakeword are out of reach**, and not for want of
+    software: energy needs an LPM01A or JouleScope, and `sww01` needs an
+    STM32H573I-DK feeding I2S. Performance and accuracy need nothing but the USB
+    cable. Host setup, dataset generation and the run itself are in
+    **`scripts/mlperf/README.md`**.
 - **`ai stream` / `ai overlay`** — the camera-driven pipeline. The interesting part is
   what it does **not** have: no staging buffer, no state machine, no per-inference
   copy. Inference is ~373 ms and a camera frame period is ~74 ms, so a fresh frame is
@@ -141,8 +175,9 @@ time as the USB console. 27 commands:
   depends on. Addresses are device offsets, not pointers. Every subcommand reaches
   the bare device, past both of its tenants (`kv` and `blob`) — deliberately, since
   this is the tool for looking at the device itself.
-- **`blob`** — the **asset region** on that same NOR (issue #10): eight 256 KB slots
-  at 1 MB–3 MB holding read-only files that arrive from the PC over YMODEM. It exists
+- **`blob`** — the **asset region** on that same NOR (issue #10, widened by issue #55):
+  six 512 KB slots at 1 MB–4 MB holding read-only files that arrive from the PC over
+  YMODEM. It exists
   because issue #9 supplies the TFLM model from here: a 189 KB `.tflite` does not fit
   in the internal flash's spare ~115 KB, and linking one in would spend an internal
   flash erase cycle (of ~10k) on every model change.
@@ -987,8 +1022,8 @@ time as the USB console. 27 commands:
   touched (see *Brick safety*), and the external flash is readable over SWD or with a
   hot-air gun regardless. `kv list` masks the value so it does not end up in a pasted
   log, which is shoulder-surfing hygiene and not protection — do not treat it as such.
-- **Asset region (issue #10 / issue #9 P2b)**: `app/blob.c` puts eight 256 KB slots at
-  1 MB–3 MB of the same NOR, each holding one file received over YMODEM. It is a third
+- **Asset region (issue #10 / issue #9 P2b, widened by issue #55)**: `app/blob.c` puts
+  six 512 KB slots at 1 MB–4 MB of the same NOR, each holding one file received over YMODEM. It is a third
   sibling of `port/nor` and `app/kv.c`, not a layer over either — it calls the `nor_*`
   primitives directly and borrows exactly one thing from the database side,
   `fdb_calc_crc32()`. Four decisions carry it:
@@ -1110,8 +1145,8 @@ app/        main + USB CDC wiring, fault handlers, USB descriptors, retarget,
             OCTOSPI1 PSRAM bring-up (psram.c), MPU regions (mpu.c),
             configuration store: kv.c (the only FlashDB caller) +
             kv_boot.c (the thread that opens it, issue #37),
-            asset region: blob.c (8 x 256 KB NOR slots + the YMODEM sink,
-            issue #10),
+            asset region: blob.c (6 x 512 KB NOR slots + the YMODEM sink,
+            issue #10/#55),
             camera glue: cam_band.c (refcounted fan-out of the one band
             callback), cam_preview.c (bands -> LTDC + the box overlay) and
             nn_camera.c (bands -> nn_input() -> BlazeFace, issue #9 P3/P4),
@@ -1203,7 +1238,7 @@ Listed in memory-hierarchy order — the same order `free` and `membench` print
 | FLASH | `0x08020000` | internal flash **sectors 1-3 = 384 KB** (issue #25). Sector 0 (`0x08000000`, 128 KB) is the DFU bootloader; the 128 KB erase granule is what keeps the two apart, so no programming path can reach it. ~905 MB/s read (`membench`). The image currently uses **278,052 B = 70.7%**; see [Build](#build) for why it is built `-Os` + LTO. |
 | PSRAM | `0x90000000` | external OCTOSPI1 **APS6408 8 MB Octal DDR PSRAM**, memory-mapped @ 133 MHz Fixed Latency; MPU Normal non-cacheable (DMA-coherent scratch; `.psram_noinit`). Since issue #7 the first 300 KB are the **LTDC double frame buffer**, which the display controller reads continuously while scanout is on — hence the `lcd off` interlock on every path that retunes OCTOSPI1. 🔴 **The window is no longer one kind of memory.** Issue #9 carved its **top 2 MB (`0x90600000`, `.psram_ai`) out as Normal write-back cacheable** (MPU region 3) for the NN runtime's working set, because through the non-cacheable mapping that working set is billed *one bus transaction per access* rather than per cache line — measured at ~9.8 core cycles for every byte-wide access, with the device's 113 MB/s nowhere in sight. Measured effect on the same workload: **296 µs → 114 µs, 2.6×** — and that is a *floor*, because the workload streams once with no reuse, so it collects only the line-fill amortisation and none of the cache hits real inference gets. `membench` puts the streaming half of that at read 113 → 184 MB/s and write 154 → 281 MB/s. Everything below stays non-cacheable, which is what lets the LTDC, the DMA2D and the DCMI share their buffers with the CPU with no maintenance at all. That split is the whole reason `free` prints **two** PSRAM rows, and why **nothing a bus master touches may be placed in the carve-out**: unlike the DTCM mistake, such a buffer still transfers correctly and is then read back stale, intermittently, only under cache pressure. `cmake/check_psram_ai_residency.py` refuses the build instead. Note also that the DTCM figure the linker prints as "free" is not spendable — the top 8 KB of it is the main stack, so the real headroom there is about 7.6 KB. |
 | *(bootloader)* | `0x08000000` | internal flash **sector 0, 128 KB** — the DFU bootloader. The app does not own it and no app-side path can erase it (the 128 KB erase granule is the sector granule). |
-| *(external flash)* | `0x70000000` | the 16 MB W25Q128 the app used to execute from, now storage: its **first 1 MB is the `kv` configuration partition** (FlashDB), **1 MB–3 MB is the `blob` asset region** (issue #10: 8 slots × 256 KB, each 4 KB header + 252 KB payload), and the remaining 13 MB is unallocated. Only the `kv` megabyte has a FAL partition entry; the blob region is addressed directly by `app/blob.c`, so a stray FAL call still cannot reach it. **Deliberately still not mapped**, even though issue #37 brought OCTOSPI2 back up: `port/nor` reaches the device only through indirect transactions, and `app/mpu.c` keeps the 256 MB window no-access + execute-never so a stray or *speculative* access raises MemManage (recorded in `dmesg`) instead of hitting a controller that is not in memory-mapped mode. Opening a window here is a separate design with its own MPU region. |
+| *(external flash)* | `0x70000000` | the 16 MB W25Q128 the app used to execute from, now storage: its **first 1 MB is the `kv` configuration partition** (FlashDB), **1 MB–4 MB is the `blob` asset region** (issue #10, widened by #55: 6 slots × 512 KB, each 4 KB header + 508 KB payload), and the remaining 12 MB is unallocated. Only the `kv` megabyte has a FAL partition entry; the blob region is addressed directly by `app/blob.c`, so a stray FAL call still cannot reach it. **Deliberately still not mapped**, even though issue #37 brought OCTOSPI2 back up: `port/nor` reaches the device only through indirect transactions, and `app/mpu.c` keeps the 256 MB window no-access + execute-never so a stray or *speculative* access raises MemManage (recorded in `dmesg`) instead of hitting a controller that is not in memory-mapped mode. Opening a window here is a separate design with its own MPU region. |
 
 ## Build
 

@@ -212,8 +212,13 @@ dfu-util -d 0483:df11 -a 0 -D build/<app>.bin
 - **コンソール = USB CDC**: 単一 USB = **USB1_OTG_HS を FS（内蔵 PHY）動作**。CMSIS に
   `USB2_OTG_FS` / `OTG_FS_IRQn` は**無い** → TinyUSB(dwc2) は rhport0 を OTG_HS base +
   `OTG_HS_IRQHandler` にエイリアス（`tud_int_handler(0)`）。GPIO = PA11/PA12
-  `GPIO_AF10_OTG1_FS`。USB クロックは PLL3Q 48 MHz。app 動作時 `8050:2886` "CDC in FS Mode"
-  → `/dev/ttyACM0`。**shell の UART backend はこの USB CDC backend に差し替える**のが移植の要。
+  `GPIO_AF10_OTG1_FS`。USB クロックは PLL3Q 48 MHz。app 動作時 **`0483:5740`**
+  "CDC in FS Mode" → `/dev/ttyACM0`（`app/usb_descriptors.c`。boot は `0483:df11` = DFU）。
+  🔴 **ここは長く `8050:2886` と書かれていたが誤り**で、#55 で実機の enumeration と
+  descriptor の両方から訂正した。`0483:5740` は **ST の汎用 VCP ID** なので、VID/PID で
+  DUT を選ぶホスト側ツールは他の ST デバイスと衝突しうる（MLPerf のランナーはこの ID を
+  LPM01A 電力計に割り当てている＝`scripts/mlperf/devices_wio.yaml` が要る理由）。
+  **shell の UART backend はこの USB CDC backend に差し替える**のが移植の要。
 - **LED / ボタン**（schematic sheet8）:
   - LED0（赤）= **PC13**（NPN バッファ経由。低ドライブの backup-domain ピン）
   - LED1（黄）= **PF0**
