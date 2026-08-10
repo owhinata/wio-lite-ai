@@ -106,6 +106,14 @@ time as the USB console. 27 commands:
     | vww01 | MobileNet 96×96 int8, 333 KB | 23.344 inf/s | 42.8 ms |
     | ad01 | Deep AutoEncoder int8, 277 KB | 232.062 inf/s | 4.31 ms |
 
+  - **Accuracy**: ic02 scores **94.0 % top-1** on the real CIFAR-10 stimulus set
+    against a closed-division target of 91 %. That number is also the harness's own
+    proof of correctness — an input transform or a dequantization that was subtly
+    wrong would still complete every run and simply score badly.
+    `scripts/mlperf/make_ic_accuracy_dataset.py` builds that set from CIFAR-10 with
+    numpy alone (upstream's generator pulls in TensorFlow only because the same file
+    also trains the model) and **refuses to write anything unless its labels match
+    upstream's reference `y_labels.csv` exactly**.
   - 🔴 **The board is fast enough that the runner's *floor* bites, not its timeout.**
     MLPerf requires a five-iteration loop to last ≥10 s or it reports no median, and
     upstream's iteration counts are sized for an 80 MHz reference DUT. At 550 MHz

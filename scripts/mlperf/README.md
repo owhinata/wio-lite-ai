@@ -83,7 +83,25 @@ python3 scripts/mlperf/make_perf_dataset.py --out ~/mlperf-datasets
 ＝ **レイテンシは中身に依存しない**ので、これで出る throughput は本物。
 🔴 **精度は出せない**（返ってくる分類は無意味）。`--mode a` に使わないこと。
 
-### accuracy を測るなら（実データが要る）
+### ic01/ic02 の accuracy（CIFAR-10 だけで済む。**TensorFlow 不要**）
+
+```bash
+curl -O https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz   # 170 MB
+tar xzf cifar-10-python.tar.gz
+python3 scripts/mlperf/make_ic_accuracy_dataset.py \
+        --cifar cifar-10-batches-py --out ~/mlperf-datasets
+```
+
+upstream の `perf_samples_loader.py` は `import train` 経由で TensorFlow を要求するが、
+テスト画像 200 枚を取り出すのに要るのは pickle と numpy だけ。
+🔴 **このスクリプトは自分の出力を upstream の `y_labels.csv` と照合し、
+食い違えば 1 バイトも書かずに終了する**ので、「たぶん一致する再実装」にはなっていない。
+
+（一番間違えやすいのは **CIFAR-10 が planar 1024R+1024G+1024B** なのにベンチマークは
+**interleaved RGB** を要求する点。取り違えてもファイルは 3,072 B のまま run も完走し、
+**精度だけが下がる**。）
+
+### 他の 3 ベンチの accuracy（実データが要る）
 
 `y_labels.csv` は upstream の `benchmark/evaluation/datasets/<id>/` にある（`_ref/mlperf-tiny/y_labels/`
 にもコピー済み）。**`.bin` の実体は入っていない**ので、`benchmark/training/<bench>/` の
@@ -147,6 +165,16 @@ kws01 が 4 秒で終わって弾かれる。差分は kws01 の `70 → 800` **
 | **ad01** | Deep AutoEncoder int8 (277 KB) | 232.06 inf/s | 4.31 ms |
 
 5 window の median。ic01（小さい方の ResNet, 260 KB）は未測定。
+
+### accuracy（`--mode a`）
+
+| ベンチ | Top-1 | 目標（Closed Division） | |
+|---|---:|---:|---|
+| **ic02**（CIFAR-10 実データ 200 枚） | **94.0 %** | 91 % | ✅ クリア |
+
+kws01 / vww01 / ad01 は実データ未取得のため未測定。
+🔴 **94% が出たこと自体がハーネスの正しさの証明**でもある — 入力変換（planar/interleaved、
+`^0x80`）か逆量子化のどちらかを間違えていれば、この数字にはならない。
 
 ⚠ **arena が外部 PSRAM にある構成の数字**であることを忘れないこと。#9 P2c で
 BlazeFace が 6.45 cyc/MACC だったのと同じ制約下で、内蔵 SRAM に収まるモデルを持つ
