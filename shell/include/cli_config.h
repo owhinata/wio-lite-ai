@@ -233,39 +233,60 @@
  * "max completion candidates" knob.
  */
 
-/* Sanity checks for the knobs that have meaning at this stage. */
-_Static_assert(CLI_CMD_BUFFER_SIZE > 0,     "CLI_CMD_BUFFER_SIZE must be > 0");
-_Static_assert(CLI_MAX_ARGC >= 1,           "CLI_MAX_ARGC must be >= 1");
-_Static_assert(CLI_HISTORY_BUFFER_SIZE > 0, "CLI_HISTORY_BUFFER_SIZE must be > 0");
-_Static_assert(CLI_HISTORY_BUFFER_SIZE <= 65535,
+/*
+ * Sanity checks for the knobs that have meaning at this stage.
+ *
+ * 🔴 CLI_STATIC_ASSERT, not _Static_assert directly, BECAUSE THIS HEADER IS NOW
+ * REACHED FROM C++.  `_Static_assert` is a C11 keyword; C++ spells it
+ * `static_assert`, and GCC only started accepting the C spelling in C++ as an
+ * extension in version 14.  Every C++ translation unit in this firmware used to live
+ * inside the tflm library, which never includes cli.h -- port/mlperf/mlperf_th.cc
+ * (issue #55) is the first one that does, and it compiled only because the pinned ARM
+ * toolchain happens to be GCC 15.  The host test suite's g++ 13 found it immediately.
+ *
+ * That is a landmine rather than a preference: the failure is at the toolchain
+ * version, not in anything anyone wrote, and it would land on whoever next bumps or
+ * downgrades the compiler.  Two lines make the header say what it means in both
+ * languages, and the checks keep running in both.
+ */
+#ifdef __cplusplus
+#define CLI_STATIC_ASSERT(cond, msg)  static_assert(cond, msg)
+#else
+#define CLI_STATIC_ASSERT(cond, msg)  _Static_assert(cond, msg)
+#endif
+
+CLI_STATIC_ASSERT(CLI_CMD_BUFFER_SIZE > 0,     "CLI_CMD_BUFFER_SIZE must be > 0");
+CLI_STATIC_ASSERT(CLI_MAX_ARGC >= 1,           "CLI_MAX_ARGC must be >= 1");
+CLI_STATIC_ASSERT(CLI_HISTORY_BUFFER_SIZE > 0, "CLI_HISTORY_BUFFER_SIZE must be > 0");
+CLI_STATIC_ASSERT(CLI_HISTORY_BUFFER_SIZE <= 65535,
                "CLI_HISTORY_BUFFER_SIZE must fit uint16_t hist_used/hist_nav");
-_Static_assert(CLI_PRINTF_BUFFER_SIZE > 0,  "CLI_PRINTF_BUFFER_SIZE must be > 0");
-_Static_assert(CLI_PROMPT_BUFFER_SIZE > 0,  "CLI_PROMPT_BUFFER_SIZE must be > 0");
-_Static_assert(CLI_INSTANCE_STACK_SIZE >= 512, "CLI_INSTANCE_STACK_SIZE too small");
-_Static_assert(CLI_MAX_INSTANCES >= 1,      "CLI_MAX_INSTANCES must be >= 1");
-_Static_assert(CLI_MAX_SUBCMD_DEPTH >= 1,   "CLI_MAX_SUBCMD_DEPTH must be >= 1");
-_Static_assert(CLI_INSTANCE_PRIORITY <= 31, "CLI_INSTANCE_PRIORITY must be 0..31 (ThreadX)");
-_Static_assert(CLI_MAX_BG_JOBS >= 1,        "CLI_MAX_BG_JOBS must be >= 1");
-_Static_assert(CLI_BG_JOB_STACK_SIZE >= 512, "CLI_BG_JOB_STACK_SIZE too small");
-_Static_assert(CLI_BG_JOB_PRIORITY <= 31,   "CLI_BG_JOB_PRIORITY must be 0..31 (ThreadX)");
-_Static_assert(CLI_BG_TX_POLL_TICKS >= 1,   "CLI_BG_TX_POLL_TICKS must be >= 1");
-_Static_assert(CLI_RX_DRAIN_CHUNK >= 1,     "CLI_RX_DRAIN_CHUNK must be >= 1");
-_Static_assert(CLI_TERM_WIDTH >= 20 && CLI_TERM_WIDTH <= 255,
+CLI_STATIC_ASSERT(CLI_PRINTF_BUFFER_SIZE > 0,  "CLI_PRINTF_BUFFER_SIZE must be > 0");
+CLI_STATIC_ASSERT(CLI_PROMPT_BUFFER_SIZE > 0,  "CLI_PROMPT_BUFFER_SIZE must be > 0");
+CLI_STATIC_ASSERT(CLI_INSTANCE_STACK_SIZE >= 512, "CLI_INSTANCE_STACK_SIZE too small");
+CLI_STATIC_ASSERT(CLI_MAX_INSTANCES >= 1,      "CLI_MAX_INSTANCES must be >= 1");
+CLI_STATIC_ASSERT(CLI_MAX_SUBCMD_DEPTH >= 1,   "CLI_MAX_SUBCMD_DEPTH must be >= 1");
+CLI_STATIC_ASSERT(CLI_INSTANCE_PRIORITY <= 31, "CLI_INSTANCE_PRIORITY must be 0..31 (ThreadX)");
+CLI_STATIC_ASSERT(CLI_MAX_BG_JOBS >= 1,        "CLI_MAX_BG_JOBS must be >= 1");
+CLI_STATIC_ASSERT(CLI_BG_JOB_STACK_SIZE >= 512, "CLI_BG_JOB_STACK_SIZE too small");
+CLI_STATIC_ASSERT(CLI_BG_JOB_PRIORITY <= 31,   "CLI_BG_JOB_PRIORITY must be 0..31 (ThreadX)");
+CLI_STATIC_ASSERT(CLI_BG_TX_POLL_TICKS >= 1,   "CLI_BG_TX_POLL_TICKS must be >= 1");
+CLI_STATIC_ASSERT(CLI_RX_DRAIN_CHUNK >= 1,     "CLI_RX_DRAIN_CHUNK must be >= 1");
+CLI_STATIC_ASSERT(CLI_TERM_WIDTH >= 20 && CLI_TERM_WIDTH <= 255,
                "CLI_TERM_WIDTH must be 20..255 (fits uint8_t term_width)");
-_Static_assert(CLI_BACKSPACE_MODE == 0 || CLI_BACKSPACE_MODE == 1,
+CLI_STATIC_ASSERT(CLI_BACKSPACE_MODE == 0 || CLI_BACKSPACE_MODE == 1,
                "CLI_BACKSPACE_MODE must be 0 or 1");
-_Static_assert(CLI_ENABLE_DANGEROUS_CMDS == 0 || CLI_ENABLE_DANGEROUS_CMDS == 1,
+CLI_STATIC_ASSERT(CLI_ENABLE_DANGEROUS_CMDS == 0 || CLI_ENABLE_DANGEROUS_CMDS == 1,
                "CLI_ENABLE_DANGEROUS_CMDS must be 0 or 1");
-_Static_assert(CLI_DEVMEM_DUMP_MAX_LEN > 0, "CLI_DEVMEM_DUMP_MAX_LEN must be > 0");
-_Static_assert(CLI_SLEEP_MAX_SEC > 0 && CLI_SLEEP_MAX_SEC <= 0xFFFFFFFFu / 1000u,
+CLI_STATIC_ASSERT(CLI_DEVMEM_DUMP_MAX_LEN > 0, "CLI_DEVMEM_DUMP_MAX_LEN must be > 0");
+CLI_STATIC_ASSERT(CLI_SLEEP_MAX_SEC > 0 && CLI_SLEEP_MAX_SEC <= 0xFFFFFFFFu / 1000u,
                "CLI_SLEEP_MAX_SEC*1000 must fit a 32-bit ThreadX tick");
 /* usleep busy-wait multiplies us by SystemCoreClock/1e6 = 550 (DWT cycles/us at
  * 550 MHz); keep the product in uint32. */
-_Static_assert(CLI_USLEEP_MAX_US > 0 && CLI_USLEEP_MAX_US <= 0xFFFFFFFFu / 550u,
+CLI_STATIC_ASSERT(CLI_USLEEP_MAX_US > 0 && CLI_USLEEP_MAX_US <= 0xFFFFFFFFu / 550u,
                "CLI_USLEEP_MAX_US*550 must fit uint32 (DWT cycles)");
-_Static_assert(CLI_WATCH_DEFAULT_SEC <= CLI_WATCH_MAX_SEC,
+CLI_STATIC_ASSERT(CLI_WATCH_DEFAULT_SEC <= CLI_WATCH_MAX_SEC,
                "CLI_WATCH_DEFAULT_SEC must be <= CLI_WATCH_MAX_SEC");
-_Static_assert(CLI_WATCH_MAX_SEC <= 0xFFFFFFFFu / 1000u,
+CLI_STATIC_ASSERT(CLI_WATCH_MAX_SEC <= 0xFFFFFFFFu / 1000u,
                "CLI_WATCH_MAX_SEC*1000 must fit a 32-bit ThreadX tick");
 
 #endif /* CLI_CONFIG_H */

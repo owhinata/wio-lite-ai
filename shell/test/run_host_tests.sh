@@ -217,4 +217,46 @@ gcc $CFLAGS -I "$here/../../include" -I "$here/../../port/nn" \
     $LDFLAGS -lm -o "$out/test_blazeface"
 "$out/test_blazeface"
 
+# issue #55 -- the MLPerf Tiny harness (port/mlperf/mlperf_th.cc), driven through
+# UPSTREAM'S OWN PARSER (lib/mlperf-tiny/benchmark/api/internally_implemented.cpp,
+# unmodified).  So what is under test is the protocol itself, fed the way the host's
+# runner feeds it -- `db load N`, 31-byte hex chunks, `infer N W` -- and what is
+# asserted is the bytes the board would put on the wire.
+#
+# It earns its place because all three things this layer can get wrong are SILENT on
+# hardware: the per-benchmark input transform (shift by 128 / pass through / quantize
+# from float) still produces confident scores when it is wrong, the three-decimal
+# formatting is assembled from integers because svc/fmt.c has no %f, and the benchmark
+# identification is what decides which test the host runs at all.  None of them
+# announce themselves; they come back as accuracy that is quietly a few points low.
+#
+# Skipped rather than failed when the submodule is absent: it is ~340 MB and only
+# fetched for CONFIG_MLPERF_TINY builds, so a plain checkout must still run the suite.
+# g++ links it -- upstream's half is C++ and declares no linkage, which is the whole
+# reason mlperf_th is C++ too (see its header).
+mlperf="$here/../../lib/mlperf-tiny/benchmark"
+if [ -f "$mlperf/api/internally_implemented.cpp" ]; then
+    gcc $CFLAGS -c -I "$svc" "$svc/fmt.c" -o "$out/fmt.o"
+    gcc $CFLAGS -I "$here/../../port/nn" -I "$here/../../port/mlperf" \
+        -c "$here/test_mlperf.c" -o "$out/test_mlperf.o"
+    # -std=gnu++17 to match the firmware, which passes no -std and so gets the GNU
+    # dialect by default: the test should compile the shared headers the same way the
+    # board does.  (This is also where cli_config.h's C11 _Static_assert was caught --
+    # GCC only accepts that spelling in C++ from version 14, the ARM toolchain is 15
+    # and this host's g++ is 13.  The header now uses CLI_STATIC_ASSERT and works in
+    # both, but the dialect match is what made the difference visible.)
+    g++ -std=gnu++17 -Wall -Wextra -ffunction-sections -fdata-sections -no-pie \
+        -I "$mlperf" -I "$here/../../port/mlperf" -I "$here/../../port/nn" \
+        -I "$inc" -I "$svc" -I "$here/../../port/threadx" \
+        -fno-exceptions -fno-rtti \
+        -include "$here/../../port/mlperf/mlperf_th.h" \
+        "$mlperf/api/internally_implemented.cpp" \
+        "$here/../../port/mlperf/mlperf_th.cc" \
+        "$out/test_mlperf.o" "$out/fmt.o" \
+        -Wl,--gc-sections -lm -o "$out/test_mlperf"
+    "$out/test_mlperf"
+else
+    echo "test_mlperf: SKIP (lib/mlperf-tiny not checked out)"
+fi
+
 echo "host tests passed"

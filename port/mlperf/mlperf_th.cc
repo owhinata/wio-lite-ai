@@ -90,12 +90,9 @@ struct mlperf_bench {
 
 static const struct mlperf_bench mlperf_table[] = {
 	{ "ic01",  { 1u, 32u, 32u, 3u }, 4u,  10u, LOAD_OFFSET_U8,  REPORT_CLASSES, 1u },
-	/* Recognised so `mlperf` can refuse them by NAME instead of as "unknown shape",
-	 * which is the difference between "not done yet" and "your model is wrong".
-	 * Issue #55 P3 fills these in, together with their host tests. */
-	{ "kws01", { 1u, 49u, 10u, 1u }, 4u,  12u, LOAD_INT8,       REPORT_CLASSES, 0u },
-	{ "vww01", { 1u, 96u, 96u, 3u }, 4u,   2u, LOAD_OFFSET_U8,  REPORT_CLASSES, 0u },
-	{ "ad01",  { 1u, 640u, 1u, 1u }, 2u, 640u, LOAD_F32_QUANT,  REPORT_MSE,     0u },
+	{ "kws01", { 1u, 49u, 10u, 1u }, 4u,  12u, LOAD_INT8,       REPORT_CLASSES, 1u },
+	{ "vww01", { 1u, 96u, 96u, 3u }, 4u,   2u, LOAD_OFFSET_U8,  REPORT_CLASSES, 1u },
+	{ "ad01",  { 1u, 640u, 1u, 1u }, 2u, 640u, LOAD_F32_QUANT,  REPORT_MSE,     1u },
 };
 
 #define MLPERF_BENCH_COUNT (sizeof mlperf_table / sizeof mlperf_table[0])
@@ -113,7 +110,8 @@ static struct mlperf_stats       mp_stats;
  * One formatted line at a time.  svc/fmt.c renders into a caller buffer, and going
  * through a buffer rather than a per-character sink keeps a protocol line to one
  * cli_write() -- which matters here because the host is waiting on `m-ready` with a
- * five-second timeout for every one of the ~4,000 `db` commands a vww01 sample takes.
+ * five-second timeout for every one of the 892 `db` commands a vww01 sample takes
+ * (27,648 B at the runner's 31 bytes per command).
  *
  * 192 B is comfortably over the longest line the protocol carries (kws01's
  * `m-results-[` + twelve "0.000" + separators + "]\r\n" is about 100), and a
@@ -128,6 +126,24 @@ static char mp_line[192];
 /* Start of the current monitor session, subtracted from every timestamp -- see
  * th_timestamp() for why the protocol's clock is session-relative here. */
 static uint64_t mp_epoch_us;
+
+/*
+ * ad01's input, kept as the floats the host sent.
+ *
+ * Anomaly detection is the one benchmark whose SCORE is computed here rather than
+ * read out of the model: the deep autoencoder reconstructs its own input, and the
+ * result is the mean squared error between the two.  So the float form has to
+ * survive th_load_tensor() -- comparing the output against the DEQUANTIZED input
+ * instead would subtract the input's quantization error from both sides and report a
+ * reconstruction that is better than it was.
+ *
+ * 2,560 B of .bss rather than a local: the CLI thread runs on 4,096 B, and its
+ * measured peak with the rest of this harness is already about half of that.  Sized
+ * from the benchmark, and checked against the tensor at load time, so a model with a
+ * different element count is refused rather than trusted.
+ */
+#define MLPERF_AD_ELEMS  640u
+static float mp_ad_input[MLPERF_AD_ELEMS];
 
 static uint32_t tensor_elems(const struct nn_tensor *t)
 {
@@ -238,6 +254,49 @@ void mlperf_monitor_start(void)
 void mlperf_feed(char c)
 {
 	ee_serial_callback(c);
+}
+
+/* ------------------------------------------------------------------ *
+ *  Quantization -- needed by BOTH halves of a benchmark, so it sits
+ *  above them: th_load_tensor() converts the host's floats in, and
+ *  th_results() converts the model's int8 back out.
+ * ------------------------------------------------------------------ */
+
+static float dequant(int8_t q, const struct nn_tensor *t)
+{
+	return t->scale * (float)((int32_t)q - t->zero_point);
+}
+
+/*
+ * The inverse, matching upstream's QuantizeFloatToInt8()
+ * (lib/mlperf-tiny/benchmark/util/quantization_helpers.h) exactly: round(v/scale)
+ * plus the zero point, saturated to the int8 range.
+ *
+ * The rounding is written out rather than calling round(), which is a double-precision
+ * libm entry.  Adding +/-0.5 before truncating toward zero IS round-half-away-from-
+ * zero, which is what round() specifies -- and this stays in single precision, which
+ * is the only kind the FPU does in one instruction here.
+ *
+ * A zero scale would be a division by zero, and it is reachable: a per-axis quantized
+ * tensor reads back scale 0 through this API (issue #51 found that the hard way).
+ * mlperf_bind() cannot see it -- the value is per tensor, not per shape -- so the
+ * guard lives here, and it yields the zero point, i.e. "no information", rather than
+ * an infinity that would propagate into every score.
+ */
+static int8_t quantize(float v, const struct nn_tensor *t)
+{
+	int32_t q;
+
+	if (t->scale == 0.0f)
+		return (int8_t)t->zero_point;
+
+	v = v / t->scale;
+	q = (int32_t)(v + (v >= 0.0f ? 0.5f : -0.5f)) + t->zero_point;
+	if (q < -128)
+		q = -128;
+	if (q > 127)
+		q = 127;
+	return (int8_t)q;
 }
 
 /* ------------------------------------------------------------------ *
@@ -367,10 +426,37 @@ void th_infer(void)
 	mp_stats.cycles += (uint64_t)nn_last_cycles(mp_model);
 }
 
+/*
+ * Does the `db` buffer hold the @p want bytes this benchmark needs?  Reports and
+ * counts if not.
+ *
+ * 🔴 ASKED BEFORE ANY COPY, AND THAT IS THE POINT.  ee_get_buffer() copies whatever
+ * it has and returns how much -- so checking its RETURN value means the short data is
+ * already in the destination.  Upstream can live with that because its reference
+ * copies into a scratch array and simply does not forward it; this harness writes
+ * straight into the input tensor (a vww01 sample is 27,648 B and the CLI thread has a
+ * 4,096 B stack), so the same mistake would leave the tensor half-overwritten with
+ * untransformed bytes and the NEXT inference would quietly run on it.
+ *
+ * Passing NULL is upstream's own documented probe: it skips the memcpy and returns
+ * the length it would have copied (api/internally_implemented.cpp).
+ */
+static int buffer_has(size_t want)
+{
+	size_t got = ee_get_buffer(NULL, want);
+
+	if (got == want)
+		return 1;
+	mp_stats.short_loads++;
+	th_printf("e-[Input db has %u bytes, expected %u]\r\n",
+	          (unsigned)got, (unsigned)want);
+	return 0;
+}
+
 void th_load_tensor(void)
 {
 	struct nn_tensor *in;
-	size_t want, got, i;
+	size_t want, i;
 	uint8_t *p;
 
 	/* Unbound means the monitor is not running and nothing should be touching the
@@ -383,8 +469,33 @@ void th_load_tensor(void)
 	if (in == NULL || in->data == NULL)
 		return;
 
+	p = (uint8_t *)in->data;
+
+	/*
+	 * ad01 is the exception: the host sends FLOATS, four bytes per element, so the
+	 * transfer is four times the tensor and cannot land in it.  It goes to the float
+	 * staging array (which th_results() needs anyway) and is quantized across.
+	 */
+	if (mp_bench->load == LOAD_F32_QUANT) {
+		want = MLPERF_AD_ELEMS * sizeof(float);
+
+		/* The array is sized from the benchmark; this is where that assumption
+		 * meets the model that was actually loaded. */
+		if (tensor_elems(in) != MLPERF_AD_ELEMS) {
+			th_printf("e-[Input tensor has %u elements, expected %u]\r\n",
+			          (unsigned)tensor_elems(in), (unsigned)MLPERF_AD_ELEMS);
+			return;
+		}
+
+		if (!buffer_has(want))
+			return;
+		(void)ee_get_buffer((uint8_t *)mp_ad_input, want);
+		for (i = 0u; i < MLPERF_AD_ELEMS; i++)
+			((int8_t *)p)[i] = quantize(mp_ad_input[i], in);
+		return;
+	}
+
 	want = (size_t)in->bytes;
-	p    = (uint8_t *)in->data;
 
 	/*
 	 * Straight into the input tensor -- no intermediate array.  Upstream's reference
@@ -400,13 +511,9 @@ void th_load_tensor(void)
 	 * model half a picture.  A load between two th_infer() calls would be that bug;
 	 * the protocol never asks for one.
 	 */
-	got = ee_get_buffer(p, want);
-	if (got != want) {
-		mp_stats.short_loads++;
-		th_printf("e-[Input db has %u bytes, expected %u]\r\n",
-		          (unsigned)got, (unsigned)want);
+	if (!buffer_has(want))
 		return;
-	}
+	(void)ee_get_buffer(p, want);
 
 	switch (mp_bench->load) {
 	case LOAD_OFFSET_U8:
@@ -420,12 +527,9 @@ void th_load_tensor(void)
 			p[i] ^= 0x80u;
 		break;
 	case LOAD_INT8:
-		break;               /* already the tensor's own representation */
-	case LOAD_F32_QUANT:
 	default:
-		/* Unreachable: mlperf_bind() refuses any benchmark whose `ready` flag is
-		 * clear, and ic01 is the only one set in this build.  Left as a case so
-		 * the switch stays exhaustive when P3 fills the others in. */
+		/* kws01: the runner already quantized the MFCCs, so the bytes ARE the
+		 * tensor's representation and touching them would be the bug. */
 		break;
 	}
 }
@@ -464,11 +568,6 @@ static void put_fixed3(float v)
 	          (unsigned long)(milli / 1000u), (unsigned long)(milli % 1000u));
 }
 
-static float dequant(int8_t q, const struct nn_tensor *t)
-{
-	return t->scale * (float)((int32_t)q - t->zero_point);
-}
-
 void th_results(void)
 {
 	const struct nn_tensor *out;
@@ -492,11 +591,44 @@ void th_results(void)
 	n = tensor_elems(out);
 
 	th_printf("m-results-[");
-	for (i = 0u; i < n; i++) {
-		if (i != 0u)
-			th_printf(",");
-		put_fixed3(dequant(q[i], out));
+
+	if (mp_bench->report == REPORT_MSE) {
+		/*
+		 * ad01 does not classify.  The autoencoder reconstructs its input, and
+		 * the anomaly score is how badly it managed -- the mean squared error
+		 * between the reconstruction and the ORIGINAL float input, which is why
+		 * mp_ad_input had to survive th_load_tensor().  The host collects one
+		 * such score per window and computes an AUC across the set; it never
+		 * sees the 640 output elements.
+		 *
+		 * Accumulated in double, unlike everything else here -- and unlike
+		 * upstream's reference, which uses float
+		 * (reference_submissions/anomaly_detection/submitter_implemented.cpp).
+		 * 640 squared residuals summed in float lose low-order bits once the
+		 * running total outgrows the individual terms, and this number IS the
+		 * score: there is no downstream step to absorb the error, the host feeds
+		 * it straight into an AUC.  The FPU is double-capable (fpv5-d16), so it
+		 * costs instructions rather than a software library.  A deliberate
+		 * deviation, and one that can only move the value toward the exact answer.
+		 */
+		double sum = 0.0;
+
+		if (n > MLPERF_AD_ELEMS)
+			n = MLPERF_AD_ELEMS;
+		for (i = 0u; i < n; i++) {
+			double d = (double)dequant(q[i], out) - (double)mp_ad_input[i];
+
+			sum += d * d;
+		}
+		put_fixed3((n != 0u) ? (float)(sum / (double)n) : 0.0f);
+	} else {
+		for (i = 0u; i < n; i++) {
+			if (i != 0u)
+				th_printf(",");
+			put_fixed3(dequant(q[i], out));
+		}
 	}
+
 	th_printf("]\r\n");
 }
 
