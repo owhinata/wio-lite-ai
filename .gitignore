@@ -44,6 +44,13 @@ __pycache__/
 # of a benchmark run and has no business in a firmware build.
 /.venv-mlperf/
 
+# ...and the third one (issue #56), which exists only because kws01's stimulus set has
+# to come out of tensorflow_datasets in tensorflow_datasets' own order.  Kept apart
+# from /.venv-mlperf/ on purpose: that one installs in two minutes and is what a
+# benchmark run needs, this one is a multi-gigabyte TensorFlow install nobody should
+# have to make in order to run the benchmark.
+/.venv-mlperf-tf/
+
 # ...and the runner's per-run output directory, if someone starts it from the repo
 # root instead of a scratch directory.  Each run writes a timestamped log plus
 # results.txt/json; they are results, not sources, and one `git add -A` during a

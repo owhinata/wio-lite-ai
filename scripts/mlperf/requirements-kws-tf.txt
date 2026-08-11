@@ -1,0 +1,46 @@
+# TensorFlow environment, needed ONLY to generate the kws01 accuracy stimulus set (#56).
+#
+#   python3 -m venv .venv-mlperf-tf
+#   .venv-mlperf-tf/bin/pip install -r scripts/mlperf/requirements-kws-tf.txt
+#
+# 🔴 A SEPARATE VIRTUALENV, NOT AN ADDITION TO .venv-mlperf.  This is several gigabytes
+# and it pins numpy and protobuf tightly; the runner environment is meant to stay a
+# two-minute install.  Nothing here is needed to RUN a benchmark, and nothing here is
+# needed for the other three accuracy sets either -- see requirements-datasets.txt for
+# why kws01 is the one that cannot avoid it.
+#
+# The pins below are not preferences.  Each one is a build that does not import
+# otherwise, found the hard way on Python 3.12:
+#
+#   tensorflow-metadata==1.17.2
+#       tensorflow_datasets pulls tensorflow-metadata, and current versions of it ship
+#       protobuf gencode 6.31, while TensorFlow 2.19/2.20 pin the protobuf RUNTIME to
+#       5.29.  Protobuf refuses a runtime older than the gencode, so `import
+#       tensorflow_datasets` dies with a VersionError before anything else happens.
+#       1.17.2 is the newest whose gencode the runtime TensorFlow allows will accept.
+#       Symptom if this drifts: "Detected incompatible Protobuf Gencode/Runtime
+#       versions ... gencode 6.31.1 runtime 5.29.6".
+#
+#   importlib_resources, pydub
+#       Undeclared at install time and required at run time: tensorflow_datasets
+#       reaches for importlib_resources while resolving a builder's code path, and the
+#       speech_commands builder decodes wavs through pydub.  Neither is in any
+#       dependency list, so both fail only once the download is under way.
+#
+#   matplotlib
+#       Upstream's keyword_spotting/kws_util.py imports pyplot at module scope (it also
+#       holds the plotting helpers for training).  Importing it is unavoidable: it is
+#       where parse_command() and therefore every feature-extraction default lives.
+#
+# TensorFlow itself is pinned to a series rather than a version.  2.20 is what this was
+# built and verified with; what matters is that `tf.lite.Interpreter` still exists (it
+# supplies the input scale and zero point that quantize the MFCCs) and that
+# `tensorflow.lite.experimental.microfrontend` still imports, because upstream's
+# get_dataset.py imports it at module scope -- and never uses it.
+
+tensorflow==2.20.*
+tensorflow_datasets
+tensorflow-metadata==1.17.2
+importlib_resources
+pydub
+matplotlib
