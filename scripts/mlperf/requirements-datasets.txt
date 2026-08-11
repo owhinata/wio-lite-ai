@@ -1,0 +1,34 @@
+# Host packages for GENERATING the accuracy stimulus sets and scoring them (issue #56).
+#
+#   .venv-mlperf/bin/pip install -r scripts/mlperf/requirements-datasets.txt
+#
+# On top of requirements-runner.txt, which is what a benchmark RUN needs.  Keeping the
+# two apart is the point: someone who only wants to measure the board installs the
+# runner list in two minutes and never sees any of this.
+#
+# 🔴 STILL NO TENSORFLOW.  Three of the four accuracy sets are built without it:
+#
+#   ic01/ic02  pickle + numpy          (make_ic_accuracy_dataset.py, issue #55)
+#   vww01      a JPEG decoder          (make_vww_accuracy_dataset.py)
+#   ad01       librosa                 (make_ad_accuracy_dataset.py, calling upstream's
+#                                       own DCASE feature extraction)
+#
+# kws01 is the exception and has its own file, requirements-kws-tf.txt, because its
+# stimulus set has to come out of tensorflow_datasets in tensorflow_datasets' order.
+# Install that one into a SEPARATE virtualenv -- it is multiple gigabytes and it pins
+# numpy and protobuf hard enough to disturb everything else in an environment.
+#
+# Unpinned, like requirements-runner.txt, with one thing worth knowing: librosa is not
+# bit-stable across major versions (0.10 changed the STFT's default padding) and
+# upstream pinned 0.6.0 in 2020.  ad01 takes its features from the centre of the clip,
+# where the padding cannot reach, so this is expected to be immaterial -- and
+# score_dataset.py exists so that "expected" can be checked against the 0.85 AUC target
+# before the board spends half an hour on it.
+
+pillow          # vww01: decode the 96x96 JPEGs to raw RGB
+librosa         # ad01: the mel spectrogram, via upstream's common.py
+soundfile       # librosa's wav reader (a dependency, listed because ad01 lives on it)
+pyyaml          # ad01: read upstream's baseline.yaml for the mel parameters
+tqdm            # imported at module scope by upstream's anomaly_detection/common.py
+ai-edge-litert  # score_dataset.py's interpreter.  tflite_runtime or a full
+                # tensorflow install work too; this is the small one.
