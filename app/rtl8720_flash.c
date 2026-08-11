@@ -312,8 +312,8 @@ int rtl_dl_probe(int use_slip, uint32_t timeout_ms,
  *  Protocol reference: pvvx SharpRTL872xTool Program.cs (cited per function).
  * ================================================================== */
 
-/* Flashloader stub, embedded at build time from _ref/ambd/imgtool_flashloader_amebad.bin
- * (see CMakeLists.txt; the Realtek blob is not committed). */
+/* Flashloader stub, embedded at configure time from the pinned copy CMake fetches into
+ * build/ambd/ (see CMakeLists.txt; the Realtek blob is not committed). */
 extern const uint8_t  rtl8720_flashloader[];
 extern const uint32_t rtl8720_flashloader_len;
 

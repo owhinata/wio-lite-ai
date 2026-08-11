@@ -310,23 +310,65 @@ configure_file("${CMAKE_SOURCE_DIR}/cmake/cli_version.h.in"
 
 # RTL8720DN download flashloader stub (issue #19 M2): the on-device flasher
 # (app/rtl8720_flash.c) uploads this Realtek AmebaD ROM flashloader into the module's
-# SRAM.  It is a Realtek-proprietary blob, so it is NOT committed -- embed it at
-# configure time from _ref/ambd/ (git-ignored) into GEN_DIR.  Fail loudly if absent
-# rather than building a non-functional flasher.
-set(RTL_FLASHLOADER_BIN "${CMAKE_SOURCE_DIR}/_ref/ambd/imgtool_flashloader_amebad.bin")
-if(NOT EXISTS "${RTL_FLASHLOADER_BIN}")
-    message(FATAL_ERROR
-        "Missing ${RTL_FLASHLOADER_BIN}\n"
-        "  Place imgtool_flashloader_amebad.bin (4688 B AmebaD flashloader, load 0x00082000)\n"
-        "  there, e.g. from github.com/Seeed-Studio/ambd_flash_tool or\n"
-        "  github.com/openshwprojects/SharpRTL872xTool (issue #19).")
+# SRAM.  It is a Realtek-proprietary blob, so it is NOT committed -- fetch it at
+# configure time into the build tree and embed it into GEN_DIR from there.
+#
+# issue #58: this used to read _ref/ambd/, which made a plain `git clone` fail to
+# configure -- _ref/ is a git-ignored dump of local reference material (datasheets,
+# vendor SDKs, flash backups), not a build input.  Nothing outside build/ is written
+# now, so `rm -rf build` really does return the tree to a clean checkout.
+#
+# The pin is a commit, not a branch: a branch would let the blob change underneath us,
+# and this one is uploaded into the module's SRAM and then executed.  EXPECTED_HASH
+# both verifies the download and makes CMake skip it when the cached copy already
+# matches, so re-configuring an existing build tree does not touch the network.
+set(RTL_FLASHLOADER_URL
+    "https://raw.githubusercontent.com/Seeed-Studio/ambd_flash_tool/de56db9716f9cbf5641fe6e440b1c96033c41962/imgtool_flashloader_amebad.bin")
+set(RTL_FLASHLOADER_SHA256
+    "9307121385cb390dfd2da64da2c6c515f17b5a9556b3d04021487c9b9f220b55")
+# Offline / air-gapped escape hatch: point this at any local copy of the 4688 B blob.
+# It is hash-checked exactly like the download -- a wrong file here would be uploaded
+# to the module and run, so "the user supplied it" is not a reason to trust it.
+set(RTL_FLASHLOADER_BIN "" CACHE FILEPATH
+    "Local imgtool_flashloader_amebad.bin (offline builds); empty = fetch into build/")
+
+if(RTL_FLASHLOADER_BIN)
+    if(NOT EXISTS "${RTL_FLASHLOADER_BIN}")
+        message(FATAL_ERROR "RTL_FLASHLOADER_BIN=${RTL_FLASHLOADER_BIN} does not exist")
+    endif()
+    file(SHA256 "${RTL_FLASHLOADER_BIN}" _RTL_FL_GOT)
+    if(NOT _RTL_FL_GOT STREQUAL RTL_FLASHLOADER_SHA256)
+        message(FATAL_ERROR
+            "RTL_FLASHLOADER_BIN=${RTL_FLASHLOADER_BIN} is not the AmebaD flashloader\n"
+            "  expected SHA256 ${RTL_FLASHLOADER_SHA256}\n"
+            "  got      SHA256 ${_RTL_FL_GOT}")
+    endif()
+    set(_RTL_FL_FILE "${RTL_FLASHLOADER_BIN}")
+else()
+    set(_RTL_FL_FILE "${CMAKE_BINARY_DIR}/ambd/imgtool_flashloader_amebad.bin")
+    file(DOWNLOAD "${RTL_FLASHLOADER_URL}" "${_RTL_FL_FILE}"
+         EXPECTED_HASH "SHA256=${RTL_FLASHLOADER_SHA256}"
+         TLS_VERIFY ON
+         STATUS _RTL_FL_DL)
+    list(GET _RTL_FL_DL 0 _RTL_FL_DL_CODE)
+    if(NOT _RTL_FL_DL_CODE EQUAL 0)
+        file(REMOVE "${_RTL_FL_FILE}")
+        message(FATAL_ERROR
+            "Could not fetch the AmebaD flashloader stub: ${_RTL_FL_DL}\n"
+            "  ${RTL_FLASHLOADER_URL}\n"
+            "  For an offline build, pass -DRTL_FLASHLOADER_BIN=/path/to/"
+            "imgtool_flashloader_amebad.bin\n"
+            "  (4688 B, load 0x00082000; it also ships inside ameba_d_tools-1.0.4 at\n"
+            "  bsp/image/, and in github.com/openshwprojects/SharpRTL872xTool -- issue #19).")
+    endif()
 endif()
-file(READ "${RTL_FLASHLOADER_BIN}" _RTL_FL_HEX HEX)
+
+file(READ "${_RTL_FL_FILE}" _RTL_FL_HEX HEX)
 string(LENGTH "${_RTL_FL_HEX}" _RTL_FL_HEXLEN)
 math(EXPR _RTL_FL_LEN "${_RTL_FL_HEXLEN} / 2")
 string(REGEX REPLACE "(..)" "0x\\1," _RTL_FL_ARRAY "${_RTL_FL_HEX}")
 file(WRITE "${GEN_DIR}/rtl8720_flashloader_data.c"
-"/* AUTO-GENERATED at configure time from _ref/ambd/imgtool_flashloader_amebad.bin.\n"
+"/* AUTO-GENERATED at configure time from ${_RTL_FL_FILE}.\n"
 " * Do NOT edit and do NOT commit -- it is a Realtek-proprietary blob (issue #19 M2). */\n"
 "#include <stdint.h>\n"
 "const uint8_t rtl8720_flashloader[] = { ${_RTL_FL_ARRAY} };\n"

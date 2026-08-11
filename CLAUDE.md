@@ -224,6 +224,12 @@ dfu-util -d 0483:df11 -a 0 -D build/<app>.bin
   - LED1（黄）= **PF0**
   - USER ボタン = **PF1**（active-low）。**保持リセットで DFU モード**に入る。
 - リファレンス: `_ref/`（git 管理外）
+  - 🔴 **`_ref/` は「読むための資料」専用で、ビルドは一切ここを読まない**（#58）。
+    CMake / スクリプト / `fw/rtl8720/build.sh` が `_ref/` を参照してはいけない
+    — git 管理外なので、参照した瞬間に**クローンしただけでは configure できない
+    リポジトリ**になる（実際そうなっていた）。ビルド入力は「pin して fetch」、
+    ビルド作業状態は `build/` か `fw/rtl8720/vendor/`（どちらも git-ignore）。
+    C コードの `_ref/...` 言及は**出典コメントのみ**で、これは依存ではないので残す。
   - `_ref/rm0468-*.pdf` — RM0468（H723/733, H725/735, H730）レジスタ/ペリフェラル根拠
   - `_ref/pm0253-*.pdf` — Cortex-M7 プログラミングマニュアル（NVIC/キャッシュ/FPU）
   - `_ref/733260648-Wio-Lite-AI-v1-0-SCH-Final-*.pdf` — 基板 schematic（配線・ピン）

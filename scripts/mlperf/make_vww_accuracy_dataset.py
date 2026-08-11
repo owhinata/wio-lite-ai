@@ -42,7 +42,8 @@ datasets/vw_coco2014_96.tar.gz
     # then, before running the board (needs a tflite interpreter -- see README):
     python3 scripts/mlperf/score_dataset.py \
         --bench vww01 --dataset ~/mlperf-datasets/vww01 \
-        --model _ref/mlperf-tiny/models/vww01_mobilenet_int8.tflite
+        --model lib/mlperf-tiny/benchmark/training/visual_wake_words/\
+trained_models/vww_96_int8.tflite
 """
 
 import argparse
@@ -71,15 +72,13 @@ MEMBER_RE = re.compile(
 
 
 def y_labels_path(bench):
-    """Upstream's ground truth, from the submodule or from the _ref copy of it."""
-    for p in (os.path.join(REPO, "lib", "mlperf-tiny", "benchmark", "evaluation",
-                           "datasets", bench, "y_labels.csv"),
-              os.path.join(REPO, "_ref", "mlperf-tiny", "y_labels", bench,
-                           "y_labels.csv")):
-        if os.path.exists(p):
-            return p
-    sys.exit(f"no y_labels.csv for {bench}; check out the upstream mirror with\n"
-             f"  git submodule update --init --depth 1 -- lib/mlperf-tiny")
+    """Upstream's ground truth, from the submodule."""
+    p = os.path.join(REPO, "lib", "mlperf-tiny", "benchmark", "evaluation",
+                     "datasets", bench, "y_labels.csv")
+    if not os.path.exists(p):
+        sys.exit(f"no y_labels.csv for {bench}; check out the upstream mirror with\n"
+                 f"  git submodule update --init --depth 1 -- lib/mlperf-tiny")
+    return p
 
 
 def read_y_labels(path):

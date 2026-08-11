@@ -9,6 +9,13 @@
 # pins in build.sh, so none of it belongs in git.
 /fw/rtl8720/out/
 
+# ...and what that build fetches and installs: the upstream mirrors, the arduino-cli
+# data directory (~1 GB of core + toolchain) and the board2 stock flash backup.  This
+# used to live in /_ref/ambd/ (issue #58); it is build state, not reference material,
+# and it is kept out of /fw/rtl8720/out/ so `./build.sh clean` does not throw away a
+# multi-minute download.
+/fw/rtl8720/vendor/
+
 # Downloaded ARM GNU toolchain (fetched by cmake/arm-none-eabi-toolchain.cmake)
 /tools/
 
@@ -31,7 +38,8 @@ __pycache__/
 # RTL8720DN flash dumps that land here from a YMODEM receive (`wifi flashbackup` /
 # `wifi imgsend` + `rb`, which writes to the terminal's working directory -- issue
 # #19).  NEVER commit these: a full-chip image contains the factory WiFi settings
-# sector at 0x105000, and the PSK in it is in the clear.  Keep them in _ref/ambd/.
+# sector at 0x105000, and the PSK in it is in the clear.  Keep them in
+# /fw/rtl8720/vendor/board2-stock/ (issue #58 moved that out of /_ref/ambd/).
 /rtl8720_*.bin
 
 # Camera frames that land here the same way (`camera send` + `rb`, issue #8).  Not

@@ -18,7 +18,7 @@
 #   - toolchain/tools   realtek:ameba_d_asdk_toolchain@1.0.1, realtek:ameba_d_tools@1.0.4
 #                       (from the board index; these DO come from the tarball)
 #
-# The arduino-cli data directory is kept inside _ref/ambd/ so the user's own
+# The arduino-cli data directory is kept inside fw/rtl8720/vendor/ so the user's own
 # ~/.arduino15 (esp32, rp2040, ...) is never touched.
 #
 # Usage:
@@ -44,18 +44,25 @@ TOOLCHAIN_REL=ameba_d_asdk_toolchain/1.0.1
 TOOLS_REL=ameba_d_tools/1.0.4
 
 # ---------------------------------------------------------------- paths
+# Everything this script clones, installs and mutates lives under fw/rtl8720/vendor/
+# (git-ignored).  It used to live in _ref/ambd/, but _ref/ is a dump of local reference
+# material -- datasheets, schematics, flash backups, things you *read* -- and a ~1 GB
+# arduino-cli installation is build state, not reference (issue #58).
+#
+# vendor/ deliberately sits beside out/ rather than inside it: `./build.sh clean`
+# removes out/, and re-downloading the core and the toolchain on every clean would
+# punish you for asking to drop the artifacts.
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-ROOT=$(cd -- "$HERE/../.." && pwd)
-REF=$ROOT/_ref/ambd
-FW_SRC=$ROOT/_ref/seeed-ambd-firmware
-CORE_SRC=$REF/ArduinoCore-ambd
-DATA=$REF/arduino15
-USERDIR=$REF/arduino_user
+VENDOR=$HERE/vendor
+FW_SRC=$VENDOR/seeed-ambd-firmware
+CORE_SRC=$VENDOR/ArduinoCore-ambd
+DATA=$VENDOR/arduino15
+USERDIR=$VENDOR/arduino_user
 PKG=$DATA/packages/realtek
 CORE=$PKG/hardware/AmebaD/$CORE_VERSION
 TOOLS=$PKG/tools/$TOOLS_REL
-STOCK=$REF/board2-stock/rtl8720_000000_200000.bin
-FLASHLOADER=$REF/imgtool_flashloader_amebad.bin
+STOCK=$VENDOR/board2-stock/rtl8720_000000_200000.bin
+FLASHLOADER=$VENDOR/imgtool_flashloader_amebad.bin
 
 OUT=$HERE/out
 SKETCH=$OUT/sketch/seeed-ambd-firmware                  # dir name must match the .ino name
@@ -82,8 +89,8 @@ is_fork() {
 # the shared tools directory.  Two concurrent runs would interleave their artifacts, so
 # serialise them instead of trying to make the vendor tool behave.
 take_lock() {
-	mkdir -p "$REF"
-	exec 9>"$REF/.build.lock"
+	mkdir -p "$VENDOR"
+	exec 9>"$VENDOR/.build.lock"
 	flock -n 9 || {
 		say "another fw/rtl8720 build is running -- waiting for the lock"
 		flock 9
@@ -124,15 +131,26 @@ do_setup() {
 	fi
 	[ -d "$TOOLS" ] || die "ameba_d_tools not installed at $TOOLS"
 
+	# Stash a pristine copy of the AmebaD flashloader stub outside the core, because the
+	# vendor postbuild step does `rm -f bsp/image/*.bin` and deletes the core's copy;
+	# do_build restores it from here.  The tarball is the source of truth, so take it
+	# from there rather than asking anyone to place the file by hand (issue #58).  The
+	# STM32 build no longer reads this copy -- it fetches its own into build/.
+	if [ ! -f "$FLASHLOADER" ] &&
+	   [ -f "$TOOLS/bsp/image/imgtool_flashloader_amebad.bin" ]; then
+		say "stashing the AmebaD flashloader stub -> $FLASHLOADER"
+		cp "$TOOLS/bsp/image/imgtool_flashloader_amebad.bin" "$FLASHLOADER"
+	fi
+
 	# Keep the untouched board-manager platform around for reference/diffing, then put
 	# the fork in its place (this is what upstream's README tells you to do).  Only ever
 	# stash something that is actually the board-manager platform: on a re-run $CORE
 	# already holds the fork, and stashing that would destroy the pristine copy.
 	if [ -d "$CORE" ] && ! is_fork "$CORE"; then
-		[ -d "$REF/core-bm-$CORE_VERSION" ] &&
-			die "$REF/core-bm-$CORE_VERSION already exists -- move it aside first"
-		say "stashing the board-manager platform -> $REF/core-bm-$CORE_VERSION"
-		mv "$CORE" "$REF/core-bm-$CORE_VERSION"
+		[ -d "$VENDOR/core-bm-$CORE_VERSION" ] &&
+			die "$VENDOR/core-bm-$CORE_VERSION already exists -- move it aside first"
+		say "stashing the board-manager platform -> $VENDOR/core-bm-$CORE_VERSION"
+		mv "$CORE" "$VENDOR/core-bm-$CORE_VERSION"
 	fi
 	# Stage the new platform beside the old one and swap at the end, so an interrupted
 	# run cannot leave a half-extracted tree where arduino-cli expects a platform.  The
@@ -143,8 +161,8 @@ do_setup() {
 	mkdir -p "$CORE.new"
 	git -C "$CORE_SRC" archive "$CORE_COMMIT" | tar -x -C "$CORE.new"
 	# arduino-cli wants the platform metadata that came with the tarball.
-	[ -f "$REF/core-bm-$CORE_VERSION/installed.json" ] &&
-		cp "$REF/core-bm-$CORE_VERSION/installed.json" "$CORE.new/installed.json"
+	[ -f "$VENDOR/core-bm-$CORE_VERSION/installed.json" ] &&
+		cp "$VENDOR/core-bm-$CORE_VERSION/installed.json" "$CORE.new/installed.json"
 	rm -rf "$CORE"
 	mv "$CORE.new" "$CORE"
 	echo "$CORE_COMMIT" > "$CORE_STAMP"
@@ -185,7 +203,7 @@ do_build() {
 	verify_pins
 
 	# Build from a pristine export of the pinned commit plus patches/, never from the
-	# reference checkout itself -- _ref/seeed-ambd-firmware stays an untouched mirror.
+	# upstream mirror itself -- vendor/seeed-ambd-firmware stays untouched.
 	say "exporting $FW_COMMIT -> $SKETCH"
 	rm -rf "$OUT/sketch"
 	mkdir -p "$SKETCH"
@@ -246,8 +264,8 @@ do_build() {
 
 	# The postbuild step (`postbuild_img2_arduino_linux`) runs with its cwd inside the
 	# shared tools directory and drops the images there, so collect them out.  It also
-	# does `rm -f bsp/image/*.bin`, which deletes the AmebaD flashloader stub that the
-	# STM32 build embeds at configure time -- put it back.
+	# does `rm -f bsp/image/*.bin`, which deletes the AmebaD flashloader stub the module
+	# is flashed with -- put it back from the copy do_setup stashed in vendor/.
 	[ -f "$TOOLS/km0_km4_image2.bin" ] || die "postbuild produced no km0_km4_image2.bin"
 	cp "$TOOLS/km0_km4_image2.bin" "$TOOLS/km0_image2_all.bin" \
 	   "$TOOLS/km4_image2_all.bin" "$TOOLS/application.axf" "$OUT/"

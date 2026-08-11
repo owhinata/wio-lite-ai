@@ -7,7 +7,7 @@
  *
  * Why this exists: until now the board could only read the module's flash (M2/M4).  To
  * (re)write it, an image has to get ONTO the board first, and that path is also the only
- * way to restore the verified stock backup in _ref/ambd/board2-stock/ -- so it has to
+ * way to restore the verified stock backup in fw/rtl8720/vendor/board2-stock/ -- so it has to
  * work before anything is allowed to erase the module's boot sectors.
  *
  * The image lands in the external OCTOSPI1 PSRAM window at 0x90000000 (8 MB, brought up

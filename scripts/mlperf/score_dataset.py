@@ -35,7 +35,8 @@ USAGE
 -----
     python3 scripts/mlperf/score_dataset.py \
         --bench vww01 --dataset ~/mlperf-datasets/vww01 \
-        --model _ref/mlperf-tiny/models/vww01_mobilenet_int8.tflite
+        --model lib/mlperf-tiny/benchmark/training/visual_wake_words/\
+trained_models/vww_96_int8.tflite
 
 Needs an interpreter: `pip install ai-edge-litert` (small), or any environment that
 already has tflite_runtime or tensorflow.

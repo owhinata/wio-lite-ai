@@ -67,7 +67,7 @@ otherwise.
 | FQBN | `realtek:AmebaD:ameba_rtl8721d` |
 | arduino-cli | 1.5.1 (see *Known quirks* — nothing here depends on the version) |
 
-Everything is installed under `_ref/ambd/` (git-ignored) with
+Everything is installed under `fw/rtl8720/vendor/` (git-ignored) with
 `ARDUINO_DIRECTORIES_DATA`/`_USER` pointed at it, so **your `~/.arduino15` is never
 touched**.
 
@@ -86,7 +86,7 @@ The firmware compiles against a **patched lwIP** — `struct rpc_tcp_pcb`, plus
 repository, not in the released tarball. Upstream's README says to `rm -rf` the
 board-manager platform and `git clone` the fork over it; `build.sh setup` does exactly
 that, but keeps the tarball's `tools/` (toolchain + image tools) and stashes the
-discarded platform at `_ref/ambd/core-bm-3.0.5/` for reference.
+discarded platform at `vendor/core-bm-3.0.5/` for reference.
 
 `build.sh` guards against silently regressing to the wrong core two ways: a
 `.wio-core-commit` stamp inside the installed core, and a direct `grep` for
@@ -120,7 +120,7 @@ and the gate output rather than digests.
 
 The firmware source is never built in place. `build.sh` exports the pinned commit with
 `git archive` into `out/sketch/` and applies `patches/*.patch` there, so
-`_ref/seeed-ambd-firmware` stays an untouched upstream mirror. To change the firmware,
+`vendor/seeed-ambd-firmware` stays an untouched upstream mirror. To change the firmware,
 add a patch — do not edit the mirror.
 
 **Patch application must not be swallowed.** The export lives under `out/`, which is
@@ -186,7 +186,7 @@ image2   876544 B  (0xd6000) -> 0x6000..0xdbfff, 167936 B clear of 0x105000
   km4 part             310115 B differ    (expected: different core build)
 ```
 
-For reference, the prebuilt `km0_km4_image2.bin` kept at `_ref/ambd/firmware/` differs
+For reference, the prebuilt `km0_km4_image2.bin` kept at `vendor/firmware/` differs
 from the on-chip image in 675789 bytes — more than our rebuild does. Its KM0 part is the
 same core prebuilt as ours, so it comes from this same core, but the image on board #2 is
 not a byte-match for it either.
@@ -231,7 +231,7 @@ The RTL8720DN's download mode lives in **mask ROM** and is entered by a strap pl
 unbrickable, and the restore path was proven end-to-end in issue #19 (M5):
 
 ```
-wio> wifi flash imgload                 # send _ref/ambd/board2-stock/rtl8720_000000_200000.bin
+wio> wifi flash imgload                 # send vendor/board2-stock/rtl8720_000000_200000.bin
 wio> wifi flash imginfo                 # 2 MB, digest 0x464A5FFD
 wio> wifi flash write 0x0 confirm       # full-chip restore, boot sectors included
 ```
@@ -269,22 +269,23 @@ fw/rtl8720/
 
 ## Known quirks
 
-- **`setup` and `build` take a lock** (`_ref/ambd/.build.lock`). They mutate shared state
+- **`setup` and `build` take a lock** (`vendor/.build.lock`). They mutate shared state
   — the arduino-cli data directory, and the vendor postbuild step below — so two
   concurrent runs would interleave their artifacts. The core is staged beside the old one
   and swapped in at the end, with the `.wio-core-commit` stamp written last, so an
   interrupted `setup` leaves a state that `build` refuses rather than one it trusts.
 - **The postbuild step writes into the shared tools directory.**
   `postbuild_img2_arduino_linux` runs with its cwd set to
-  `_ref/ambd/arduino15/packages/realtek/tools/ameba_d_tools/1.0.4/` and drops
+  `vendor/arduino15/packages/realtek/tools/ameba_d_tools/1.0.4/` and drops
   `application.axf`, `km0_km4_image2.bin` and friends there, ignoring `--build-path`.
   `build.sh` copies them out into `out/`.
 - **It also runs `rm -f bsp/image/*.bin`**, which deletes
-  `imgtool_flashloader_amebad.bin` — the AmebaD flashloader stub that the *STM32* build
-  embeds at configure time (`CMakeLists.txt` reads
-  `_ref/ambd/imgtool_flashloader_amebad.bin`). The canonical copy lives at
-  `_ref/ambd/`, outside the core, so the STM32 build is unaffected; `build.sh` restores
-  the core's copy afterwards anyway.
+  `imgtool_flashloader_amebad.bin` — the AmebaD flashloader stub the module is flashed
+  with. `setup` stashes a pristine copy at `vendor/imgtool_flashloader_amebad.bin`,
+  outside the core, and `build` restores the core's from there. The *STM32* build embeds
+  the same stub (`app/rtl8720_flash.c` uploads it into the module's SRAM), but since
+  issue #58 it fetches its own pinned copy into `build/` and does not read this one — so
+  a wiped `bsp/image/` cannot affect it either way.
 - **PMU variant.** The postbuild tool hardcodes `bsp/image/PMU_bins/NONE/` as the source
   of the boot images (KM4 boot 4068 B). The other variants (`TL_RTC`, `D27_PA20`, …) ship
   a 4196 B KM4 boot and are not used. This matters for gate 3: `NONE` is the variant that

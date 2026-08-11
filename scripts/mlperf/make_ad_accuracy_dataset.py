@@ -34,7 +34,8 @@ board:
 
     python3 scripts/mlperf/score_dataset.py --bench ad01 \
         --dataset ~/mlperf-datasets/ad01 \
-        --model _ref/mlperf-tiny/models/ad01_autoencoder_int8.tflite
+        --model lib/mlperf-tiny/benchmark/training/anomaly_detection/\
+trained_models/ad01_int8.tflite
 
 The closed-division target is 0.85 AUC and upstream's reference reports 0.864 averaged
 per machine id, so there is not much room: a materially different feature extraction
@@ -74,13 +75,12 @@ BYTES_PER_FLOAT = 4
 
 
 def y_labels_path(name):
-    for p in (os.path.join(REPO, "lib", "mlperf-tiny", "benchmark", "evaluation",
-                           "datasets", "ad01", name),
-              os.path.join(REPO, "_ref", "mlperf-tiny", "y_labels", "ad01", name)):
-        if os.path.exists(p):
-            return p
-    sys.exit(f"no {name} for ad01; check out the upstream mirror with\n"
-             f"  git submodule update --init --depth 1 -- lib/mlperf-tiny")
+    p = os.path.join(REPO, "lib", "mlperf-tiny", "benchmark", "evaluation",
+                     "datasets", "ad01", name)
+    if not os.path.exists(p):
+        sys.exit(f"no {name} for ad01; check out the upstream mirror with\n"
+                 f"  git submodule update --init --depth 1 -- lib/mlperf-tiny")
+    return p
 
 
 def read_y_labels(path):

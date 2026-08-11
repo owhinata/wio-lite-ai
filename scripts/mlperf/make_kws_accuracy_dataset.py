@@ -40,7 +40,8 @@ the host before the board is asked for half an hour:
 
     python3 scripts/mlperf/score_dataset.py --bench kws01 \
         --dataset ~/mlperf-datasets/kws01 \
-        --model _ref/mlperf-tiny/models/kws01_dscnn_int8.tflite
+        --model lib/mlperf-tiny/benchmark/training/keyword_spotting/\
+trained_models/kws_ref_model.tflite
 
 The reference model is documented at 92% on this test set and the closed-division
 target is 90%, so a feature extraction that has drifted has very little room to hide.
@@ -70,14 +71,12 @@ SAMPLE_BYTES = 49 * 10      # int8 MFCCs, one byte each
 
 
 def y_labels_path():
-    for p in (os.path.join(REPO, "lib", "mlperf-tiny", "benchmark", "evaluation",
-                           "datasets", "kws01", "y_labels.csv"),
-              os.path.join(REPO, "_ref", "mlperf-tiny", "y_labels", "kws01",
-                           "y_labels.csv")):
-        if os.path.exists(p):
-            return p
-    sys.exit("no y_labels.csv for kws01; check out the upstream mirror with\n"
-             "  git submodule update --init --depth 1 -- lib/mlperf-tiny")
+    p = os.path.join(REPO, "lib", "mlperf-tiny", "benchmark", "evaluation",
+                     "datasets", "kws01", "y_labels.csv")
+    if not os.path.exists(p):
+        sys.exit("no y_labels.csv for kws01; check out the upstream mirror with\n"
+                 "  git submodule update --init --depth 1 -- lib/mlperf-tiny")
+    return p
 
 
 def read_rows(path):

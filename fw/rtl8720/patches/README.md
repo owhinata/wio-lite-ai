@@ -1,6 +1,6 @@
 # N2..N7 patches land here (see ../README.md).  Applied in filename order to a
-# pristine export of the pinned upstream commit -- the reference checkout in
-# _ref/seeed-ambd-firmware is never modified.
+# pristine export of the pinned upstream commit -- the upstream mirror in
+# vendor/seeed-ambd-firmware is never modified.
 #
 # Shell command names in the "Verify with" notes are as they were at the time; issue
 # #28 renamed/removed some (see the note near the top of ../README.md for the mapping).

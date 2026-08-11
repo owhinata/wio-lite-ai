@@ -195,7 +195,7 @@ CSV のラベルと一致すること**、生成物が**きっかり 102,400 B**
 ```bash
 .venv-mlperf/bin/python scripts/mlperf/score_dataset.py \
         --bench vww01 --dataset ~/mlperf-datasets/vww01 \
-        --model _ref/mlperf-tiny/models/vww01_mobilenet_int8.tflite
+        --model lib/mlperf-tiny/benchmark/training/visual_wake_words/trained_models/vww_96_int8.tflite
 ```
 
 同じ `.tflite` を、**ファームと同じバイト変換**（`^0x80` / int8 素通し / float32 量子化）と

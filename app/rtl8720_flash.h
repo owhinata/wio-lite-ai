@@ -243,7 +243,7 @@ int rtl_dl_flash_chksum(uint32_t off, uint32_t len, uint32_t timeout_ms, uint32_
  */
 
 /* First 8 bytes of an AmebaD km0_boot image -- checked before anything may be written
- * at offset 0.  Confirmed twice: _ref/ambd/firmware/km0_boot_all.bin, and the M2 read
+ * at offset 0.  Confirmed twice: fw/rtl8720/vendor/firmware/km0_boot_all.bin, and the M2 read
  * of this board's own flash. */
 #define RTL_DL_KM0_MAGIC_LEN  8u
 extern const uint8_t rtl_dl_km0_magic[RTL_DL_KM0_MAGIC_LEN];
