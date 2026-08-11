@@ -1,0 +1,86 @@
+# Accuracy test script for the MLPerf Tiny runner, Wio Lite AI edition (issue #56).
+#
+#   python main.py --device_list  <repo>/scripts/mlperf/devices_wio.yaml \
+#                  --test_script  <repo>/scripts/mlperf/tests_accuracy_wio.yaml \
+#                  --dataset_path <datasets> --mode a
+#
+# It replaces upstream's benchmark/runner/tests_accuracy.yaml rather than editing it --
+# lib/mlperf-tiny is a read-only mirror.
+#
+# 🔴 THE ONLY DIFFERENCE FROM UPSTREAM IS ad01's truth_file, AND IT IS A DIFFERENCE OF
+# HOURS.  Accuracy mode sends ad01 as a sliding window: every file is 102,400 B, the
+# window is 2,560 B and the stride is 512, so each file is 196 separate downloads and
+# 196 separate inferences.  Upstream's y_labels.csv has 248 files = 48,608 inferences,
+# each preceded by 2,560 B at the runner's 31 bytes per `db` command -- about four
+# million serial round trips.  y_labels_alt.csv is upstream's own answer to that: 72 of
+# the same files (36 normal, 36 anomaly), a strict subset, and accepted in submissions
+# since v1.2.  It runs in well under an hour instead of several.
+#
+# Both files are written into the dataset directory by
+# scripts/mlperf/make_ad_accuracy_dataset.py and they share the stimulus files, so
+# swapping this line for `y_labels.csv` is all it takes to run the full set.
+#
+# 🔴 AND THERE IS A REASON TO: THE ALT SET SITS EXACTLY ON THE TARGET.  Scored on the
+# host with the reference model (scripts/mlperf/score_dataset.py):
+#
+#     y_labels_alt.csv   72 files, 36/36 balanced    AUC 0.850   the target, to 3 dp
+#     y_labels.csv      248 files, 140 normal/108    AUC 0.859
+#
+# Both clear 0.85, but only one of them clears it by anything.  The two sets are
+# different samples with different class balances, so a spread of that size is ordinary
+# -- what is not ordinary is measuring against a threshold with no margin.  The board
+# runs CMSIS-NN kernels rather than LiteRT's, and a 0.849 on the alt set would be
+# indistinguishable from a rounding difference.  If the number has to mean something,
+# spend the two hours on the full set; if it is a smoke test, alt is fine.
+#
+# The key of each entry is matched against what the DUT reports for `m-model-[...]`
+# (benchmark/runner/main.py: `test_script.get(dut.get_model())`), which on this board is
+# a function of which model is in the arena -- see mlperf_model_id() in
+# port/mlperf/mlperf_th.cc.  ic02 is shape-identical to ic01 and reports as `ic01`, so
+# its entry here is unreachable and the ic01 one covers both; upstream's own file says
+# `model: ic01` for ic02 for the same reason.
+#
+# No loop counts: with none given the runner uses the whole truth file, which is what
+# an accuracy run means.  (The performance script needs them, and needs one of them
+# raised -- see tests_performance_wio.yaml.)
+ad01:
+  name: anomoly_detection
+  model: ad01
+  truth_file: y_labels_alt.csv
+  script:
+    - loop:
+      - download
+      - infer 1 0 # Inferences, Warmups
+      - reset 20
+ic01:
+  name: image_classification
+  model: ic01
+  truth_file: y_labels.csv
+  script:
+    - loop:
+      - download
+      - infer 1 0
+ic02:
+  name: image_classification
+  model: ic01
+  truth_file: y_labels.csv
+  script:
+    - loop:
+      - download
+      - infer 1 0
+kws01:
+  name: keyword_spotting
+  model: kws01
+  truth_file: y_labels.csv
+  script:
+    - loop:
+      - download
+      - infer 1 0
+vww01:
+  name: person_detection
+  model: vww01
+  truth_file: y_labels.csv
+  script:
+    - loop:
+      - download
+      - infer 1 0
