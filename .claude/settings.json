@@ -1,17 +1,4 @@
 {
-  "permissions": {
-    "allow": [
-      "mcp__codex__codex",
-      "mcp__codex__codex-reply"
-    ]
-  },
-  "mcpServers": {
-    "codex": {
-      "type": "stdio",
-      "command": "codex",
-      "args": ["mcp-server"]
-    }
-  },
   "hooks": {
     "PreToolUse": [
       {
@@ -29,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "m=\"$HOME/.claude/.wio-lite-ai-plan-codex-reviewed\"; if [ -f \"$m\" ] && [ $(( $(date +%s) - $(stat -c %Y \"$m\") )) -lt 7200 ]; then exit 0; fi; echo '{\"decision\":\"block\",\"reason\":\"Phase/architecture plan は ExitPlanMode の前に codex-review skill を実行してください (CLAUDE.md Plan+Codex ワークフロー)。app のクロック継承/ThreadX SysTick/XIP/USB CDC/boot 変更は特に厳格に。LGTM に至ると codex-review が marker を更新して通過します。trivial plan で skip する場合は user 承認後に touch ~/.claude/.wio-lite-ai-plan-codex-reviewed\"}'; exit 2",
+            "command": "m=\"$HOME/.claude/.wio-lite-ai-plan-codex-reviewed\"; if [ -f \"$m\" ] && [ $(( $(date +%s) - $(stat -c %Y \"$m\") )) -lt 7200 ]; then exit 0; fi; echo '{\"decision\":\"block\",\"reason\":\"Phase/architecture plan は ExitPlanMode の前に codex-review skill を実行してください (CLAUDE.md Plan+Codex ワークフロー)。app のクロック継承/ThreadX SysTick/メモリ配置/USB CDC/boot 変更は特に厳格に。plan レビューは codex-review skill だけが担当します (/codex:review は git 差分専用で plan を見られず marker も更新しません)。LGTM に至ると codex-review が marker を更新して通過します。trivial plan で skip する場合は user 承認後に touch ~/.claude/.wio-lite-ai-plan-codex-reviewed\"}'; exit 2",
             "statusMessage": "Checking codex-review gate..."
           }
         ]

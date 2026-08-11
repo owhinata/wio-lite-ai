@@ -76,21 +76,43 @@ VTOR はリンカの `g_pfnVectors` から取る（アドレスをハードコ�
 
 ゲートのタイミング:
 
-1. **Plan 確定前**（実装着手前）: plan を `codex-review` skill で 3 面（設計 / MCU 実機能
+1. **Plan 確定前**（実装着手前）: plan を **`codex-review` skill** で 3 面（設計 / MCU 実機能
    (RM0468 照合) / HW リソース競合）review。BLOCKING / CONCERN を全解消してから
    `ExitPlanMode`。
-2. **実装後**（commit 前）: branch の diff を `codex-review` で再 review。BLOCKING 解消 →
-   user に実機 verify 依頼 → commit。
+2. **実装後**（commit 前）: branch の diff を **`/codex:review`**（Codex 内蔵レビュアー）で
+   review。観点を絞りたい・設計判断そのものを疑いたいときは
+   **`/codex:adversarial-review [--base <ref>] <focus>`**。BLOCKING 解消 → user に実機 verify
+   依頼 → commit。
 
-`codex-review` skill は `.claude/skills/codex-review/` で定義済（sandbox は
-`danger-full-access`、approval-policy は `never`、cwd は絶対パス）。
+**Codex 呼び出しは codex plugin（`codex@openai-codex`）のランタイムに一本化**されている
+（MCP server `mcp__codex__codex` は撤去済。`danger-full-access` も不要になった＝plugin 側は
+`read-only` サンドボックスでローカルシェルが動く）。入口の使い分け:
+
+| 対象 | 使うもの |
+|---|---|
+| **plan（会話中の設計・実装計画）** | **`codex-review` skill**（marker を更新する唯一の経路） |
+| 実装後の差分 | `/codex:review` |
+| 差分＋観点指定 / 設計判断への異議 | `/codex:adversarial-review <focus>` |
+| 不具合の原因追跡 | `codex-debug` skill、または `/codex:rescue` |
+
+`/codex:review` は **git 差分専用**で、まだコードになっていない plan はレビューできず marker も
+更新しない。だから plan ゲートだけが `codex-review` skill に残っている。
+レビューは毎回 120s を超えるので `run_in_background: true` で起動して待つ
+（`/codex:review` 自体も background 実行を勧めてくる。進捗は `/codex:status`）。
+
+**プロジェクト不変条件は `AGENTS.md` に置く**。`/codex:review` の内蔵レビュアーは focus text を
+受け取れないので、boot 不可侵 / RCC 非再設定 / DTCM に DMA バッファ禁止 / LTO で ASSERT が空振り
+といった前提を Codex に伝える経路は `AGENTS.md` しかない。**不変条件を変えたら CLAUDE.md と
+`AGENTS.md` の両方を直す。**
 
 **ゲートの強制**: `ExitPlanMode` の PreToolUse hook（`.claude/settings.json`）が
 `~/.claude/.wio-lite-ai-plan-codex-reviewed` marker を確認する。marker が無い/古い（2h 超）と
 block される。codex-review が LGTM に至ると marker を更新して通過。trivial plan で skip する
 場合も **user 承認を得てから** `touch ~/.claude/.wio-lite-ai-plan-codex-reviewed`。
 
-不具合解析には `codex-debug` skill を使う。
+**Codex の指摘は鵜呑みにしない。** 内蔵レビュアーは根拠を GitHub 側から引いてくることがあり、
+ローカルの実物と食い違う指摘（実測: CMake `file(DOWNLOAD)` の挙動を誤った P1）を出しうる。
+報告前にリポジトリの実物か RM0468 で裏を取る。
 
 ## Git ワークフロー
 
