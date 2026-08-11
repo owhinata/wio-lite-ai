@@ -42,9 +42,9 @@ already has tflite_runtime or tensorflow.
 """
 
 import argparse
+import atexit
 import os
 import shutil
-import struct
 import sys
 import tempfile
 
@@ -93,36 +93,61 @@ def import_upstream_scoring():
     at all -- calculate_accuracy() switches to an F1 sweep when there is one output per
     sample -- and that is exactly the kind of detail a reimplementation gets wrong.
 
-    main.py opens a log under ./sessions/ at import time (it is written to be run, not
-    imported), so the import happens with the cwd pointed at a scratch directory.
+    🔴 IMPORTING IT HAS SIDE EFFECTS, AND THEY HAVE TO BE UNDONE.  benchmark/runner/
+    script.py, which main.py pulls in, is written to be RUN: at module scope it opens a
+    log under ./sessions/ and then replaces sys.stdout AND sys.stderr with writers that
+    funnel everything into logging (script.py:49-50).  Left in place that is not
+    cosmetic -- LoggerWriter.write() calls .strip() on every message, so `end="\\r"`
+    disappears and this tool's progress counter prints a thousand separate lines.  So
+    the cwd is pointed at a scratch directory for the import and all three globals are
+    restored afterwards.
+
+    The scratch directory outlives the import on purpose: the FileHandler installed by
+    that module keeps the log open for the life of the process, and removing the
+    directory underneath it would leave it writing to an unlinked file.
     """
     if not os.path.isdir(RUNNER):
         sys.exit(f"missing {RUNNER}\n"
                  f"  git submodule update --init --depth 1 -- lib/mlperf-tiny")
     cwd = os.getcwd()
+    saved_path, saved_out, saved_err = list(sys.path), sys.stdout, sys.stderr
     tmp = tempfile.mkdtemp(prefix="mlperf-score-")
+    atexit.register(shutil.rmtree, tmp, True)
     try:
         os.chdir(tmp)
         sys.path.insert(0, RUNNER)
         import main as upstream_main
     finally:
         os.chdir(cwd)
-        shutil.rmtree(tmp, ignore_errors=True)
+        sys.path[:] = saved_path
+        sys.stdout, sys.stderr = saved_out, saved_err
     return upstream_main
 
 
-def read_y_labels(path):
-    """Upstream's ground truth, whitespace-normalised.  Columns 4/5 exist for ad01."""
+def read_y_labels(path, want_window):
+    """Upstream's ground truth, whitespace-normalised.
+
+    Three columns for a classifier, five for ad01 -- the extra two being the sliding
+    window and its stride (upstream's datasets/README.md).  The count is checked rather
+    than tolerated: a three-column ad01 file would otherwise reach the window loop as
+    `None` and only be diagnosed there, and a five-column classifier file would mean
+    the wrong ground truth was handed to the wrong benchmark.
+    """
     rows = []
     with open(path) as f:
-        for line in f:
+        for n, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             p = [x.strip() for x in line.split(",")]
+            if len(p) != (5 if want_window else 3):
+                sys.exit(f"{path}:{n}: {len(p)} columns, expected "
+                         f"{5 if want_window else 3} "
+                         f"({'file,classes,class,window,stride' if want_window else 'file,classes,class'})"
+                         f"\n  {line}")
             rows.append(dict(file=p[0], classes=int(p[1]), cls=int(p[2]),
-                             bytes_to_send=int(p[3]) if len(p) > 3 else None,
-                             stride=int(p[4]) if len(p) > 4 else None))
+                             bytes_to_send=int(p[3]) if want_window else None,
+                             stride=int(p[4]) if want_window else None))
     return rows
 
 
@@ -133,12 +158,27 @@ def fixed3(v):
     the wire rounded to a milli-unit.  Applying the same rounding here keeps the two
     numbers comparable; leaving it out would introduce a difference that has nothing to
     do with either the model or the data.
+
+    In float32 throughout, because the board's is: the saturation constant, the
+    multiply and the add are all float there, and 999999.999f is not 999999.999.  It
+    makes no difference to any score these benchmarks produce -- probabilities are at
+    most 1 and ad01's errors are tens -- but a mirror that is only a mirror in the
+    common case is not one worth having.
+
+    Checked against the C rather than reasoned about, by compiling put_fixed3() and
+    running both over the same values.  All fourteen agree, including the three that
+    are easy to get wrong: -0.0 takes the positive branch (`-0.0f < 0.0f` is false),
+    NaN takes the saturation branch (which is why the C spells it `!(v < ...)`), and
+    999999.999 saturates to 1000000.000 rather than to itself, because 999999.999f
+    times 1000.0f rounds up to exactly 1e9 in float32.
     """
-    neg = v < 0.0
-    v = abs(float(v))
-    if not v < 1000000.0:          # catches NaN too, as the C does
-        v = 999999.999
-    milli = int(v * 1000.0 + 0.5)
+    v = np.float32(v)
+    neg = bool(v < np.float32(0.0))
+    if neg:
+        v = -v
+    if not bool(v < np.float32(1000000.0)):      # catches NaN too, as the C does
+        v = np.float32(999999.999)
+    milli = int(v * np.float32(1000.0) + np.float32(0.5))
     return -milli / 1000.0 if neg else milli / 1000.0
 
 
@@ -190,7 +230,7 @@ def main():
     truth = os.path.join(args.dataset, args.truth)
     if not os.path.exists(truth):
         sys.exit(f"missing {truth}")
-    rows = read_y_labels(truth)
+    rows = read_y_labels(truth, want_window=(bench["report"] == "mse"))
     if args.limit:
         rows = rows[:args.limit]
 
@@ -227,6 +267,16 @@ def main():
             starts = range(0, len(data) - seg_len + 1, stride)
             for start in starts:
                 floats = np.frombuffer(data[start:start + seg_len], dtype="<f4")
+                # A NaN or an infinity here would reach the int32 cast in both
+                # quantize() and the board's, where the result is undefined in C and
+                # merely unspecified in numpy -- so the two would stop mirroring at
+                # exactly the point where the answer stopped meaning anything.  Refuse
+                # instead of reporting a score derived from it.
+                if not np.isfinite(floats).all():
+                    sys.exit(f"{path}: window at byte {start} holds a non-finite "
+                             f"float.\n"
+                             f"  A log-mel spectrogram cannot; regenerate the file "
+                             f"with make_ad_accuracy_dataset.py.")
                 q = quantize(floats, in_scale, in_zp).reshape(in_shape)
                 out = run_one(interp, in_det, out_det, q).astype(np.int32).flatten()
                 deq = np.float32(out_scale) * (out - out_zp).astype(np.float32)

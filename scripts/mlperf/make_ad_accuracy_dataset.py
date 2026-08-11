@@ -58,6 +58,7 @@ is 14,112.
 """
 
 import argparse
+import atexit
 import os
 import shutil
 import sys
@@ -105,6 +106,13 @@ def import_upstream():
     import happens from a scratch directory (the log is an artefact of importing, not
     something we want in the caller's tree or in the read-only mirror), and the
     parameters are read directly from upstream's file by path.
+
+    The scratch directory is removed at exit rather than immediately: the FileHandler
+    that import installs holds baseline.log open for the life of the process, and
+    pulling the directory out from under it would leave it writing to an unlinked file.
+    sys.path is restored for the same reason the cwd is -- upstream's directory has
+    modules named common, keras_model and train, which are exactly the names a later
+    import in a bigger program would collide with.
     """
     import yaml
 
@@ -115,14 +123,16 @@ def import_upstream():
         param = yaml.safe_load(f)["feature"]
 
     cwd = os.getcwd()
+    saved_path = list(sys.path)
     tmp = tempfile.mkdtemp(prefix="mlperf-ad-")
+    atexit.register(shutil.rmtree, tmp, True)
     try:
         os.chdir(tmp)
         sys.path.insert(0, UPSTREAM_AD)
         import common
     finally:
         os.chdir(cwd)
-        shutil.rmtree(tmp, ignore_errors=True)
+        sys.path[:] = saved_path
     return common, param
 
 
@@ -162,7 +172,7 @@ def main():
                  f"ToyCar/ inside what dev_data_ToyCar.zip extracts to")
 
     # THE CHECK, over every row, before a single feature is computed.
-    missing, mislabelled = [], []
+    missing, mislabelled, unnamed = [], [], []
     for row in rows:
         wav = wav_for(row["file"])
         if not os.path.exists(os.path.join(test_dir, wav)):
@@ -170,12 +180,22 @@ def main():
         # The archive states the label twice: once in upstream's CSV, once in its own
         # filename.  Requiring both means a mismatched or reordered download is caught
         # here rather than surfacing as a mysteriously poor AUC.
-        expect = 1 if wav.startswith("anomaly_") else 0
+        # Spelled as a three-way test rather than `1 if anomaly_ else 0`: the archive's
+        # OTHER naming scheme (eval_data ships `id_05_*.wav` with no verdict in the
+        # name) would read as "normal" under a two-way test and then AGREE with every
+        # normal row, so the check would pass on a dataset it never inspected.
+        if wav.startswith("anomaly_"):
+            expect = 1
+        elif wav.startswith("normal_"):
+            expect = 0
+        else:
+            unnamed.append(wav)
+            continue
         if expect != row["cls"]:
             mislabelled.append((wav, expect, row["cls"]))
 
     unknown = {r["file"] for r in alt_rows} - {r["file"] for r in rows}
-    if missing or mislabelled or unknown:
+    if missing or mislabelled or unknown or unnamed:
         msg = [f"REFUSING TO WRITE: {test_dir} and upstream's "
                f"{os.path.relpath(full_csv, REPO)} disagree."]
         if missing:
@@ -189,54 +209,86 @@ def main():
         if unknown:
             msg.append(f"  y_labels_alt.csv names {len(unknown)} files that "
                        f"y_labels.csv does not; it is supposed to be a subset")
+        if unnamed:
+            msg.append(f"  {len(unnamed)} names are neither normal_ nor anomaly_ "
+                       f"(first: {unnamed[0]}); the label cannot be cross-checked, "
+                       f"so this is the eval_data set rather than dev_data")
         sys.exit("\n".join(msg))
 
     common, param = import_upstream()
     n_mels = param["n_mels"]
     expect_bytes = FRAMES_KEPT * n_mels * BYTES_PER_FLOAT
 
-    out_dir = os.path.join(args.out, "ad01")
-    os.makedirs(out_dir, exist_ok=True)
     print(f"ad01: {len(rows)} files, n_mels={n_mels} n_fft={param['n_fft']} "
           f"hop={param['hop_length']} power={param['power']}")
 
+    # 🔴 EVERY FILE COMPUTED AND CHECKED BEFORE THE OUTPUT DIRECTORY IS TOUCHED.
+    #
+    # The label checks above all run up front, but the SIZE check is per file and can
+    # only run once that file exists -- and so can a corrupt wav, a librosa failure, a
+    # full disk or a Ctrl-C.  Writing as it went would leave the output directory
+    # holding some of this run's files, some of a previous run's, and a y_labels.csv
+    # naming all of them, which the runner and score_dataset.py would then measure
+    # without complaint.  That is the failure this whole script is built to prevent, so
+    # it must not come back in through the writing.
+    #
+    # 25 MB of held bytes (248 x 102,400) buys that, and makes this script's guarantee
+    # the same as the other three's rather than "true until the first bad element".
+    blobs = []
     for i, row in enumerate(rows, 1):
         wav_path = os.path.join(test_dir, wav_for(row["file"]))
         # save_bin=True is upstream's own writer, and it puts the .bin beside the wav
         # (the path is derived from the wav's).  Computing it any other way would mean
-        # reimplementing the one line this script exists to avoid reimplementing.
-        try:
-            common.file_to_vector_array(wav_path,
-                                        n_mels=n_mels,
-                                        frames=param["frames"],
-                                        n_fft=param["n_fft"],
-                                        hop_length=param["hop_length"],
-                                        power=param["power"],
-                                        save_bin=True)
-        except TypeError:
-            # common.file_load() swallows every read error and returns None, so the
-            # unpacking one frame up is where a truncated or corrupt wav surfaces --
-            # as an unpacking error that says nothing about the file.  Name it.
-            sys.exit(f"could not read {wav_path}\n"
-                     f"  librosa failed on it; the archive is probably truncated "
-                     f"(check the zip before re-extracting)")
+        # reimplementing the one line this script exists to avoid reimplementing.  The
+        # intermediate is read back and removed immediately, so a failure anywhere in
+        # this loop leaves neither the source tree nor the output directory changed.
         produced = wav_path[:-len(".wav")] + "_hist_librosa.bin"
-        if not os.path.exists(produced):
-            sys.exit(f"upstream's file_to_vector_array() wrote no {produced}\n"
-                     f"  the wav is probably shorter than one 5-frame window")
-        size = os.path.getsize(produced)
-        if size != expect_bytes:
-            os.remove(produced)
-            sys.exit(f"REFUSING TO WRITE: {produced} is {size} B, expected "
+        try:
+            try:
+                common.file_to_vector_array(wav_path,
+                                            n_mels=n_mels,
+                                            frames=param["frames"],
+                                            n_fft=param["n_fft"],
+                                            hop_length=param["hop_length"],
+                                            power=param["power"],
+                                            save_bin=True)
+            except TypeError:
+                # common.file_load() swallows every read error and returns None, so the
+                # unpacking one frame up is where a truncated or corrupt wav surfaces --
+                # as an unpacking error that says nothing about the file.  Name it.
+                sys.exit(f"could not read {wav_path}\n"
+                         f"  librosa failed on it; the archive is probably truncated "
+                         f"(check the zip before re-extracting)")
+            if not os.path.exists(produced):
+                sys.exit(f"upstream's file_to_vector_array() wrote no {produced}\n"
+                         f"  the wav is probably shorter than one 5-frame window")
+            with open(produced, "rb") as f:
+                blob = f.read()
+        finally:
+            if os.path.exists(produced):
+                os.remove(produced)
+
+        if len(blob) != expect_bytes:
+            sys.exit(f"REFUSING TO WRITE: {produced} was {len(blob)} B, expected "
                      f"{expect_bytes} ({FRAMES_KEPT} frames x {n_mels} bins x "
                      f"{BYTES_PER_FLOAT} B).\n"
                      f"  The size follows from the mel parameters and the centre crop, "
                      f"so a different one means the features are not the benchmark's.")
-        shutil.move(produced, os.path.join(out_dir, row["file"]))
+        blobs.append(blob)
         if i % 20 == 0 or i == len(rows):
             print(f"  {i}/{len(rows)}", end="\r", flush=True)
     print()
 
+    if len(blobs) != len(rows):
+        sys.exit(f"REFUSING TO WRITE: produced {len(blobs)} of {len(rows)} files")
+
+    out_dir = os.path.join(args.out, "ad01")
+    os.makedirs(out_dir, exist_ok=True)
+    for row, blob in zip(rows, blobs):
+        with open(os.path.join(out_dir, row["file"]), "wb") as f:
+            f.write(blob)
+    # The ground truth last: it is what selects the set, so until it lands, a directory
+    # left behind by an interrupted write still describes the previous run.
     for csv_rows, name in ((rows, "y_labels.csv"), (alt_rows, "y_labels_alt.csv")):
         with open(os.path.join(out_dir, name), "w") as f:
             for r in csv_rows:

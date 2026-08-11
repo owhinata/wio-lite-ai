@@ -119,10 +119,21 @@ def main():
         sys.exit(f"missing {UPSTREAM_KWS}\n"
                  f"  git submodule update --init --depth 1 -- lib/mlperf-tiny")
 
-    # Upstream's modules read quant_cal_idxs.txt and default --bg_path from the cwd,
-    # so they are imported and called from their own directory.  Nothing writes there:
-    # there is no _background_noise_ directory to find, and the plotting in
-    # make_bin_files.py is the part this script does not reproduce.
+    # 🔴 EVERY PATH RESOLVED BEFORE THE chdir BELOW, AND THAT ORDER IS THE POINT.
+    # os.path.abspath() resolves against the CURRENT directory, so doing this after the
+    # chdir would silently reinterpret a relative argument against upstream's tree --
+    # and `--out mlperf-datasets` would then try to write the dataset INTO the
+    # read-only submodule mirror.
+    tfds_dir = os.path.abspath(os.path.expanduser(args.tfds_dir))
+    model_path = os.path.abspath(os.path.expanduser(args.model))
+    out_dir = os.path.join(os.path.abspath(os.path.expanduser(args.out)), "kws01")
+
+    # Upstream's modules read quant_cal_idxs.txt from the cwd, so they are imported and
+    # called from their own directory.  Nothing writes there: --bg_path defaults to the
+    # $PWD environment variable rather than the cwd and finds no _background_noise_
+    # either way, and the plotting in make_bin_files.py is the part this script does
+    # not reproduce.
+    caller_cwd = os.getcwd()
     os.chdir(UPSTREAM_KWS)
     sys.path.insert(0, UPSTREAM_KWS)
 
@@ -134,7 +145,7 @@ def main():
     # that shapes the features lives (16 kHz, 30 ms window, 20 ms stride, 10 DCT
     # coefficients), and restating them here is how those quietly drift apart.
     sys.argv = ["make_kws_accuracy_dataset",
-                "--data_dir", os.path.abspath(os.path.expanduser(args.tfds_dir)),
+                "--data_dir", tfds_dir,
                 "--feature_type", "mfcc",
                 "--target_set", "test",
                 "--num_bin_files", str(args.count)]
@@ -144,14 +155,15 @@ def main():
     # runner sends kws01 already quantized (upstream's datasets/README.md: "49 frames x
     # 10 MFCCs as INT8"), so this is the one benchmark where the host decides the
     # tensor's representation and the firmware copies the bytes verbatim.
-    interpreter = tf.lite.Interpreter(model_path=os.path.abspath(args.model))
+    interpreter = tf.lite.Interpreter(model_path=model_path)
     interpreter.allocate_tensors()
     input_scale, input_zero_point = interpreter.get_input_details()[0]["quantization"]
     print(f"kws01: scale={input_scale} zero_point={input_zero_point} "
-          f"(from {os.path.relpath(os.path.abspath(args.model), REPO)})")
+          f"(from {os.path.relpath(model_path, REPO)})")
 
     print("building the test split (the first run prepares ~2.5 GB) ...")
     _, ds_test, _ = kws_data.get_training_data(Flags, val_cal_subset=True)
+    os.chdir(caller_cwd)   # upstream is done reading its directory
 
     rows, blobs = [], []
     eval_data = ds_test.unbatch().batch(1).take(args.count).as_numpy_iterator()
@@ -177,12 +189,16 @@ def main():
                  f"  {os.path.relpath(truth_csv, REPO)}.  A tensorflow_datasets version\n"
                  f"  that shards speech_commands differently would do this.")
 
-    out_dir = os.path.join(os.path.abspath(os.path.expanduser(args.out)), "kws01")
-    os.makedirs(out_dir, exist_ok=True)
+    # Sizes checked in a pass of their own, so that "nothing is written unless
+    # everything checks out" stays literally true rather than true until the first
+    # bad element.
     for (fname, _, _), blob in zip(rows, blobs):
         if len(blob) != SAMPLE_BYTES:
             sys.exit(f"REFUSING TO WRITE: {fname} is {len(blob)} B, expected "
                      f"{SAMPLE_BYTES} (49 frames x 10 coefficients)")
+
+    os.makedirs(out_dir, exist_ok=True)
+    for (fname, _, _), blob in zip(rows, blobs):
         with open(os.path.join(out_dir, fname), "wb") as f:
             f.write(blob)
     with open(os.path.join(out_dir, "y_labels.csv"), "w") as f:

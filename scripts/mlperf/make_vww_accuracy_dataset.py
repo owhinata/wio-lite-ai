@@ -101,34 +101,52 @@ def read_y_labels(path):
     return rows
 
 
-def index_images(source):
-    """id -> (directory, member-or-path), over a tarball or an extracted tree."""
+def collect(source, wanted):
+    """id -> (directory, decoded RGB bytes), for the ids in @p wanted.
+
+    🔴 ONE PASS, AND THAT IS WHAT MAKES THE CHECK MEAN ANYTHING.  An earlier version
+    walked the tarball once to record where each id lived, checked those directories
+    against upstream's labels, and then walked it AGAIN to read the pixels -- so what
+    was verified and what was written came from two different reads of the file, and
+    anything that changed in between would be written unverified.  Decoding during the
+    same pass that records the directory removes the gap rather than narrowing it: the
+    bytes that get written are the bytes that were checked.
+
+    It is also simply less work.  The tarball holds 109,619 images and only 1,000 are
+    wanted, so filtering before decoding costs one pass instead of two over 235 MB.
+    """
     found = {}
     dups = []
 
-    def add(image_id, folder, handle):
+    def add(image_id, folder, raw, name):
+        if image_id not in wanted:
+            return
         if image_id in found:
             dups.append(image_id)
-        else:
-            found[image_id] = (folder, handle)
+            return
+        found[image_id] = (folder, decode(raw, name))
 
     if os.path.isdir(source):
         for folder in ("person", "non_person"):
             d = os.path.join(source, folder)
             if not os.path.isdir(d):
                 continue
-            for name in os.listdir(d):
+            for name in sorted(os.listdir(d)):
                 m = MEMBER_RE.search(f"vw_coco2014_96/{folder}/{name}")
-                if m:
-                    add(m.group(2), folder, os.path.join(d, name))
+                if not m or m.group(2) not in wanted:
+                    continue
+                with open(os.path.join(d, name), "rb") as f:
+                    add(m.group(2), folder, f.read(), name)
     else:
         with tarfile.open(source, "r:gz") as tar:
             for member in tar:
                 if not member.isfile():
                     continue
                 m = MEMBER_RE.search(member.name)
-                if m:
-                    add(m.group(2), m.group(1), member.name)
+                if not m or m.group(2) not in wanted:
+                    continue
+                add(m.group(2), m.group(1), tar.extractfile(member).read(),
+                    member.name)
 
     if dups:
         sys.exit(f"REFUSING TO WRITE: {len(dups)} image ids appear more than once in "
@@ -164,11 +182,14 @@ def main():
     truth_csv = y_labels_path("vww01")
     rows = read_y_labels(truth_csv)
 
-    print(f"indexing {args.vww} ...")
-    images = index_images(args.vww)
-    print(f"  {len(images)} images")
+    wanted = {name[:-4] if name.endswith(".bin") else name for name, _, _ in rows}
 
-    # THE CHECK, over every row, before a single file is written.
+    print(f"reading {args.vww} ...")
+    images = collect(args.vww, wanted)
+    print(f"  {len(images)} of {len(wanted)} wanted images found")
+
+    # THE CHECK, over every row, before a single file is written -- against the very
+    # bytes collect() decoded, not against a second look at the source.
     missing, mislabelled = [], []
     for name, _, true_class in rows:
         image_id = name[:-4] if name.endswith(".bin") else name
@@ -195,27 +216,9 @@ def main():
 
     out_dir = os.path.join(args.out, "vww01")
     os.makedirs(out_dir, exist_ok=True)
-
-    # One pass over the tarball for all 1,000 images rather than one open per image:
-    # a re-open would decompress 235 MB each time.
-    blobs = {}
-    if os.path.isdir(args.vww):
-        for name, _, _ in rows:
-            image_id = name[:-4]
-            with open(images[image_id][1], "rb") as f:
-                blobs[image_id] = decode(f.read(), name)
-    else:
-        wanted = {images[n[:-4]][1]: n[:-4] for n, _, _ in rows}
-        with tarfile.open(args.vww, "r:gz") as tar:
-            for member in tar:
-                image_id = wanted.get(member.name)
-                if image_id is None:
-                    continue
-                blobs[image_id] = decode(tar.extractfile(member).read(), member.name)
-
     for name, _, _ in rows:
         with open(os.path.join(out_dir, name), "wb") as f:
-            f.write(blobs[name[:-4]])
+            f.write(images[name[:-4]][1])
     with open(os.path.join(out_dir, "y_labels.csv"), "w") as f:
         for name, n_classes, true_class in rows:
             f.write(f"{name},{n_classes},{true_class}\n")
