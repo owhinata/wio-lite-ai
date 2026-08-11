@@ -114,7 +114,13 @@ int nn_camera_stop(void);
 int nn_camera_running(void);
 void nn_camera_stats_get(struct nn_camera_stats *out);
 
-/** Copy the most recently published detections.  Returns how many were copied. */
+/**
+ * Copy the most recently published detections.  Returns how many were copied, or -1
+ * if the decoder does not recognise the loaded model's outputs at all -- the same
+ * convention blazeface_decode() uses, because it is the same answer travelling
+ * through the worker.  -1 and 0 are different facts and the caller must not merge
+ * them: one is "this is not a face model", the other is "no faces" (issue #57).
+ */
 int nn_camera_dets_get(struct bf_det *out, int max);
 
 /** Input normalization: 1 = [-1,1], 0 = [0,1] (default).  Applies to float32 and

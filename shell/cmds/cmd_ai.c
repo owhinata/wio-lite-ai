@@ -8,6 +8,7 @@
  *
  *   ai info              backend / model / tensor shapes / quantization / arena
  *   ai bench [n]         run inference n times, report min/avg/max latency
+ *   ai out [i] [n]       dequantized values the last run left in output tensor i
  *   ai model load <slot> read a .tflite out of a NOR blob slot and run it
  *   ai model unload      drop it again
  *
@@ -17,6 +18,9 @@
  * which the `null` build still accepts and answers honestly, because the "this
  * backend cannot load a model" case is a value nn.c returns rather than a missing
  * command (port/nn/nn.h).  The camera-driven `ai run` / `ai stream` are phase 3.
+ * `ai out` is issue #57: once this build could load models other than BlazeFace
+ * (issue #55), `ai dets` was the only way to read an output and it reads them as
+ * BlazeFace, so any other model ran with its answer invisible.
  *
  * WHERE A MODEL COMES FROM IS DECIDED HERE, not in port/nn.  That layer is
  * model-agnostic on purpose; the fact that this board keeps models in the external
@@ -61,6 +65,17 @@
 
 #define AI_BENCH_DEFAULT_ITERS 50u
 #define AI_BENCH_MAX_ITERS     100000u
+
+/*
+ * `ai out` prints a PREFIX of a tensor, never all of it (issue #57).  16 covers every
+ * classifier this board runs -- vww01 has 2 classes, ic0x 10, kws01 12 -- and the cap
+ * exists because the other kind of output tensor is BlazeFace's 512x16, which at one
+ * line each would be 8192 lines the console cannot be interrupted out of usefully
+ * (cli_core drops a cancelled handler's output, issue #16, so a long dump is not
+ * something the user can stop and still read).
+ */
+#define AI_OUT_DEFAULT_ELEMS   16u
+#define AI_OUT_MAX_ELEMS       64u
 
 static const char *ai_dtype_name(uint8_t dt)
 {
@@ -635,6 +650,223 @@ static int cmd_ai_bench(struct cli_instance *sh, int argc, char **argv)
 	return 0;
 }
 
+/* ---- ai out (issue #57) --------------------------------------------------- */
+
+/*
+ * Decompose @p v for printing as "%s%lu.%06lu" -- sign, integer part, six fraction
+ * digits.  svc/fmt.c implements no %f and no precision flag, so every fractional value
+ * in this firmware is printed as scaled integers; ai_print_tensor() above does the same
+ * thing inline for the quantization scale.  It is a separate function here because a
+ * dequantized OUTPUT can be negative and a scale cannot, and the sign is not decoration:
+ * for a logit it is the whole answer.
+ *
+ * Returns -1 for NaN, which the caller prints as "nan" rather than as some number.  A
+ * NaN in an output tensor is a diagnosis, not a value, and printing "0.000000" for it
+ * would hide the one thing worth seeing.
+ */
+static int ai_f32_parts(float v, const char **sign, uint32_t *ip, uint32_t *frac)
+{
+	*sign = "";
+	if (v != v)                     /* the only value that is not equal to itself */
+		return -1;
+	if (v < 0.0f) {
+		*sign = "-";
+		v = -v;
+	}
+	/* 🔴 Clamped BEFORE the cast, not after: float -> uint32_t is undefined for
+	 * anything outside the destination's range, and this command is reached for when
+	 * a model is already suspect -- it must not be the thing that then misbehaves.
+	 * Same reasoning, same clamp, as the scale in ai_print_tensor(). */
+	if (v >= 1000000.0f) {
+		*ip = 999999u;
+		*frac = 999999u;
+		return 0;
+	}
+	*ip = (uint32_t)v;
+	*frac = (uint32_t)((v - (float)*ip) * 1000000.0f + 0.5f);
+	if (*frac >= 1000000u) {        /* the rounding carried */
+		(*ip)++;
+		*frac -= 1000000u;
+	}
+	return 0;
+}
+
+static uint32_t ai_dtype_size(uint8_t dt)
+{
+	switch (dt) {
+	case NN_DTYPE_INT8:
+	case NN_DTYPE_UINT8:   return 1u;
+	case NN_DTYPE_INT16:   return 2u;
+	case NN_DTYPE_INT32:
+	case NN_DTYPE_FLOAT32: return 4u;
+	default:               return 0u;
+	}
+}
+
+/* The stored code of element @p i, sign-extended into an int32.  Integer dtypes only --
+   the caller has already separated the float case, which has no code to show. */
+static int32_t ai_tensor_raw(const struct nn_tensor *t, uint32_t i)
+{
+	switch (t->dtype) {
+	case NN_DTYPE_INT8:  return ((const int8_t  *)t->data)[i];
+	case NN_DTYPE_UINT8: return ((const uint8_t *)t->data)[i];
+	case NN_DTYPE_INT16: return ((const int16_t *)t->data)[i];
+	case NN_DTYPE_INT32: return ((const int32_t *)t->data)[i];
+	default:             return 0;   /* unreachable: ai_dtype_size() filtered these */
+	}
+}
+
+/*
+ * Print the values in an output tensor.
+ *
+ * WHY THIS IS NOT ANOTHER DECODER.  `ai dets` reads the outputs too, but it reads them
+ * AS BLAZEFACE: four tensors in a known order, turned into boxes.  Every other model has
+ * no decoder here and therefore no way to be read at all, which is what issue #57 hit --
+ * vww01 (MLPerf Tiny's MobileNet, issue #55) already runs on camera frames without a
+ * line of change, because app/nn_camera.c takes its geometry and its quantization from
+ * the input tensor rather than assuming BlazeFace's; its 1x2 answer was simply invisible.
+ * Dequantized numbers are model-agnostic, and that is the whole point: a command that
+ * knows nothing about the model is the one that can still tell you the model works.
+ *
+ * IT RUNS NOTHING.  The values are whatever the last inference left in the arena -- the
+ * same contract `ai dets` documents, and it pairs with the same two idioms: `ai bench 1`
+ * then `ai out` reads a run over the constant pattern, and `ai run` then `ai out` reads
+ * one camera frame.
+ *
+ * 🔴 A ZERO SCALE IS NOT A UNIT SCALE.  A per-axis quantized tensor arrives through this
+ * API with params.scale == 0 because its real parameters live in the affine-quantization
+ * struct port/nn/nn.h does not expose (issue #51, the same fact app/nn_camera.c refuses
+ * an input over).  Dequantizing with it would print 0.000000 for every element of a
+ * perfectly good tensor, so the codes are printed alone and the header says why.
+ */
+static int cmd_ai_out(struct cli_instance *sh, int argc, char **argv)
+{
+	struct nn_model *m = NULL;
+	const struct nn_tensor *t;
+	uint32_t idx = 0u, want = AI_OUT_DEFAULT_ELEMS, elems, esz, i;
+	int nout, rc, quantized, dequant;
+
+#if BSP_ENABLE_CAMERA
+	/*
+	 * The worker holds the NN session for the whole stream, so the guards below would
+	 * refuse anyway -- but they would refuse with "NN busy", and the useful answer is
+	 * which command to run instead.  Unlike `ai dets` there is no snapshot to print:
+	 * the worker publishes decoded detections, not raw tensors, and publishing them
+	 * would mean copying an output tensor of unknown size out of the arena on every
+	 * inference for a command that is usually not watching.
+	 */
+	if (nn_camera_running()) {
+		cli_error(sh, "ai: a stream is running -- the worker owns the arena. "
+		          "`ai stream stop`, then `ai run` + `ai out`\r\n");
+		return 1;
+	}
+#endif
+
+	rc = nn_model_open(&m);
+	if (rc != 0) {
+		cli_error(sh, "ai: model open failed (%d)\r\n", rc);
+		return 1;
+	}
+	nout = nn_output_count(m);
+	if (nout <= 0) {
+		cli_error(sh, "ai: no model loaded -- `blob list`, then "
+		          "`ai model load <slot>`\r\n");
+		return 1;
+	}
+
+	if (argc > 1) {
+		uint32_t v;
+
+		if (cli_parse_u32(argv[1], &v) != 0 || v >= (uint32_t)nout) {
+			cli_error(sh, "ai: bad output index (0 .. %d)\r\n", nout - 1);
+			return 1;
+		}
+		idx = v;
+	}
+	if (argc > 2) {
+		uint32_t v;
+
+		if (cli_parse_u32(argv[2], &v) != 0 || v == 0u) {
+			cli_error(sh, "ai: bad element count (1 .. %lu)\r\n",
+			          (unsigned long)AI_OUT_MAX_ELEMS);
+			return 1;
+		}
+		want = (v > AI_OUT_MAX_ELEMS) ? AI_OUT_MAX_ELEMS : v;
+	}
+
+	t = nn_output(m, (int)idx);
+	esz = t ? ai_dtype_size(t->dtype) : 0u;
+	if (t == NULL || t->data == NULL || esz == 0u) {
+		cli_error(sh, "ai: output[%lu] has no readable buffer (dtype %s)\r\n",
+		          (unsigned long)idx, t ? ai_dtype_name(t->dtype) : "none");
+		return 1;
+	}
+
+	/* Element count from the SHAPE, then clamped by the buffer.  The two should agree;
+	   taking the smaller means a descriptor that disagrees with itself costs a short
+	   listing rather than a read past the end of the arena. */
+	elems = 1u;
+	for (i = 0; i < t->ndim && i < NN_MAX_DIMS; i++)
+		elems *= t->dims[i];
+	if (elems > t->bytes / esz)
+		elems = t->bytes / esz;
+	if (elems == 0u) {
+		cli_error(sh, "ai: output[%lu] is empty\r\n", (unsigned long)idx);
+		return 1;
+	}
+	if (want > elems)
+		want = elems;
+
+	quantized = (t->dtype != NN_DTYPE_FLOAT32);
+	dequant   = !quantized || (t->scale > 0.0f);
+
+	/* Reading the tensor bodies walks the arena, which lives in the PSRAM -- the same
+	   reason `ai bench` and `ai dets` are guarded and `ai info` is not. */
+	if (ai_guards_take(sh) != 0)
+		return 1;
+
+	ai_print_tensor(sh, "out", (int)idx, t);
+	if (!dequant)
+		cli_warn(sh, "  scale unavailable (per-axis quantization) -- raw codes "
+		         "only\r\n");
+	for (i = 0; i < want; i++) {
+		const char *sign;
+		uint32_t ip, frac;
+		int32_t raw = 0;
+		float v = 0.0f;
+
+		if (quantized) {
+			raw = ai_tensor_raw(t, i);
+			v = ((float)raw - (float)t->zero_point) * t->scale;
+		} else {
+			v = ((const float *)t->data)[i];
+		}
+
+		if (!dequant)
+			cli_print(sh, "  [%lu]  q=%ld\r\n",
+			          (unsigned long)i, (long)raw);
+		else if (ai_f32_parts(v, &sign, &ip, &frac) != 0)
+			/* An integer element cannot itself be NaN, so for a quantized tensor
+			   the broken number is the scale -- name it, rather than leaving the
+			   element looking like the problem. */
+			cli_print(sh, "  [%lu]  nan%s\r\n", (unsigned long)i,
+			          quantized ? "  (the SCALE is NaN, not the element)" : "");
+		else if (quantized)
+			cli_print(sh, "  [%lu]  %s%lu.%06lu  (q=%ld)\r\n", (unsigned long)i,
+			          sign, (unsigned long)ip, (unsigned long)frac, (long)raw);
+		else
+			cli_print(sh, "  [%lu]  %s%lu.%06lu\r\n", (unsigned long)i,
+			          sign, (unsigned long)ip, (unsigned long)frac);
+	}
+	ai_guards_give();
+
+	if (want < elems)
+		cli_print(sh, "  ... %lu of %lu shown (`ai out %lu <n>`, max %lu)\r\n",
+		          (unsigned long)want, (unsigned long)elems, (unsigned long)idx,
+		          (unsigned long)AI_OUT_MAX_ELEMS);
+	return 0;
+}
+
 /* ---- ai dets / ai thresh (issue #9 phase 3) ------------------------------- */
 
 /*
@@ -656,6 +888,32 @@ static void ai_print_dets(struct cli_instance *sh, const struct bf_det *d, int n
 		          i, (long)(d[i].x * 100.0f), (long)(d[i].y * 100.0f),
 		          (long)(d[i].w * 100.0f), (long)(d[i].h * 100.0f),
 		          (long)(d[i].score * 1000.0f));
+}
+
+/*
+ * Print what the worker's decoder made of the last inference: the detections, or -- for
+ * a model the decoder does not recognise at all -- that fact and where to look instead.
+ *
+ * 🔴 THE TWO CASES MUST NOT PRINT THE SAME THING (issue #57).  A non-BlazeFace model
+ * used to arrive here as `dets: 0`, which reads as "no faces in the frame", beside a
+ * `maxscore` that blazeface_decode() had returned too early to touch -- so the number
+ * still belonged to whichever model ran before.  Both lines look like a measurement of
+ * the model that is loaded, and neither is one.  This is the shape of stale diagnostic
+ * this file has been bitten by before (the `re-issue ai stream start` hint that could
+ * not actually re-arm): a confident wrong answer costs more than no answer.
+ */
+static void ai_print_decode(struct cli_instance *sh, const struct bf_det *d, int n,
+                            const char *suffix)
+{
+	if (n < 0) {
+		cli_print(sh, "dets    : n/a -- this model's outputs are not "
+		          "BlazeFace-shaped; read them with `ai out`%s\r\n", suffix);
+		return;
+	}
+	ai_print_dets(sh, d, n);
+	cli_print(sh, "maxscore: %ld (raw x1000, pre-sigmoid)  cand: %d (pre-NMS)%s\r\n",
+	          (long)(blazeface_last_max_score() * 1000.0f),
+	          blazeface_last_ncand(), suffix);
 }
 
 /*
@@ -683,11 +941,7 @@ static int cmd_ai_dets(struct cli_instance *sh, int argc, char **argv)
 	   the worker published instead. */
 	if (nn_camera_running()) {
 		n = nn_camera_dets_get(dets, BF_MAX_DET);
-		ai_print_dets(sh, dets, n);
-		cli_print(sh, "maxscore: %ld (raw x1000, pre-sigmoid)  cand: %d (pre-NMS)"
-		          "  [live stream]\r\n",
-		          (long)(blazeface_last_max_score() * 1000.0f),
-		          blazeface_last_ncand());
+		ai_print_decode(sh, dets, n, "  [live stream]");
 		return 0;
 	}
 #endif
@@ -707,13 +961,10 @@ static int cmd_ai_dets(struct cli_instance *sh, int argc, char **argv)
 	if (n < 0) {
 		cli_error(sh, "ai: the loaded model's outputs are not BlazeFace-shaped "
 		          "(need 1x512x16 / 1x512x1 / 1x384x16 / 1x384x1 float32 -- "
-		          "see `ai info`)\r\n");
+		          "see `ai info`).  `ai out` reads any model's outputs\r\n");
 		return 1;
 	}
-	ai_print_dets(sh, dets, n);
-	cli_print(sh, "maxscore: %ld (raw x1000, pre-sigmoid)  cand: %d (pre-NMS)\r\n",
-	          (long)(blazeface_last_max_score() * 1000.0f),
-	          blazeface_last_ncand());
+	ai_print_decode(sh, dets, n, "");
 	return 0;
 }
 
@@ -911,10 +1162,7 @@ static int cmd_ai_stream_stats(struct cli_instance *sh, int argc, char **argv)
 	          st.norm_signed ? "[-1,1]" : "[0,1]", st.overlay ? "on" : "off");
 
 	n = nn_camera_dets_get(dets, BF_MAX_DET);
-	ai_print_dets(sh, dets, n);
-	cli_print(sh, "maxscore: %ld (raw x1000, pre-sigmoid)  cand: %d (pre-NMS)\r\n",
-	          (long)(blazeface_last_max_score() * 1000.0f),
-	          blazeface_last_ncand());
+	ai_print_decode(sh, dets, n, "");
 
 	return 0;
 }
@@ -992,10 +1240,7 @@ static int cmd_ai_run(struct cli_instance *sh, int argc, char **argv)
 	}
 	cli_print(sh, "inference: %lu us\r\n",
 	          (unsigned long)ai_cyc_to_us(st.infer_last_cyc));
-	ai_print_dets(sh, dets, n);
-	cli_print(sh, "maxscore: %ld (raw x1000, pre-sigmoid)  cand: %d (pre-NMS)\r\n",
-	          (long)(blazeface_last_max_score() * 1000.0f),
-	          blazeface_last_ncand());
+	ai_print_decode(sh, dets, n, "");
 	return 0;
 
 cancelled:
@@ -1063,6 +1308,8 @@ CLI_SUBCMD_SET_CREATE(ai_subcmds,
 	            "runtime model swap (load <slot> / unload)", cmd_ai_model, 1, 2),
 	CLI_CMD_ARG(bench, NULL, "run inference [n] times, report latency",
 	            cmd_ai_bench, 1, 1),
+	CLI_CMD_ARG(out,   NULL, "dequantized values of output tensor [i] [n]",
+	            cmd_ai_out,   1, 2),
 	CLI_CMD_ARG(dets,   NULL, "decode the current outputs into face boxes",
 	            cmd_ai_dets,   1, 0),
 	CLI_CMD_ARG(thresh, NULL, "score threshold [milli-probability 1..999]",

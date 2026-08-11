@@ -80,6 +80,21 @@ time as the USB console. 27 commands:
     the display is scanning out — whether the LTDC underran *during that run*, read
     from the sticky flags inside the measured window rather than left to a later
     `lcd info` that could not tell inference apart from anything else that ran.
+  - `ai out [i] [n]` prints the **values** an inference left in an output tensor —
+    dequantized, with the raw codes beside them (issue #57). It exists because
+    `ai dets` reads the outputs *as BlazeFace*, four tensors in a known order, so once
+    this build could load other models (issue #55) they ran with their answers
+    invisible. It runs nothing itself: `ai bench 1` or `ai run` puts numbers in the
+    arena and this reads them. A **per-axis** quantized tensor arrives through the nn
+    API with `scale == 0` (its real parameters live where `port/nn/nn.h` cannot see
+    them), so that case prints the codes alone and says why, rather than dequantizing
+    by a zero and reporting `0.000000` for a perfectly good tensor. 🔴 The same issue
+    fixed the other half: a model the face decoder does not recognise used to be
+    reported as `dets: 0` — indistinguishable from "no faces" — beside a `maxscore`
+    the decoder had returned too early to touch, so that number **still belonged to
+    the previously loaded model**. `blazeface_decode()`'s `-1` now travels through the
+    worker to the shell, and `ai run` / `ai dets` / `ai stream stats` name the reason
+    instead.
   - **Live camera inference** (issue #9 phases 3–4): `ai stream start` runs
     **camera → BlazeFace → face boxes** continuously, and `ai overlay on` draws them
     on the preview. `ai run` does one shot. See *Live camera inference* below.
@@ -1616,6 +1631,26 @@ quantization `nncam_rows()` performs was checked against tflite-micro's own
 `AffineQuantize` reference over all 256 channel values × both `ai norm` settings ×
 four (scale, zero point) pairs: **identical everywhere**, which is why stripping a
 model's `QUANTIZE` and doing it in the firmware yields the same tensor.
+
+🔴 **The preprocessing is written for the tensor, not for BlazeFace, and that is what
+lets a second model in.** `nn_camera_start()` takes the input's height, width and
+channel count from `dims[1..3]`, and the band tiling is derived from them
+(`nncam_oy_bound()`), so MLPerf Tiny's **vww01** — MobileNet, 96×96, `scale` 1/255,
+`zp` −128 — runs on camera frames with **no change to any of this**: 96 output rows
+over four 60-row bands is 24 rows per band, and every source row a band samples falls
+inside that band. What it lacked was not preprocessing but a way to *read* the answer,
+which is `ai out` (issue #57). Two limits are worth naming:
+
+- **The channel count is checked** (1 or 3), because `nncam_rows()` fills at most three
+  channels from an RGB565 pixel. A four-channel input would not have faulted or
+  overrun — it would have handed the model one plane of stale activations as image
+  data, the same silent-wrong-pixels failure the zero-scale refusal above exists for.
+- **A model whose input `scale` is 1.0 passes every check and still sees nothing.**
+  ic01/ic02 are quantized that way: the sampler produces a normalized `[0,1]` value,
+  and dividing that by 1.0 puts every pixel at −128 or −127 — a one-bit image. Those
+  models want the raw byte in offset binary, which is a property of the *benchmark*
+  rather than of the model (issue #56) and which `ai norm`'s two settings cannot
+  express.
 
 ## Flash (over DFU)
 

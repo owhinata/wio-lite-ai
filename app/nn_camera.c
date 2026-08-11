@@ -315,7 +315,15 @@ static void nncam_publish(const struct bf_det *d, int n)
 		return;
 	if (n > 0)
 		memcpy(nncam_dets, d, (size_t)n * sizeof(*d));
-	nncam_ndet = (n > 0) ? n : 0;
+	/*
+	 * 🔴 A DECODER THAT DOES NOT RECOGNISE THE MODEL IS NOT "ZERO FACES" (issue #57).
+	 * Collapsing blazeface_decode()'s -1 into 0 made every non-BlazeFace model report
+	 * `dets: 0` -- which reads as a measurement -- next to a `maxscore` the decoder had
+	 * returned too early to touch, so that number still belonged to whatever model ran
+	 * before.  Two readings that both look like this model's answer, and neither is.
+	 * The -1 is carried through to the shell instead, which prints the reason.
+	 */
+	nncam_ndet = (n < 0) ? -1 : n;
 	(void)tx_mutex_put(&nncam_det_lock);
 }
 
@@ -539,9 +547,20 @@ int nn_camera_start(int colorbar)
 	nncam_oh = in->dims[1];
 	nncam_ow = in->dims[2];
 	nncam_oc = in->dims[3];
-	/* The tiling has to cover the input exactly, or some output rows would never
-	   be written (and would then be inferred from whatever the arena last held). */
-	if (nncam_oh == 0u || nncam_ow == 0u || nncam_oc == 0u ||
+	/*
+	 * 🔴 THE CHANNEL COUNT IS CHECKED BECAUSE nncam_rows() STOPS AT THREE (issue #57).
+	 * It writes `c < oc && c < 3` channels from an RGB565 pixel, so a four-channel
+	 * input would leave channel 3 of every pixel holding whatever the arena last had --
+	 * no fault, no overrun, just one plane of stale activations fed to the model as if
+	 * it were image data.  That is the failure mode this file already refuses a
+	 * per-axis scale over: silently wrong pixels with nothing to show for it.  1 (the
+	 * red channel alone) and 3 (RGB) are what the sampler can actually produce.
+	 *
+	 * The tiling then has to cover the input exactly, or some output rows would never
+	 * be written (and would then be inferred from whatever the arena last held).
+	 */
+	if ((nncam_oc != 1u && nncam_oc != 3u) ||
+	    nncam_oh == 0u || nncam_ow == 0u ||
 	    nncam_oy_bound(0u, nncam_oh) != 0u ||
 	    nncam_oy_bound(CAMERA_BANDS_PER_FRAME, nncam_oh) != nncam_oh ||
 	    (uint32_t)nncam_ow * nncam_oh * nncam_oc *
